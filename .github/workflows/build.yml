@@ -40,14 +40,35 @@ jobs:
       - name: Install Android platform
         run: sdkmanager "platforms;android-34" "build-tools;34.0.0"
 
-      - name: Build APK
-        run: gradle -p android-client :app:assembleDebug --no-daemon --stacktrace
+      - name: Restore release keystore
+        shell: bash
+        env:
+          SIDEDOCK_RELEASE_KEYSTORE_BASE64: ${{ secrets.SIDEDOCK_RELEASE_KEYSTORE_BASE64 }}
+          SIDEDOCK_RELEASE_STORE_PASSWORD: ${{ secrets.SIDEDOCK_RELEASE_STORE_PASSWORD }}
+          SIDEDOCK_RELEASE_KEY_ALIAS: ${{ secrets.SIDEDOCK_RELEASE_KEY_ALIAS }}
+        run: |
+          set -euo pipefail
+          test -n "$SIDEDOCK_RELEASE_KEYSTORE_BASE64"
+          echo "$SIDEDOCK_RELEASE_KEYSTORE_BASE64" | base64 --decode > "$RUNNER_TEMP/sidedock-release.keystore"
+          keytool -list \
+            -keystore "$RUNNER_TEMP/sidedock-release.keystore" \
+            -storepass "$SIDEDOCK_RELEASE_STORE_PASSWORD" \
+            -alias "$SIDEDOCK_RELEASE_KEY_ALIAS" \
+            -v | grep -E "Alias name|SHA256:"
+
+      - name: Build signed release APK
+        env:
+          SIDEDOCK_RELEASE_STORE_FILE: ${{ runner.temp }}/sidedock-release.keystore
+          SIDEDOCK_RELEASE_STORE_PASSWORD: ${{ secrets.SIDEDOCK_RELEASE_STORE_PASSWORD }}
+          SIDEDOCK_RELEASE_KEY_ALIAS: ${{ secrets.SIDEDOCK_RELEASE_KEY_ALIAS }}
+          SIDEDOCK_RELEASE_KEY_PASSWORD: ${{ secrets.SIDEDOCK_RELEASE_KEY_PASSWORD }}
+        run: gradle -p android-client :app:assembleRelease --no-daemon --stacktrace
 
       - name: Upload APK
         uses: actions/upload-artifact@v4
         with:
-          name: sidedock-android-apk
-          path: android-client/app/build/outputs/apk/debug/*.apk
+          name: sidedock-android-release-apk
+          path: android-client/app/build/outputs/apk/release/*.apk
           if-no-files-found: error
 
   windows-host:
@@ -181,7 +202,7 @@ jobs:
         run: |
           set -euo pipefail
           mkdir -p release-assets
-          (cd release-input/sidedock-android-apk && zip -r ../../release-assets/sidedock-android-apk.zip .)
+          (cd release-input/sidedock-android-release-apk && zip -r ../../release-assets/sidedock-android-release-apk.zip .)
           (cd release-input/sidedock-windows-host && zip -r ../../release-assets/sidedock-windows-host.zip .)
           (cd release-input/sidedock-windows-driver && zip -r ../../release-assets/sidedock-windows-driver.zip .)
 

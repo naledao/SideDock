@@ -13,4 +13,22 @@ android {
         versionCode = 1
         versionName = "0.1.0"
     }
+
+    signingConfigs {
+        create("release") {
+            val storeFilePath = providers.environmentVariable("SIDEDOCK_RELEASE_STORE_FILE").orNull
+            if (!storeFilePath.isNullOrBlank()) {
+                storeFile = file(storeFilePath)
+                storePassword = providers.environmentVariable("SIDEDOCK_RELEASE_STORE_PASSWORD").orNull
+                keyAlias = providers.environmentVariable("SIDEDOCK_RELEASE_KEY_ALIAS").orNull
+                keyPassword = providers.environmentVariable("SIDEDOCK_RELEASE_KEY_PASSWORD").orNull
+            }
+        }
+    }
+
+    buildTypes {
+        release {
+            signingConfig = signingConfigs.getByName("release")
+        }
+    }
 }
