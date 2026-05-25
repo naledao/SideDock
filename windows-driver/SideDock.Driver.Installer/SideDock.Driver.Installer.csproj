@@ -1,0 +1,18 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <TargetFramework>net8.0-windows</TargetFramework>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+    <AssemblyName>SideDock.Driver.Installer</AssemblyName>
+    <ApplicationManifest>app.manifest</ApplicationManifest>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <EmbeddedResource Include="DriverPayload.zip" Condition="Exists('DriverPayload.zip')" />
+  </ItemGroup>
+
+  <Target Name="RequireDriverPayload" BeforeTargets="BeforeBuild" Condition="'$(CI)' == 'true' and !Exists('DriverPayload.zip')">
+    <Error Text="DriverPayload.zip is required for CI installer builds." />
+  </Target>
+</Project>

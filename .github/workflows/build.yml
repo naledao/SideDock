@@ -171,13 +171,53 @@ jobs:
             /p:SkipPackageVerification=true `
             /p:SignMode=Off
 
-      - name: Upload driver artifact
+      - name: Test-sign driver package
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $driverPackage = Resolve-Path ".\windows-driver\SideDock.Idd\x64\Release\SideDock.Idd"
+          $certPath = Join-Path $driverPackage "SideDock.Idd.cer"
+          $catPath = Join-Path $driverPackage "sidedock.idd.cat"
+          $cert = New-SelfSignedCertificate `
+            -Type CodeSigningCert `
+            -Subject "CN=SideDock Test Driver" `
+            -CertStoreLocation "Cert:\CurrentUser\My" `
+            -KeyExportPolicy Exportable `
+            -KeyLength 2048 `
+            -HashAlgorithm SHA256
+          Export-Certificate -Cert $cert -FilePath $certPath | Out-Null
+          & "${env:ProgramFiles(x86)}\Windows Kits\10\bin\10.0.26100.0\x64\signtool.exe" sign `
+            /v `
+            /fd SHA256 `
+            /s My `
+            /sha1 $cert.Thumbprint `
+            $catPath
+
+      - name: Build driver installer
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $payloadRoot = Join-Path $env:RUNNER_TEMP "driver-payload"
+          $driverDest = Join-Path $payloadRoot "SideDock.Idd"
+          $toolDest = Join-Path $payloadRoot "SideDock.Idd.DeviceTool"
+          New-Item -ItemType Directory -Force $driverDest, $toolDest | Out-Null
+          Copy-Item -Recurse -Force .\windows-driver\SideDock.Idd\x64 $driverDest
+          Copy-Item -Recurse -Force .\windows-driver\SideDock.Idd.DeviceTool\x64 $toolDest
+          Compress-Archive -Path (Join-Path $payloadRoot "*") -DestinationPath .\windows-driver\SideDock.Driver.Installer\DriverPayload.zip -Force
+          dotnet publish .\windows-driver\SideDock.Driver.Installer\SideDock.Driver.Installer.csproj `
+            --configuration Release `
+            --runtime win-x64 `
+            --self-contained true `
+            -p:PublishSingleFile=true `
+            -p:EnableCompressionInSingleFile=true `
+            -p:IncludeNativeLibrariesForSelfExtract=true `
+            --output "$env:RUNNER_TEMP\sidedock-driver-installer"
+
+      - name: Upload driver installer
         uses: actions/upload-artifact@v4
         with:
-          name: sidedock-windows-driver
-          path: |
-            windows-driver/SideDock.Idd/x64/Release/**
-            windows-driver/SideDock.Idd.DeviceTool/x64/Release/**
+          name: sidedock-driver-installer
+          path: ${{ runner.temp }}\sidedock-driver-installer\SideDock.Driver.Installer.exe
           if-no-files-found: error
 
   release:
@@ -204,7 +244,7 @@ jobs:
           mkdir -p release-assets
           (cd release-input/sidedock-android-release-apk && zip -r ../../release-assets/sidedock-android-release-apk.zip .)
           (cd release-input/sidedock-windows-host && zip -r ../../release-assets/sidedock-windows-host.zip .)
-          (cd release-input/sidedock-windows-driver && zip -r ../../release-assets/sidedock-windows-driver.zip .)
+          cp release-input/sidedock-driver-installer/SideDock.Driver.Installer.exe release-assets/SideDock.Driver.Installer.exe
 
       - name: Create release
         env:
