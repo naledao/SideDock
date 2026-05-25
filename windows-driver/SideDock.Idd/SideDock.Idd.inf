@@ -1,0 +1,68 @@
+;
+; SideDock.Idd.inf
+;
+
+[Version]
+PnpLockDown=1
+Signature="$Windows NT$"
+ClassGUID={4D36E968-E325-11CE-BFC1-08002BE10318}
+Class=Display
+ClassVer=2.0
+Provider=%ManufacturerName%
+CatalogFile=SideDock.Idd.cat
+DriverVer=05/24/2026,0.1.0.0
+
+[Manufacturer]
+%ManufacturerName%=Standard,NT$ARCH$.10.0...22000
+
+[Standard.NT$ARCH$.10.0...22000]
+%DeviceName%=SideDock_Idd_Install, Root\SideDockIdd
+%DeviceName%=SideDock_Idd_Install, SideDockIdd
+
+[SourceDisksFiles]
+SideDock.Idd.dll=1
+
+[SourceDisksNames]
+1=%DiskName%
+
+[DestinationDirs]
+UMDriverCopy=12,UMDF
+
+[SideDock_Idd_Install.NT]
+Include=WUDFRD.inf
+Needs=WUDFRD.NT
+CopyFiles=UMDriverCopy
+
+[SideDock_Idd_Install.NT.hw]
+Include=WUDFRD.inf
+Needs=WUDFRD.NT.HW
+AddReg=SideDock_Idd_HardwareDeviceSettings
+
+[SideDock_Idd_HardwareDeviceSettings]
+HKR,, "UpperFilters", %REG_MULTI_SZ%, "IndirectKmd"
+HKR, "WUDF", "DeviceGroupId", %REG_SZ%, "SideDockIddDriverGroup"
+
+[SideDock_Idd_Install.NT.Services]
+Include=WUDFRD.inf
+Needs=WUDFRD.NT.Services
+
+[SideDock_Idd_Install.NT.Wdf]
+UmdfService=SideDock.Idd,SideDock_Idd_ServiceInstall
+UmdfServiceOrder=SideDock.Idd
+UmdfKernelModeClientPolicy=AllowKernelModeClients
+
+[SideDock_Idd_ServiceInstall]
+UmdfLibraryVersion=$UMDFVERSION$
+ServiceBinary=%12%\UMDF\SideDock.Idd.dll
+UmdfExtensions=IddCx0102
+
+[UMDriverCopy]
+SideDock.Idd.dll
+
+[Strings]
+ManufacturerName="SideDock"
+DiskName="SideDock IddCx Driver Installation Disk"
+DeviceName="SideDock Virtual Display"
+
+REG_MULTI_SZ=0x00010000
+REG_SZ=0x00000000

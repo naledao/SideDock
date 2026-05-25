@@ -1,0 +1,147 @@
+# SideDock.Idd
+
+Minimal UMDF + IddCx virtual display driver for the SideDock prototype.
+
+Current scope:
+
+- Reports one virtual monitor named `SideDock Virtual Display`.
+- Exposes `720p`, `1080p`, and `2K` modes at `30Hz`, `60Hz`, and `120Hz`.
+- Accepts the IddCx swap chain.
+- Copies swap-chain frames to a CPU-readable staging texture.
+- Exports BGRA frames through `Global\SideDockFrameBuffer`; the shared buffer can hold up to `2560x1440`.
+- Signals `Global\SideDockFrameReady` after writing a frame.
+- Uses `Global\SideDockFrameConsumerAlive` to skip export when `SideDock.Host --video-source idd` is not running.
+
+Verified locally on 2026-05-25:
+
+- The driver solution builds in `Debug|x64`.
+- ApiValidator, Inf2Cat, and test signing pass.
+- The validation package installed as `oem92.inf`.
+- `SideDock.Idd.DeviceTool.exe` keeps the software device alive.
+- Windows Display Settings shows `SideDock Virtual Display`.
+- The original smoke test reported `1280 x 720 (32 bit) (30Hz)`; the current driver advertises `1280x720`, `1920x1080`, and `2560x1440` at `30/60/120Hz`.
+- Uninstalling the package and removing the software device makes the virtual display disappear again.
+- `SideDock.Host --video-source idd` reads the shared BGRA frames and streams the virtual desktop to Android.
+- Lenovo TB-J706F displays the real `SideDock Virtual Display` desktop content.
+- 10-minute Android stability validation passed from `2026-05-25 16:13:38` to `16:24:04`.
+- Removing `adb reverse tcp:27183` and `tcp:27184` is recovered automatically by Host; Android video continues decoding after the mapping is rebuilt.
+
+Run the Android visual path with:
+
+```powershell
+dotnet run --project .\windows-host\SideDock.Host\SideDock.Host.csproj -- --video-source idd
+```
+
+Select a quality/refresh preset with:
+
+```powershell
+dotnet run --project .\windows-host\SideDock.Host\SideDock.Host.csproj -- --video-source idd --resolution 1080p --refresh-rate 60
+dotnet run --project .\windows-host\SideDock.Host\SideDock.Host.csproj -- --video-source idd --resolution 2k --refresh-rate 120
+```
+
+This project is intentionally based on Microsoft Windows-driver-samples `video/IndirectDisplay/IddSampleDriver`, then reduced to the SideDock one-monitor path. The original sample is distributed under MS-PL; keep [../LICENSE-MS-PL.txt](../LICENSE-MS-PL.txt) with this source tree.
+
+## Build
+
+Install Visual Studio with C++ desktop workload plus the Windows Driver Kit that includes the IddCx headers and driver MSBuild targets.
+
+```powershell
+& "C:\Program Files (x86)\Microsoft Visual Studio\2022\BuildTools\MSBuild\Current\Bin\amd64\MSBuild.exe" `
+  .\windows-driver\SideDock.Driver.sln `
+  /p:Configuration=Debug `
+  /p:Platform=x64
+```
+
+Expected driver package output is under:
+
+```text
+windows-driver\SideDock.Idd\x64\Debug\
+```
+
+## Test Install
+
+Run an elevated PowerShell session.
+
+```powershell
+bcdedit /set testsigning on
+```
+
+Reboot after enabling test signing. Then add the driver package:
+
+```powershell
+pnputil /add-driver .\windows-driver\SideDock.Idd\x64\Debug\SideDock.Idd.inf /install
+```
+
+Create a software device instance and keep it alive:
+
+```powershell
+.\windows-driver\SideDock.Idd.DeviceTool\x64\Debug\SideDock.Idd.DeviceTool.exe
+```
+
+While the tool is running, check:
+
+```powershell
+pnputil /enum-devices /class Display /deviceids /drivers
+```
+
+Windows Display Settings should show an additional display that can be extended.
+
+Press `x` in the device tool console to close the software device.
+
+On the current development machine, the validation package has been verified end to end with `oem92.inf`, `SWD\SideDockIdd\SideDockIdd`, and `SideDock Virtual Display`. The Android validation artifacts are under `artifacts/validation/idd-smoke-20260525-160926/`.
+
+## Uninstall
+
+Remove the software device first by closing `SideDock.Idd.DeviceTool.exe`.
+
+Find the published driver package:
+
+```powershell
+pnputil /enum-drivers /class Display /files | Select-String -Context 3,8 "SideDock.Idd"
+```
+
+Then delete the matching `oemXX.inf`:
+
+```powershell
+pnputil /delete-driver oemXX.inf /uninstall /force
+```
+
+If the software device entry remains listed after package removal, run:
+
+```powershell
+pnputil /remove-device SWD\SIDEDOCKIDD\SIDEDOCKIDD
+```
+
+Disable test signing when finished:
+
+```powershell
+bcdedit /set testsigning off
+```
+
+Reboot after changing test signing.
+
+## Logs
+
+The driver uses WPP tracing with provider GUID:
+
+```text
+1D37EF59-31CB-4D8A-9B97-0C8E7569C6D6
+```
+
+Key log points are:
+
+- `DriverEntry`
+- `DeviceAdd`
+- `DeviceD0Entry`
+- `AdapterInit`
+- `MonitorArrival`
+- `ModeQuery`
+- `SwapChainAssigned`
+- `shared frame buffer ready`
+- `staging texture ready`
+- `frame exported`
+- `framesReceived` / `framesExported` / `framesDropped` / `exportErrors`
+- `SwapChainReleased`
+- `DriverUnload`
+
+The simplest first diagnostic pass is Device Manager plus `pnputil`. For deeper driver tracing, use WDK tracing tools such as TraceView or `traceview.exe` if present in the local WDK installation.

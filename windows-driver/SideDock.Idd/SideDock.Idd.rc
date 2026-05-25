@@ -1,0 +1,10 @@
+#include <windows.h>
+#include <ntverp.h>
+
+#define VER_FILETYPE VFT_DLL
+#define VER_FILESUBTYPE VFT_UNKNOWN
+#define VER_FILEDESCRIPTION_STR "SideDock UMDF Indirect Display Driver"
+#define VER_INTERNALNAME_STR "SideDock.Idd"
+#define VER_ORIGINALFILENAME_STR "SideDock.Idd.dll"
+
+#include "common.ver"

@@ -1,0 +1,53 @@
+# OS/editor noise
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+*.swp
+AGENTS.md
+安卓平板作为Windows副屏*.md
+tools/
+
+# Logs and temporary runtime files
+*.log
+*.pid
+*.tmp
+*.temp
+
+# Validation/build artifacts
+artifacts/
+
+# Android/Gradle outputs
+**/.gradle/
+**/build/
+*.apk
+*.aab
+*.idsig
+*.keystore
+
+# .NET outputs
+**/bin/
+**/obj/
+
+# Visual Studio / Windows driver outputs
+**/.vs/
+**/x64/
+**/Win32/
+**/ARM64/
+*.user
+*.suo
+*.pdb
+*.ilk
+*.exp
+*.lib
+*.dll
+*.exe
+*.cer
+*.cat
+
+# Generated media/captures
+*.h264
+*.mp4
+*.png
+*.jpg
+*.jpeg
