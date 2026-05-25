@@ -303,8 +303,9 @@ bool SharedFrameBuffer::EnsureInitialized()
 
     SECURITY_ATTRIBUTES securityAttributes = {};
     SECURITY_DESCRIPTOR securityDescriptor = {};
+    PACL securityAcl = nullptr;
     SECURITY_ATTRIBUTES* securityAttributesPointer = nullptr;
-    if (CreateSecurityAttributes(securityAttributes, securityDescriptor))
+    if (CreateSecurityAttributes(securityAttributes, securityDescriptor, securityAcl))
     {
         securityAttributesPointer = &securityAttributes;
     }
@@ -324,6 +325,10 @@ bool SharedFrameBuffer::EnsureInitialized()
     if (!m_mapping)
     {
         TraceEvents(TRACE_LEVEL_ERROR, TRACE_SWAPCHAIN, "%!FUNC! CreateFileMapping failed: %lu", GetLastError());
+        if (securityAcl)
+        {
+            LocalFree(securityAcl);
+        }
         return false;
     }
 
@@ -333,6 +338,10 @@ bool SharedFrameBuffer::EnsureInitialized()
         TraceEvents(TRACE_LEVEL_ERROR, TRACE_SWAPCHAIN, "%!FUNC! MapViewOfFile failed: %lu", GetLastError());
         CloseHandle(m_mapping);
         m_mapping = nullptr;
+        if (securityAcl)
+        {
+            LocalFree(securityAcl);
+        }
         return false;
     }
 
@@ -344,6 +353,10 @@ bool SharedFrameBuffer::EnsureInitialized()
         m_view = nullptr;
         CloseHandle(m_mapping);
         m_mapping = nullptr;
+        if (securityAcl)
+        {
+            LocalFree(securityAcl);
+        }
         return false;
     }
 
@@ -357,6 +370,10 @@ bool SharedFrameBuffer::EnsureInitialized()
         m_view = nullptr;
         CloseHandle(m_mapping);
         m_mapping = nullptr;
+        if (securityAcl)
+        {
+            LocalFree(securityAcl);
+        }
         return false;
     }
 
@@ -367,6 +384,12 @@ bool SharedFrameBuffer::EnsureInitialized()
         "%!FUNC! shared frame buffer ready bytes=%u slots=%u",
         SharedFrameMappingSize,
         SharedFrameSlotCount);
+
+    if (securityAcl)
+    {
+        LocalFree(securityAcl);
+    }
+
     return true;
 }
 
@@ -458,15 +481,59 @@ void SharedFrameBuffer::InitializeHeader()
     header->TimestampQpc = 0;
 }
 
-bool SharedFrameBuffer::CreateSecurityAttributes(SECURITY_ATTRIBUTES& attributes, SECURITY_DESCRIPTOR& descriptor)
+bool SharedFrameBuffer::CreateSecurityAttributes(SECURITY_ATTRIBUTES& attributes, SECURITY_DESCRIPTOR& descriptor, PACL& acl)
 {
+    acl = nullptr;
     if (!InitializeSecurityDescriptor(&descriptor, SECURITY_DESCRIPTOR_REVISION))
     {
         return false;
     }
 
-    if (!SetSecurityDescriptorDacl(&descriptor, TRUE, nullptr, FALSE))
+    BYTE localSystemSid[SECURITY_MAX_SID_SIZE] = {};
+    BYTE administratorsSid[SECURITY_MAX_SID_SIZE] = {};
+    BYTE authenticatedUsersSid[SECURITY_MAX_SID_SIZE] = {};
+    DWORD localSystemSidSize = sizeof(localSystemSid);
+    DWORD administratorsSidSize = sizeof(administratorsSid);
+    DWORD authenticatedUsersSidSize = sizeof(authenticatedUsersSid);
+
+    if (!CreateWellKnownSid(WinLocalSystemSid, nullptr, localSystemSid, &localSystemSidSize) ||
+        !CreateWellKnownSid(WinBuiltinAdministratorsSid, nullptr, administratorsSid, &administratorsSidSize) ||
+        !CreateWellKnownSid(WinAuthenticatedUserSid, nullptr, authenticatedUsersSid, &authenticatedUsersSidSize))
     {
+        return false;
+    }
+
+    EXPLICIT_ACCESSW entries[3] = {};
+    entries[0].grfAccessPermissions = GENERIC_ALL;
+    entries[0].grfAccessMode = SET_ACCESS;
+    entries[0].grfInheritance = NO_INHERITANCE;
+    entries[0].Trustee.TrusteeForm = TRUSTEE_IS_SID;
+    entries[0].Trustee.TrusteeType = TRUSTEE_IS_USER;
+    entries[0].Trustee.ptstrName = reinterpret_cast<LPWSTR>(localSystemSid);
+
+    entries[1].grfAccessPermissions = GENERIC_ALL;
+    entries[1].grfAccessMode = SET_ACCESS;
+    entries[1].grfInheritance = NO_INHERITANCE;
+    entries[1].Trustee.TrusteeForm = TRUSTEE_IS_SID;
+    entries[1].Trustee.TrusteeType = TRUSTEE_IS_GROUP;
+    entries[1].Trustee.ptstrName = reinterpret_cast<LPWSTR>(administratorsSid);
+
+    entries[2].grfAccessPermissions = GENERIC_READ | GENERIC_WRITE | SYNCHRONIZE;
+    entries[2].grfAccessMode = SET_ACCESS;
+    entries[2].grfInheritance = NO_INHERITANCE;
+    entries[2].Trustee.TrusteeForm = TRUSTEE_IS_SID;
+    entries[2].Trustee.TrusteeType = TRUSTEE_IS_GROUP;
+    entries[2].Trustee.ptstrName = reinterpret_cast<LPWSTR>(authenticatedUsersSid);
+
+    if (SetEntriesInAclW(static_cast<ULONG>(std::size(entries)), entries, nullptr, &acl) != ERROR_SUCCESS)
+    {
+        return false;
+    }
+
+    if (!SetSecurityDescriptorDacl(&descriptor, TRUE, acl, FALSE))
+    {
+        LocalFree(acl);
+        acl = nullptr;
         return false;
     }
 

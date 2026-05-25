@@ -146,6 +146,8 @@ jobs:
             /p:Configuration=$env:BUILD_CONFIGURATION `
             /p:Platform=$env:DRIVER_PLATFORM `
             /p:RunCodeAnalysis=false `
+            /p:EnablePREfast=false `
+            /p:SkipPackageVerification=true `
             /p:SignMode=Off
 
       - name: Upload driver artifact

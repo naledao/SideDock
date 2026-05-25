@@ -13,6 +13,7 @@
 #include <dxgi1_5.h>
 #include <wrl.h>
 
+#include <aclapi.h>
 #include <cstdint>
 #include <memory>
 
@@ -106,7 +107,7 @@ namespace SideDock::Idd
 
     private:
         void InitializeHeader();
-        bool CreateSecurityAttributes(SECURITY_ATTRIBUTES& attributes, SECURITY_DESCRIPTOR& descriptor);
+        bool CreateSecurityAttributes(SECURITY_ATTRIBUTES& attributes, SECURITY_DESCRIPTOR& descriptor, PACL& acl);
 
         HANDLE m_mapping = nullptr;
         HANDLE m_frameReadyEvent = nullptr;
