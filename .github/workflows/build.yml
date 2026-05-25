@@ -85,23 +85,34 @@ jobs:
           dotnet-version: "8.0.x"
 
       - name: Restore
-        run: dotnet restore .\windows-host\SideDock.Host\SideDock.Host.csproj
+        run: |
+          dotnet restore .\windows-host\SideDock.Host\SideDock.Host.csproj
+          dotnet restore .\windows-host\SideDock.Host.App\SideDock.Host.App.csproj
 
-      - name: Publish
+      - name: Publish host app
         shell: pwsh
         run: |
           $out = Join-Path $env:RUNNER_TEMP "sidedock-windows-host"
           dotnet publish .\windows-host\SideDock.Host\SideDock.Host.csproj `
             --configuration $env:BUILD_CONFIGURATION `
             --runtime win-x64 `
-            --self-contained false `
+            --self-contained true `
             --output $out
+          Compress-Archive -Path (Join-Path $out "*") -DestinationPath .\windows-host\SideDock.Host.App\HostPayload.zip -Force
+          dotnet publish .\windows-host\SideDock.Host.App\SideDock.Host.App.csproj `
+            --configuration $env:BUILD_CONFIGURATION `
+            --runtime win-x64 `
+            --self-contained true `
+            -p:PublishSingleFile=true `
+            -p:EnableCompressionInSingleFile=true `
+            -p:IncludeNativeLibrariesForSelfExtract=true `
+            --output "$env:RUNNER_TEMP\sidedock-host-app"
 
-      - name: Upload host artifact
+      - name: Upload host app
         uses: actions/upload-artifact@v4
         with:
-          name: sidedock-windows-host
-          path: ${{ runner.temp }}\sidedock-windows-host\**
+          name: sidedock-host-app
+          path: ${{ runner.temp }}\sidedock-host-app\SideDock.Host.App.exe
           if-no-files-found: error
 
   windows-driver:
@@ -243,7 +254,7 @@ jobs:
           set -euo pipefail
           mkdir -p release-assets
           (cd release-input/sidedock-android-release-apk && zip -r ../../release-assets/sidedock-android-release-apk.zip .)
-          (cd release-input/sidedock-windows-host && zip -r ../../release-assets/sidedock-windows-host.zip .)
+          cp release-input/sidedock-host-app/SideDock.Host.App.exe release-assets/SideDock.Host.App.exe
           cp release-input/sidedock-driver-installer/SideDock.Driver.Installer.exe release-assets/SideDock.Driver.Installer.exe
 
       - name: Create release

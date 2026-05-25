@@ -1,0 +1,370 @@
+using System.Diagnostics;
+using System.Drawing;
+using System.IO.Compression;
+using System.Reflection;
+using System.Text;
+using System.Windows.Forms;
+
+namespace SideDock.Host.App;
+
+internal static class Program
+{
+    [STAThread]
+    private static void Main()
+    {
+        ApplicationConfiguration.Initialize();
+        Application.Run(new HostMainForm());
+    }
+}
+
+internal sealed class HostMainForm : Form
+{
+    private const string HostExe = "SideDock.Host.exe";
+
+    private readonly ComboBox _videoSource = new();
+    private readonly ComboBox _resolution = new();
+    private readonly ComboBox _refreshRate = new();
+    private readonly CheckBox _enableInput = new();
+    private readonly TextBox _adbPath = new();
+    private readonly TextBox _controlPort = new();
+    private readonly TextBox _videoPort = new();
+    private readonly Button _startButton = new();
+    private readonly Button _stopButton = new();
+    private readonly Button _clearLogButton = new();
+    private readonly Label _statusLabel = new();
+    private readonly TextBox _logBox = new();
+
+    private Process? _hostProcess;
+    private string? _payloadRoot;
+    private string? _hostPath;
+
+    public HostMainForm()
+    {
+        Text = "SideDock Host";
+        MinimumSize = new Size(880, 620);
+        Size = new Size(980, 700);
+        StartPosition = FormStartPosition.CenterScreen;
+        Font = new Font("Segoe UI", 10f);
+
+        BuildLayout();
+        SetRunningState(false);
+
+        FormClosing += (_, _) => StopHost();
+    }
+
+    private void BuildLayout()
+    {
+        var root = new TableLayoutPanel
+        {
+            Dock = DockStyle.Fill,
+            ColumnCount = 1,
+            RowCount = 3,
+            Padding = new Padding(14)
+        };
+        root.RowStyles.Add(new RowStyle(SizeType.AutoSize));
+        root.RowStyles.Add(new RowStyle(SizeType.AutoSize));
+        root.RowStyles.Add(new RowStyle(SizeType.Percent, 100));
+        Controls.Add(root);
+
+        var title = new Label
+        {
+            Text = "SideDock Windows Host",
+            AutoSize = true,
+            Font = new Font(Font.FontFamily, 18f, FontStyle.Bold),
+            Margin = new Padding(0, 0, 0, 10)
+        };
+        root.Controls.Add(title, 0, 0);
+
+        var settings = new TableLayoutPanel
+        {
+            Dock = DockStyle.Top,
+            ColumnCount = 4,
+            AutoSize = true,
+            Margin = new Padding(0, 0, 0, 12)
+        };
+        settings.ColumnStyles.Add(new ColumnStyle(SizeType.Absolute, 120));
+        settings.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 50));
+        settings.ColumnStyles.Add(new ColumnStyle(SizeType.Absolute, 120));
+        settings.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 50));
+        root.Controls.Add(settings, 0, 1);
+
+        ConfigureCombo(_videoSource, "idd", "realtime");
+        ConfigureCombo(_resolution, "720p", "1080p", "2k");
+        ConfigureCombo(_refreshRate, "30", "60", "120");
+        _controlPort.Text = "27183";
+        _videoPort.Text = "27184";
+        _adbPath.PlaceholderText = "Optional adb.exe path";
+        _enableInput.Text = "Enable input injection";
+        _enableInput.AutoSize = true;
+        _enableInput.Checked = true;
+
+        AddLabeled(settings, "Video source", _videoSource, 0);
+        AddLabeled(settings, "Resolution", _resolution, 1);
+        AddLabeled(settings, "Refresh rate", _refreshRate, 2);
+        AddLabeled(settings, "Control port", _controlPort, 3);
+        AddLabeled(settings, "Video port", _videoPort, 4);
+        AddLabeled(settings, "ADB path", _adbPath, 5);
+
+        settings.Controls.Add(new Label { Text = "", AutoSize = true }, 0, 6);
+        settings.Controls.Add(_enableInput, 1, 6);
+        settings.SetColumnSpan(_enableInput, 3);
+
+        var buttons = new FlowLayoutPanel
+        {
+            Dock = DockStyle.Top,
+            FlowDirection = FlowDirection.LeftToRight,
+            AutoSize = true,
+            Margin = new Padding(0, 10, 0, 0)
+        };
+        _startButton.Text = "Start";
+        _startButton.Width = 120;
+        _startButton.Click += (_, _) => StartHost();
+        _stopButton.Text = "Stop";
+        _stopButton.Width = 120;
+        _stopButton.Click += (_, _) => StopHost();
+        _clearLogButton.Text = "Clear log";
+        _clearLogButton.Width = 120;
+        _clearLogButton.Click += (_, _) => _logBox.Clear();
+        _statusLabel.AutoSize = true;
+        _statusLabel.Padding = new Padding(14, 8, 0, 0);
+        buttons.Controls.Add(_startButton);
+        buttons.Controls.Add(_stopButton);
+        buttons.Controls.Add(_clearLogButton);
+        buttons.Controls.Add(_statusLabel);
+        settings.Controls.Add(buttons, 0, 7);
+        settings.SetColumnSpan(buttons, 4);
+
+        _logBox.Dock = DockStyle.Fill;
+        _logBox.Multiline = true;
+        _logBox.ReadOnly = true;
+        _logBox.ScrollBars = ScrollBars.Both;
+        _logBox.WordWrap = false;
+        _logBox.BackColor = Color.FromArgb(18, 22, 28);
+        _logBox.ForeColor = Color.FromArgb(228, 234, 240);
+        _logBox.Font = new Font("Consolas", 10f);
+        root.Controls.Add(_logBox, 0, 2);
+    }
+
+    private static void ConfigureCombo(ComboBox comboBox, params string[] items)
+    {
+        comboBox.DropDownStyle = ComboBoxStyle.DropDownList;
+        comboBox.Items.AddRange(items);
+        comboBox.SelectedIndex = 0;
+        comboBox.Dock = DockStyle.Fill;
+    }
+
+    private static void AddLabeled(TableLayoutPanel panel, string label, Control control, int row)
+    {
+        var leftColumn = row % 2 == 0 ? 0 : 2;
+        var rightColumn = leftColumn + 1;
+        var targetRow = row / 2;
+        while (panel.RowCount <= targetRow)
+        {
+            panel.RowCount += 1;
+            panel.RowStyles.Add(new RowStyle(SizeType.AutoSize));
+        }
+
+        panel.Controls.Add(new Label
+        {
+            Text = label,
+            AutoSize = true,
+            Anchor = AnchorStyles.Left,
+            Margin = new Padding(0, 7, 8, 7)
+        }, leftColumn, targetRow);
+
+        control.Margin = new Padding(0, 4, 16, 4);
+        panel.Controls.Add(control, rightColumn, targetRow);
+    }
+
+    private void StartHost()
+    {
+        if (_hostProcess is { HasExited: false })
+        {
+            return;
+        }
+
+        try
+        {
+            _hostPath ??= ExtractHostPayload();
+            var arguments = BuildArguments();
+            var startInfo = new ProcessStartInfo
+            {
+                FileName = _hostPath,
+                Arguments = arguments,
+                WorkingDirectory = Path.GetDirectoryName(_hostPath) ?? Environment.CurrentDirectory,
+                UseShellExecute = false,
+                RedirectStandardOutput = true,
+                RedirectStandardError = true,
+                CreateNoWindow = true,
+                StandardOutputEncoding = Encoding.UTF8,
+                StandardErrorEncoding = Encoding.UTF8
+            };
+
+            var adbPath = _adbPath.Text.Trim();
+            if (!string.IsNullOrWhiteSpace(adbPath))
+            {
+                startInfo.Environment["SIDEDOCK_ADB"] = adbPath;
+            }
+
+            AppendLog($"> {Path.GetFileName(_hostPath)} {arguments}");
+            _hostProcess = new Process { StartInfo = startInfo, EnableRaisingEvents = true };
+            _hostProcess.OutputDataReceived += (_, eventArgs) => AppendLog(eventArgs.Data);
+            _hostProcess.ErrorDataReceived += (_, eventArgs) => AppendLog(eventArgs.Data);
+            _hostProcess.Exited += (_, _) => RunOnUiThread(() =>
+            {
+                AppendLog($"Host exited with code {_hostProcess?.ExitCode}");
+                SetRunningState(false);
+            });
+
+            _hostProcess.Start();
+            _hostProcess.BeginOutputReadLine();
+            _hostProcess.BeginErrorReadLine();
+            SetRunningState(true);
+        }
+        catch (Exception ex)
+        {
+            MessageBox.Show(this, ex.Message, "Unable to start SideDock Host", MessageBoxButtons.OK, MessageBoxIcon.Error);
+            SetRunningState(false);
+        }
+    }
+
+    private string BuildArguments()
+    {
+        var args = new List<string>
+        {
+            "--video-source", Selected(_videoSource),
+            "--resolution", Selected(_resolution),
+            "--refresh-rate", Selected(_refreshRate),
+            "--control-port", Port(_controlPort, "control"),
+            "--video-port", Port(_videoPort, "video")
+        };
+
+        if (_enableInput.Checked)
+        {
+            args.Add("--enable-input-injection");
+        }
+
+        return string.Join(" ", args.Select(QuoteArgument));
+    }
+
+    private static string Selected(ComboBox comboBox)
+    {
+        return comboBox.SelectedItem?.ToString() ?? "";
+    }
+
+    private static string Port(TextBox textBox, string name)
+    {
+        var text = textBox.Text.Trim();
+        if (!int.TryParse(text, out var port) || port < 1 || port > 65535)
+        {
+            throw new InvalidOperationException($"Invalid {name} port: {text}");
+        }
+
+        return port.ToString();
+    }
+
+    private static string QuoteArgument(string argument)
+    {
+        return argument.Contains(' ') || argument.Contains('"')
+            ? "\"" + argument.Replace("\"", "\\\"") + "\""
+            : argument;
+    }
+
+    private string ExtractHostPayload()
+    {
+        var resourceName = Assembly.GetExecutingAssembly().GetManifestResourceNames()
+            .FirstOrDefault(name => name.EndsWith(".HostPayload.zip", StringComparison.OrdinalIgnoreCase))
+            ?? throw new InvalidOperationException("Embedded host payload was not found.");
+
+        _payloadRoot = Path.Combine(
+            Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
+            "SideDock",
+            "HostApp");
+
+        if (Directory.Exists(_payloadRoot))
+        {
+            Directory.Delete(_payloadRoot, recursive: true);
+        }
+
+        Directory.CreateDirectory(_payloadRoot);
+        var zipPath = Path.Combine(_payloadRoot, "HostPayload.zip");
+
+        using (var resource = Assembly.GetExecutingAssembly().GetManifestResourceStream(resourceName)
+            ?? throw new InvalidOperationException("Embedded host payload stream was not found."))
+        using (var output = File.Create(zipPath))
+        {
+            resource.CopyTo(output);
+        }
+
+        ZipFile.ExtractToDirectory(zipPath, _payloadRoot);
+        File.Delete(zipPath);
+
+        return Directory.GetFiles(_payloadRoot, HostExe, SearchOption.AllDirectories).FirstOrDefault()
+            ?? throw new FileNotFoundException($"{HostExe} was not found in the embedded payload.");
+    }
+
+    private void StopHost()
+    {
+        var process = _hostProcess;
+        if (process is null || process.HasExited)
+        {
+            SetRunningState(false);
+            return;
+        }
+
+        try
+        {
+            process.Kill(entireProcessTree: true);
+            process.WaitForExit(3000);
+        }
+        catch (Exception ex)
+        {
+            AppendLog($"Failed to stop Host: {ex.Message}");
+        }
+        finally
+        {
+            SetRunningState(false);
+        }
+    }
+
+    private void SetRunningState(bool running)
+    {
+        _startButton.Enabled = !running;
+        _stopButton.Enabled = running;
+        _statusLabel.Text = running ? "Running" : "Stopped";
+        _statusLabel.ForeColor = running ? Color.FromArgb(24, 128, 72) : Color.FromArgb(128, 42, 42);
+    }
+
+    private void AppendLog(string? line)
+    {
+        if (string.IsNullOrEmpty(line))
+        {
+            return;
+        }
+
+        if (InvokeRequired)
+        {
+            RunOnUiThread(() => AppendLog(line));
+            return;
+        }
+
+        _logBox.AppendText($"[{DateTime.Now:HH:mm:ss}] {line}{Environment.NewLine}");
+    }
+
+    private void RunOnUiThread(Action action)
+    {
+        if (IsDisposed || !IsHandleCreated)
+        {
+            return;
+        }
+
+        try
+        {
+            BeginInvoke(action);
+        }
+        catch (InvalidOperationException)
+        {
+            // The form can be closing while the hosted process is exiting.
+        }
+    }
+}

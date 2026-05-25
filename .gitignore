@@ -28,6 +28,7 @@ artifacts/
 # .NET outputs
 **/bin/
 **/obj/
+**/HostPayload.zip
 
 # Visual Studio / Windows driver outputs
 **/.vs/
