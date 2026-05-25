@@ -1,0 +1,153 @@
+name: Build artifacts
+
+on:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  BUILD_CONFIGURATION: Release
+  DRIVER_PLATFORM: x64
+
+jobs:
+  android-client:
+    name: Android client APK
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up JDK
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - name: Set up Android SDK
+        uses: android-actions/setup-android@v3
+
+      - name: Set up Gradle
+        uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: "8.10.2"
+
+      - name: Install Android platform
+        run: sdkmanager "platforms;android-34" "build-tools;34.0.0"
+
+      - name: Build APK
+        run: gradle -p android-client :app:assembleDebug --no-daemon --stacktrace
+
+      - name: Upload APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: sidedock-android-apk
+          path: android-client/app/build/outputs/apk/debug/*.apk
+          if-no-files-found: error
+
+  windows-host:
+    name: Windows host
+    runs-on: windows-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up .NET
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: "8.0.x"
+
+      - name: Restore
+        run: dotnet restore .\windows-host\SideDock.Host\SideDock.Host.csproj
+
+      - name: Publish
+        shell: pwsh
+        run: |
+          $out = Join-Path $env:RUNNER_TEMP "sidedock-windows-host"
+          dotnet publish .\windows-host\SideDock.Host\SideDock.Host.csproj `
+            --configuration $env:BUILD_CONFIGURATION `
+            --runtime win-x64 `
+            --self-contained false `
+            --output $out
+
+      - name: Upload host artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: sidedock-windows-host
+          path: ${{ runner.temp }}\sidedock-windows-host\**
+          if-no-files-found: error
+
+  windows-driver:
+    name: Windows driver package
+    runs-on: windows-latest
+    timeout-minutes: 90
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up MSBuild
+        uses: microsoft/setup-msbuild@v2
+
+      - name: Ensure WDK is available
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+
+          function Test-WdkTargets {
+            $driverTargets = Get-ChildItem "${env:ProgramFiles(x86)}\Windows Kits\10\build\*\WindowsDriver.Common.targets" -ErrorAction SilentlyContinue
+            $driverToolset = Get-ChildItem "${env:ProgramFiles}\Microsoft Visual Studio\2022\*\MSBuild\Microsoft\VC\v170\Platforms\x64\PlatformToolsets\WindowsUserModeDriver10.0\Toolset.props" -ErrorAction SilentlyContinue
+            return ($driverTargets.Count -gt 0 -and $driverToolset.Count -gt 0)
+          }
+
+          if (Test-WdkTargets) {
+            Write-Host "WDK MSBuild targets are already available."
+            exit 0
+          }
+
+          Write-Host "Installing Windows SDK and WDK."
+          winget install --id Microsoft.WindowsSDK.10.0.28000 --source winget --silent --accept-package-agreements --accept-source-agreements
+          winget install --id Microsoft.WindowsWDK.10.0.28000 --source winget --silent --accept-package-agreements --accept-source-agreements
+
+          $vswhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
+          $enginePath = & $vswhere -nologo -latest -products * -property enginePath
+          if (-not $enginePath) {
+            throw "Unable to locate Visual Studio Installer engine."
+          }
+
+          $vsixInstaller = Join-Path $enginePath "VSIXInstaller.exe"
+          $wdkVsix = Get-ChildItem "${env:ProgramFiles(x86)}\Windows Kits\10\Vsix\VS2022" -Filter WDK.vsix -Recurse -ErrorAction SilentlyContinue |
+            Sort-Object FullName -Descending |
+            Select-Object -First 1
+
+          if ($wdkVsix) {
+            & $vsixInstaller /quiet $wdkVsix.FullName
+          }
+
+          if (-not (Test-WdkTargets)) {
+            throw "WDK MSBuild targets were not found after installation."
+          }
+
+      - name: Build driver solution
+        shell: pwsh
+        run: |
+          msbuild .\windows-driver\SideDock.Driver.sln `
+            /m `
+            /p:Configuration=$env:BUILD_CONFIGURATION `
+            /p:Platform=$env:DRIVER_PLATFORM `
+            /p:RunCodeAnalysis=false `
+            /p:SignMode=Off
+
+      - name: Upload driver artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: sidedock-windows-driver
+          path: |
+            windows-driver/SideDock.Idd/x64/Release/**
+            windows-driver/SideDock.Idd.DeviceTool/x64/Release/**
+          if-no-files-found: error
