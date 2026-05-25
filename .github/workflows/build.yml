@@ -12,6 +12,7 @@ permissions:
 env:
   BUILD_CONFIGURATION: Release
   DRIVER_PLATFORM: x64
+  WDK_VERSION: "10.0.26100"
 
 jobs:
   android-client:
@@ -51,7 +52,7 @@ jobs:
 
   windows-host:
     name: Windows host
-    runs-on: windows-latest
+    runs-on: windows-2022
 
     steps:
       - name: Checkout
@@ -84,7 +85,7 @@ jobs:
 
   windows-driver:
     name: Windows driver package
-    runs-on: windows-latest
+    runs-on: windows-2022
     timeout-minutes: 90
 
     steps:
@@ -100,9 +101,10 @@ jobs:
           $ErrorActionPreference = "Stop"
 
           function Test-WdkTargets {
-            $driverTargets = Get-ChildItem "${env:ProgramFiles(x86)}\Windows Kits\10\build\*\WindowsDriver.Common.targets" -ErrorAction SilentlyContinue
+            $driverTargets = Get-ChildItem "${env:ProgramFiles(x86)}\Windows Kits\10\build\$env:WDK_VERSION.*\WindowsDriver.Common.targets" -ErrorAction SilentlyContinue
+            $driverTasks = Get-ChildItem "${env:ProgramFiles(x86)}\Windows Kits\10\build\$env:WDK_VERSION.*\bin\Microsoft.DriverKit.Build.Tasks.17.0.dll" -ErrorAction SilentlyContinue
             $driverToolset = Get-ChildItem "${env:ProgramFiles}\Microsoft Visual Studio\2022\*\MSBuild\Microsoft\VC\v170\Platforms\x64\PlatformToolsets\WindowsUserModeDriver10.0\Toolset.props" -ErrorAction SilentlyContinue
-            return ($driverTargets.Count -gt 0 -and $driverToolset.Count -gt 0)
+            return ($driverTargets.Count -gt 0 -and $driverTasks.Count -gt 0 -and $driverToolset.Count -gt 0)
           }
 
           if (Test-WdkTargets) {
@@ -111,8 +113,8 @@ jobs:
           }
 
           Write-Host "Installing Windows SDK and WDK."
-          winget install --id Microsoft.WindowsSDK.10.0.28000 --source winget --silent --accept-package-agreements --accept-source-agreements
-          winget install --id Microsoft.WindowsWDK.10.0.28000 --source winget --silent --accept-package-agreements --accept-source-agreements
+          winget install --id Microsoft.WindowsSDK.$env:WDK_VERSION --source winget --silent --accept-package-agreements --accept-source-agreements
+          winget install --id Microsoft.WindowsWDK.$env:WDK_VERSION --source winget --silent --accept-package-agreements --accept-source-agreements
 
           $vswhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
           $enginePath = & $vswhere -nologo -latest -products * -property enginePath
@@ -130,6 +132,9 @@ jobs:
           }
 
           if (-not (Test-WdkTargets)) {
+            Get-ChildItem "${env:ProgramFiles(x86)}\Windows Kits\10\build" -ErrorAction SilentlyContinue |
+              Select-Object FullName |
+              Format-Table -AutoSize
             throw "WDK MSBuild targets were not found after installation."
           }
 
