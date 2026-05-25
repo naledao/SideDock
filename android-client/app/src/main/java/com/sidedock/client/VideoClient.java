@@ -80,6 +80,7 @@ public final class VideoClient {
     private long droppedFrames;
     private long reconnects;
     private long roughLatencyMs;
+    private long lastFrameStatsEmitAtMs;
     private volatile long serverTimeOffsetMs;
 
     public VideoClient(Listener listener) {
@@ -303,6 +304,11 @@ public final class VideoClient {
                 codec.releaseOutputBuffer(outputIndex, render);
                 if (render) {
                     framesDecoded += 1;
+                    long now = System.currentTimeMillis();
+                    if (framesDecoded == 1L || now - lastFrameStatsEmitAtMs >= 1000L) {
+                        lastFrameStatsEmitAtMs = now;
+                        emitStats();
+                    }
                 }
                 timeoutUs = 0L;
                 continue;

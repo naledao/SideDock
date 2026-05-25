@@ -20,6 +20,7 @@ import android.view.Window;
 import android.view.WindowManager;
 import android.widget.FrameLayout;
 import android.widget.LinearLayout;
+import android.widget.ProgressBar;
 import android.widget.TextView;
 import java.text.SimpleDateFormat;
 import java.util.ArrayDeque;
@@ -52,6 +53,11 @@ public final class MainActivity extends Activity implements ControlClient.Listen
     private TextView overlayText;
     private TextView modeToggleText;
     private LinearLayout modePanel;
+    private FrameLayout connectionStatusLayer;
+    private ProgressBar connectionStatusProgress;
+    private TextView connectionStatusTitle;
+    private TextView connectionStatusDetail;
+    private TextView connectionStatusHint;
     private final TextView[] resolutionButtons = new TextView[RESOLUTION_LABELS.length];
     private final TextView[] refreshButtons = new TextView[REFRESH_PRESETS.length];
     private final ArrayDeque<String> logLines = new ArrayDeque<>();
@@ -62,11 +68,15 @@ public final class MainActivity extends Activity implements ControlClient.Listen
     private int videoWidth = DEFAULT_VIDEO_WIDTH;
     private int videoHeight = DEFAULT_VIDEO_HEIGHT;
     private int videoFps = DEFAULT_VIDEO_FPS;
+    private ConnectionState controlConnectionState = ConnectionState.DISCONNECTED;
     private String controlState = "已断开";
     private String videoState = "STOPPED";
+    private String lastVideoError = "";
     private long controlSent;
     private long controlReceived;
     private long serverTimeOffsetMs;
+    private long lastRenderedFramesSeen;
+    private boolean waitingForVideoFrame = true;
     private VideoClient.VideoStats lastVideoStats;
     private InputCollector.InputStats lastInputStats;
     private ControlClient.CaptureStatus lastCaptureStatus;
@@ -141,10 +151,12 @@ public final class MainActivity extends Activity implements ControlClient.Listen
     public void surfaceCreated(SurfaceHolder holder) {
         activeSurface = holder.getSurface();
         surfaceReady = activeSurface != null && activeSurface.isValid();
+        waitingForVideoFrame = true;
         sendVideoReadyIfSurfaceReady();
         addLog("Surface 已创建，准备接收视频");
         Log.i(TAG, "surfaceCreated ready=" + surfaceReady);
         maybeStartVideo();
+        updateOverlay();
     }
 
     @Override
@@ -161,6 +173,7 @@ public final class MainActivity extends Activity implements ControlClient.Listen
     public void surfaceDestroyed(SurfaceHolder holder) {
         surfaceReady = false;
         activeSurface = null;
+        waitingForVideoFrame = true;
         videoClient.stop();
         addLog("Surface 已销毁，停止视频通道");
         Log.i(TAG, "surfaceDestroyed");
@@ -168,7 +181,11 @@ public final class MainActivity extends Activity implements ControlClient.Listen
 
     @Override
     public void onStateChanged(ConnectionState state) {
+        controlConnectionState = state;
         controlState = labelFor(state);
+        if (state != ConnectionState.CONNECTED) {
+            waitingForVideoFrame = true;
+        }
         if (state == ConnectionState.CONNECTED) {
             sendVideoReadyIfSurfaceReady();
             maybeStartVideo();
@@ -194,6 +211,8 @@ public final class MainActivity extends Activity implements ControlClient.Listen
         videoWidth = width;
         videoHeight = height;
         videoFps = Math.max(1, fps);
+        waitingForVideoFrame = true;
+        lastVideoError = "";
         selectedModeWidth = videoWidth;
         selectedModeHeight = videoHeight;
         selectedModeRefresh = normalizeObservedRefresh(videoFps);
@@ -271,6 +290,7 @@ public final class MainActivity extends Activity implements ControlClient.Listen
             videoWidth = selectedModeWidth;
             videoHeight = selectedModeHeight;
             videoFps = selectedModeRefresh;
+            waitingForVideoFrame = true;
             if (surfaceView != null) {
                 surfaceView.getHolder().setFixedSize(videoWidth, videoHeight);
             }
@@ -313,6 +333,12 @@ public final class MainActivity extends Activity implements ControlClient.Listen
     @Override
     public void onVideoState(String state) {
         videoState = state;
+        if ("CONNECTED".equals(state)) {
+            lastVideoError = "";
+        }
+        if (!"CONNECTED".equals(state)) {
+            waitingForVideoFrame = true;
+        }
         updateOverlay();
     }
 
@@ -324,6 +350,11 @@ public final class MainActivity extends Activity implements ControlClient.Listen
     @Override
     public void onVideoStats(VideoClient.VideoStats stats) {
         lastVideoStats = stats;
+        if (stats.framesDecoded > lastRenderedFramesSeen) {
+            lastRenderedFramesSeen = stats.framesDecoded;
+            waitingForVideoFrame = false;
+            lastVideoError = "";
+        }
         controlClient.sendVideoStats(
             stats.framesDecoded,
             stats.packetsReceived,
@@ -338,6 +369,8 @@ public final class MainActivity extends Activity implements ControlClient.Listen
 
     @Override
     public void onVideoError(String code, String message) {
+        lastVideoError = code + ": " + message;
+        waitingForVideoFrame = true;
         controlClient.sendVideoError(code, message);
         addLog("视频错误 " + code + ": " + message);
     }
@@ -541,6 +574,12 @@ public final class MainActivity extends Activity implements ControlClient.Listen
             ViewGroup.LayoutParams.MATCH_PARENT
         ));
 
+        connectionStatusLayer = createConnectionStatusLayer(density);
+        root.addView(connectionStatusLayer, new FrameLayout.LayoutParams(
+            ViewGroup.LayoutParams.MATCH_PARENT,
+            ViewGroup.LayoutParams.MATCH_PARENT
+        ));
+
         overlayText = new TextView(this);
         overlayText.setTextColor(0xFFE9F0F2);
         overlayText.setTextSize(12f);
@@ -585,6 +624,72 @@ public final class MainActivity extends Activity implements ControlClient.Listen
             }
         });
         return root;
+    }
+
+    private FrameLayout createConnectionStatusLayer(float density) {
+        FrameLayout layer = new FrameLayout(this);
+        layer.setBackgroundColor(0xCC050607);
+        layer.setVisibility(View.VISIBLE);
+        hideSystemPointerIcon(layer);
+
+        LinearLayout panel = new LinearLayout(this);
+        panel.setOrientation(LinearLayout.VERTICAL);
+        panel.setGravity(Gravity.CENTER_HORIZONTAL);
+        panel.setPadding(dp(22, density), dp(22, density), dp(22, density), dp(22, density));
+        panel.setBackground(makeRoundedBackground(0xE6111820, 0xFF314555, dp(8, density)));
+        hideSystemPointerIcon(panel);
+
+        connectionStatusProgress = new ProgressBar(this);
+        connectionStatusProgress.setIndeterminate(true);
+        hideSystemPointerIcon(connectionStatusProgress);
+        panel.addView(connectionStatusProgress, new LinearLayout.LayoutParams(
+            dp(34, density),
+            dp(34, density)
+        ));
+
+        connectionStatusTitle = new TextView(this);
+        connectionStatusTitle.setTextColor(0xFFFFFFFF);
+        connectionStatusTitle.setTextSize(20f);
+        connectionStatusTitle.setGravity(Gravity.CENTER);
+        connectionStatusTitle.setPadding(0, dp(14, density), 0, 0);
+        hideSystemPointerIcon(connectionStatusTitle);
+        panel.addView(connectionStatusTitle, new LinearLayout.LayoutParams(
+            ViewGroup.LayoutParams.MATCH_PARENT,
+            ViewGroup.LayoutParams.WRAP_CONTENT
+        ));
+
+        connectionStatusDetail = new TextView(this);
+        connectionStatusDetail.setTextColor(0xFFD7E1E6);
+        connectionStatusDetail.setTextSize(14f);
+        connectionStatusDetail.setGravity(Gravity.CENTER);
+        connectionStatusDetail.setPadding(0, dp(10, density), 0, 0);
+        connectionStatusDetail.setLineSpacing(dp(2, density), 1.0f);
+        hideSystemPointerIcon(connectionStatusDetail);
+        panel.addView(connectionStatusDetail, new LinearLayout.LayoutParams(
+            ViewGroup.LayoutParams.MATCH_PARENT,
+            ViewGroup.LayoutParams.WRAP_CONTENT
+        ));
+
+        connectionStatusHint = new TextView(this);
+        connectionStatusHint.setTextColor(0xFF9DAEB8);
+        connectionStatusHint.setTextSize(12f);
+        connectionStatusHint.setGravity(Gravity.CENTER);
+        connectionStatusHint.setPadding(0, dp(12, density), 0, 0);
+        connectionStatusHint.setLineSpacing(dp(2, density), 1.0f);
+        hideSystemPointerIcon(connectionStatusHint);
+        panel.addView(connectionStatusHint, new LinearLayout.LayoutParams(
+            ViewGroup.LayoutParams.MATCH_PARENT,
+            ViewGroup.LayoutParams.WRAP_CONTENT
+        ));
+
+        FrameLayout.LayoutParams panelParams = new FrameLayout.LayoutParams(
+            ViewGroup.LayoutParams.MATCH_PARENT,
+            ViewGroup.LayoutParams.WRAP_CONTENT,
+            Gravity.CENTER
+        );
+        panelParams.setMargins(dp(28, density), 0, dp(28, density), 0);
+        layer.addView(panel, panelParams);
+        return layer;
     }
 
     private TextView createModeToggle(float density) {
@@ -994,6 +1099,7 @@ public final class MainActivity extends Activity implements ControlClient.Listen
 
     private void updateOverlay() {
         updateModeControlVisibility();
+        updateConnectionStatusLayer();
 
         if (overlayText == null) {
             return;
@@ -1096,6 +1202,104 @@ public final class MainActivity extends Activity implements ControlClient.Listen
             builder.append(line).append('\n');
         }
         overlayText.setText(builder.toString().trim());
+    }
+
+    private void updateConnectionStatusLayer() {
+        if (connectionStatusLayer == null
+            || connectionStatusProgress == null
+            || connectionStatusTitle == null
+            || connectionStatusDetail == null
+            || connectionStatusHint == null) {
+            return;
+        }
+
+        if (!shouldShowConnectionStatus()) {
+            connectionStatusLayer.setVisibility(View.GONE);
+            return;
+        }
+
+        connectionStatusLayer.setVisibility(View.VISIBLE);
+
+        String title;
+        String hint;
+        boolean showProgress = true;
+        if (lastCaptureStatus != null && "ERROR".equals(lastCaptureStatus.state)) {
+            title = "采集异常";
+            hint = lastCaptureStatus.errorMessage.length() == 0
+                ? "请查看 Windows 端日志，确认采集源或虚拟屏是否可用。"
+                : lastCaptureStatus.errorMessage;
+            showProgress = false;
+        } else if (!surfaceReady) {
+            title = "正在准备显示层";
+            hint = "Surface 创建完成后会自动请求视频流。";
+        } else if (controlConnectionState == ConnectionState.DISCONNECTED) {
+            title = "等待 Windows 主机";
+            hint = "请确认 Host 正在运行，并已配置 adb reverse tcp:27183/tcp:27184。";
+        } else if (controlConnectionState == ConnectionState.CONNECTING) {
+            title = "正在连接 Windows 主机";
+            hint = "控制通道连接中。";
+        } else if (controlConnectionState == ConnectionState.RECONNECTING) {
+            title = "正在重连";
+            hint = "连接中断，客户端会自动重试。";
+        } else if (!"CONNECTED".equals(videoState)) {
+            title = "控制通道已连接";
+            hint = lastVideoError.length() == 0 ? "正在等待视频通道。" : "正在重试视频通道: " + lastVideoError;
+        } else if (lastVideoError.length() > 0) {
+            title = "视频连接异常";
+            hint = lastVideoError;
+            showProgress = false;
+        } else {
+            title = "正在等待画面";
+            hint = "视频通道已连接，等待首帧渲染。";
+        }
+
+        StringBuilder detail = new StringBuilder();
+        detail
+            .append("控制: ").append(controlState)
+            .append("   视频: ").append(videoState).append('\n')
+            .append("画面: ").append(videoWidth).append('x').append(videoHeight)
+            .append('@').append(videoFps)
+            .append("   port ").append(videoPort);
+        if (lastVideoStats != null) {
+            detail
+                .append('\n')
+                .append("已收包 ").append(lastVideoStats.packetsReceived)
+                .append("   已解码帧 ").append(lastVideoStats.framesDecoded)
+                .append("   重连 ").append(lastVideoStats.reconnects);
+        }
+        if (lastCaptureStatus != null) {
+            detail
+                .append('\n')
+                .append("采集: ").append(lastCaptureStatus.state)
+                .append("   帧 ").append(lastCaptureStatus.framesCaptured)
+                .append("   错 ").append(lastCaptureStatus.captureErrors);
+        }
+
+        connectionStatusProgress.setVisibility(showProgress ? View.VISIBLE : View.GONE);
+        connectionStatusTitle.setText(title);
+        connectionStatusDetail.setText(detail.toString());
+        connectionStatusHint.setText(hint);
+    }
+
+    private boolean shouldShowConnectionStatus() {
+        if (!surfaceReady) {
+            return true;
+        }
+        if (controlConnectionState != ConnectionState.CONNECTED) {
+            return true;
+        }
+        if (!"CONNECTED".equals(videoState)) {
+            return true;
+        }
+        if (lastCaptureStatus != null && "ERROR".equals(lastCaptureStatus.state)) {
+            return true;
+        }
+        if (lastVideoError.length() > 0) {
+            return true;
+        }
+
+        long framesDecoded = lastVideoStats == null ? 0L : lastVideoStats.framesDecoded;
+        return waitingForVideoFrame || framesDecoded == 0L;
     }
 
     private void appendCompactOverlay(StringBuilder builder) {
