@@ -254,7 +254,7 @@ jobs:
           set -euo pipefail
           short_sha="${GITHUB_SHA::7}"
           tag="build-${GITHUB_RUN_NUMBER}-${short_sha}"
-          gh release create "$tag" release-assets/*.zip \
+          gh release create "$tag" release-assets/* \
             --title "SideDock build ${GITHUB_RUN_NUMBER} (${short_sha})" \
             --notes "Automated build from ${GITHUB_SHA}." \
             --target "$GITHUB_SHA"
