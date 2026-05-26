@@ -13,6 +13,8 @@ env:
   BUILD_CONFIGURATION: Release
   DRIVER_PLATFORM: x64
   WDK_VERSION: "10.0.26100"
+  ARTIFACT_RETENTION_DAYS: 7
+  RELEASES_TO_KEEP: 10
 
 jobs:
   android-client:
@@ -70,6 +72,7 @@ jobs:
           name: sidedock-android-release-apk
           path: android-client/app/build/outputs/apk/release/*.apk
           if-no-files-found: error
+          retention-days: ${{ env.ARTIFACT_RETENTION_DAYS }}
 
   windows-host:
     name: Windows host
@@ -114,6 +117,7 @@ jobs:
           name: sidedock-host-app
           path: ${{ runner.temp }}\sidedock-host-app\SideDock.Host.App.exe
           if-no-files-found: error
+          retention-days: ${{ env.ARTIFACT_RETENTION_DAYS }}
 
   windows-driver:
     name: Windows driver package
@@ -230,6 +234,7 @@ jobs:
           name: sidedock-driver-installer
           path: ${{ runner.temp }}\sidedock-driver-installer\SideDock.Driver.Installer.exe
           if-no-files-found: error
+          retention-days: ${{ env.ARTIFACT_RETENTION_DAYS }}
 
   release:
     name: Publish GitHub release
@@ -271,3 +276,20 @@ jobs:
             --title "SideDock build ${GITHUB_RUN_NUMBER} (${short_sha})" \
             --notes "Automated build from ${GITHUB_SHA}." \
             --target "$GITHUB_SHA"
+
+      - name: Prune old automated releases
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          gh release list \
+            --limit 1000 \
+            --order desc \
+            --json tagName,isDraft,isPrerelease,createdAt \
+            --jq '.[] | select(.tagName | startswith("build-")) | .tagName' |
+            tail -n +"$((RELEASES_TO_KEEP + 1))" |
+            while read -r old_tag; do
+              test -n "$old_tag" || continue
+              gh release delete "$old_tag" --cleanup-tag --yes
+            done
