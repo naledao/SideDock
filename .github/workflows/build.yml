@@ -253,7 +253,9 @@ jobs:
         run: |
           set -euo pipefail
           mkdir -p release-assets
-          (cd release-input/sidedock-android-release-apk && zip -r ../../release-assets/sidedock-android-release-apk.zip .)
+          android_apk="$(find release-input/sidedock-android-release-apk -type f -name "*.apk" | head -n 1)"
+          test -n "$android_apk"
+          cp "$android_apk" release-assets/SideDock.Android.Release.apk
           cp release-input/sidedock-host-app/SideDock.Host.App.exe release-assets/SideDock.Host.App.exe
           cp release-input/sidedock-driver-installer/SideDock.Driver.Installer.exe release-assets/SideDock.Driver.Installer.exe
 
