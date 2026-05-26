@@ -50,5 +50,7 @@ artifacts/
 *.h264
 *.mp4
 *.png
+!android-client/app/src/main/res/mipmap-*/ic_launcher.png
+!android-client/app/src/main/res/mipmap-*/ic_launcher_round.png
 *.jpg
 *.jpeg

@@ -7,6 +7,7 @@
     <Nullable>enable</Nullable>
     <AssemblyName>SideDock.Host.App</AssemblyName>
     <ApplicationManifest>app.manifest</ApplicationManifest>
+    <ApplicationIcon>..\..\assets\SideDock.ico</ApplicationIcon>
   </PropertyGroup>
 
   <ItemGroup>

@@ -6,6 +6,7 @@
     <Nullable>enable</Nullable>
     <AssemblyName>SideDock.Driver.Installer</AssemblyName>
     <ApplicationManifest>app.manifest</ApplicationManifest>
+    <ApplicationIcon>..\..\assets\SideDock.ico</ApplicationIcon>
   </PropertyGroup>
 
   <ItemGroup>
