@@ -59,9 +59,11 @@ internal sealed class HostMainForm : Form
         {
             Dock = DockStyle.Fill,
             ColumnCount = 1,
-            RowCount = 3,
+            RowCount = 5,
             Padding = new Padding(14)
         };
+        root.RowStyles.Add(new RowStyle(SizeType.AutoSize));
+        root.RowStyles.Add(new RowStyle(SizeType.AutoSize));
         root.RowStyles.Add(new RowStyle(SizeType.AutoSize));
         root.RowStyles.Add(new RowStyle(SizeType.AutoSize));
         root.RowStyles.Add(new RowStyle(SizeType.Percent, 100));
@@ -80,16 +82,15 @@ internal sealed class HostMainForm : Form
         {
             Dock = DockStyle.Top,
             ColumnCount = 4,
-            RowCount = 5,
+            RowCount = 3,
             AutoSize = true,
-            Margin = new Padding(0, 0, 0, 12)
+            AutoSizeMode = AutoSizeMode.GrowAndShrink,
+            Margin = new Padding(0, 0, 0, 6)
         };
         settings.ColumnStyles.Add(new ColumnStyle(SizeType.Absolute, 120));
         settings.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 50));
         settings.ColumnStyles.Add(new ColumnStyle(SizeType.Absolute, 120));
         settings.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 50));
-        settings.RowStyles.Add(new RowStyle(SizeType.AutoSize));
-        settings.RowStyles.Add(new RowStyle(SizeType.AutoSize));
         settings.RowStyles.Add(new RowStyle(SizeType.AutoSize));
         settings.RowStyles.Add(new RowStyle(SizeType.AutoSize));
         settings.RowStyles.Add(new RowStyle(SizeType.AutoSize));
@@ -112,34 +113,44 @@ internal sealed class HostMainForm : Form
         AddLabeled(settings, "Video port", _videoPort, 4);
         AddLabeled(settings, "ADB path", _adbPath, 5);
 
-        settings.Controls.Add(new Label { Text = "", AutoSize = true }, 0, 3);
-        settings.Controls.Add(_enableInput, 1, 3);
-        settings.SetColumnSpan(_enableInput, 3);
+        var inputOptions = new TableLayoutPanel
+        {
+            Dock = DockStyle.Top,
+            ColumnCount = 2,
+            RowCount = 1,
+            AutoSize = true,
+            AutoSizeMode = AutoSizeMode.GrowAndShrink,
+            Margin = new Padding(0, 0, 0, 8)
+        };
+        inputOptions.ColumnStyles.Add(new ColumnStyle(SizeType.Absolute, 120));
+        inputOptions.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100));
+        inputOptions.Controls.Add(new Label { Text = "", AutoSize = true }, 0, 0);
+        inputOptions.Controls.Add(_enableInput, 1, 0);
+        root.Controls.Add(inputOptions, 0, 2);
 
         var buttons = new FlowLayoutPanel
         {
             Dock = DockStyle.Top,
             FlowDirection = FlowDirection.LeftToRight,
             AutoSize = true,
-            Margin = new Padding(0, 10, 0, 0)
+            AutoSizeMode = AutoSizeMode.GrowAndShrink,
+            WrapContents = false,
+            Margin = new Padding(0, 0, 0, 12)
         };
-        _startButton.Text = "Start";
-        _startButton.Width = 120;
+        ConfigureActionButton(_startButton, "Start");
         _startButton.Click += (_, _) => StartHost();
-        _stopButton.Text = "Stop";
-        _stopButton.Width = 120;
+        ConfigureActionButton(_stopButton, "Stop");
         _stopButton.Click += (_, _) => StopHost();
-        _clearLogButton.Text = "Clear log";
-        _clearLogButton.Width = 120;
+        ConfigureActionButton(_clearLogButton, "Clear log");
         _clearLogButton.Click += (_, _) => _logBox.Clear();
+        buttons.MinimumSize = new Size(0, _startButton.PreferredSize.Height + 8);
         _statusLabel.AutoSize = true;
-        _statusLabel.Padding = new Padding(14, 8, 0, 0);
+        _statusLabel.Margin = new Padding(14, 8, 0, 0);
         buttons.Controls.Add(_startButton);
         buttons.Controls.Add(_stopButton);
         buttons.Controls.Add(_clearLogButton);
         buttons.Controls.Add(_statusLabel);
-        settings.Controls.Add(buttons, 0, 4);
-        settings.SetColumnSpan(buttons, 4);
+        root.Controls.Add(buttons, 0, 3);
 
         _logBox.Dock = DockStyle.Fill;
         _logBox.Multiline = true;
@@ -149,7 +160,17 @@ internal sealed class HostMainForm : Form
         _logBox.BackColor = Color.FromArgb(18, 22, 28);
         _logBox.ForeColor = Color.FromArgb(228, 234, 240);
         _logBox.Font = new Font("Consolas", 10f);
-        root.Controls.Add(_logBox, 0, 2);
+        root.Controls.Add(_logBox, 0, 4);
+    }
+
+    private static void ConfigureActionButton(Button button, string text)
+    {
+        button.Text = text;
+        button.AutoSize = true;
+        button.AutoSizeMode = AutoSizeMode.GrowAndShrink;
+        button.MinimumSize = new Size(120, 0);
+        button.Padding = new Padding(12, 4, 12, 4);
+        button.Margin = new Padding(0, 0, 8, 0);
     }
 
     private static void ConfigureCombo(ComboBox comboBox, params string[] items)
