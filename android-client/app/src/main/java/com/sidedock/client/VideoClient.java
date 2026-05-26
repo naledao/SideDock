@@ -2,8 +2,10 @@ package com.sidedock.client;
 
 import android.media.MediaCodec;
 import android.media.MediaFormat;
+import android.os.Build;
 import android.os.Handler;
 import android.os.Looper;
+import android.os.SystemClock;
 import android.util.Log;
 import android.view.Surface;
 import java.io.EOFException;
@@ -12,12 +14,18 @@ import java.net.InetSocketAddress;
 import java.net.Socket;
 import java.nio.ByteBuffer;
 import java.util.ArrayDeque;
+import java.util.ArrayList;
+import java.util.Collections;
+import java.util.HashMap;
+import java.util.List;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.ThreadFactory;
 
 public final class VideoClient {
     private static final String TAG = "SideDock.Video";
+    private static final String ERROR_DECODER_UNSUPPORTED = "DECODER_UNSUPPORTED";
+    private static final String ERROR_VIDEO_FAILED = "VIDEO_FAILED";
 
     public interface Listener {
         void onVideoState(String state);
@@ -28,41 +36,129 @@ public final class VideoClient {
 
     public static final class VideoStats {
         public final long framesDecoded;
+        public final long framesRendered;
         public final long packetsReceived;
         public final long decodeErrors;
         public final long droppedFrames;
         public final long reconnects;
         public final long roughLatencyMs;
+        public final double decodeFps;
+        public final double renderFps;
+        public final double newFrameFps;
+        public final double repeatFrameFps;
+        public final long newFramesReceived;
+        public final long repeatFramesReceived;
+        public final long blackFramesReceived;
+        public final long keepaliveFramesReceived;
+        public final String lastFrameKind;
+        public final long lastSourceSeq;
+        public final int lastSourceAgeMs;
+        public final double lastReceiveToQueueMs;
+        public final double lastQueueToOutputMs;
+        public final double lastOutputToRenderMs;
+        public final double lastQueueToRenderMs;
+        public final double p50QueueToOutputMs;
+        public final double p95QueueToOutputMs;
+        public final double p99QueueToOutputMs;
+        public final double p50OutputToRenderMs;
+        public final double p95OutputToRenderMs;
+        public final double p99OutputToRenderMs;
+        public final double p50QueueToRenderMs;
+        public final double p95QueueToRenderMs;
+        public final double p99QueueToRenderMs;
+        public final double lastEncodeMs;
         public final String state;
 
         private VideoStats(
             long framesDecoded,
+            long framesRendered,
             long packetsReceived,
             long decodeErrors,
             long droppedFrames,
             long reconnects,
             long roughLatencyMs,
+            double decodeFps,
+            double renderFps,
+            double newFrameFps,
+            double repeatFrameFps,
+            long newFramesReceived,
+            long repeatFramesReceived,
+            long blackFramesReceived,
+            long keepaliveFramesReceived,
+            String lastFrameKind,
+            long lastSourceSeq,
+            int lastSourceAgeMs,
+            double lastReceiveToQueueMs,
+            double lastQueueToOutputMs,
+            double lastOutputToRenderMs,
+            double lastQueueToRenderMs,
+            double p50QueueToOutputMs,
+            double p95QueueToOutputMs,
+            double p99QueueToOutputMs,
+            double p50OutputToRenderMs,
+            double p95OutputToRenderMs,
+            double p99OutputToRenderMs,
+            double p50QueueToRenderMs,
+            double p95QueueToRenderMs,
+            double p99QueueToRenderMs,
+            double lastEncodeMs,
             String state
         ) {
             this.framesDecoded = framesDecoded;
+            this.framesRendered = framesRendered;
             this.packetsReceived = packetsReceived;
             this.decodeErrors = decodeErrors;
             this.droppedFrames = droppedFrames;
             this.reconnects = reconnects;
             this.roughLatencyMs = roughLatencyMs;
+            this.decodeFps = decodeFps;
+            this.renderFps = renderFps;
+            this.newFrameFps = newFrameFps;
+            this.repeatFrameFps = repeatFrameFps;
+            this.newFramesReceived = newFramesReceived;
+            this.repeatFramesReceived = repeatFramesReceived;
+            this.blackFramesReceived = blackFramesReceived;
+            this.keepaliveFramesReceived = keepaliveFramesReceived;
+            this.lastFrameKind = lastFrameKind;
+            this.lastSourceSeq = lastSourceSeq;
+            this.lastSourceAgeMs = lastSourceAgeMs;
+            this.lastReceiveToQueueMs = lastReceiveToQueueMs;
+            this.lastQueueToOutputMs = lastQueueToOutputMs;
+            this.lastOutputToRenderMs = lastOutputToRenderMs;
+            this.lastQueueToRenderMs = lastQueueToRenderMs;
+            this.p50QueueToOutputMs = p50QueueToOutputMs;
+            this.p95QueueToOutputMs = p95QueueToOutputMs;
+            this.p99QueueToOutputMs = p99QueueToOutputMs;
+            this.p50OutputToRenderMs = p50OutputToRenderMs;
+            this.p95OutputToRenderMs = p95OutputToRenderMs;
+            this.p99OutputToRenderMs = p99OutputToRenderMs;
+            this.p50QueueToRenderMs = p50QueueToRenderMs;
+            this.p95QueueToRenderMs = p95QueueToRenderMs;
+            this.p99QueueToRenderMs = p99QueueToRenderMs;
+            this.lastEncodeMs = lastEncodeMs;
             this.state = state;
         }
     }
 
     private static final int HEADER_SIZE = 24;
+    private static final int EXTENDED_HEADER_SIZE = 16;
     private static final int MAX_PAYLOAD_LENGTH = 8 * 1024 * 1024;
     private static final long INPUT_TIMEOUT_US = 10000L;
     private static final byte[] MAGIC = new byte[] { 'S', 'D', 'K', 'V' };
+    private static final int FRAME_KIND_NEW = 0;
+    private static final int FRAME_KIND_REPEAT = 1;
+    private static final int FRAME_KIND_BLACK = 2;
+    private static final int FRAME_KIND_KEEPALIVE = 3;
 
     private final String host;
     private final Listener listener;
     private final Handler mainHandler = new Handler(Looper.getMainLooper());
     private final Object lifecycleLock = new Object();
+    private final Object timingLock = new Object();
+    private final HashMap<Long, PacketTiming> packetTimings = new HashMap<>();
+    private final ArrayList<Double> queueToOutputSamples = new ArrayList<>();
+    private final ArrayList<Double> outputToRenderSamples = new ArrayList<>();
+    private final ArrayList<Double> queueToRenderSamples = new ArrayList<>();
 
     private ExecutorService executor;
     private Socket socket;
@@ -75,12 +171,43 @@ public final class VideoClient {
     private volatile String state = "STOPPED";
     private long generation;
     private long framesDecoded;
+    private long framesRendered;
     private long packetsReceived;
+    private long newFramesReceived;
+    private long repeatFramesReceived;
+    private long blackFramesReceived;
+    private long keepaliveFramesReceived;
     private long decodeErrors;
     private long droppedFrames;
     private long reconnects;
     private long roughLatencyMs;
     private long lastFrameStatsEmitAtMs;
+    private long lastRateSnapshotNanos;
+    private long lastRateDecodedFrames;
+    private long lastRateRenderedFrames;
+    private long lastRateNewFrames;
+    private long lastRateRepeatFrames;
+    private double decodeFps;
+    private double renderFps;
+    private double newFrameFps;
+    private double repeatFrameFps;
+    private String lastFrameKind = "new";
+    private long lastSourceSeq;
+    private int lastSourceAgeMs;
+    private double lastReceiveToQueueMs;
+    private double lastQueueToOutputMs;
+    private double lastOutputToRenderMs;
+    private double lastQueueToRenderMs;
+    private double p50QueueToOutputMs;
+    private double p95QueueToOutputMs;
+    private double p99QueueToOutputMs;
+    private double p50OutputToRenderMs;
+    private double p95OutputToRenderMs;
+    private double p99OutputToRenderMs;
+    private double p50QueueToRenderMs;
+    private double p95QueueToRenderMs;
+    private double p99QueueToRenderMs;
+    private double lastEncodeMs;
     private volatile long serverTimeOffsetMs;
 
     public VideoClient(Listener listener) {
@@ -169,8 +296,9 @@ public final class VideoClient {
                 if (running) {
                     decodeErrors += 1;
                     String message = ex.getMessage() == null ? ex.getClass().getSimpleName() : ex.getMessage();
+                    String code = isDecoderUnsupported(ex) ? ERROR_DECODER_UNSUPPORTED : ERROR_VIDEO_FAILED;
                     Log.e(TAG, "video failed", ex);
-                    emitError("VIDEO_FAILED", message);
+                    emitError(code, message);
                     emitLog("视频通道断开: " + message);
                 }
             } finally {
@@ -211,6 +339,7 @@ public final class VideoClient {
             while (running && !nextSocket.isClosed()) {
                 VideoPacket packet = readPacket(input);
                 packetsReceived += 1;
+                recordPacketKind(packet);
                 roughLatencyMs = Math.max(0L, System.currentTimeMillis() - packet.timestampMs + serverTimeOffsetMs);
                 codecConfig.scan(packet.payload);
                 pendingPackets.add(packet);
@@ -244,20 +373,46 @@ public final class VideoClient {
     }
 
     private MediaCodec createDecoder(CodecConfig codecConfig) throws Exception {
+        MediaCodec codec = MediaCodec.createDecoderByType("video/avc");
+        try {
+            MediaFormat format = createDecoderFormat(codecConfig, true);
+            codec.configure(format, surface, null, 0);
+        } catch (Exception ex) {
+            codec.release();
+            codec = MediaCodec.createDecoderByType("video/avc");
+            MediaFormat fallbackFormat = createDecoderFormat(codecConfig, false);
+            codec.configure(fallbackFormat, surface, null, 0);
+            emitLog("MediaCodec low-latency keys ignored: " + ex.getClass().getSimpleName());
+        }
+
+        codec.setOnFrameRenderedListener(new MediaCodec.OnFrameRenderedListener() {
+            @Override
+            public void onFrameRendered(MediaCodec codec, long presentationTimeUs, long nanoTime) {
+                recordFrameRendered(presentationTimeUs);
+            }
+        }, mainHandler);
+        codec.start();
+        return codec;
+    }
+
+    private MediaFormat createDecoderFormat(CodecConfig codecConfig, boolean lowLatency) {
         MediaFormat format = MediaFormat.createVideoFormat("video/avc", width, height);
         format.setInteger(MediaFormat.KEY_FRAME_RATE, fps);
         format.setInteger(MediaFormat.KEY_MAX_INPUT_SIZE, MAX_PAYLOAD_LENGTH);
+        if (lowLatency) {
+            format.setInteger(MediaFormat.KEY_PRIORITY, 0);
+            format.setFloat(MediaFormat.KEY_OPERATING_RATE, (float) Math.max(1, fps));
+            if (Build.VERSION.SDK_INT >= 30) {
+                format.setInteger(MediaFormat.KEY_LOW_LATENCY, 1);
+            }
+        }
         if (codecConfig.sps != null) {
             format.setByteBuffer("csd-0", ByteBuffer.wrap(codecConfig.sps));
         }
         if (codecConfig.pps != null) {
             format.setByteBuffer("csd-1", ByteBuffer.wrap(codecConfig.pps));
         }
-
-        MediaCodec codec = MediaCodec.createDecoderByType("video/avc");
-        codec.configure(format, surface, null, 0);
-        codec.start();
-        return codec;
+        return format;
     }
 
     private void queuePacket(
@@ -292,7 +447,13 @@ public final class VideoClient {
         inputBuffer.clear();
         inputBuffer.put(packet.payload);
         long presentationTimeUs = submittedPackets * (1000000L / Math.max(1, fps));
+        long queueInputAtNanos = SystemClock.elapsedRealtimeNanos();
+        lastReceiveToQueueMs = nanosToMs(queueInputAtNanos - packet.receiveElapsedRealtimeNanos);
         codec.queueInputBuffer(inputIndex, 0, packet.payload.length, presentationTimeUs, 0);
+        synchronized (timingLock) {
+            packetTimings.put(presentationTimeUs, new PacketTiming(packet, queueInputAtNanos));
+            trimPacketTimingsLocked();
+        }
         drainOutput(codec, bufferInfo, 0L);
     }
 
@@ -301,6 +462,9 @@ public final class VideoClient {
             int outputIndex = codec.dequeueOutputBuffer(bufferInfo, timeoutUs);
             if (outputIndex >= 0) {
                 boolean render = bufferInfo.size > 0;
+                if (render) {
+                    recordFrameOutput(bufferInfo.presentationTimeUs);
+                }
                 codec.releaseOutputBuffer(outputIndex, render);
                 if (render) {
                     framesDecoded += 1;
@@ -322,26 +486,82 @@ public final class VideoClient {
         }
     }
 
+    private void recordFrameOutput(long presentationTimeUs) {
+        long outputAtNanos = SystemClock.elapsedRealtimeNanos();
+        synchronized (timingLock) {
+            PacketTiming timing = packetTimings.get(presentationTimeUs);
+            if (timing != null) {
+                timing.outputElapsedRealtimeNanos = outputAtNanos;
+                lastQueueToOutputMs = nanosToMs(outputAtNanos - timing.queueInputElapsedRealtimeNanos);
+                addSample(queueToOutputSamples, lastQueueToOutputMs);
+            }
+        }
+    }
+
+    private void recordFrameRendered(long presentationTimeUs) {
+        long renderAtNanos = SystemClock.elapsedRealtimeNanos();
+        synchronized (timingLock) {
+            framesRendered += 1;
+            PacketTiming timing = packetTimings.remove(presentationTimeUs);
+            if (timing != null) {
+                if (timing.outputElapsedRealtimeNanos > 0L) {
+                    lastOutputToRenderMs = nanosToMs(renderAtNanos - timing.outputElapsedRealtimeNanos);
+                    addSample(outputToRenderSamples, lastOutputToRenderMs);
+                }
+                lastQueueToRenderMs = nanosToMs(renderAtNanos - timing.queueInputElapsedRealtimeNanos);
+                addSample(queueToRenderSamples, lastQueueToRenderMs);
+            }
+        }
+
+        long now = System.currentTimeMillis();
+        if (framesRendered == 1L || now - lastFrameStatsEmitAtMs >= 1000L) {
+            lastFrameStatsEmitAtMs = now;
+            emitStats();
+        }
+    }
+
     private VideoPacket readPacket(InputStream input) throws Exception {
         byte[] header = new byte[HEADER_SIZE];
         readFully(input, header, 0, header.length);
         if (header[0] != MAGIC[0] || header[1] != MAGIC[1] || header[2] != MAGIC[2] || header[3] != MAGIC[3]) {
             throw new IllegalStateException("video magic mismatch");
         }
-        if ((header[4] & 0xFF) != 1) {
-            throw new IllegalStateException("unsupported video packet version: " + (header[4] & 0xFF));
+        int version = header[4] & 0xFF;
+        if (version != 1 && version != 2) {
+            throw new IllegalStateException("unsupported video packet version: " + version);
         }
 
         long seq = readUInt32Le(header, 8);
         long timestampMs = readInt64Le(header, 12);
         int length = readInt32Le(header, 20);
+        int frameKind = FRAME_KIND_NEW;
+        long sourceSeq = seq;
+        int sourceAgeMs = 0;
+        int encodeUs = 0;
+        if (version >= 2) {
+            frameKind = header[6] & 0xFF;
+            byte[] extended = new byte[EXTENDED_HEADER_SIZE];
+            readFully(input, extended, 0, extended.length);
+            sourceSeq = readInt64Le(extended, 0);
+            sourceAgeMs = Math.max(0, readInt32Le(extended, 8));
+            encodeUs = Math.max(0, readInt32Le(extended, 12));
+        }
         if (length <= 0 || length > MAX_PAYLOAD_LENGTH) {
             throw new IllegalStateException("invalid video payload length: " + length);
         }
 
         byte[] payload = new byte[length];
         readFully(input, payload, 0, payload.length);
-        return new VideoPacket(seq, timestampMs, payload);
+        return new VideoPacket(
+            seq,
+            timestampMs,
+            payload,
+            frameKind,
+            sourceSeq,
+            sourceAgeMs,
+            encodeUs / 1000.0,
+            SystemClock.elapsedRealtimeNanos()
+        );
     }
 
     private static void readFully(InputStream input, byte[] buffer, int offset, int length) throws Exception {
@@ -375,6 +595,56 @@ public final class VideoClient {
             | (((long) data[offset + 5] & 0xFFL) << 40)
             | (((long) data[offset + 6] & 0xFFL) << 48)
             | (((long) data[offset + 7] & 0xFFL) << 56);
+    }
+
+    private boolean isDecoderUnsupported(Throwable throwable) {
+        Throwable current = throwable;
+        while (current != null) {
+            if (current instanceof MediaCodec.CodecException) {
+                MediaCodec.CodecException codecException = (MediaCodec.CodecException) current;
+                if (!codecException.isRecoverable() && !codecException.isTransient()) {
+                    return true;
+                }
+            }
+            if (current instanceof IllegalStateException
+                && width >= 2560
+                && height >= 1440
+                && fps > 60
+                && hasMediaCodecStack(current)) {
+                return true;
+            }
+
+            String message = current.getMessage();
+            if (message != null) {
+                String normalized = message.toLowerCase();
+                if (normalized.contains("insufficient")
+                    || normalized.contains("resource")
+                    || normalized.contains("hardware")
+                    || normalized.contains("unsupported")
+                    || normalized.contains("released state")
+                    || normalized.contains("executing state")
+                    || normalized.contains("pending dequeue input buffer")
+                    || normalized.contains("0x80001001")
+                    || normalized.contains("0x80001000")) {
+                    return true;
+                }
+            }
+
+            current = current.getCause();
+        }
+
+        return false;
+    }
+
+    private static boolean hasMediaCodecStack(Throwable throwable) {
+        StackTraceElement[] stackTrace = throwable.getStackTrace();
+        for (StackTraceElement element : stackTrace) {
+            if (element.getClassName().startsWith("android.media.MediaCodec")) {
+                return true;
+            }
+        }
+
+        return false;
     }
 
     private void closeSocket() {
@@ -425,13 +695,59 @@ public final class VideoClient {
     }
 
     private void emitStats() {
+        updateRateSnapshot();
+        long renderedSnapshot;
+        synchronized (timingLock) {
+            renderedSnapshot = framesRendered;
+            double[] queueToOutput = percentiles(queueToOutputSamples);
+            double[] outputToRender = percentiles(outputToRenderSamples);
+            double[] queueToRender = percentiles(queueToRenderSamples);
+            p50QueueToOutputMs = queueToOutput[0];
+            p95QueueToOutputMs = queueToOutput[1];
+            p99QueueToOutputMs = queueToOutput[2];
+            p50OutputToRenderMs = outputToRender[0];
+            p95OutputToRenderMs = outputToRender[1];
+            p99OutputToRenderMs = outputToRender[2];
+            p50QueueToRenderMs = queueToRender[0];
+            p95QueueToRenderMs = queueToRender[1];
+            p99QueueToRenderMs = queueToRender[2];
+            queueToOutputSamples.clear();
+            outputToRenderSamples.clear();
+            queueToRenderSamples.clear();
+        }
         VideoStats stats = new VideoStats(
             framesDecoded,
+            renderedSnapshot,
             packetsReceived,
             decodeErrors,
             droppedFrames,
             reconnects,
             roughLatencyMs,
+            decodeFps,
+            renderFps,
+            newFrameFps,
+            repeatFrameFps,
+            newFramesReceived,
+            repeatFramesReceived,
+            blackFramesReceived,
+            keepaliveFramesReceived,
+            lastFrameKind,
+            lastSourceSeq,
+            lastSourceAgeMs,
+            lastReceiveToQueueMs,
+            lastQueueToOutputMs,
+            lastOutputToRenderMs,
+            lastQueueToRenderMs,
+            p50QueueToOutputMs,
+            p95QueueToOutputMs,
+            p99QueueToOutputMs,
+            p50OutputToRenderMs,
+            p95OutputToRenderMs,
+            p99OutputToRenderMs,
+            p50QueueToRenderMs,
+            p95QueueToRenderMs,
+            p99QueueToRenderMs,
+            lastEncodeMs,
             state
         );
         mainHandler.post(new Runnable() {
@@ -440,6 +756,139 @@ public final class VideoClient {
                 listener.onVideoStats(stats);
             }
         });
+    }
+
+    private void recordPacketKind(VideoPacket packet) {
+        lastFrameKind = frameKindName(packet.frameKind);
+        lastSourceSeq = packet.sourceSeq;
+        lastSourceAgeMs = packet.sourceAgeMs;
+        lastEncodeMs = packet.encodeMs;
+        switch (packet.frameKind) {
+            case FRAME_KIND_REPEAT:
+                repeatFramesReceived += 1;
+                break;
+            case FRAME_KIND_BLACK:
+                blackFramesReceived += 1;
+                break;
+            case FRAME_KIND_KEEPALIVE:
+                keepaliveFramesReceived += 1;
+                break;
+            case FRAME_KIND_NEW:
+            default:
+                newFramesReceived += 1;
+                break;
+        }
+    }
+
+    private void updateRateSnapshot() {
+        long nowNanos = SystemClock.elapsedRealtimeNanos();
+        if (lastRateSnapshotNanos == 0L) {
+            lastRateSnapshotNanos = nowNanos;
+            lastRateDecodedFrames = framesDecoded;
+            synchronized (timingLock) {
+                lastRateRenderedFrames = framesRendered;
+            }
+            lastRateNewFrames = newFramesReceived;
+            lastRateRepeatFrames = repeatFramesReceived;
+            return;
+        }
+
+        long elapsedNanos = nowNanos - lastRateSnapshotNanos;
+        if (elapsedNanos < 500_000_000L) {
+            return;
+        }
+
+        double seconds = elapsedNanos / 1_000_000_000.0;
+        long rendered;
+        synchronized (timingLock) {
+            rendered = framesRendered;
+        }
+        decodeFps = (framesDecoded - lastRateDecodedFrames) / seconds;
+        renderFps = (rendered - lastRateRenderedFrames) / seconds;
+        newFrameFps = (newFramesReceived - lastRateNewFrames) / seconds;
+        repeatFrameFps = (repeatFramesReceived - lastRateRepeatFrames) / seconds;
+        lastRateSnapshotNanos = nowNanos;
+        lastRateDecodedFrames = framesDecoded;
+        lastRateRenderedFrames = rendered;
+        lastRateNewFrames = newFramesReceived;
+        lastRateRepeatFrames = repeatFramesReceived;
+    }
+
+    private static String frameKindName(int frameKind) {
+        switch (frameKind) {
+            case FRAME_KIND_REPEAT:
+                return "repeat";
+            case FRAME_KIND_BLACK:
+                return "black";
+            case FRAME_KIND_KEEPALIVE:
+                return "keepalive";
+            case FRAME_KIND_NEW:
+            default:
+                return "new";
+        }
+    }
+
+    private void trimPacketTimingsLocked() {
+        if (packetTimings.size() <= 240) {
+            return;
+        }
+
+        Long oldestKey = null;
+        long oldestNanos = Long.MAX_VALUE;
+        for (Long key : packetTimings.keySet()) {
+            PacketTiming timing = packetTimings.get(key);
+            if (timing != null && timing.queueInputElapsedRealtimeNanos < oldestNanos) {
+                oldestNanos = timing.queueInputElapsedRealtimeNanos;
+                oldestKey = key;
+            }
+        }
+        if (oldestKey != null) {
+            packetTimings.remove(oldestKey);
+        }
+    }
+
+    private static double nanosToMs(long nanos) {
+        return Math.max(0.0, nanos / 1_000_000.0);
+    }
+
+    private static void addSample(ArrayList<Double> samples, double value) {
+        if (Double.isNaN(value) || Double.isInfinite(value)) {
+            return;
+        }
+        samples.add(Math.max(0.0, value));
+        if (samples.size() > 240) {
+            samples.remove(0);
+        }
+    }
+
+    private static double[] percentiles(List<Double> samples) {
+        if (samples.isEmpty()) {
+            return new double[] { 0.0, 0.0, 0.0 };
+        }
+
+        ArrayList<Double> sorted = new ArrayList<>(samples);
+        Collections.sort(sorted);
+        return new double[] {
+            percentile(sorted, 0.50),
+            percentile(sorted, 0.95),
+            percentile(sorted, 0.99)
+        };
+    }
+
+    private static double percentile(List<Double> sorted, double percentile) {
+        if (sorted.isEmpty()) {
+            return 0.0;
+        }
+
+        double position = percentile * (sorted.size() - 1);
+        int lower = (int) Math.floor(position);
+        int upper = (int) Math.ceil(position);
+        if (lower == upper) {
+            return sorted.get(lower);
+        }
+
+        double fraction = position - lower;
+        return sorted.get(lower) + (sorted.get(upper) - sorted.get(lower)) * fraction;
     }
 
     private static final class CodecConfig {
@@ -512,11 +961,39 @@ public final class VideoClient {
         private final long seq;
         private final long timestampMs;
         private final byte[] payload;
+        private final int frameKind;
+        private final long sourceSeq;
+        private final int sourceAgeMs;
+        private final double encodeMs;
+        private final long receiveElapsedRealtimeNanos;
 
-        private VideoPacket(long seq, long timestampMs, byte[] payload) {
+        private VideoPacket(
+            long seq,
+            long timestampMs,
+            byte[] payload,
+            int frameKind,
+            long sourceSeq,
+            int sourceAgeMs,
+            double encodeMs,
+            long receiveElapsedRealtimeNanos
+        ) {
             this.seq = seq;
             this.timestampMs = timestampMs;
             this.payload = payload;
+            this.frameKind = frameKind;
+            this.sourceSeq = sourceSeq;
+            this.sourceAgeMs = sourceAgeMs;
+            this.encodeMs = encodeMs;
+            this.receiveElapsedRealtimeNanos = receiveElapsedRealtimeNanos;
+        }
+    }
+
+    private static final class PacketTiming {
+        private final long queueInputElapsedRealtimeNanos;
+        private long outputElapsedRealtimeNanos;
+
+        private PacketTiming(VideoPacket packet, long queueInputElapsedRealtimeNanos) {
+            this.queueInputElapsedRealtimeNanos = queueInputElapsedRealtimeNanos;
         }
     }
 

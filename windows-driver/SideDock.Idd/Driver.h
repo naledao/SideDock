@@ -52,9 +52,12 @@ namespace SideDock::Idd
     inline constexpr DWORD MaxVirtualDisplayHeight = 1440;
     inline constexpr UINT VirtualMonitorConnectorIndex = 0;
     inline constexpr UINT SharedFrameSlotCount = 3;
+    inline constexpr UINT SharedGpuFrameSlotCount = 6;
     inline constexpr UINT SharedFrameFormatBgra = 1;
     inline constexpr UINT SharedFrameMagic = 0x464B4453; // SDKF
     inline constexpr UINT SharedFrameVersion = 1;
+    inline constexpr UINT SharedGpuFrameMagic = 0x474B4453; // SDKG
+    inline constexpr UINT SharedGpuFrameVersion = 1;
 
     struct Direct3DDevice
     {
@@ -90,6 +93,36 @@ namespace SideDock::Idd
         UINT32 Length;
         UINT32 Reserved;
     };
+
+    struct SharedGpuFrameSlotHeader
+    {
+        UINT64 Seq;
+        UINT64 TimestampQpc;
+        UINT32 Width;
+        UINT32 Height;
+        UINT32 Format;
+        UINT32 State;
+    };
+
+    struct SharedGpuFrameMetadata
+    {
+        UINT32 Magic;
+        UINT32 Version;
+        UINT32 Width;
+        UINT32 Height;
+        UINT32 Format;
+        UINT32 SlotCount;
+        UINT32 LatestSlot;
+        UINT32 Generation;
+        UINT64 WriteSeq;
+        UINT64 TimestampQpc;
+        UINT32 AdapterLuidLow;
+        INT32 AdapterLuidHigh;
+        UINT64 FrameDuration100ns;
+        UINT32 ModeRefreshHz;
+        UINT32 Flags;
+        SharedGpuFrameSlotHeader Slots[SharedGpuFrameSlotCount];
+    };
 #pragma pack(pop)
 
     class SharedFrameBuffer
@@ -113,6 +146,40 @@ namespace SideDock::Idd
         HANDLE m_frameReadyEvent = nullptr;
         HANDLE m_consumerAliveEvent = nullptr;
         BYTE* m_view = nullptr;
+        UINT64 m_writeSeq = 0;
+    };
+
+    class SharedGpuFrameRing
+    {
+    public:
+        SharedGpuFrameRing() = default;
+        ~SharedGpuFrameRing();
+
+        SharedGpuFrameRing(const SharedGpuFrameRing&) = delete;
+        SharedGpuFrameRing& operator=(const SharedGpuFrameRing&) = delete;
+
+        bool EnsureInitialized(Direct3DDevice& device, ID3D11Texture2D* sourceTexture);
+        bool IsConsumerAlive() const;
+        bool WriteFrame(Direct3DDevice& device, ID3D11Texture2D* sourceTexture, UINT64 timestampQpc);
+
+    private:
+        void Close();
+        void CloseTextures();
+        bool CreateSecurityAttributes(SECURITY_ATTRIBUTES& attributes, SECURITY_DESCRIPTOR& descriptor, PACL& acl);
+        bool RecreateTextures(Direct3DDevice& device, const D3D11_TEXTURE2D_DESC& sourceDesc, SECURITY_ATTRIBUTES* securityAttributes);
+        void InitializeMetadata(Direct3DDevice& device, const D3D11_TEXTURE2D_DESC& sourceDesc);
+        bool HasMatchingTextures(const D3D11_TEXTURE2D_DESC& sourceDesc) const;
+
+        HANDLE m_mapping = nullptr;
+        HANDLE m_frameReadyEvent = nullptr;
+        HANDLE m_consumerAliveEvent = nullptr;
+        SharedGpuFrameMetadata* m_metadata = nullptr;
+        Microsoft::WRL::ComPtr<ID3D11Texture2D> m_textures[SharedGpuFrameSlotCount];
+        Microsoft::WRL::ComPtr<IDXGIKeyedMutex> m_mutexes[SharedGpuFrameSlotCount];
+        HANDLE m_sharedHandles[SharedGpuFrameSlotCount] = {};
+        UINT m_width = 0;
+        UINT m_height = 0;
+        UINT m_generation = 0;
         UINT64 m_writeSeq = 0;
     };
 
@@ -140,9 +207,12 @@ namespace SideDock::Idd
         Microsoft::WRL::Wrappers::Event m_terminateEvent;
         Microsoft::WRL::ComPtr<ID3D11Texture2D> m_stagingTexture;
         SharedFrameBuffer m_sharedFrameBuffer;
+        SharedGpuFrameRing m_sharedGpuFrameRing;
         UINT64 m_framesReceived = 0;
         UINT64 m_framesExported = 0;
+        UINT64 m_gpuFramesExported = 0;
         UINT64 m_framesDropped = 0;
+        UINT64 m_gpuFramesDropped = 0;
         UINT64 m_exportErrors = 0;
         UINT64 m_framesDiscarded = 0;
     };

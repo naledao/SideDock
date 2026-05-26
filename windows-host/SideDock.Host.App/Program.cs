@@ -88,7 +88,7 @@ internal sealed class HostMainForm : Form
         settings.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 50));
         root.Controls.Add(settings, 0, 1);
 
-        ConfigureCombo(_videoSource, "idd", "realtime");
+        ConfigureCombo(_videoSource, "idd-gpu", "idd", "realtime");
         ConfigureCombo(_resolution, "720p", "1080p", "2k");
         ConfigureCombo(_refreshRate, "30", "60", "120");
         _controlPort.Text = "27183";

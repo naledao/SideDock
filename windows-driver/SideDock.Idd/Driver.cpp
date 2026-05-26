@@ -41,10 +41,23 @@ static PDRIVER_OBJECT g_driverObject = nullptr;
 static constexpr LPCWSTR SharedFrameBufferName = L"Global\\SideDockFrameBuffer";
 static constexpr LPCWSTR SharedFrameReadyName = L"Global\\SideDockFrameReady";
 static constexpr LPCWSTR SharedFrameConsumerAliveName = L"Global\\SideDockFrameConsumerAlive";
+static constexpr LPCWSTR SharedGpuFrameMetadataName = L"Global\\SideDockGpuFrameMetadata";
+static constexpr LPCWSTR SharedGpuFrameReadyName = L"Global\\SideDockGpuFrameReady";
+static constexpr LPCWSTR SharedGpuConsumerAliveName = L"Global\\SideDockGpuConsumerAlive";
+static constexpr LPCWSTR SharedGpuFrameSlotNames[SharedGpuFrameSlotCount] =
+{
+    L"Global\\SideDockGpuFrameSlot0",
+    L"Global\\SideDockGpuFrameSlot1",
+    L"Global\\SideDockGpuFrameSlot2",
+    L"Global\\SideDockGpuFrameSlot3",
+    L"Global\\SideDockGpuFrameSlot4",
+    L"Global\\SideDockGpuFrameSlot5"
+};
 static constexpr UINT MaxSharedFrameStride = MaxVirtualDisplayWidth * 4;
 static constexpr UINT MaxSharedFrameSlotSize = MaxSharedFrameStride * MaxVirtualDisplayHeight;
 static constexpr UINT SharedFrameMappingSize =
     sizeof(SharedFrameHeader) + SharedFrameSlotCount * (sizeof(SharedFrameSlotHeader) + MaxSharedFrameSlotSize);
+static constexpr UINT SharedGpuFrameMetadataSize = sizeof(SharedGpuFrameMetadata);
 
 struct DeviceContextWrapper
 {
@@ -122,6 +135,68 @@ static IDDCX_TARGET_MODE CreateTargetMode(DWORD width, DWORD height, DWORD refre
     mode.Size = sizeof(mode);
     FillSignalInfo(mode.TargetVideoSignalInfo.targetVideoSignalInfo, width, height, refreshRate, false);
     return mode;
+}
+
+static bool CreateSharedObjectSecurityAttributes(SECURITY_ATTRIBUTES& attributes, SECURITY_DESCRIPTOR& descriptor, PACL& acl)
+{
+    acl = nullptr;
+    if (!InitializeSecurityDescriptor(&descriptor, SECURITY_DESCRIPTOR_REVISION))
+    {
+        return false;
+    }
+
+    BYTE localSystemSid[SECURITY_MAX_SID_SIZE] = {};
+    BYTE administratorsSid[SECURITY_MAX_SID_SIZE] = {};
+    BYTE authenticatedUsersSid[SECURITY_MAX_SID_SIZE] = {};
+    DWORD localSystemSidSize = sizeof(localSystemSid);
+    DWORD administratorsSidSize = sizeof(administratorsSid);
+    DWORD authenticatedUsersSidSize = sizeof(authenticatedUsersSid);
+
+    if (!CreateWellKnownSid(WinLocalSystemSid, nullptr, localSystemSid, &localSystemSidSize) ||
+        !CreateWellKnownSid(WinBuiltinAdministratorsSid, nullptr, administratorsSid, &administratorsSidSize) ||
+        !CreateWellKnownSid(WinAuthenticatedUserSid, nullptr, authenticatedUsersSid, &authenticatedUsersSidSize))
+    {
+        return false;
+    }
+
+    EXPLICIT_ACCESSW entries[3] = {};
+    entries[0].grfAccessPermissions = GENERIC_ALL;
+    entries[0].grfAccessMode = SET_ACCESS;
+    entries[0].grfInheritance = NO_INHERITANCE;
+    entries[0].Trustee.TrusteeForm = TRUSTEE_IS_SID;
+    entries[0].Trustee.TrusteeType = TRUSTEE_IS_USER;
+    entries[0].Trustee.ptstrName = reinterpret_cast<LPWSTR>(localSystemSid);
+
+    entries[1].grfAccessPermissions = GENERIC_ALL;
+    entries[1].grfAccessMode = SET_ACCESS;
+    entries[1].grfInheritance = NO_INHERITANCE;
+    entries[1].Trustee.TrusteeForm = TRUSTEE_IS_SID;
+    entries[1].Trustee.TrusteeType = TRUSTEE_IS_GROUP;
+    entries[1].Trustee.ptstrName = reinterpret_cast<LPWSTR>(administratorsSid);
+
+    entries[2].grfAccessPermissions = GENERIC_READ | GENERIC_WRITE | SYNCHRONIZE;
+    entries[2].grfAccessMode = SET_ACCESS;
+    entries[2].grfInheritance = NO_INHERITANCE;
+    entries[2].Trustee.TrusteeForm = TRUSTEE_IS_SID;
+    entries[2].Trustee.TrusteeType = TRUSTEE_IS_GROUP;
+    entries[2].Trustee.ptstrName = reinterpret_cast<LPWSTR>(authenticatedUsersSid);
+
+    if (SetEntriesInAclW(static_cast<ULONG>(std::size(entries)), entries, nullptr, &acl) != ERROR_SUCCESS)
+    {
+        return false;
+    }
+
+    if (!SetSecurityDescriptorDacl(&descriptor, TRUE, acl, FALSE))
+    {
+        LocalFree(acl);
+        acl = nullptr;
+        return false;
+    }
+
+    attributes.nLength = sizeof(attributes);
+    attributes.lpSecurityDescriptor = &descriptor;
+    attributes.bInheritHandle = FALSE;
+    return true;
 }
 
 _Use_decl_annotations_
@@ -250,7 +325,7 @@ HRESULT Direct3DDevice::Init()
         Adapter.Get(),
         D3D_DRIVER_TYPE_UNKNOWN,
         nullptr,
-        D3D11_CREATE_DEVICE_BGRA_SUPPORT,
+        D3D11_CREATE_DEVICE_BGRA_SUPPORT | D3D11_CREATE_DEVICE_VIDEO_SUPPORT,
         nullptr,
         0,
         D3D11_SDK_VERSION,
@@ -483,64 +558,343 @@ void SharedFrameBuffer::InitializeHeader()
 
 bool SharedFrameBuffer::CreateSecurityAttributes(SECURITY_ATTRIBUTES& attributes, SECURITY_DESCRIPTOR& descriptor, PACL& acl)
 {
-    acl = nullptr;
-    if (!InitializeSecurityDescriptor(&descriptor, SECURITY_DESCRIPTOR_REVISION))
+    return CreateSharedObjectSecurityAttributes(attributes, descriptor, acl);
+}
+
+SharedGpuFrameRing::~SharedGpuFrameRing()
+{
+    Close();
+}
+
+bool SharedGpuFrameRing::EnsureInitialized(Direct3DDevice& device, ID3D11Texture2D* sourceTexture)
+{
+    if (!sourceTexture)
     {
         return false;
     }
 
-    BYTE localSystemSid[SECURITY_MAX_SID_SIZE] = {};
-    BYTE administratorsSid[SECURITY_MAX_SID_SIZE] = {};
-    BYTE authenticatedUsersSid[SECURITY_MAX_SID_SIZE] = {};
-    DWORD localSystemSidSize = sizeof(localSystemSid);
-    DWORD administratorsSidSize = sizeof(administratorsSid);
-    DWORD authenticatedUsersSidSize = sizeof(authenticatedUsersSid);
+    D3D11_TEXTURE2D_DESC sourceDesc = {};
+    sourceTexture->GetDesc(&sourceDesc);
+    if (HasMatchingTextures(sourceDesc))
+    {
+        return true;
+    }
 
-    if (!CreateWellKnownSid(WinLocalSystemSid, nullptr, localSystemSid, &localSystemSidSize) ||
-        !CreateWellKnownSid(WinBuiltinAdministratorsSid, nullptr, administratorsSid, &administratorsSidSize) ||
-        !CreateWellKnownSid(WinAuthenticatedUserSid, nullptr, authenticatedUsersSid, &authenticatedUsersSidSize))
+    SECURITY_ATTRIBUTES securityAttributes = {};
+    SECURITY_DESCRIPTOR securityDescriptor = {};
+    PACL securityAcl = nullptr;
+    SECURITY_ATTRIBUTES* securityAttributesPointer = nullptr;
+    if (CreateSecurityAttributes(securityAttributes, securityDescriptor, securityAcl))
+    {
+        securityAttributesPointer = &securityAttributes;
+    }
+    else
+    {
+        TraceEvents(TRACE_LEVEL_WARNING, TRACE_SWAPCHAIN, "%!FUNC! security descriptor creation failed: %lu", GetLastError());
+    }
+
+    if (!m_mapping)
+    {
+        m_mapping = CreateFileMappingW(
+            INVALID_HANDLE_VALUE,
+            securityAttributesPointer,
+            PAGE_READWRITE,
+            0,
+            SharedGpuFrameMetadataSize,
+            SharedGpuFrameMetadataName);
+
+        if (!m_mapping)
+        {
+            TraceEvents(TRACE_LEVEL_ERROR, TRACE_SWAPCHAIN, "%!FUNC! CreateFileMapping GPU metadata failed: %lu", GetLastError());
+            if (securityAcl)
+            {
+                LocalFree(securityAcl);
+            }
+            return false;
+        }
+    }
+
+    if (!m_metadata)
+    {
+        m_metadata = static_cast<SharedGpuFrameMetadata*>(MapViewOfFile(m_mapping, FILE_MAP_ALL_ACCESS, 0, 0, SharedGpuFrameMetadataSize));
+        if (!m_metadata)
+        {
+            TraceEvents(TRACE_LEVEL_ERROR, TRACE_SWAPCHAIN, "%!FUNC! MapViewOfFile GPU metadata failed: %lu", GetLastError());
+            Close();
+            if (securityAcl)
+            {
+                LocalFree(securityAcl);
+            }
+            return false;
+        }
+    }
+
+    if (!m_frameReadyEvent)
+    {
+        m_frameReadyEvent = CreateEventW(securityAttributesPointer, FALSE, FALSE, SharedGpuFrameReadyName);
+        if (!m_frameReadyEvent)
+        {
+            TraceEvents(TRACE_LEVEL_ERROR, TRACE_SWAPCHAIN, "%!FUNC! CreateEvent GPU frame ready failed: %lu", GetLastError());
+            Close();
+            if (securityAcl)
+            {
+                LocalFree(securityAcl);
+            }
+            return false;
+        }
+    }
+
+    if (!m_consumerAliveEvent)
+    {
+        m_consumerAliveEvent = CreateEventW(securityAttributesPointer, TRUE, FALSE, SharedGpuConsumerAliveName);
+        if (!m_consumerAliveEvent)
+        {
+            TraceEvents(TRACE_LEVEL_ERROR, TRACE_SWAPCHAIN, "%!FUNC! CreateEvent GPU consumer alive failed: %lu", GetLastError());
+            Close();
+            if (securityAcl)
+            {
+                LocalFree(securityAcl);
+            }
+            return false;
+        }
+    }
+
+    const bool created = RecreateTextures(device, sourceDesc, securityAttributesPointer);
+    if (securityAcl)
+    {
+        LocalFree(securityAcl);
+    }
+
+    return created;
+}
+
+bool SharedGpuFrameRing::IsConsumerAlive() const
+{
+    if (!m_consumerAliveEvent)
     {
         return false;
     }
 
-    EXPLICIT_ACCESSW entries[3] = {};
-    entries[0].grfAccessPermissions = GENERIC_ALL;
-    entries[0].grfAccessMode = SET_ACCESS;
-    entries[0].grfInheritance = NO_INHERITANCE;
-    entries[0].Trustee.TrusteeForm = TRUSTEE_IS_SID;
-    entries[0].Trustee.TrusteeType = TRUSTEE_IS_USER;
-    entries[0].Trustee.ptstrName = reinterpret_cast<LPWSTR>(localSystemSid);
+    return WaitForSingleObject(m_consumerAliveEvent, 0) == WAIT_OBJECT_0;
+}
 
-    entries[1].grfAccessPermissions = GENERIC_ALL;
-    entries[1].grfAccessMode = SET_ACCESS;
-    entries[1].grfInheritance = NO_INHERITANCE;
-    entries[1].Trustee.TrusteeForm = TRUSTEE_IS_SID;
-    entries[1].Trustee.TrusteeType = TRUSTEE_IS_GROUP;
-    entries[1].Trustee.ptstrName = reinterpret_cast<LPWSTR>(administratorsSid);
-
-    entries[2].grfAccessPermissions = GENERIC_READ | GENERIC_WRITE | SYNCHRONIZE;
-    entries[2].grfAccessMode = SET_ACCESS;
-    entries[2].grfInheritance = NO_INHERITANCE;
-    entries[2].Trustee.TrusteeForm = TRUSTEE_IS_SID;
-    entries[2].Trustee.TrusteeType = TRUSTEE_IS_GROUP;
-    entries[2].Trustee.ptstrName = reinterpret_cast<LPWSTR>(authenticatedUsersSid);
-
-    if (SetEntriesInAclW(static_cast<ULONG>(std::size(entries)), entries, nullptr, &acl) != ERROR_SUCCESS)
+bool SharedGpuFrameRing::WriteFrame(Direct3DDevice& device, ID3D11Texture2D* sourceTexture, UINT64 timestampQpc)
+{
+    if (!EnsureInitialized(device, sourceTexture))
     {
         return false;
     }
 
-    if (!SetSecurityDescriptorDacl(&descriptor, TRUE, acl, FALSE))
+    if (!IsConsumerAlive())
     {
-        LocalFree(acl);
-        acl = nullptr;
         return false;
     }
 
-    attributes.nLength = sizeof(attributes);
-    attributes.lpSecurityDescriptor = &descriptor;
-    attributes.bInheritHandle = FALSE;
+    const UINT64 seq = ++m_writeSeq;
+    const UINT slotIndex = static_cast<UINT>((seq - 1) % SharedGpuFrameSlotCount);
+    auto& texture = m_textures[slotIndex];
+    auto& keyedMutex = m_mutexes[slotIndex];
+    if (!texture || !keyedMutex)
+    {
+        return false;
+    }
+
+    HRESULT hr = keyedMutex->AcquireSync(0, 0);
+    if (FAILED(hr))
+    {
+        TraceEvents(TRACE_LEVEL_VERBOSE, TRACE_SWAPCHAIN, "%!FUNC! GPU slot busy slot=%u hr=0x%08x", slotIndex, hr);
+        return false;
+    }
+
+    device.DeviceContext->CopyResource(texture.Get(), sourceTexture);
+    MemoryBarrier();
+
+    auto& slot = m_metadata->Slots[slotIndex];
+    slot.TimestampQpc = timestampQpc;
+    slot.Width = m_width;
+    slot.Height = m_height;
+    slot.Format = SharedFrameFormatBgra;
+    slot.State = 1;
+    MemoryBarrier();
+    slot.Seq = seq;
+
+    m_metadata->Width = m_width;
+    m_metadata->Height = m_height;
+    m_metadata->Format = SharedFrameFormatBgra;
+    m_metadata->SlotCount = SharedGpuFrameSlotCount;
+    m_metadata->LatestSlot = slotIndex;
+    m_metadata->TimestampQpc = timestampQpc;
+    MemoryBarrier();
+    m_metadata->WriteSeq = seq;
+
+    keyedMutex->ReleaseSync(1);
+    SetEvent(m_frameReadyEvent);
     return true;
+}
+
+void SharedGpuFrameRing::Close()
+{
+    CloseTextures();
+
+    if (m_consumerAliveEvent)
+    {
+        CloseHandle(m_consumerAliveEvent);
+        m_consumerAliveEvent = nullptr;
+    }
+
+    if (m_frameReadyEvent)
+    {
+        CloseHandle(m_frameReadyEvent);
+        m_frameReadyEvent = nullptr;
+    }
+
+    if (m_metadata)
+    {
+        UnmapViewOfFile(m_metadata);
+        m_metadata = nullptr;
+    }
+
+    if (m_mapping)
+    {
+        CloseHandle(m_mapping);
+        m_mapping = nullptr;
+    }
+}
+
+void SharedGpuFrameRing::CloseTextures()
+{
+    for (UINT slotIndex = 0; slotIndex < SharedGpuFrameSlotCount; ++slotIndex)
+    {
+        m_mutexes[slotIndex].Reset();
+        m_textures[slotIndex].Reset();
+        if (m_sharedHandles[slotIndex])
+        {
+            CloseHandle(m_sharedHandles[slotIndex]);
+            m_sharedHandles[slotIndex] = nullptr;
+        }
+    }
+}
+
+bool SharedGpuFrameRing::CreateSecurityAttributes(SECURITY_ATTRIBUTES& attributes, SECURITY_DESCRIPTOR& descriptor, PACL& acl)
+{
+    return CreateSharedObjectSecurityAttributes(attributes, descriptor, acl);
+}
+
+bool SharedGpuFrameRing::HasMatchingTextures(const D3D11_TEXTURE2D_DESC& sourceDesc) const
+{
+    return m_metadata &&
+        m_width == sourceDesc.Width &&
+        m_height == sourceDesc.Height &&
+        m_textures[0];
+}
+
+bool SharedGpuFrameRing::RecreateTextures(Direct3DDevice& device, const D3D11_TEXTURE2D_DESC& sourceDesc, SECURITY_ATTRIBUTES* securityAttributes)
+{
+    if (sourceDesc.Width == 0 ||
+        sourceDesc.Height == 0 ||
+        sourceDesc.Format != DXGI_FORMAT_B8G8R8A8_UNORM ||
+        sourceDesc.Width > MaxVirtualDisplayWidth ||
+        sourceDesc.Height > MaxVirtualDisplayHeight)
+    {
+        TraceEvents(
+            TRACE_LEVEL_WARNING,
+            TRACE_SWAPCHAIN,
+            "%!FUNC! unsupported GPU texture layout width=%u height=%u format=%u",
+            sourceDesc.Width,
+            sourceDesc.Height,
+            sourceDesc.Format);
+        return false;
+    }
+
+    CloseTextures();
+
+    D3D11_TEXTURE2D_DESC textureDesc = sourceDesc;
+    textureDesc.Width = sourceDesc.Width;
+    textureDesc.Height = sourceDesc.Height;
+    textureDesc.MipLevels = 1;
+    textureDesc.ArraySize = 1;
+    textureDesc.Format = DXGI_FORMAT_B8G8R8A8_UNORM;
+    textureDesc.SampleDesc.Count = 1;
+    textureDesc.SampleDesc.Quality = 0;
+    textureDesc.Usage = D3D11_USAGE_DEFAULT;
+    textureDesc.BindFlags = D3D11_BIND_SHADER_RESOURCE | D3D11_BIND_RENDER_TARGET;
+    textureDesc.CPUAccessFlags = 0;
+    textureDesc.MiscFlags = D3D11_RESOURCE_MISC_SHARED_NTHANDLE | D3D11_RESOURCE_MISC_SHARED_KEYEDMUTEX;
+
+    for (UINT slotIndex = 0; slotIndex < SharedGpuFrameSlotCount; ++slotIndex)
+    {
+        HRESULT hr = device.Device->CreateTexture2D(&textureDesc, nullptr, &m_textures[slotIndex]);
+        if (FAILED(hr))
+        {
+            TraceEvents(TRACE_LEVEL_ERROR, TRACE_SWAPCHAIN, "%!FUNC! GPU shared texture creation failed slot=%u hr=0x%08x", slotIndex, hr);
+            CloseTextures();
+            return false;
+        }
+
+        ComPtr<IDXGIResource1> resource;
+        hr = m_textures[slotIndex].As(&resource);
+        if (FAILED(hr))
+        {
+            TraceEvents(TRACE_LEVEL_ERROR, TRACE_SWAPCHAIN, "%!FUNC! Query IDXGIResource1 failed slot=%u hr=0x%08x", slotIndex, hr);
+            CloseTextures();
+            return false;
+        }
+
+        hr = resource->CreateSharedHandle(
+            securityAttributes,
+            DXGI_SHARED_RESOURCE_READ | DXGI_SHARED_RESOURCE_WRITE,
+            SharedGpuFrameSlotNames[slotIndex],
+            &m_sharedHandles[slotIndex]);
+        if (FAILED(hr))
+        {
+            TraceEvents(TRACE_LEVEL_ERROR, TRACE_SWAPCHAIN, "%!FUNC! CreateSharedHandle failed slot=%u hr=0x%08x", slotIndex, hr);
+            CloseTextures();
+            return false;
+        }
+
+        hr = m_textures[slotIndex].As(&m_mutexes[slotIndex]);
+        if (FAILED(hr))
+        {
+            TraceEvents(TRACE_LEVEL_ERROR, TRACE_SWAPCHAIN, "%!FUNC! Query IDXGIKeyedMutex failed slot=%u hr=0x%08x", slotIndex, hr);
+            CloseTextures();
+            return false;
+        }
+    }
+
+    m_width = sourceDesc.Width;
+    m_height = sourceDesc.Height;
+    ++m_generation;
+    m_writeSeq = 0;
+    InitializeMetadata(device, textureDesc);
+
+    TraceEvents(
+        TRACE_LEVEL_INFORMATION,
+        TRACE_SWAPCHAIN,
+        "%!FUNC! GPU shared texture ring ready width=%u height=%u generation=%u",
+        m_width,
+        m_height,
+        m_generation);
+    return true;
+}
+
+void SharedGpuFrameRing::InitializeMetadata(Direct3DDevice& device, const D3D11_TEXTURE2D_DESC& sourceDesc)
+{
+    ZeroMemory(m_metadata, SharedGpuFrameMetadataSize);
+    m_metadata->Magic = SharedGpuFrameMagic;
+    m_metadata->Version = SharedGpuFrameVersion;
+    m_metadata->Width = sourceDesc.Width;
+    m_metadata->Height = sourceDesc.Height;
+    m_metadata->Format = SharedFrameFormatBgra;
+    m_metadata->SlotCount = SharedGpuFrameSlotCount;
+    m_metadata->LatestSlot = 0;
+    m_metadata->Generation = m_generation;
+    m_metadata->WriteSeq = 0;
+    m_metadata->TimestampQpc = 0;
+    m_metadata->AdapterLuidLow = static_cast<UINT32>(device.AdapterLuid.LowPart);
+    m_metadata->AdapterLuidHigh = device.AdapterLuid.HighPart;
+    m_metadata->FrameDuration100ns = 0;
+    m_metadata->ModeRefreshHz = 0;
+    m_metadata->Flags = 0;
 }
 
 SwapChainProcessor::SwapChainProcessor(IDDCX_SWAPCHAIN swapChain, std::shared_ptr<Direct3DDevice> device, HANDLE newFrameEvent) :
@@ -568,10 +922,12 @@ SwapChainProcessor::~SwapChainProcessor()
     TraceEvents(
         TRACE_LEVEL_INFORMATION,
         TRACE_SWAPCHAIN,
-        "%!FUNC! SwapChainReleased framesReceived=%llu framesExported=%llu framesDropped=%llu exportErrors=%llu framesDiscarded=%llu",
+        "%!FUNC! SwapChainReleased framesReceived=%llu framesExported=%llu gpuFramesExported=%llu framesDropped=%llu gpuFramesDropped=%llu exportErrors=%llu framesDiscarded=%llu",
         m_framesReceived,
         m_framesExported,
+        m_gpuFramesExported,
         m_framesDropped,
+        m_gpuFramesDropped,
         m_exportErrors,
         m_framesDiscarded);
 }
@@ -674,10 +1030,12 @@ void SwapChainProcessor::RunCore()
             TraceEvents(
                 TRACE_LEVEL_INFORMATION,
                 TRACE_SWAPCHAIN,
-                "%!FUNC! framesReceived=%llu framesExported=%llu framesDropped=%llu exportErrors=%llu",
+                "%!FUNC! framesReceived=%llu framesExported=%llu gpuFramesExported=%llu framesDropped=%llu gpuFramesDropped=%llu exportErrors=%llu",
                 m_framesReceived,
                 m_framesExported,
+                m_gpuFramesExported,
                 m_framesDropped,
+                m_gpuFramesDropped,
                 m_exportErrors);
         }
     }
@@ -685,20 +1043,6 @@ void SwapChainProcessor::RunCore()
 
 void SwapChainProcessor::ProcessFrame(const IDDCX_METADATA& metadata)
 {
-    if (!m_sharedFrameBuffer.EnsureInitialized())
-    {
-        ++m_exportErrors;
-        ++m_framesDiscarded;
-        return;
-    }
-
-    if (!m_sharedFrameBuffer.IsConsumerAlive())
-    {
-        ++m_framesDropped;
-        ++m_framesDiscarded;
-        return;
-    }
-
     if (!metadata.pSurface)
     {
         ++m_exportErrors;
@@ -714,6 +1058,36 @@ void SwapChainProcessor::ProcessFrame(const IDDCX_METADATA& metadata)
         ++m_exportErrors;
         ++m_framesDiscarded;
         TraceEvents(TRACE_LEVEL_WARNING, TRACE_SWAPCHAIN, "%!FUNC! Query ID3D11Texture2D failed: 0x%08x", hr);
+        return;
+    }
+
+    if (m_sharedGpuFrameRing.EnsureInitialized(*m_device, sourceTexture.Get()) &&
+        m_sharedGpuFrameRing.IsConsumerAlive())
+    {
+        if (m_sharedGpuFrameRing.WriteFrame(*m_device, sourceTexture.Get(), metadata.PresentDisplayQPCTime))
+        {
+            ++m_gpuFramesExported;
+            if ((m_gpuFramesExported % 300) == 0)
+            {
+                TraceEvents(TRACE_LEVEL_INFORMATION, TRACE_SWAPCHAIN, "%!FUNC! GPU frame exported seq=%llu", m_gpuFramesExported);
+            }
+            return;
+        }
+
+        ++m_gpuFramesDropped;
+    }
+
+    if (!m_sharedFrameBuffer.EnsureInitialized())
+    {
+        ++m_exportErrors;
+        ++m_framesDiscarded;
+        return;
+    }
+
+    if (!m_sharedFrameBuffer.IsConsumerAlive())
+    {
+        ++m_framesDropped;
+        ++m_framesDiscarded;
         return;
     }
 

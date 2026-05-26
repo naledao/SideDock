@@ -3,6 +3,8 @@ package com.sidedock.client;
 import android.app.Activity;
 import android.content.res.Configuration;
 import android.graphics.drawable.GradientDrawable;
+import android.media.MediaCodecInfo;
+import android.media.MediaCodecList;
 import android.os.Bundle;
 import android.util.Log;
 import android.view.Gravity;
@@ -33,6 +35,8 @@ public final class MainActivity extends Activity implements ControlClient.Listen
     private static final int DEFAULT_VIDEO_WIDTH = 1280;
     private static final int DEFAULT_VIDEO_HEIGHT = 720;
     private static final int DEFAULT_VIDEO_FPS = 30;
+    private static final String VIDEO_CODEC_AVC = "video/avc";
+    private static final String ERROR_DECODER_UNSUPPORTED = "DECODER_UNSUPPORTED";
     private static final int OVERLAY_MODE_DETAILED = 0;
     private static final int OVERLAY_MODE_COMPACT = 1;
     private static final int OVERLAY_MODE_HIDDEN = 2;
@@ -68,6 +72,7 @@ public final class MainActivity extends Activity implements ControlClient.Listen
     private int videoWidth = DEFAULT_VIDEO_WIDTH;
     private int videoHeight = DEFAULT_VIDEO_HEIGHT;
     private int videoFps = DEFAULT_VIDEO_FPS;
+    private boolean videoStartReceived;
     private ConnectionState controlConnectionState = ConnectionState.DISCONNECTED;
     private String controlState = "已断开";
     private String videoState = "STOPPED";
@@ -80,6 +85,7 @@ public final class MainActivity extends Activity implements ControlClient.Listen
     private VideoClient.VideoStats lastVideoStats;
     private InputCollector.InputStats lastInputStats;
     private ControlClient.CaptureStatus lastCaptureStatus;
+    private ControlClient.EncoderStatus lastEncoderStatus;
     private ControlClient.DisplayLayout lastDisplayLayout;
     private ControlClient.DisplayMetrics lastDisplayMetrics;
     private ControlClient.DisplayModeChanged lastDisplayModeChanged;
@@ -155,7 +161,6 @@ public final class MainActivity extends Activity implements ControlClient.Listen
         sendVideoReadyIfSurfaceReady();
         addLog("Surface 已创建，准备接收视频");
         Log.i(TAG, "surfaceCreated ready=" + surfaceReady);
-        maybeStartVideo();
         updateOverlay();
     }
 
@@ -166,7 +171,6 @@ public final class MainActivity extends Activity implements ControlClient.Listen
         updateVideoRectForSurfaceView();
         sendVideoReadyIfSurfaceReady();
         Log.i(TAG, "surfaceChanged ready=" + surfaceReady + " size=" + width + "x" + height);
-        maybeStartVideo();
     }
 
     @Override
@@ -188,7 +192,6 @@ public final class MainActivity extends Activity implements ControlClient.Listen
         }
         if (state == ConnectionState.CONNECTED) {
             sendVideoReadyIfSurfaceReady();
-            maybeStartVideo();
         }
         updateOverlay();
     }
@@ -213,6 +216,7 @@ public final class MainActivity extends Activity implements ControlClient.Listen
         videoFps = Math.max(1, fps);
         waitingForVideoFrame = true;
         lastVideoError = "";
+        videoStartReceived = true;
         selectedModeWidth = videoWidth;
         selectedModeHeight = videoHeight;
         selectedModeRefresh = normalizeObservedRefresh(videoFps);
@@ -221,6 +225,11 @@ public final class MainActivity extends Activity implements ControlClient.Listen
         updateModeControls();
         addLog("收到 video_start " + videoWidth + "x" + videoHeight + "@" + videoFps + " port=" + videoPort);
         Log.i(TAG, "onVideoStart port=" + videoPort + " size=" + videoWidth + "x" + videoHeight + " fps=" + videoFps);
+        if (shouldRejectAvcBeforeStart(videoWidth, videoHeight, videoFps)) {
+            handlePreflightDecoderUnsupported();
+            return;
+        }
+
         maybeStartVideo();
     }
 
@@ -241,6 +250,12 @@ public final class MainActivity extends Activity implements ControlClient.Listen
         } else {
             updateOverlay();
         }
+    }
+
+    @Override
+    public void onEncoderStatus(ControlClient.EncoderStatus status) {
+        lastEncoderStatus = status;
+        updateOverlay();
     }
 
     @Override
@@ -350,18 +365,44 @@ public final class MainActivity extends Activity implements ControlClient.Listen
     @Override
     public void onVideoStats(VideoClient.VideoStats stats) {
         lastVideoStats = stats;
-        if (stats.framesDecoded > lastRenderedFramesSeen) {
-            lastRenderedFramesSeen = stats.framesDecoded;
+        if (stats.framesRendered > lastRenderedFramesSeen) {
+            lastRenderedFramesSeen = stats.framesRendered;
             waitingForVideoFrame = false;
             lastVideoError = "";
         }
         controlClient.sendVideoStats(
             stats.framesDecoded,
+            stats.framesRendered,
             stats.packetsReceived,
             stats.decodeErrors,
             stats.droppedFrames,
             stats.reconnects,
             stats.roughLatencyMs,
+            stats.decodeFps,
+            stats.renderFps,
+            stats.newFrameFps,
+            stats.repeatFrameFps,
+            stats.newFramesReceived,
+            stats.repeatFramesReceived,
+            stats.blackFramesReceived,
+            stats.keepaliveFramesReceived,
+            stats.lastFrameKind,
+            stats.lastSourceSeq,
+            stats.lastSourceAgeMs,
+            stats.lastReceiveToQueueMs,
+            stats.lastQueueToOutputMs,
+            stats.lastOutputToRenderMs,
+            stats.lastQueueToRenderMs,
+            stats.p50QueueToOutputMs,
+            stats.p95QueueToOutputMs,
+            stats.p99QueueToOutputMs,
+            stats.p50OutputToRenderMs,
+            stats.p95OutputToRenderMs,
+            stats.p99OutputToRenderMs,
+            stats.p50QueueToRenderMs,
+            stats.p95QueueToRenderMs,
+            stats.p99QueueToRenderMs,
+            stats.lastEncodeMs,
             stats.state
         );
         updateOverlay();
@@ -952,6 +993,11 @@ public final class MainActivity extends Activity implements ControlClient.Listen
     private void maybeStartVideo() {
         refreshSurfaceState();
 
+        if (!videoStartReceived) {
+            Log.i(TAG, "maybeStartVideo skipped, waiting for video_start");
+            return;
+        }
+
         if (!surfaceReady || activeSurface == null || !activeSurface.isValid()) {
             Log.i(TAG, "maybeStartVideo skipped, surface not ready");
             return;
@@ -973,8 +1019,64 @@ public final class MainActivity extends Activity implements ControlClient.Listen
             return;
         }
 
-        controlClient.sendVideoReady(videoWidth, videoHeight, "video/avc");
+        controlClient.sendVideoReady(videoWidth, videoHeight, VIDEO_CODEC_AVC);
         Log.i(TAG, "video_ready sent");
+    }
+
+    private void handlePreflightDecoderUnsupported() {
+        videoStartReceived = false;
+        String message = "Preflight decoder capability rejected " + VIDEO_CODEC_AVC
+            + " " + videoWidth + "x" + videoHeight + "@" + videoFps;
+        lastVideoError = ERROR_DECODER_UNSUPPORTED + ": " + message;
+        waitingForVideoFrame = true;
+        controlClient.sendVideoError(ERROR_DECODER_UNSUPPORTED, message);
+        addLog("video preflight unsupported " + videoWidth + "x" + videoHeight + "@" + videoFps);
+        Log.w(TAG, message);
+        updateOverlay();
+    }
+
+    private boolean shouldRejectAvcBeforeStart(int width, int height, int fps) {
+        if (width <= 0 || height <= 0 || fps <= 60) {
+            return false;
+        }
+
+        if (width >= 2560 || height >= 1440) {
+            return fps > 72;
+        }
+
+        Boolean supported = queryAvcDecoderSupport(width, height, fps);
+        return supported != null && !supported.booleanValue();
+    }
+
+    private Boolean queryAvcDecoderSupport(int width, int height, int fps) {
+        try {
+            MediaCodecList codecList = new MediaCodecList(MediaCodecList.REGULAR_CODECS);
+            MediaCodecInfo[] codecInfos = codecList.getCodecInfos();
+            for (MediaCodecInfo codecInfo : codecInfos) {
+                if (codecInfo.isEncoder()) {
+                    continue;
+                }
+
+                String[] supportedTypes = codecInfo.getSupportedTypes();
+                for (String type : supportedTypes) {
+                    if (!VIDEO_CODEC_AVC.equalsIgnoreCase(type)) {
+                        continue;
+                    }
+
+                    MediaCodecInfo.CodecCapabilities capabilities = codecInfo.getCapabilitiesForType(type);
+                    MediaCodecInfo.VideoCapabilities videoCapabilities = capabilities.getVideoCapabilities();
+                    if (videoCapabilities != null
+                        && videoCapabilities.areSizeAndRateSupported(width, height, fps)) {
+                        return Boolean.TRUE;
+                    }
+                }
+            }
+
+            return Boolean.FALSE;
+        } catch (Exception ex) {
+            Log.w(TAG, "Unable to query AVC decoder capabilities", ex);
+            return null;
+        }
     }
 
     private void refreshSurfaceState() {
@@ -1131,11 +1233,28 @@ public final class MainActivity extends Activity implements ControlClient.Listen
         if (lastVideoStats != null) {
             builder
                 .append("帧: ").append(lastVideoStats.framesDecoded)
+                .append('/').append(lastVideoStats.framesRendered)
                 .append("  包: ").append(lastVideoStats.packetsReceived)
                 .append("  错误: ").append(lastVideoStats.decodeErrors)
                 .append("  丢弃: ").append(lastVideoStats.droppedFrames)
                 .append("  重连: ").append(lastVideoStats.reconnects)
-                .append("  延迟≈").append(lastVideoStats.roughLatencyMs).append("ms");
+                .append("  延迟≈").append(lastVideoStats.roughLatencyMs).append("ms")
+                .append("  dec/render ")
+                .append(String.format(Locale.ROOT, "%.0f/%.0f", lastVideoStats.decodeFps, lastVideoStats.renderFps))
+                .append("fps")
+                .append("  new/repeat ")
+                .append(String.format(Locale.ROOT, "%.0f/%.0f", lastVideoStats.newFrameFps, lastVideoStats.repeatFrameFps));
+            builder
+                .append('\n')
+                .append("阶段: ").append(lastVideoStats.lastFrameKind)
+                .append(" seq=").append(lastVideoStats.lastSourceSeq)
+                .append(" age=").append(lastVideoStats.lastSourceAgeMs).append("ms")
+                .append(" enc=").append(String.format(Locale.ROOT, "%.1f", lastVideoStats.lastEncodeMs)).append("ms")
+                .append(" q=").append(String.format(Locale.ROOT, "%.1f", lastVideoStats.lastReceiveToQueueMs)).append("ms")
+                .append(" dec=").append(String.format(Locale.ROOT, "%.1f", lastVideoStats.lastQueueToOutputMs)).append("ms")
+                .append(" render=").append(String.format(Locale.ROOT, "%.1f", lastVideoStats.lastOutputToRenderMs)).append("ms")
+                .append("  render p95/p99=")
+                .append(String.format(Locale.ROOT, "%.1f/%.1f", lastVideoStats.p95QueueToRenderMs, lastVideoStats.p99QueueToRenderMs)).append("ms");
             if (serverTimeOffsetMs != 0) {
                 builder.append("  时差").append(serverTimeOffsetMs >= 0 ? "+" : "").append(serverTimeOffsetMs).append("ms");
             }
@@ -1151,8 +1270,38 @@ public final class MainActivity extends Activity implements ControlClient.Listen
                 .append("  错 ").append(lastCaptureStatus.captureErrors)
                 .append("  取 ").append(String.format(Locale.ROOT, "%.1f", lastCaptureStatus.avgCaptureMs)).append("ms")
                 .append("  转 ").append(String.format(Locale.ROOT, "%.1f", lastCaptureStatus.avgConvertMs)).append("ms");
+            builder.append("  ").append(lastCaptureStatus.gpuPath ? "GPU" : "CPU");
+            if (lastCaptureStatus.gpuConvertMs > 0.0) {
+                builder.append("  GPU=").append(String.format(Locale.ROOT, "%.1f", lastCaptureStatus.gpuConvertMs)).append("ms");
+            }
+            if (lastCaptureStatus.framesDropped > 0L) {
+                builder.append("  drop=").append(lastCaptureStatus.framesDropped);
+            }
+            if (lastCaptureStatus.lastFrameAgeMs > 0.0) {
+                builder.append("  age=").append(String.format(Locale.ROOT, "%.0f", lastCaptureStatus.lastFrameAgeMs)).append("ms");
+            }
+            if (lastCaptureStatus.fallback.length() > 0 && !"none".equals(lastCaptureStatus.fallback)) {
+                builder.append("  fallback=").append(lastCaptureStatus.fallback);
+            }
             if (lastCaptureStatus.errorCode.length() > 0) {
                 builder.append("  ").append(lastCaptureStatus.errorCode);
+            }
+            builder.append('\n');
+        }
+
+        if (lastEncoderStatus != null) {
+            builder
+                .append("Encoder: sent ").append(lastEncoderStatus.framesSent)
+                .append("  stream ").append(String.format(Locale.ROOT, "%.1f", lastEncoderStatus.streamFps)).append("fps")
+                .append("  new/repeat ").append(lastEncoderStatus.newFramesSent).append('/').append(lastEncoderStatus.repeatFramesSent)
+                .append("  drop ").append(lastEncoderStatus.framesDropped)
+                .append("  enc p95/p99 ")
+                .append(String.format(Locale.ROOT, "%.1f/%.1f", lastEncoderStatus.p95EncodeMs, lastEncoderStatus.p99EncodeMs)).append("ms")
+                .append("  send p95/p99 ")
+                .append(String.format(Locale.ROOT, "%.1f/%.1f", lastEncoderStatus.p95SendMs, lastEncoderStatus.p99SendMs)).append("ms")
+                .append("  kbps ").append(String.format(Locale.ROOT, "%.0f", lastEncoderStatus.outputKbps));
+            if (lastEncoderStatus.gpuPath) {
+                builder.append("  GPU");
             }
             builder.append('\n');
         }
@@ -1265,6 +1414,7 @@ public final class MainActivity extends Activity implements ControlClient.Listen
                 .append('\n')
                 .append("已收包 ").append(lastVideoStats.packetsReceived)
                 .append("   已解码帧 ").append(lastVideoStats.framesDecoded)
+                .append("   已渲染帧 ").append(lastVideoStats.framesRendered)
                 .append("   重连 ").append(lastVideoStats.reconnects);
         }
         if (lastCaptureStatus != null) {
@@ -1273,6 +1423,14 @@ public final class MainActivity extends Activity implements ControlClient.Listen
                 .append("采集: ").append(lastCaptureStatus.state)
                 .append("   帧 ").append(lastCaptureStatus.framesCaptured)
                 .append("   错 ").append(lastCaptureStatus.captureErrors);
+        }
+
+        if (lastEncoderStatus != null) {
+            detail
+                .append('\n')
+                .append("Encoder: sent ").append(lastEncoderStatus.framesSent)
+                .append("   stream ").append(String.format(Locale.ROOT, "%.1f", lastEncoderStatus.streamFps)).append("fps")
+                .append("   p95 ").append(String.format(Locale.ROOT, "%.1f", lastEncoderStatus.p95EncodeMs)).append("ms");
         }
 
         connectionStatusProgress.setVisibility(showProgress ? View.VISIBLE : View.GONE);
@@ -1298,8 +1456,8 @@ public final class MainActivity extends Activity implements ControlClient.Listen
             return true;
         }
 
-        long framesDecoded = lastVideoStats == null ? 0L : lastVideoStats.framesDecoded;
-        return waitingForVideoFrame || framesDecoded == 0L;
+        long framesRendered = lastVideoStats == null ? 0L : lastVideoStats.framesRendered;
+        return waitingForVideoFrame || framesRendered == 0L;
     }
 
     private void appendCompactOverlay(StringBuilder builder) {
@@ -1309,7 +1467,9 @@ public final class MainActivity extends Activity implements ControlClient.Listen
             .append("  ").append(videoWidth).append('x').append(videoHeight).append('@').append(videoFps);
 
         if (lastVideoStats != null) {
-            builder.append("  latency~").append(lastVideoStats.roughLatencyMs).append("ms");
+            builder
+                .append("  latency~").append(lastVideoStats.roughLatencyMs).append("ms")
+                .append("  render=").append(String.format(Locale.ROOT, "%.0f", lastVideoStats.renderFps)).append("fps");
         }
         builder.append('\n');
 
@@ -1329,8 +1489,27 @@ public final class MainActivity extends Activity implements ControlClient.Listen
                     .append(" drop=").append(droppedFrames)
                     .append(" retry=").append(reconnects);
             }
+            builder.append("  ").append(lastCaptureStatus.gpuPath ? "GPU" : "CPU");
+            if (lastCaptureStatus.fallback.length() > 0 && !"none".equals(lastCaptureStatus.fallback)) {
+                builder.append(" fallback=").append(lastCaptureStatus.fallback);
+            }
+            if (lastCaptureStatus.framesDropped > 0L) {
+                builder.append(" drop=").append(lastCaptureStatus.framesDropped);
+            }
             if (lastCaptureStatus.errorCode.length() > 0) {
                 builder.append("  ").append(lastCaptureStatus.errorCode);
+            }
+            builder.append('\n');
+        }
+
+        if (lastEncoderStatus != null) {
+            builder
+                .append("Encoder: ")
+                .append(String.format(Locale.ROOT, "%.0f", lastEncoderStatus.streamFps)).append("fps")
+                .append(" enc95=").append(String.format(Locale.ROOT, "%.1f", lastEncoderStatus.p95EncodeMs)).append("ms")
+                .append(" sent=").append(lastEncoderStatus.framesSent);
+            if (lastEncoderStatus.framesDropped > 0L) {
+                builder.append(" drop=").append(lastEncoderStatus.framesDropped);
             }
             builder.append('\n');
         }
@@ -1359,6 +1538,11 @@ public final class MainActivity extends Activity implements ControlClient.Listen
         long captureErrors = next.captureErrors > 0L ? next.captureErrors : previous.captureErrors;
         double avgCaptureMs = next.avgCaptureMs > 0.0 ? next.avgCaptureMs : previous.avgCaptureMs;
         double avgConvertMs = next.avgConvertMs > 0.0 ? next.avgConvertMs : previous.avgConvertMs;
+        double gpuConvertMs = next.gpuConvertMs > 0.0 ? next.gpuConvertMs : previous.gpuConvertMs;
+        long framesDropped = next.framesDropped > 0L ? next.framesDropped : previous.framesDropped;
+        double lastFrameAgeMs = next.lastFrameAgeMs > 0.0 ? next.lastFrameAgeMs : previous.lastFrameAgeMs;
+        boolean gpuPath = next.gpuPath || previous.gpuPath && next.source.length() == 0;
+        String fallback = next.fallback.length() > 0 ? next.fallback : previous.fallback;
         String errorCode = next.errorCode.length() > 0 ? next.errorCode : ("ERROR".equals(next.state) ? previous.errorCode : "");
         String errorMessage = next.errorMessage.length() > 0 ? next.errorMessage : ("ERROR".equals(next.state) ? previous.errorMessage : "");
         return new ControlClient.CaptureStatus(
@@ -1370,6 +1554,11 @@ public final class MainActivity extends Activity implements ControlClient.Listen
             captureErrors,
             avgCaptureMs,
             avgConvertMs,
+            gpuConvertMs,
+            framesDropped,
+            lastFrameAgeMs,
+            gpuPath,
+            fallback,
             errorCode,
             errorMessage
         );

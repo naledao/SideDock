@@ -28,6 +28,7 @@ public final class ControlClient {
         void onVideoStart(int port, int width, int height, int fps);
         void onServerTime(long serverTimeMs);
         void onCaptureStatus(CaptureStatus status);
+        void onEncoderStatus(EncoderStatus status);
         void onDisplayLayout(DisplayLayout layout);
         void onDisplayMetrics(DisplayMetrics metrics);
         void onDisplayModeChanged(DisplayModeChanged mode);
@@ -44,6 +45,11 @@ public final class ControlClient {
         public final long captureErrors;
         public final double avgCaptureMs;
         public final double avgConvertMs;
+        public final double gpuConvertMs;
+        public final long framesDropped;
+        public final double lastFrameAgeMs;
+        public final boolean gpuPath;
+        public final String fallback;
         public final String errorCode;
         public final String errorMessage;
 
@@ -56,6 +62,11 @@ public final class ControlClient {
             long captureErrors,
             double avgCaptureMs,
             double avgConvertMs,
+            double gpuConvertMs,
+            long framesDropped,
+            double lastFrameAgeMs,
+            boolean gpuPath,
+            String fallback,
             String errorCode,
             String errorMessage
         ) {
@@ -67,8 +78,86 @@ public final class ControlClient {
             this.captureErrors = captureErrors;
             this.avgCaptureMs = avgCaptureMs;
             this.avgConvertMs = avgConvertMs;
+            this.gpuConvertMs = gpuConvertMs;
+            this.framesDropped = framesDropped;
+            this.lastFrameAgeMs = lastFrameAgeMs;
+            this.gpuPath = gpuPath;
+            this.fallback = fallback;
             this.errorCode = errorCode;
             this.errorMessage = errorMessage;
+        }
+    }
+
+    public static final class EncoderStatus {
+        public final long framesGenerated;
+        public final long framesEncoded;
+        public final long framesSent;
+        public final long framesDropped;
+        public final double avgEncodeMs;
+        public final double maxEncodeMs;
+        public final double p50EncodeMs;
+        public final double p95EncodeMs;
+        public final double p99EncodeMs;
+        public final double avgSendMs;
+        public final double maxSendMs;
+        public final double p50SendMs;
+        public final double p95SendMs;
+        public final double p99SendMs;
+        public final double outputKbps;
+        public final double streamFps;
+        public final long newFramesSent;
+        public final long repeatFramesSent;
+        public final long blackFramesSent;
+        public final long keepaliveFramesSent;
+        public final long lastKeyFrameSeq;
+        public final boolean gpuPath;
+
+        public EncoderStatus(
+            long framesGenerated,
+            long framesEncoded,
+            long framesSent,
+            long framesDropped,
+            double avgEncodeMs,
+            double maxEncodeMs,
+            double p50EncodeMs,
+            double p95EncodeMs,
+            double p99EncodeMs,
+            double avgSendMs,
+            double maxSendMs,
+            double p50SendMs,
+            double p95SendMs,
+            double p99SendMs,
+            double outputKbps,
+            double streamFps,
+            long newFramesSent,
+            long repeatFramesSent,
+            long blackFramesSent,
+            long keepaliveFramesSent,
+            long lastKeyFrameSeq,
+            boolean gpuPath
+        ) {
+            this.framesGenerated = framesGenerated;
+            this.framesEncoded = framesEncoded;
+            this.framesSent = framesSent;
+            this.framesDropped = framesDropped;
+            this.avgEncodeMs = avgEncodeMs;
+            this.maxEncodeMs = maxEncodeMs;
+            this.p50EncodeMs = p50EncodeMs;
+            this.p95EncodeMs = p95EncodeMs;
+            this.p99EncodeMs = p99EncodeMs;
+            this.avgSendMs = avgSendMs;
+            this.maxSendMs = maxSendMs;
+            this.p50SendMs = p50SendMs;
+            this.p95SendMs = p95SendMs;
+            this.p99SendMs = p99SendMs;
+            this.outputKbps = outputKbps;
+            this.streamFps = streamFps;
+            this.newFramesSent = newFramesSent;
+            this.repeatFramesSent = repeatFramesSent;
+            this.blackFramesSent = blackFramesSent;
+            this.keepaliveFramesSent = keepaliveFramesSent;
+            this.lastKeyFrameSeq = lastKeyFrameSeq;
+            this.gpuPath = gpuPath;
         }
     }
 
@@ -281,20 +370,72 @@ public final class ControlClient {
 
     public void sendVideoStats(
         long framesDecoded,
+        long framesRendered,
         long packetsReceived,
         long decodeErrors,
         long droppedFrames,
         long videoReconnects,
         long roughLatencyMs,
+        double decodeFps,
+        double renderFps,
+        double newFrameFps,
+        double repeatFrameFps,
+        long newFramesReceived,
+        long repeatFramesReceived,
+        long blackFramesReceived,
+        long keepaliveFramesReceived,
+        String lastFrameKind,
+        long lastSourceSeq,
+        int lastSourceAgeMs,
+        double lastReceiveToQueueMs,
+        double lastQueueToOutputMs,
+        double lastOutputToRenderMs,
+        double lastQueueToRenderMs,
+        double p50QueueToOutputMs,
+        double p95QueueToOutputMs,
+        double p99QueueToOutputMs,
+        double p50OutputToRenderMs,
+        double p95OutputToRenderMs,
+        double p99OutputToRenderMs,
+        double p50QueueToRenderMs,
+        double p95QueueToRenderMs,
+        double p99QueueToRenderMs,
+        double lastEncodeMs,
         String state
     ) {
         sendFromAnyThread("video_stats", payload(
             "framesDecoded", framesDecoded,
+            "framesRendered", framesRendered,
             "packetsReceived", packetsReceived,
             "decodeErrors", decodeErrors,
             "droppedFrames", droppedFrames,
             "videoReconnects", videoReconnects,
             "roughLatencyMs", roughLatencyMs,
+            "decodeFps", decodeFps,
+            "renderFps", renderFps,
+            "newFrameFps", newFrameFps,
+            "repeatFrameFps", repeatFrameFps,
+            "newFramesReceived", newFramesReceived,
+            "repeatFramesReceived", repeatFramesReceived,
+            "blackFramesReceived", blackFramesReceived,
+            "keepaliveFramesReceived", keepaliveFramesReceived,
+            "lastFrameKind", lastFrameKind == null ? "" : lastFrameKind,
+            "lastSourceSeq", lastSourceSeq,
+            "lastSourceAgeMs", lastSourceAgeMs,
+            "receiveToQueueMs", lastReceiveToQueueMs,
+            "queueToOutputMs", lastQueueToOutputMs,
+            "outputToRenderMs", lastOutputToRenderMs,
+            "queueToRenderMs", lastQueueToRenderMs,
+            "p50QueueToOutputMs", p50QueueToOutputMs,
+            "p95QueueToOutputMs", p95QueueToOutputMs,
+            "p99QueueToOutputMs", p99QueueToOutputMs,
+            "p50OutputToRenderMs", p50OutputToRenderMs,
+            "p95OutputToRenderMs", p95OutputToRenderMs,
+            "p99OutputToRenderMs", p99OutputToRenderMs,
+            "p50QueueToRenderMs", p50QueueToRenderMs,
+            "p95QueueToRenderMs", p95QueueToRenderMs,
+            "p99QueueToRenderMs", p99QueueToRenderMs,
+            "encodeMs", lastEncodeMs,
             "state", state
         ));
     }
@@ -490,6 +631,11 @@ public final class ControlClient {
                     0L,
                     0.0,
                     0.0,
+                    0.0,
+                    0L,
+                    0.0,
+                    message.payload.optBoolean("gpuPath", false),
+                    message.payload.optString("fallback", ""),
                     "",
                     ""
                 ));
@@ -504,8 +650,39 @@ public final class ControlClient {
                     message.payload.optLong("captureErrors", 0L),
                     message.payload.optDouble("avgCaptureMs", 0.0),
                     message.payload.optDouble("avgConvertMs", 0.0),
+                    message.payload.optDouble("gpuConvertMs", 0.0),
+                    message.payload.optLong("framesDropped", 0L),
+                    message.payload.optDouble("lastFrameAgeMs", 0.0),
+                    message.payload.optBoolean("gpuPath", false),
+                    message.payload.optString("fallback", ""),
                     "",
                     ""
+                ));
+                break;
+            case "encoder_stats":
+                emitEncoderStatus(new EncoderStatus(
+                    message.payload.optLong("framesGenerated", 0L),
+                    message.payload.optLong("framesEncoded", 0L),
+                    message.payload.optLong("framesSent", 0L),
+                    message.payload.optLong("framesDropped", 0L),
+                    message.payload.optDouble("avgEncodeMs", 0.0),
+                    message.payload.optDouble("maxEncodeMs", 0.0),
+                    message.payload.optDouble("p50EncodeMs", 0.0),
+                    message.payload.optDouble("p95EncodeMs", 0.0),
+                    message.payload.optDouble("p99EncodeMs", 0.0),
+                    message.payload.optDouble("avgSendMs", 0.0),
+                    message.payload.optDouble("maxSendMs", 0.0),
+                    message.payload.optDouble("p50SendMs", 0.0),
+                    message.payload.optDouble("p95SendMs", 0.0),
+                    message.payload.optDouble("p99SendMs", 0.0),
+                    message.payload.optDouble("outputKbps", 0.0),
+                    message.payload.optDouble("streamFps", 0.0),
+                    message.payload.optLong("newFramesSent", 0L),
+                    message.payload.optLong("repeatFramesSent", 0L),
+                    message.payload.optLong("blackFramesSent", 0L),
+                    message.payload.optLong("keepaliveFramesSent", 0L),
+                    message.payload.optLong("lastKeyFrameSeq", -1L),
+                    message.payload.optBoolean("gpuPath", false)
                 ));
                 break;
             case "capture_error":
@@ -518,6 +695,11 @@ public final class ControlClient {
                     0L,
                     0.0,
                     0.0,
+                    0.0,
+                    0L,
+                    0.0,
+                    message.payload.optBoolean("gpuPath", false),
+                    message.payload.optString("fallback", ""),
                     message.payload.optString("code", "CAPTURE_ERROR"),
                     message.payload.optString("message", "")
                 ));
@@ -532,6 +714,11 @@ public final class ControlClient {
                     0L,
                     0.0,
                     0.0,
+                    0.0,
+                    0L,
+                    0.0,
+                    message.payload.optBoolean("gpuPath", false),
+                    message.payload.optString("fallback", ""),
                     "",
                     message.payload.optString("reason", "")
                 ));
@@ -757,6 +944,15 @@ public final class ControlClient {
             @Override
             public void run() {
                 listener.onCaptureStatus(status);
+            }
+        });
+    }
+
+    private void emitEncoderStatus(EncoderStatus status) {
+        mainHandler.post(new Runnable() {
+            @Override
+            public void run() {
+                listener.onEncoderStatus(status);
             }
         });
     }
