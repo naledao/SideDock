@@ -30,9 +30,7 @@ internal sealed class HostMainForm : Form
     private readonly TextBox _videoPort = new();
     private readonly Button _startButton = new();
     private readonly Button _stopButton = new();
-    private readonly Button _clearLogButton = new();
     private readonly Label _statusLabel = new();
-    private readonly TextBox _logBox = new();
 
     private Process? _hostProcess;
     private string? _payloadRoot;
@@ -41,8 +39,8 @@ internal sealed class HostMainForm : Form
     public HostMainForm()
     {
         Text = "SideDock Host";
-        MinimumSize = new Size(880, 620);
-        Size = new Size(980, 700);
+        MinimumSize = new Size(880, 300);
+        Size = new Size(980, 360);
         StartPosition = FormStartPosition.CenterScreen;
         Font = new Font("Segoe UI", 10f);
         AutoScroll = true;
@@ -59,14 +57,13 @@ internal sealed class HostMainForm : Form
         {
             Dock = DockStyle.Fill,
             ColumnCount = 1,
-            RowCount = 5,
+            RowCount = 4,
             Padding = new Padding(14)
         };
         root.RowStyles.Add(new RowStyle(SizeType.AutoSize));
         root.RowStyles.Add(new RowStyle(SizeType.AutoSize));
         root.RowStyles.Add(new RowStyle(SizeType.AutoSize));
         root.RowStyles.Add(new RowStyle(SizeType.AutoSize));
-        root.RowStyles.Add(new RowStyle(SizeType.Percent, 100));
         Controls.Add(root);
 
         var title = new Label
@@ -141,26 +138,13 @@ internal sealed class HostMainForm : Form
         _startButton.Click += (_, _) => StartHost();
         ConfigureActionButton(_stopButton, "Stop");
         _stopButton.Click += (_, _) => StopHost();
-        ConfigureActionButton(_clearLogButton, "Clear log");
-        _clearLogButton.Click += (_, _) => _logBox.Clear();
         buttons.MinimumSize = new Size(0, _startButton.PreferredSize.Height + 8);
         _statusLabel.AutoSize = true;
         _statusLabel.Margin = new Padding(14, 8, 0, 0);
         buttons.Controls.Add(_startButton);
         buttons.Controls.Add(_stopButton);
-        buttons.Controls.Add(_clearLogButton);
         buttons.Controls.Add(_statusLabel);
         root.Controls.Add(buttons, 0, 3);
-
-        _logBox.Dock = DockStyle.Fill;
-        _logBox.Multiline = true;
-        _logBox.ReadOnly = true;
-        _logBox.ScrollBars = ScrollBars.Both;
-        _logBox.WordWrap = false;
-        _logBox.BackColor = Color.FromArgb(18, 22, 28);
-        _logBox.ForeColor = Color.FromArgb(228, 234, 240);
-        _logBox.Font = new Font("Consolas", 10f);
-        root.Controls.Add(_logBox, 0, 4);
     }
 
     private static void ConfigureActionButton(Button button, string text)
@@ -369,14 +353,6 @@ internal sealed class HostMainForm : Form
         {
             return;
         }
-
-        if (InvokeRequired)
-        {
-            RunOnUiThread(() => AppendLog(line));
-            return;
-        }
-
-        _logBox.AppendText($"[{DateTime.Now:HH:mm:ss}] {line}{Environment.NewLine}");
     }
 
     private void RunOnUiThread(Action action)
