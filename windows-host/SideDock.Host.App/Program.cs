@@ -45,6 +45,7 @@ internal sealed class HostMainForm : Form
         Size = new Size(980, 700);
         StartPosition = FormStartPosition.CenterScreen;
         Font = new Font("Segoe UI", 10f);
+        AutoScroll = true;
 
         BuildLayout();
         SetRunningState(false);
@@ -79,6 +80,7 @@ internal sealed class HostMainForm : Form
         {
             Dock = DockStyle.Top,
             ColumnCount = 4,
+            RowCount = 5,
             AutoSize = true,
             Margin = new Padding(0, 0, 0, 12)
         };
@@ -86,6 +88,11 @@ internal sealed class HostMainForm : Form
         settings.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 50));
         settings.ColumnStyles.Add(new ColumnStyle(SizeType.Absolute, 120));
         settings.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 50));
+        settings.RowStyles.Add(new RowStyle(SizeType.AutoSize));
+        settings.RowStyles.Add(new RowStyle(SizeType.AutoSize));
+        settings.RowStyles.Add(new RowStyle(SizeType.AutoSize));
+        settings.RowStyles.Add(new RowStyle(SizeType.AutoSize));
+        settings.RowStyles.Add(new RowStyle(SizeType.AutoSize));
         root.Controls.Add(settings, 0, 1);
 
         ConfigureCombo(_videoSource, "idd-gpu", "idd", "realtime");
@@ -105,8 +112,8 @@ internal sealed class HostMainForm : Form
         AddLabeled(settings, "Video port", _videoPort, 4);
         AddLabeled(settings, "ADB path", _adbPath, 5);
 
-        settings.Controls.Add(new Label { Text = "", AutoSize = true }, 0, 6);
-        settings.Controls.Add(_enableInput, 1, 6);
+        settings.Controls.Add(new Label { Text = "", AutoSize = true }, 0, 3);
+        settings.Controls.Add(_enableInput, 1, 3);
         settings.SetColumnSpan(_enableInput, 3);
 
         var buttons = new FlowLayoutPanel
@@ -131,7 +138,7 @@ internal sealed class HostMainForm : Form
         buttons.Controls.Add(_stopButton);
         buttons.Controls.Add(_clearLogButton);
         buttons.Controls.Add(_statusLabel);
-        settings.Controls.Add(buttons, 0, 7);
+        settings.Controls.Add(buttons, 0, 4);
         settings.SetColumnSpan(buttons, 4);
 
         _logBox.Dock = DockStyle.Fill;
