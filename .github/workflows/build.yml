@@ -91,6 +91,7 @@ jobs:
         run: |
           dotnet restore .\windows-host\SideDock.Host\SideDock.Host.csproj
           dotnet restore .\windows-host\SideDock.Host.App\SideDock.Host.App.csproj
+          dotnet restore .\windows-host\SideDock.Host.Launcher\SideDock.Host.Launcher.csproj
 
       - name: Publish host app
         shell: pwsh
@@ -101,10 +102,13 @@ jobs:
             --runtime win-x64 `
             --self-contained true `
             --output $out
+
           $payloadRoot = Join-Path $env:RUNNER_TEMP "sidedock-host-payload"
           New-Item -ItemType Directory -Force $payloadRoot | Out-Null
           Copy-Item -Recurse -Force $out (Join-Path $payloadRoot "SideDock.Host")
           Compress-Archive -Path (Join-Path $payloadRoot "*") -DestinationPath .\windows-host\SideDock.Host.App\HostPayload.zip -Force
+
+          $appOut = Join-Path $env:RUNNER_TEMP "sidedock-host-app-ui"
           dotnet publish .\windows-host\SideDock.Host.App\SideDock.Host.App.csproj `
             --configuration $env:BUILD_CONFIGURATION `
             --runtime win-x64 `
@@ -112,7 +116,28 @@ jobs:
             -p:PublishSingleFile=true `
             -p:EnableCompressionInSingleFile=true `
             -p:IncludeNativeLibrariesForSelfExtract=true `
-            --output "$env:RUNNER_TEMP\sidedock-host-app"
+            --output $appOut
+
+          $launcherPayloadRoot = Join-Path $env:RUNNER_TEMP "sidedock-host-launcher-payload"
+          New-Item -ItemType Directory -Force $launcherPayloadRoot | Out-Null
+          Copy-Item -Recurse -Force $appOut (Join-Path $launcherPayloadRoot "SideDock.Host.App")
+          Compress-Archive -Path (Join-Path $launcherPayloadRoot "*") -DestinationPath .\windows-host\SideDock.Host.Launcher\HostPayload.zip -Force
+
+          $launcherOut = Join-Path $env:RUNNER_TEMP "sidedock-host-launcher"
+          dotnet publish .\windows-host\SideDock.Host.Launcher\SideDock.Host.Launcher.csproj `
+            --configuration $env:BUILD_CONFIGURATION `
+            --runtime win-x64 `
+            --self-contained true `
+            -p:PublishSingleFile=true `
+            -p:EnableCompressionInSingleFile=true `
+            -p:IncludeNativeLibrariesForSelfExtract=true `
+            --output $launcherOut
+          Copy-Item -Force .\windows-host\SideDock.Host.Launcher\HostPayload.zip (Join-Path $launcherOut "HostPayload.zip")
+          $launcherExe = Join-Path $launcherOut "SideDock.Host.App.exe"
+          if (-not (Test-Path -LiteralPath $launcherExe)) {
+            throw "Launcher executable was not produced."
+          }
+          Copy-Item -Force $launcherExe "$env:RUNNER_TEMP\sidedock-host-app\SideDock.Host.App.exe"
 
       - name: Upload host app
         uses: actions/upload-artifact@v4

@@ -1,0 +1,19 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <OutputType>WinExe</OutputType>
+    <TargetFramework>net8.0-windows</TargetFramework>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+    <AssemblyName>SideDock.Host.App</AssemblyName>
+    <RootNamespace>SideDock.Host.App.Launcher</RootNamespace>
+    <ApplicationIcon>..\..\assets\SideDock.ico</ApplicationIcon>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <EmbeddedResource Include="HostPayload.zip" Condition="Exists('HostPayload.zip')" />
+  </ItemGroup>
+
+  <Target Name="RequireHostPayload" BeforeTargets="BeforeBuild" Condition="'$(CI)' == 'true' and !Exists('HostPayload.zip')">
+    <Error Text="HostPayload.zip is required for CI launcher builds." />
+  </Target>
+</Project>
