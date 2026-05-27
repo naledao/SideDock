@@ -52,6 +52,7 @@ public final class MainActivity extends Activity implements ControlClient.Listen
     private ControlClient controlClient;
     private VideoClient videoClient;
     private InputCollector inputCollector;
+    private FrameLayout rootView;
     private SurfaceView surfaceView;
     private CursorOverlayView cursorOverlayView;
     private TextView overlayText;
@@ -588,13 +589,31 @@ public final class MainActivity extends Activity implements ControlClient.Listen
     private View buildContentView() {
         float density = getResources().getDisplayMetrics().density;
 
-        FrameLayout root = new FrameLayout(this);
-        root.setBackgroundColor(0xFF050607);
-        root.setLayoutParams(new ViewGroup.LayoutParams(
+        rootView = new FrameLayout(this);
+        rootView.setBackgroundColor(0xFF050607);
+        rootView.setLayoutParams(new ViewGroup.LayoutParams(
             ViewGroup.LayoutParams.MATCH_PARENT,
             ViewGroup.LayoutParams.MATCH_PARENT
         ));
-        hideSystemPointerIcon(root);
+        hideSystemPointerIcon(rootView);
+        rootView.addOnLayoutChangeListener(new View.OnLayoutChangeListener() {
+            @Override
+            public void onLayoutChange(
+                View v,
+                int left,
+                int top,
+                int right,
+                int bottom,
+                int oldLeft,
+                int oldTop,
+                int oldRight,
+                int oldBottom
+            ) {
+                if (right - left != oldRight - oldLeft || bottom - top != oldBottom - oldTop) {
+                    updateVideoRectForSurfaceView();
+                }
+            }
+        });
 
         surfaceView = new SurfaceView(this);
         surfaceView.getHolder().setFixedSize(videoWidth, videoHeight);
@@ -603,20 +622,20 @@ public final class MainActivity extends Activity implements ControlClient.Listen
         surfaceView.setFocusableInTouchMode(true);
         hideSystemPointerIcon(surfaceView);
         surfaceView.requestFocus();
-        root.addView(surfaceView, new FrameLayout.LayoutParams(
+        rootView.addView(surfaceView, new FrameLayout.LayoutParams(
             ViewGroup.LayoutParams.MATCH_PARENT,
             ViewGroup.LayoutParams.MATCH_PARENT
         ));
 
         cursorOverlayView = new CursorOverlayView(this);
         hideSystemPointerIcon(cursorOverlayView);
-        root.addView(cursorOverlayView, new FrameLayout.LayoutParams(
+        rootView.addView(cursorOverlayView, new FrameLayout.LayoutParams(
             ViewGroup.LayoutParams.MATCH_PARENT,
             ViewGroup.LayoutParams.MATCH_PARENT
         ));
 
         connectionStatusLayer = createConnectionStatusLayer(density);
-        root.addView(connectionStatusLayer, new FrameLayout.LayoutParams(
+        rootView.addView(connectionStatusLayer, new FrameLayout.LayoutParams(
             ViewGroup.LayoutParams.MATCH_PARENT,
             ViewGroup.LayoutParams.MATCH_PARENT
         ));
@@ -636,7 +655,7 @@ public final class MainActivity extends Activity implements ControlClient.Listen
             Gravity.START | Gravity.TOP
         );
         overlayParams.setMargins(dp(12, density), dp(12, density), dp(12, density), dp(12, density));
-        root.addView(overlayText, overlayParams);
+        rootView.addView(overlayText, overlayParams);
 
         modeToggleText = createModeToggle(density);
         FrameLayout.LayoutParams modeToggleParams = new FrameLayout.LayoutParams(
@@ -645,7 +664,7 @@ public final class MainActivity extends Activity implements ControlClient.Listen
             Gravity.END | Gravity.TOP
         );
         modeToggleParams.setMargins(dp(12, density), dp(12, density), dp(12, density), dp(12, density));
-        root.addView(modeToggleText, modeToggleParams);
+        rootView.addView(modeToggleText, modeToggleParams);
 
         modePanel = createModePanel(density);
         FrameLayout.LayoutParams modePanelParams = new FrameLayout.LayoutParams(
@@ -654,17 +673,17 @@ public final class MainActivity extends Activity implements ControlClient.Listen
             Gravity.END | Gravity.TOP
         );
         modePanelParams.setMargins(dp(12, density), dp(64, density), dp(12, density), dp(12, density));
-        root.addView(modePanel, modePanelParams);
+        rootView.addView(modePanel, modePanelParams);
         updateModeControls();
 
         updateOverlay();
-        root.post(new Runnable() {
+        rootView.post(new Runnable() {
             @Override
             public void run() {
                 updateVideoRectForSurfaceView();
             }
         });
-        return root;
+        return rootView;
     }
 
     private FrameLayout createConnectionStatusLayer(float density) {
@@ -1115,9 +1134,37 @@ public final class MainActivity extends Activity implements ControlClient.Listen
             videoRectTop = (viewHeight - videoRectHeight) / 2;
         }
 
+        applyVideoSurfaceLayout();
         updateContentRectFromMetrics();
         inputCollector.setVideoRect(contentRectLeft, contentRectTop, contentRectWidth, contentRectHeight);
         resetCursorToCenter();
+    }
+
+    private void applyVideoSurfaceLayout() {
+        if (surfaceView == null || videoRectWidth <= 0 || videoRectHeight <= 0) {
+            return;
+        }
+
+        ViewGroup.LayoutParams currentParams = surfaceView.getLayoutParams();
+        if (!(currentParams instanceof FrameLayout.LayoutParams)) {
+            return;
+        }
+
+        FrameLayout.LayoutParams params = (FrameLayout.LayoutParams) currentParams;
+        boolean changed = params.width != videoRectWidth
+            || params.height != videoRectHeight
+            || params.leftMargin != videoRectLeft
+            || params.topMargin != videoRectTop
+            || params.gravity != (Gravity.START | Gravity.TOP);
+        if (!changed) {
+            return;
+        }
+
+        params.width = videoRectWidth;
+        params.height = videoRectHeight;
+        params.gravity = Gravity.START | Gravity.TOP;
+        params.setMargins(videoRectLeft, videoRectTop, 0, 0);
+        surfaceView.setLayoutParams(params);
     }
 
     private void updateContentRectFromMetrics() {
@@ -1146,8 +1193,9 @@ public final class MainActivity extends Activity implements ControlClient.Listen
             return;
         }
 
-        int viewWidth = surfaceView.getWidth();
-        int viewHeight = surfaceView.getHeight();
+        View parent = rootView != null ? rootView : (View) surfaceView.getParent();
+        int viewWidth = parent == null ? surfaceView.getWidth() : parent.getWidth();
+        int viewHeight = parent == null ? surfaceView.getHeight() : parent.getHeight();
         if (viewWidth <= 0 || viewHeight <= 0) {
             return;
         }
