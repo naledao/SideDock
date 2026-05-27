@@ -1,11 +1,14 @@
 using System.Diagnostics;
 using System.IO.Compression;
 using System.Reflection;
+using System.Security.Cryptography.X509Certificates;
 using System.Security.Principal;
 const string AppName = "SideDock Driver Installer";
 const string DeviceToolExe = "SideDock.Idd.DeviceTool.exe";
 const string DriverInf = "SideDock.Idd.inf";
+const string DriverCertificate = "SideDock.Idd.cer";
 const string DriverHardwareId = @"SWD\SIDEDOCKIDD\SIDEDOCKIDD";
+var options = InstallerOptions.Parse(args);
 
 try
 {
@@ -35,31 +38,38 @@ try
         ?? Directory.GetFiles(driverPackageDir, DriverInf, SearchOption.AllDirectories).FirstOrDefault()
         ?? FailFile(DriverInf);
 
+    var certificatePath = Directory.GetFiles(driverPackageDir, DriverCertificate, SearchOption.AllDirectories)
+        .FirstOrDefault(path => path.Contains($"{Path.DirectorySeparatorChar}Release{Path.DirectorySeparatorChar}", StringComparison.OrdinalIgnoreCase))
+        ?? Directory.GetFiles(driverPackageDir, DriverCertificate, SearchOption.AllDirectories).FirstOrDefault()
+        ?? FailFile(DriverCertificate);
+
     var deviceToolPath = Directory.GetFiles(deviceToolDir, DeviceToolExe, SearchOption.AllDirectories)
         .FirstOrDefault(path => path.Contains($"{Path.DirectorySeparatorChar}Release{Path.DirectorySeparatorChar}", StringComparison.OrdinalIgnoreCase))
         ?? Directory.GetFiles(deviceToolDir, DeviceToolExe, SearchOption.AllDirectories).FirstOrDefault()
         ?? FailFile(DeviceToolExe);
 
     Console.WriteLine($"Driver INF: {infPath}");
+    Console.WriteLine($"Driver certificate: {certificatePath}");
     Console.WriteLine($"Device tool: {deviceToolPath}");
     Console.WriteLine();
 
+    TrustDriverCertificate(certificatePath);
     InstallDriver(infPath);
     RemoveExistingSoftwareDevice();
-    StartDeviceTool(deviceToolPath);
+    StartDeviceTool(deviceToolPath, options.HideDeviceTool);
 
     Console.WriteLine();
     Console.WriteLine("SideDock driver installation has started.");
     Console.WriteLine("Keep the SideDock.Idd.DeviceTool window running while using the virtual display.");
     Console.WriteLine("Open Windows Display Settings and look for 'SideDock Virtual Display'.");
-    Pause();
+    Pause(options.NoPause);
     return 0;
 }
 catch (Exception ex)
 {
     Console.Error.WriteLine();
     Console.Error.WriteLine($"ERROR: {ex.Message}");
-    Pause();
+    Pause(options.NoPause);
     return 1;
 }
 
@@ -150,20 +160,49 @@ static void InstallDriver(string infPath)
     RunChecked("pnputil.exe", $"/add-driver {QuoteProcessArgument(infPath)} /install");
 }
 
+static void TrustDriverCertificate(string certificatePath)
+{
+    Console.WriteLine("Trusting SideDock self-signed driver certificate.");
+    using var certificate = new X509Certificate2(certificatePath);
+    AddCertificateIfMissing(StoreName.Root, certificate);
+    AddCertificateIfMissing(StoreName.TrustedPublisher, certificate);
+}
+
+static void AddCertificateIfMissing(StoreName storeName, X509Certificate2 certificate)
+{
+    using var store = new X509Store(storeName, StoreLocation.LocalMachine);
+    store.Open(OpenFlags.ReadWrite);
+
+    var matches = store.Certificates.Find(
+        X509FindType.FindByThumbprint,
+        certificate.Thumbprint,
+        validOnly: false);
+
+    if (matches.Count > 0)
+    {
+        Console.WriteLine($"Certificate already exists in LocalMachine\\{storeName}.");
+        return;
+    }
+
+    store.Add(certificate);
+    Console.WriteLine($"Added certificate to LocalMachine\\{storeName}.");
+}
+
 static void RemoveExistingSoftwareDevice()
 {
     Console.WriteLine("Removing any stale SideDock software device instance.");
     Run("pnputil.exe", $"/remove-device {QuoteProcessArgument(DriverHardwareId)}", allowFailure: true);
 }
 
-static void StartDeviceTool(string deviceToolPath)
+static void StartDeviceTool(string deviceToolPath, bool hideWindow)
 {
     Console.WriteLine("Starting SideDock software device tool.");
     Process.Start(new ProcessStartInfo
     {
         FileName = deviceToolPath,
         WorkingDirectory = Path.GetDirectoryName(deviceToolPath) ?? Environment.CurrentDirectory,
-        UseShellExecute = true
+        UseShellExecute = true,
+        WindowStyle = hideWindow ? ProcessWindowStyle.Hidden : ProcessWindowStyle.Normal
     });
 }
 
@@ -216,13 +255,24 @@ static ProcessResult Run(string fileName, string arguments, bool allowFailure)
     return new ProcessResult(process.ExitCode, stdout, stderr);
 }
 
-static void Pause()
+static void Pause(bool noPause)
 {
-    if (!Console.IsInputRedirected)
+    if (!noPause && !Console.IsInputRedirected)
     {
         Console.WriteLine();
         Console.Write("Press Enter to exit...");
         Console.ReadLine();
+    }
+}
+
+internal readonly record struct InstallerOptions(bool NoPause, bool HideDeviceTool)
+{
+    public static InstallerOptions Parse(string[] args)
+    {
+        var fromApp = args.Any(arg => arg.Equals("--from-app", StringComparison.OrdinalIgnoreCase));
+        var noPause = fromApp || args.Any(arg => arg.Equals("--no-pause", StringComparison.OrdinalIgnoreCase));
+        var hideDeviceTool = fromApp || args.Any(arg => arg.Equals("--hide-device-tool", StringComparison.OrdinalIgnoreCase));
+        return new InstallerOptions(noPause, hideDeviceTool);
     }
 }
 

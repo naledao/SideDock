@@ -12,6 +12,7 @@ public sealed partial class MainWindow : Window
 {
     private const string HostExe = "SideDock.Host.exe";
     private const string DeviceToolExe = "SideDock.Idd.DeviceTool.exe";
+    private const string DriverInstallerExe = "SideDock.Driver.Installer.exe";
     private static readonly string DeviceToolProcessName = Path.GetFileNameWithoutExtension(DeviceToolExe);
 
     private readonly DispatcherTimer _displayStatusTimer = new();
@@ -24,6 +25,7 @@ public sealed partial class MainWindow : Window
     private string? _payloadRoot;
     private string? _hostPath;
     private string? _deviceToolPath;
+    private string? _driverInstallerPath;
     private bool _hostOwnsVirtualDisplay;
 
     public MainWindow()
@@ -57,6 +59,11 @@ public sealed partial class MainWindow : Window
     private void StartDisplayButton_Click(object sender, RoutedEventArgs e)
     {
         StartVirtualDisplay();
+    }
+
+    private async void InstallDriverButton_Click(object sender, RoutedEventArgs e)
+    {
+        await InstallDriverAsync();
     }
 
     private void StopDisplayButton_Click(object sender, RoutedEventArgs e)
@@ -114,7 +121,7 @@ public sealed partial class MainWindow : Window
         catch (Exception ex)
         {
             StopHostOwnedVirtualDisplay();
-            ShowError("Unable to start SideDock Host", ex.Message);
+            ShowError("无法启动 SideDock 主机", ex.Message);
             SetRunningState(false);
         }
     }
@@ -147,13 +154,13 @@ public sealed partial class MainWindow : Window
     {
         if (double.IsNaN(numberBox.Value))
         {
-            throw new InvalidOperationException($"Invalid {name} port.");
+            throw new InvalidOperationException($"{name} 端口无效。");
         }
 
         var port = (int)numberBox.Value;
         if (port < 1 || port > 65535)
         {
-            throw new InvalidOperationException($"Invalid {name} port: {port}");
+            throw new InvalidOperationException($"{name} 端口无效: {port}");
         }
 
         return port.ToString();
@@ -183,7 +190,7 @@ public sealed partial class MainWindow : Window
         }
 
         throw new FileNotFoundException(
-            $"{HostExe} was not found. Build SideDock.Host first or include HostPayload.zip in the app payload.");
+            $"未找到 {HostExe}。请先构建 SideDock.Host，或把 HostPayload.zip 打进桌面端包。");
     }
 
     private string TryExtractHostPayload()
@@ -322,7 +329,7 @@ public sealed partial class MainWindow : Window
         }
         catch (Exception ex)
         {
-            ShowError("Unable to start virtual display", ex.Message);
+            ShowError("无法启动虚拟显示器", ex.Message);
             return false;
         }
         finally
@@ -396,7 +403,138 @@ public sealed partial class MainWindow : Window
         }
 
         throw new FileNotFoundException(
-            $"{DeviceToolExe} was not found. Install the SideDock driver package or build SideDock.Idd.DeviceTool first.");
+            $"未找到 {DeviceToolExe}。请先安装 SideDock 驱动包，或先构建 SideDock.Idd.DeviceTool。");
+    }
+
+    private async Task InstallDriverAsync()
+    {
+        InstallDriverButton.IsEnabled = false;
+        DriverInstallStatusText.Text = "正在启动驱动安装器，请在管理员权限弹窗中选择“是”。";
+
+        try
+        {
+            _driverInstallerPath ??= ResolveDriverInstallerPath();
+            var startInfo = new ProcessStartInfo
+            {
+                FileName = _driverInstallerPath,
+                Arguments = "--from-app",
+                WorkingDirectory = Path.GetDirectoryName(_driverInstallerPath) ?? Environment.CurrentDirectory,
+                UseShellExecute = true,
+                Verb = "runas"
+            };
+
+            var process = Process.Start(startInfo)
+                ?? throw new InvalidOperationException($"无法启动 {DriverInstallerExe}。");
+
+            await process.WaitForExitAsync();
+            if (process.ExitCode == 0)
+            {
+                _deviceToolPath = null;
+                DriverInstallStatusText.Text = "驱动安装流程已完成。若显示器没有立即出现，请点“启动显示器”。";
+            }
+            else
+            {
+                DriverInstallStatusText.Text = $"驱动安装器退出码: {process.ExitCode}。";
+                ShowError("驱动安装未完成", $"安装器退出码: {process.ExitCode}");
+            }
+        }
+        catch (Exception ex)
+        {
+            DriverInstallStatusText.Text = "驱动安装未完成。";
+            ShowError("无法安装驱动", ex.Message);
+        }
+        finally
+        {
+            InstallDriverButton.IsEnabled = true;
+            RefreshVirtualDisplayState();
+        }
+    }
+
+    private string ResolveDriverInstallerPath()
+    {
+        foreach (var candidate in EnumerateDriverInstallerCandidates())
+        {
+            if (File.Exists(candidate))
+            {
+                return Path.GetFullPath(candidate);
+            }
+        }
+
+        var extracted = TryExtractDriverInstallerPayload();
+        if (!string.IsNullOrWhiteSpace(extracted))
+        {
+            return extracted;
+        }
+
+        throw new FileNotFoundException(
+            $"未找到 {DriverInstallerExe}。请使用包含驱动安装器的 SideDock 桌面端发布包。");
+    }
+
+    private string TryExtractDriverInstallerPayload()
+    {
+        var resourceName = Assembly.GetExecutingAssembly().GetManifestResourceNames()
+            .FirstOrDefault(name => name.EndsWith(".DriverInstallerPayload.zip", StringComparison.OrdinalIgnoreCase))
+            ?? string.Empty;
+
+        if (string.IsNullOrWhiteSpace(resourceName))
+        {
+            return string.Empty;
+        }
+
+        var root = Path.Combine(
+            Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
+            "SideDock",
+            "DriverInstaller");
+
+        if (Directory.Exists(root))
+        {
+            Directory.Delete(root, recursive: true);
+        }
+
+        Directory.CreateDirectory(root);
+        var zipPath = Path.Combine(root, "DriverInstallerPayload.zip");
+
+        using (var resource = Assembly.GetExecutingAssembly().GetManifestResourceStream(resourceName)
+            ?? throw new InvalidOperationException("未找到内置驱动安装器资源流。"))
+        using (var output = File.Create(zipPath))
+        {
+            resource.CopyTo(output);
+        }
+
+        ZipFile.ExtractToDirectory(zipPath, root);
+        File.Delete(zipPath);
+
+        return Directory.GetFiles(root, DriverInstallerExe, SearchOption.AllDirectories).FirstOrDefault()
+            ?? string.Empty;
+    }
+
+    private IEnumerable<string> EnumerateDriverInstallerCandidates()
+    {
+        var baseDirectory = AppContext.BaseDirectory;
+        yield return Path.Combine(baseDirectory, DriverInstallerExe);
+        yield return Path.Combine(baseDirectory, "SideDock.Driver.Installer", DriverInstallerExe);
+
+        if (_payloadRoot is not null)
+        {
+            yield return Path.Combine(_payloadRoot, DriverInstallerExe);
+            yield return Path.Combine(_payloadRoot, "SideDock.Driver.Installer", DriverInstallerExe);
+        }
+
+        yield return Path.GetFullPath(Path.Combine(
+            baseDirectory,
+            "..",
+            "..",
+            "..",
+            "..",
+            "..",
+            "windows-driver",
+            "SideDock.Driver.Installer",
+            "bin",
+            "Release",
+            "net8.0-windows",
+            "win-x64",
+            "publish",
+            DriverInstallerExe));
     }
 
     private IEnumerable<string> EnumerateDeviceToolCandidates()
@@ -472,11 +610,11 @@ public sealed partial class MainWindow : Window
         var running = IsVirtualDisplayToolRunning();
         StartDisplayButton.IsEnabled = !running;
         StopDisplayButton.IsEnabled = running;
-        DisplayStatusText.Text = running ? "Display On" : "Display Off";
+        DisplayStatusText.Text = running ? "显示器已启动" : "显示器未启动";
         DisplayStatusText.Foreground = running ? _successBrush : _dangerBrush;
         DisplayStatusSubtext.Text = running
-            ? "The SideDock virtual display device tool is running."
-            : "The virtual display tool is not running.";
+            ? "SideDock 虚拟显示器工具正在运行。"
+            : "虚拟显示器工具未运行。";
     }
 
     private static bool IsVirtualDisplayToolRunning()
@@ -516,7 +654,7 @@ public sealed partial class MainWindow : Window
     {
         StartHostButton.IsEnabled = !running;
         StopHostButton.IsEnabled = running;
-        OverallStatusText.Text = running ? "Running" : "Stopped";
+        OverallStatusText.Text = running ? "运行中" : "未启动";
         OverallStatusText.Foreground = running ? _successBrush : _dangerBrush;
     }
 

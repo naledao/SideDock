@@ -94,7 +94,9 @@ windows-driver\SideDock.Idd\x64\Debug\
 
 ## Install
 
-Run an elevated PowerShell session, then add the signed driver package:
+For the desktop app flow, click `安装/修复驱动`; the app starts the elevated installer, imports the bundled self-signed certificate into the local machine trust stores, installs the driver package, and starts `SideDock.Idd.DeviceTool.exe`.
+
+For manual development installs, run an elevated PowerShell session, trust the generated `SideDock.Idd.cer` certificate, then add the signed driver package:
 
 ```powershell
 pnputil /add-driver .\windows-driver\SideDock.Idd\x64\Debug\SideDock.Idd.inf /install

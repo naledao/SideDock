@@ -77,6 +77,8 @@ jobs:
   windows-host:
     name: Windows host
     runs-on: windows-2022
+    needs:
+      - windows-driver
 
     steps:
       - name: Checkout
@@ -93,9 +95,16 @@ jobs:
           dotnet restore .\windows-host\SideDock.Host.App\SideDock.Host.App.csproj
           dotnet restore .\windows-host\SideDock.Host.Launcher\SideDock.Host.Launcher.csproj
 
+      - name: Download driver installer
+        uses: actions/download-artifact@v4
+        with:
+          name: sidedock-driver-installer
+          path: ${{ runner.temp }}\sidedock-driver-installer
+
       - name: Publish host app
         shell: pwsh
         run: |
+          $ErrorActionPreference = "Stop"
           $out = Join-Path $env:RUNNER_TEMP "sidedock-windows-host"
           dotnet publish .\windows-host\SideDock.Host\SideDock.Host.csproj `
             --configuration $env:BUILD_CONFIGURATION `
@@ -107,6 +116,11 @@ jobs:
           New-Item -ItemType Directory -Force $payloadRoot | Out-Null
           Copy-Item -Recurse -Force $out (Join-Path $payloadRoot "SideDock.Host")
           Compress-Archive -Path (Join-Path $payloadRoot "*") -DestinationPath .\windows-host\SideDock.Host.App\HostPayload.zip -Force
+
+          $driverInstallerPayload = Join-Path $env:RUNNER_TEMP "driver-installer-payload"
+          New-Item -ItemType Directory -Force $driverInstallerPayload | Out-Null
+          Copy-Item -Recurse -Force "${env:RUNNER_TEMP}\sidedock-driver-installer" (Join-Path $driverInstallerPayload "SideDock.Driver.Installer")
+          Compress-Archive -Path (Join-Path $driverInstallerPayload "*") -DestinationPath .\windows-host\SideDock.Host.App\DriverInstallerPayload.zip -Force
 
           $appOut = Join-Path $env:RUNNER_TEMP "sidedock-host-app-ui"
           dotnet publish .\windows-host\SideDock.Host.App\SideDock.Host.App.csproj `
@@ -216,52 +230,30 @@ jobs:
             /p:SkipPackageVerification=true `
             /p:SignMode=Off
 
-      - name: Sign driver package with production certificate
+      - name: Self-sign driver package
         shell: pwsh
-        env:
-          SIDEDOCK_DRIVER_SIGNING_PFX_BASE64: ${{ secrets.SIDEDOCK_DRIVER_SIGNING_PFX_BASE64 }}
-          SIDEDOCK_DRIVER_SIGNING_PFX_PASSWORD: ${{ secrets.SIDEDOCK_DRIVER_SIGNING_PFX_PASSWORD }}
-          SIDEDOCK_DRIVER_SIGNING_TIMESTAMP_URL: ${{ secrets.SIDEDOCK_DRIVER_SIGNING_TIMESTAMP_URL }}
         run: |
           $ErrorActionPreference = "Stop"
           $driverPackage = Resolve-Path ".\windows-driver\SideDock.Idd\x64\Release\SideDock.Idd"
+          $certPath = Join-Path $driverPackage "SideDock.Idd.cer"
           $catPath = Join-Path $driverPackage "sidedock.idd.cat"
           $signtool = "${env:ProgramFiles(x86)}\Windows Kits\10\bin\10.0.26100.0\x64\signtool.exe"
+          $cert = New-SelfSignedCertificate `
+            -Type CodeSigningCert `
+            -Subject "CN=SideDock Self-Signed Driver" `
+            -CertStoreLocation "Cert:\CurrentUser\My" `
+            -KeyExportPolicy Exportable `
+            -KeyLength 2048 `
+            -HashAlgorithm SHA256
+          Export-Certificate -Cert $cert -FilePath $certPath | Out-Null
+          & $signtool sign `
+            /v `
+            /fd SHA256 `
+            /s My `
+            /sha1 $cert.Thumbprint `
+            $catPath
 
-          if ([string]::IsNullOrWhiteSpace($SIDEDOCK_DRIVER_SIGNING_PFX_BASE64)) {
-            throw "SIDEDOCK_DRIVER_SIGNING_PFX_BASE64 is required for production driver signing."
-          }
-
-          $pfxPath = Join-Path $env:RUNNER_TEMP "sidedock-driver-signing.pfx"
-          [IO.File]::WriteAllBytes($pfxPath, [Convert]::FromBase64String($SIDEDOCK_DRIVER_SIGNING_PFX_BASE64))
-          try {
-            $timestampUrl = if ([string]::IsNullOrWhiteSpace($SIDEDOCK_DRIVER_SIGNING_TIMESTAMP_URL)) {
-              "http://timestamp.digicert.com"
-            } else {
-              $SIDEDOCK_DRIVER_SIGNING_TIMESTAMP_URL
-            }
-
-            $signArgs = @(
-              "sign"
-              "/v"
-              "/fd", "SHA256"
-              "/f", $pfxPath
-              "/tr", $timestampUrl
-              "/td", "SHA256"
-            )
-
-            if (-not [string]::IsNullOrWhiteSpace($SIDEDOCK_DRIVER_SIGNING_PFX_PASSWORD)) {
-              $signArgs += @("/p", $SIDEDOCK_DRIVER_SIGNING_PFX_PASSWORD)
-            }
-
-            $signArgs += $catPath
-            & $signtool @signArgs
-          }
-          finally {
-            Remove-Item -Force $pfxPath -ErrorAction SilentlyContinue
-          }
-
-          Write-Host "Signed driver package with the production certificate."
+          Write-Host "Self-signed driver package for SideDock-controlled installations."
 
       - name: Build driver installer
         shell: pwsh
@@ -296,8 +288,8 @@ jobs:
     runs-on: ubuntu-latest
     needs:
       - android-client
-      - windows-host
       - windows-driver
+      - windows-host
 
     steps:
       - name: Checkout

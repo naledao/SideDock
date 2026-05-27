@@ -23,6 +23,7 @@
 
   <ItemGroup>
     <EmbeddedResource Include="HostPayload.zip" Condition="Exists('HostPayload.zip')" />
+    <EmbeddedResource Include="DriverInstallerPayload.zip" Condition="Exists('DriverInstallerPayload.zip')" />
   </ItemGroup>
 
   <Target Name="RequireHostPayload" BeforeTargets="BeforeBuild" Condition="'$(CI)' == 'true' and !Exists('HostPayload.zip')">
