@@ -137,7 +137,9 @@ jobs:
           if (-not (Test-Path -LiteralPath $launcherExe)) {
             throw "Launcher executable was not produced."
           }
-          Copy-Item -Force $launcherExe "$env:RUNNER_TEMP\sidedock-host-app\SideDock.Host.App.exe"
+          $hostAppOut = Join-Path $env:RUNNER_TEMP "sidedock-host-app"
+          New-Item -ItemType Directory -Force $hostAppOut | Out-Null
+          Copy-Item -Force $launcherExe (Join-Path $hostAppOut "SideDock.Host.App.exe")
 
       - name: Upload host app
         uses: actions/upload-artifact@v4
