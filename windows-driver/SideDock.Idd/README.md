@@ -18,7 +18,7 @@ Current scope:
 Verified locally on 2026-05-25:
 
 - The driver solution builds in `Debug|x64`.
-- ApiValidator, Inf2Cat, and test signing pass.
+- ApiValidator, Inf2Cat, and catalog signing pass.
 - The validation package installed as `oem92.inf`.
 - `SideDock.Idd.DeviceTool.exe` keeps the software device alive.
 - Windows Display Settings shows `SideDock Virtual Display`.
@@ -32,7 +32,7 @@ Verified locally on 2026-05-25:
 Verified locally on 2026-05-26:
 
 - The full driver solution builds in `Debug|x64` with `/p:SkipPackageVerification=true /m`.
-- `SideDock.Idd.dll` links, packages, passes ApiValidator and Inf2Cat, and is test-signed with 0 warnings / 0 errors.
+- `SideDock.Idd.dll` links, packages, passes ApiValidator and Inf2Cat, and is signed with 0 warnings / 0 errors.
 - The latest validation package installed as `oem95.inf`, `DriverVer=05/26/2026 15.31.52.112`.
 - A later local rebuild stamped the package output as `DriverVer=05/26/2026 16.15.6.595`; that output builds and signs cleanly, while the installed validation device is still using `oem95.inf`.
 - `SideDock.Idd.DeviceTool.exe` keeps `SWD\SideDockIdd\SideDockIdd` alive for the virtual display.
@@ -92,15 +92,9 @@ Expected driver package output is under:
 windows-driver\SideDock.Idd\x64\Debug\
 ```
 
-## Test Install
+## Install
 
-Run an elevated PowerShell session.
-
-```powershell
-bcdedit /set testsigning on
-```
-
-Reboot after enabling test signing. Then add the driver package:
+Run an elevated PowerShell session, then add the signed driver package:
 
 ```powershell
 pnputil /add-driver .\windows-driver\SideDock.Idd\x64\Debug\SideDock.Idd.inf /install
@@ -145,14 +139,6 @@ If the software device entry remains listed after package removal, run:
 ```powershell
 pnputil /remove-device SWD\SIDEDOCKIDD\SIDEDOCKIDD
 ```
-
-Disable test signing when finished:
-
-```powershell
-bcdedit /set testsigning off
-```
-
-Reboot after changing test signing.
 
 ## Logs
 

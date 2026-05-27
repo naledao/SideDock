@@ -216,27 +216,52 @@ jobs:
             /p:SkipPackageVerification=true `
             /p:SignMode=Off
 
-      - name: Test-sign driver package
+      - name: Sign driver package with production certificate
         shell: pwsh
+        env:
+          SIDEDOCK_DRIVER_SIGNING_PFX_BASE64: ${{ secrets.SIDEDOCK_DRIVER_SIGNING_PFX_BASE64 }}
+          SIDEDOCK_DRIVER_SIGNING_PFX_PASSWORD: ${{ secrets.SIDEDOCK_DRIVER_SIGNING_PFX_PASSWORD }}
+          SIDEDOCK_DRIVER_SIGNING_TIMESTAMP_URL: ${{ secrets.SIDEDOCK_DRIVER_SIGNING_TIMESTAMP_URL }}
         run: |
           $ErrorActionPreference = "Stop"
           $driverPackage = Resolve-Path ".\windows-driver\SideDock.Idd\x64\Release\SideDock.Idd"
-          $certPath = Join-Path $driverPackage "SideDock.Idd.cer"
           $catPath = Join-Path $driverPackage "sidedock.idd.cat"
-          $cert = New-SelfSignedCertificate `
-            -Type CodeSigningCert `
-            -Subject "CN=SideDock Test Driver" `
-            -CertStoreLocation "Cert:\CurrentUser\My" `
-            -KeyExportPolicy Exportable `
-            -KeyLength 2048 `
-            -HashAlgorithm SHA256
-          Export-Certificate -Cert $cert -FilePath $certPath | Out-Null
-          & "${env:ProgramFiles(x86)}\Windows Kits\10\bin\10.0.26100.0\x64\signtool.exe" sign `
-            /v `
-            /fd SHA256 `
-            /s My `
-            /sha1 $cert.Thumbprint `
-            $catPath
+          $signtool = "${env:ProgramFiles(x86)}\Windows Kits\10\bin\10.0.26100.0\x64\signtool.exe"
+
+          if ([string]::IsNullOrWhiteSpace($SIDEDOCK_DRIVER_SIGNING_PFX_BASE64)) {
+            throw "SIDEDOCK_DRIVER_SIGNING_PFX_BASE64 is required for production driver signing."
+          }
+
+          $pfxPath = Join-Path $env:RUNNER_TEMP "sidedock-driver-signing.pfx"
+          [IO.File]::WriteAllBytes($pfxPath, [Convert]::FromBase64String($SIDEDOCK_DRIVER_SIGNING_PFX_BASE64))
+          try {
+            $timestampUrl = if ([string]::IsNullOrWhiteSpace($SIDEDOCK_DRIVER_SIGNING_TIMESTAMP_URL)) {
+              "http://timestamp.digicert.com"
+            } else {
+              $SIDEDOCK_DRIVER_SIGNING_TIMESTAMP_URL
+            }
+
+            $signArgs = @(
+              "sign"
+              "/v"
+              "/fd", "SHA256"
+              "/f", $pfxPath
+              "/tr", $timestampUrl
+              "/td", "SHA256"
+            )
+
+            if (-not [string]::IsNullOrWhiteSpace($SIDEDOCK_DRIVER_SIGNING_PFX_PASSWORD)) {
+              $signArgs += @("/p", $SIDEDOCK_DRIVER_SIGNING_PFX_PASSWORD)
+            }
+
+            $signArgs += $catPath
+            & $signtool @signArgs
+          }
+          finally {
+            Remove-Item -Force $pfxPath -ErrorAction SilentlyContinue
+          }
+
+          Write-Host "Signed driver package with the production certificate."
 
       - name: Build driver installer
         shell: pwsh

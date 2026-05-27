@@ -1,15 +1,11 @@
 using System.Diagnostics;
 using System.IO.Compression;
 using System.Reflection;
-using System.Runtime.InteropServices;
 using System.Security.Principal;
-using Microsoft.Win32;
-
 const string AppName = "SideDock Driver Installer";
 const string DeviceToolExe = "SideDock.Idd.DeviceTool.exe";
 const string DriverInf = "SideDock.Idd.inf";
 const string DriverHardwareId = @"SWD\SIDEDOCKIDD\SIDEDOCKIDD";
-const string RunOnceValueName = "SideDockDriverInstaller";
 
 try
 {
@@ -48,20 +44,6 @@ try
     Console.WriteLine($"Device tool: {deviceToolPath}");
     Console.WriteLine();
 
-    if (!IsTestSigningEnabled())
-    {
-        Console.WriteLine("Windows test-signing mode is not enabled.");
-        Console.WriteLine("Enabling test-signing mode. A reboot is required before the driver can be installed.");
-        RunChecked("bcdedit.exe", "/set testsigning on");
-        RegisterRunOnce();
-        Console.WriteLine();
-        Console.WriteLine("Test-signing mode has been enabled.");
-        Console.WriteLine("Restart Windows, then this installer will continue automatically once after sign-in.");
-        PromptToRestart();
-        return 0;
-    }
-
-    ImportCertificates(driverPackageDir);
     InstallDriver(infPath);
     RemoveExistingSoftwareDevice();
     StartDeviceTool(deviceToolPath);
@@ -162,38 +144,6 @@ static void Fail(string message)
     throw new InvalidOperationException(message);
 }
 
-static bool IsTestSigningEnabled()
-{
-    var output = Run("bcdedit.exe", "/enum", allowFailure: true);
-    return output.ExitCode == 0 && output.Stdout.Contains("testsigning", StringComparison.OrdinalIgnoreCase)
-        && output.Stdout.Contains("Yes", StringComparison.OrdinalIgnoreCase);
-}
-
-static void RegisterRunOnce()
-{
-    var exePath = Environment.ProcessPath ?? Assembly.GetExecutingAssembly().Location;
-    using var runOnce = Registry.LocalMachine.OpenSubKey(@"SOFTWARE\Microsoft\Windows\CurrentVersion\RunOnce", writable: true)
-        ?? Registry.LocalMachine.CreateSubKey(@"SOFTWARE\Microsoft\Windows\CurrentVersion\RunOnce", writable: true);
-    runOnce.SetValue(RunOnceValueName, $"\"{exePath}\"", RegistryValueKind.String);
-}
-
-static void ImportCertificates(string driverPackageDir)
-{
-    var certificates = Directory.GetFiles(driverPackageDir, "*.cer", SearchOption.AllDirectories);
-    if (certificates.Length == 0)
-    {
-        Console.WriteLine("No .cer file found in the driver package. Skipping certificate import.");
-        return;
-    }
-
-    foreach (var cert in certificates)
-    {
-        Console.WriteLine($"Importing test certificate: {cert}");
-        RunChecked("certutil.exe", $"-addstore -f Root {QuoteProcessArgument(cert)}");
-        RunChecked("certutil.exe", $"-addstore -f TrustedPublisher {QuoteProcessArgument(cert)}");
-    }
-}
-
 static void InstallDriver(string infPath)
 {
     Console.WriteLine("Installing driver package with pnputil.");
@@ -264,22 +214,6 @@ static ProcessResult Run(string fileName, string arguments, bool allowFailure)
     }
 
     return new ProcessResult(process.ExitCode, stdout, stderr);
-}
-
-static void PromptToRestart()
-{
-    Console.Write("Restart now? [y/N] ");
-    var answer = Console.ReadLine();
-    if (string.Equals(answer, "y", StringComparison.OrdinalIgnoreCase) ||
-        string.Equals(answer, "yes", StringComparison.OrdinalIgnoreCase))
-    {
-        Process.Start(new ProcessStartInfo
-        {
-            FileName = "shutdown.exe",
-            Arguments = "/r /t 0",
-            UseShellExecute = false
-        });
-    }
 }
 
 static void Pause()
