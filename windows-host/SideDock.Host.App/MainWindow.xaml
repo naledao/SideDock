@@ -17,7 +17,6 @@
                 <Grid.RowDefinitions>
                     <RowDefinition Height="Auto" />
                     <RowDefinition Height="Auto" />
-                    <RowDefinition Height="Auto" />
                 </Grid.RowDefinitions>
 
                 <Grid Grid.Row="0" ColumnSpacing="18">
@@ -306,33 +305,6 @@
                         </Border>
                     </StackPanel>
                 </Grid>
-
-                <Border
-                    Grid.Row="2"
-                    Padding="18"
-                    CornerRadius="8"
-                    Background="{ThemeResource CardBackgroundFillColorDefaultBrush}"
-                    BorderBrush="{ThemeResource CardStrokeColorDefaultBrush}"
-                    BorderThickness="1">
-                    <StackPanel Spacing="10">
-                        <Grid>
-                            <Grid.ColumnDefinitions>
-                                <ColumnDefinition Width="*" />
-                                <ColumnDefinition Width="Auto" />
-                            </Grid.ColumnDefinitions>
-                            <TextBlock Text="Activity" FontSize="18" FontWeight="SemiBold" />
-                            <Button Grid.Column="1" Content="Clear" Click="ClearLogButton_Click" />
-                        </Grid>
-                        <TextBox
-                            x:Name="LogBox"
-                            AcceptsReturn="True"
-                            IsReadOnly="True"
-                            TextWrapping="NoWrap"
-                            FontFamily="Consolas"
-                            MinHeight="150"
-                            MaxHeight="260" />
-                    </StackPanel>
-                </Border>
             </Grid>
         </ScrollViewer>
     </Grid>

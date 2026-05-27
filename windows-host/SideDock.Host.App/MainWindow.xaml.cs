@@ -1,7 +1,6 @@
 using System.Diagnostics;
 using System.IO.Compression;
 using System.Reflection;
-using System.Text;
 using Microsoft.UI;
 using Microsoft.UI.Xaml;
 using Microsoft.UI.Xaml.Controls;
@@ -65,11 +64,6 @@ public sealed partial class MainWindow : Window
         StopVirtualDisplay();
     }
 
-    private void ClearLogButton_Click(object sender, RoutedEventArgs e)
-    {
-        LogBox.Text = string.Empty;
-    }
-
     private void StartHost()
     {
         if (_hostProcess is { HasExited: false })
@@ -98,11 +92,7 @@ public sealed partial class MainWindow : Window
                 Arguments = arguments,
                 WorkingDirectory = Path.GetDirectoryName(_hostPath) ?? Environment.CurrentDirectory,
                 UseShellExecute = false,
-                RedirectStandardOutput = true,
-                RedirectStandardError = true,
-                CreateNoWindow = true,
-                StandardOutputEncoding = Encoding.UTF8,
-                StandardErrorEncoding = Encoding.UTF8
+                CreateNoWindow = true
             };
 
             var adbPath = AdbPathBox.Text.Trim();
@@ -111,20 +101,14 @@ public sealed partial class MainWindow : Window
                 startInfo.Environment["SIDEDOCK_ADB"] = adbPath;
             }
 
-            AppendLog($"> {Path.GetFileName(_hostPath)} {arguments}");
             _hostProcess = new Process { StartInfo = startInfo, EnableRaisingEvents = true };
-            _hostProcess.OutputDataReceived += (_, eventArgs) => AppendLog(eventArgs.Data);
-            _hostProcess.ErrorDataReceived += (_, eventArgs) => AppendLog(eventArgs.Data);
             _hostProcess.Exited += (_, _) => DispatcherQueue.TryEnqueue(() =>
             {
-                AppendLog($"Host exited with code {_hostProcess?.ExitCode}");
                 StopHostOwnedVirtualDisplay();
                 SetRunningState(false);
             });
 
             _hostProcess.Start();
-            _hostProcess.BeginOutputReadLine();
-            _hostProcess.BeginErrorReadLine();
             SetRunningState(true);
         }
         catch (Exception ex)
@@ -295,9 +279,8 @@ public sealed partial class MainWindow : Window
                 process.WaitForExit(3000);
             }
         }
-        catch (Exception ex)
+        catch
         {
-            AppendLog($"Failed to stop Host: {ex.Message}");
         }
         finally
         {
@@ -325,7 +308,6 @@ public sealed partial class MainWindow : Window
                 WindowStyle = ProcessWindowStyle.Hidden
             };
 
-            AppendLog($"> {Path.GetFileName(_deviceToolPath)}");
             _deviceToolProcess = Process.Start(startInfo)
                 ?? throw new InvalidOperationException($"Unable to start {DeviceToolExe}.");
 
@@ -362,9 +344,8 @@ public sealed partial class MainWindow : Window
                     process.WaitForExit(3000);
                 }
             }
-            catch (Exception ex)
+            catch
             {
-                AppendLog($"Failed to stop virtual display tool: {ex.Message}");
             }
             finally
             {
@@ -537,20 +518,6 @@ public sealed partial class MainWindow : Window
         StopHostButton.IsEnabled = running;
         OverallStatusText.Text = running ? "Running" : "Stopped";
         OverallStatusText.Foreground = running ? _successBrush : _dangerBrush;
-    }
-
-    private void AppendLog(string? line)
-    {
-        if (string.IsNullOrEmpty(line))
-        {
-            return;
-        }
-
-        DispatcherQueue.TryEnqueue(() =>
-        {
-            LogBox.Text += line + Environment.NewLine;
-            LogBox.SelectionStart = LogBox.Text.Length;
-        });
     }
 
     private async void ShowError(string title, string message)
