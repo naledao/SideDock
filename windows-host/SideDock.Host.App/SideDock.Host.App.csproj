@@ -5,6 +5,7 @@
     <TargetPlatformMinVersion>10.0.19041.0</TargetPlatformMinVersion>
     <UseWinUI>true</UseWinUI>
     <EnableMsixTooling>false</EnableMsixTooling>
+    <EnableMsixTooling Condition="'$(PublishSingleFile)' == 'true'">true</EnableMsixTooling>
     <WindowsPackageType>None</WindowsPackageType>
     <RuntimeIdentifier>win-x64</RuntimeIdentifier>
     <WindowsAppSDKSelfContained>true</WindowsAppSDKSelfContained>
