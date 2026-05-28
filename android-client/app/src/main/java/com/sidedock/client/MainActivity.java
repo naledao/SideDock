@@ -101,6 +101,8 @@ public final class MainActivity extends Activity implements ControlClient.Listen
     private long controlReceived;
     private long serverTimeOffsetMs;
     private boolean serverTimeOffsetInitialized;
+    private long clockSyncRttMs = Long.MAX_VALUE;
+    private long clockSyncErrorBoundMs = Long.MAX_VALUE;
     private long lastRenderedFramesSeen;
     private boolean waitingForVideoFrame = true;
     private VideoClient.VideoStats lastVideoStats;
@@ -287,13 +289,25 @@ public final class MainActivity extends Activity implements ControlClient.Listen
     }
 
     @Override
-    public void onServerTime(long serverTimeMs) {
-        long nextOffsetMs = serverTimeMs - System.currentTimeMillis();
-        serverTimeOffsetMs = serverTimeOffsetInitialized
-            ? Math.round((serverTimeOffsetMs * 0.75) + (nextOffsetMs * 0.25))
-            : nextOffsetMs;
-        serverTimeOffsetInitialized = true;
-        videoClient.setServerTimeOffsetMs(serverTimeOffsetMs);
+    public void onClockSync(ControlClient.ClockSync clockSync) {
+        if (clockSync.errorBoundMs == Long.MAX_VALUE) {
+            return;
+        }
+
+        boolean betterSample = !serverTimeOffsetInitialized || clockSync.rttMs <= clockSyncRttMs + 2L;
+        if (betterSample) {
+            serverTimeOffsetMs = serverTimeOffsetInitialized
+                ? Math.round((serverTimeOffsetMs * 0.85) + (clockSync.offsetMs * 0.15))
+                : clockSync.offsetMs;
+            clockSyncRttMs = serverTimeOffsetInitialized
+                ? Math.min(clockSyncRttMs, clockSync.rttMs)
+                : clockSync.rttMs;
+            clockSyncErrorBoundMs = serverTimeOffsetInitialized
+                ? Math.min(clockSyncErrorBoundMs, clockSync.errorBoundMs)
+                : clockSync.errorBoundMs;
+            serverTimeOffsetInitialized = true;
+        }
+        videoClient.setServerTimeOffsetMs(serverTimeOffsetMs, clockSyncErrorBoundMs);
         updateOverlay();
     }
 
@@ -480,7 +494,9 @@ public final class MainActivity extends Activity implements ControlClient.Listen
             stats.p50QueueToRenderMs,
             stats.p95QueueToRenderMs,
             stats.p99QueueToRenderMs,
+            stats.localPipelineLatencyMs,
             stats.lastEncodeMs,
+            stats.latencyErrorBoundMs,
             stats.state
         );
         updateOverlay();
@@ -1551,7 +1567,8 @@ public final class MainActivity extends Activity implements ControlClient.Listen
                 .append("  错误: ").append(lastVideoStats.decodeErrors)
                 .append("  丢弃: ").append(lastVideoStats.droppedFrames)
                 .append("  重连: ").append(lastVideoStats.reconnects)
-                .append("  延迟≈").append(lastVideoStats.roughLatencyMs).append("ms")
+                .append("  local=").append(lastVideoStats.localPipelineLatencyMs).append("ms")
+                .append("  e2e~").append(lastVideoStats.roughLatencyMs).append("ms")
                 .append("  dec/render ")
                 .append(String.format(Locale.ROOT, "%.0f/%.0f", lastVideoStats.decodeFps, lastVideoStats.renderFps))
                 .append("fps")
@@ -1569,7 +1586,13 @@ public final class MainActivity extends Activity implements ControlClient.Listen
                 .append("  render p95/p99=")
                 .append(String.format(Locale.ROOT, "%.1f/%.1f", lastVideoStats.p95QueueToRenderMs, lastVideoStats.p99QueueToRenderMs)).append("ms");
             if (serverTimeOffsetMs != 0) {
-                builder.append("  时差").append(serverTimeOffsetMs >= 0 ? "+" : "").append(serverTimeOffsetMs).append("ms");
+                builder.append("  clock").append(serverTimeOffsetMs >= 0 ? "+" : "").append(serverTimeOffsetMs).append("ms");
+                if (clockSyncErrorBoundMs != Long.MAX_VALUE) {
+                    builder.append("+/-").append(clockSyncErrorBoundMs).append("ms");
+                }
+                if (clockSyncRttMs != Long.MAX_VALUE) {
+                    builder.append(" rtt=").append(clockSyncRttMs).append("ms");
+                }
             }
             builder.append('\n');
         }
@@ -1797,7 +1820,7 @@ public final class MainActivity extends Activity implements ControlClient.Listen
             ? lastVideoStats.renderFps
             : lastVideoStats.decodeFps;
         builder
-            .append("延迟 ").append(Math.max(0L, lastVideoStats.roughLatencyMs)).append("ms")
+            .append("延迟 ").append(Math.max(0L, lastVideoStats.localPipelineLatencyMs)).append("ms")
             .append("  帧率 ")
             .append(String.format(Locale.ROOT, "%.0f", Math.max(0.0, currentFps)))
             .append("fps");

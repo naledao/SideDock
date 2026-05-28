@@ -27,7 +27,7 @@ public final class ControlClient {
         void onLog(String message);
         void onStats(long sent, long received);
         void onVideoStart(int port, int width, int height, int fps);
-        void onServerTime(long serverTimeMs);
+        void onClockSync(ClockSync clockSync);
         void onCaptureStatus(CaptureStatus status);
         void onEncoderStatus(EncoderStatus status);
         void onDisplayLayout(DisplayLayout layout);
@@ -35,6 +35,31 @@ public final class ControlClient {
         void onDisplayModeChanged(DisplayModeChanged mode);
         void onCursorShape(String kind, boolean visible);
         void onCursorState(CursorState state);
+    }
+
+    public static final class ClockSync {
+        public final long serverTimeMs;
+        public final long clientSentAtMs;
+        public final long clientReceivedAtMs;
+        public final long offsetMs;
+        public final long rttMs;
+        public final long errorBoundMs;
+
+        public ClockSync(
+            long serverTimeMs,
+            long clientSentAtMs,
+            long clientReceivedAtMs,
+            long offsetMs,
+            long rttMs,
+            long errorBoundMs
+        ) {
+            this.serverTimeMs = serverTimeMs;
+            this.clientSentAtMs = clientSentAtMs;
+            this.clientReceivedAtMs = clientReceivedAtMs;
+            this.offsetMs = offsetMs;
+            this.rttMs = rttMs;
+            this.errorBoundMs = errorBoundMs;
+        }
     }
 
     public static final class CaptureStatus {
@@ -438,7 +463,9 @@ public final class ControlClient {
         double p50QueueToRenderMs,
         double p95QueueToRenderMs,
         double p99QueueToRenderMs,
+        long localPipelineLatencyMs,
         double lastEncodeMs,
+        long latencyErrorBoundMs,
         String state
     ) {
         sendFromAnyThread("video_stats", payload(
@@ -473,7 +500,9 @@ public final class ControlClient {
             "p50QueueToRenderMs", p50QueueToRenderMs,
             "p95QueueToRenderMs", p95QueueToRenderMs,
             "p99QueueToRenderMs", p99QueueToRenderMs,
+            "localPipelineLatencyMs", localPipelineLatencyMs,
             "encodeMs", lastEncodeMs,
+            "latencyErrorBoundMs", latencyErrorBoundMs,
             "state", state
         ));
     }
@@ -631,9 +660,6 @@ public final class ControlClient {
         switch (message.type) {
             case "hello_ack":
                 log("握手完成 heartbeatMs=" + message.payload.optLong("heartbeatMs", 2000));
-                if (message.payload.has("serverTimeMs")) {
-                    emitServerTime(message.payload.optLong("serverTimeMs", 0L));
-                }
                 if (message.payload.has("videoPort")) {
                     emitVideoStart(
                         message.payload.optInt("videoPort", 27184),
@@ -652,11 +678,7 @@ public final class ControlClient {
                     long clientSentAtMs = message.payload.optLong("clientSentAtMs", 0L);
                     long receivedAtMs = System.currentTimeMillis();
                     long serverTimeMs = message.payload.optLong("serverTimeMs", 0L);
-                    if (clientSentAtMs > 0L && serverTimeMs > 0L && receivedAtMs >= clientSentAtMs) {
-                        emitServerTime(serverTimeMs + ((receivedAtMs - clientSentAtMs) / 2L));
-                    } else {
-                        emitServerTime(serverTimeMs);
-                    }
+                    emitClockSync(createClockSync(serverTimeMs, clientSentAtMs, receivedAtMs));
                 }
                 break;
             case "close":
@@ -1066,11 +1088,26 @@ public final class ControlClient {
         });
     }
 
-    private void emitServerTime(long serverTimeMs) {
+    private ClockSync createClockSync(long serverTimeMs, long clientSentAtMs, long clientReceivedAtMs) {
+        if (serverTimeMs <= 0L || clientSentAtMs <= 0L || clientReceivedAtMs <= 0L) {
+            long now = System.currentTimeMillis();
+            return new ClockSync(0L, now, now, 0L, Long.MAX_VALUE, Long.MAX_VALUE);
+        }
+
+        long sentAtMs = clientSentAtMs > 0L ? clientSentAtMs : clientReceivedAtMs;
+        long receivedAtMs = Math.max(clientReceivedAtMs, sentAtMs);
+        long rttMs = Math.max(0L, receivedAtMs - sentAtMs);
+        long midpointMs = sentAtMs + (rttMs / 2L);
+        long offsetMs = serverTimeMs - midpointMs;
+        long errorBoundMs = (rttMs + 1L) / 2L;
+        return new ClockSync(serverTimeMs, sentAtMs, receivedAtMs, offsetMs, rttMs, errorBoundMs);
+    }
+
+    private void emitClockSync(ClockSync clockSync) {
         mainHandler.post(new Runnable() {
             @Override
             public void run() {
-                listener.onServerTime(serverTimeMs);
+                listener.onClockSync(clockSync);
             }
         });
     }

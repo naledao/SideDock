@@ -692,6 +692,7 @@ internal static class Program
                 "video stats "
                 + $"decoded={ReadLong(payload, "framesDecoded")} rendered={ReadLong(payload, "framesRendered")} packets={ReadLong(payload, "packetsReceived")} "
                 + $"fps decode={ReadDouble(payload, "decodeFps"):F1} render={ReadDouble(payload, "renderFps"):F1} new={ReadDouble(payload, "newFrameFps"):F1} repeat={ReadDouble(payload, "repeatFrameFps"):F1} "
+                + $"latency local={ReadDouble(payload, "localPipelineLatencyMs"):F0}ms e2e={ReadLong(payload, "roughLatencyMs")}ms err=+/-{ReadLong(payload, "latencyErrorBoundMs")}ms "
                 + $"kind={frameKind} sourceSeq={ReadLong(payload, "lastSourceSeq")} sourceAge={ReadDouble(payload, "lastSourceAgeMs"):F0}ms "
                 + $"android receiveQueue={ReadDouble(payload, "receiveToQueueMs"):F1}ms queueOutput={ReadDouble(payload, "queueToOutputMs"):F1}ms outputRender={ReadDouble(payload, "outputToRenderMs"):F1}ms queueRender={ReadDouble(payload, "queueToRenderMs"):F1}ms "
                 + $"androidP95 queueOutput={ReadDouble(payload, "p95QueueToOutputMs"):F1}ms outputRender={ReadDouble(payload, "p95OutputToRenderMs"):F1}ms queueRender={ReadDouble(payload, "p95QueueToRenderMs"):F1}ms "

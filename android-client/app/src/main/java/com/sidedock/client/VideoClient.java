@@ -5,7 +5,6 @@ import android.media.MediaFormat;
 import android.os.Build;
 import android.os.Handler;
 import android.os.Looper;
-import android.os.SystemClock;
 import android.util.Log;
 import android.view.Surface;
 import java.io.EOFException;
@@ -66,7 +65,9 @@ public final class VideoClient {
         public final double p50QueueToRenderMs;
         public final double p95QueueToRenderMs;
         public final double p99QueueToRenderMs;
+        public final long localPipelineLatencyMs;
         public final double lastEncodeMs;
+        public final long latencyErrorBoundMs;
         public final String state;
 
         private VideoStats(
@@ -101,7 +102,9 @@ public final class VideoClient {
             double p50QueueToRenderMs,
             double p95QueueToRenderMs,
             double p99QueueToRenderMs,
+            long localPipelineLatencyMs,
             double lastEncodeMs,
+            long latencyErrorBoundMs,
             String state
         ) {
             this.framesDecoded = framesDecoded;
@@ -135,7 +138,9 @@ public final class VideoClient {
             this.p50QueueToRenderMs = p50QueueToRenderMs;
             this.p95QueueToRenderMs = p95QueueToRenderMs;
             this.p99QueueToRenderMs = p99QueueToRenderMs;
+            this.localPipelineLatencyMs = localPipelineLatencyMs;
             this.lastEncodeMs = lastEncodeMs;
+            this.latencyErrorBoundMs = latencyErrorBoundMs;
             this.state = state;
         }
     }
@@ -210,8 +215,10 @@ public final class VideoClient {
     private double p50QueueToRenderMs;
     private double p95QueueToRenderMs;
     private double p99QueueToRenderMs;
+    private long localPipelineLatencyMs;
     private double lastEncodeMs;
     private volatile long serverTimeOffsetMs;
+    private volatile long latencyErrorBoundMs = Long.MAX_VALUE;
 
     public VideoClient(Listener listener) {
         this("127.0.0.1", listener);
@@ -267,8 +274,9 @@ public final class VideoClient {
             && fps == Math.max(1, nextFps);
     }
 
-    public void setServerTimeOffsetMs(long offsetMs) {
+    public void setServerTimeOffsetMs(long offsetMs, long errorBoundMs) {
         serverTimeOffsetMs = offsetMs;
+        latencyErrorBoundMs = errorBoundMs;
     }
 
     private void stopLocked() {
@@ -328,6 +336,7 @@ public final class VideoClient {
         p50QueueToRenderMs = 0.0;
         p95QueueToRenderMs = 0.0;
         p99QueueToRenderMs = 0.0;
+        localPipelineLatencyMs = 0L;
         lastEncodeMs = 0.0;
     }
 
@@ -393,7 +402,6 @@ public final class VideoClient {
                 VideoPacket packet = readPacket(input);
                 packetsReceived += 1;
                 recordPacketKind(packet);
-                roughLatencyMs = latencySinceHostTimestampMs(packet.timestampMs);
                 codecConfig.scan(packet.payload);
                 pendingPackets.add(packet);
 
@@ -500,7 +508,7 @@ public final class VideoClient {
         inputBuffer.clear();
         inputBuffer.put(packet.payload);
         long presentationTimeUs = submittedPackets * (1000000L / Math.max(1, fps));
-        long queueInputAtNanos = SystemClock.elapsedRealtimeNanos();
+        long queueInputAtNanos = System.nanoTime();
         lastReceiveToQueueMs = nanosToMs(queueInputAtNanos - packet.receiveElapsedRealtimeNanos);
         codec.queueInputBuffer(inputIndex, 0, packet.payload.length, presentationTimeUs, 0);
         synchronized (timingLock) {
@@ -540,7 +548,7 @@ public final class VideoClient {
     }
 
     private void recordFrameOutput(long presentationTimeUs) {
-        long outputAtNanos = SystemClock.elapsedRealtimeNanos();
+        long outputAtNanos = System.nanoTime();
         synchronized (timingLock) {
             PacketTiming timing = packetTimings.get(presentationTimeUs);
             if (timing != null) {
@@ -552,7 +560,8 @@ public final class VideoClient {
     }
 
     private void recordFrameRendered(long presentationTimeUs, long renderedFrameNanos) {
-        long renderAtNanos = SystemClock.elapsedRealtimeNanos();
+        long callbackAtNanos = System.nanoTime();
+        long renderAtNanos = renderedFrameNanos > 0L ? renderedFrameNanos : callbackAtNanos;
         synchronized (timingLock) {
             framesRendered += 1;
             PacketTiming timing = packetTimings.remove(presentationTimeUs);
@@ -563,9 +572,10 @@ public final class VideoClient {
                 }
                 lastQueueToRenderMs = nanosToMs(renderAtNanos - timing.queueInputElapsedRealtimeNanos);
                 addSample(queueToRenderSamples, lastQueueToRenderMs);
-                roughLatencyMs = latencySinceHostTimestampMs(timing.timestampMs);
+                localPipelineLatencyMs = Math.round(nanosToMs(renderAtNanos - timing.receiveElapsedRealtimeNanos));
+                roughLatencyMs = renderedLatencySinceHostTimestampMs(timing, renderAtNanos);
             }
-            updateInstantRenderFpsLocked(renderedFrameNanos > 0L ? renderedFrameNanos : renderAtNanos);
+            updateInstantRenderFpsLocked(renderAtNanos);
         }
 
         long now = System.currentTimeMillis();
@@ -607,6 +617,8 @@ public final class VideoClient {
 
         byte[] payload = new byte[length];
         readFully(input, payload, 0, payload.length);
+        long receiveAtMs = System.currentTimeMillis();
+        long receiveAtNanos = System.nanoTime();
         return new VideoPacket(
             seq,
             timestampMs,
@@ -615,7 +627,8 @@ public final class VideoClient {
             sourceSeq,
             sourceAgeMs,
             encodeUs / 1000.0,
-            SystemClock.elapsedRealtimeNanos()
+            receiveAtMs,
+            receiveAtNanos
         );
     }
 
@@ -802,7 +815,9 @@ public final class VideoClient {
             p50QueueToRenderMs,
             p95QueueToRenderMs,
             p99QueueToRenderMs,
+            localPipelineLatencyMs,
             lastEncodeMs,
+            latencyErrorBoundMs,
             state
         );
         mainHandler.post(new Runnable() {
@@ -836,7 +851,7 @@ public final class VideoClient {
     }
 
     private void updateRateSnapshot() {
-        long nowNanos = SystemClock.elapsedRealtimeNanos();
+        long nowNanos = System.nanoTime();
         if (lastRateSnapshotNanos == 0L) {
             lastRateSnapshotNanos = nowNanos;
             lastRateDecodedFrames = framesDecoded;
@@ -910,9 +925,11 @@ public final class VideoClient {
         return Math.max(0.0, nanos / 1_000_000.0);
     }
 
-    private long latencySinceHostTimestampMs(long hostTimestampMs) {
-        long localNowOnHostClockMs = System.currentTimeMillis() + serverTimeOffsetMs;
-        return Math.max(0L, localNowOnHostClockMs - hostTimestampMs);
+    private long renderedLatencySinceHostTimestampMs(PacketTiming timing, long renderAtNanos) {
+        long renderDeltaMs = Math.round(nanosToMs(renderAtNanos - timing.receiveElapsedRealtimeNanos));
+        long renderedWallClockMs = timing.receiveWallClockMs + renderDeltaMs;
+        long renderedOnHostClockMs = renderedWallClockMs + serverTimeOffsetMs;
+        return Math.max(0L, renderedOnHostClockMs - timing.timestampMs);
     }
 
     private void updateInstantRenderFpsLocked(long renderAtNanos) {
@@ -1041,6 +1058,7 @@ public final class VideoClient {
         private final long sourceSeq;
         private final int sourceAgeMs;
         private final double encodeMs;
+        private final long receiveWallClockMs;
         private final long receiveElapsedRealtimeNanos;
 
         private VideoPacket(
@@ -1051,6 +1069,7 @@ public final class VideoClient {
             long sourceSeq,
             int sourceAgeMs,
             double encodeMs,
+            long receiveWallClockMs,
             long receiveElapsedRealtimeNanos
         ) {
             this.seq = seq;
@@ -1060,17 +1079,22 @@ public final class VideoClient {
             this.sourceSeq = sourceSeq;
             this.sourceAgeMs = sourceAgeMs;
             this.encodeMs = encodeMs;
+            this.receiveWallClockMs = receiveWallClockMs;
             this.receiveElapsedRealtimeNanos = receiveElapsedRealtimeNanos;
         }
     }
 
     private static final class PacketTiming {
         private final long queueInputElapsedRealtimeNanos;
+        private final long receiveElapsedRealtimeNanos;
+        private final long receiveWallClockMs;
         private final long timestampMs;
         private long outputElapsedRealtimeNanos;
 
         private PacketTiming(VideoPacket packet, long queueInputElapsedRealtimeNanos) {
             this.queueInputElapsedRealtimeNanos = queueInputElapsedRealtimeNanos;
+            this.receiveElapsedRealtimeNanos = packet.receiveElapsedRealtimeNanos;
+            this.receiveWallClockMs = packet.receiveWallClockMs;
             this.timestampMs = packet.timestampMs;
         }
     }
