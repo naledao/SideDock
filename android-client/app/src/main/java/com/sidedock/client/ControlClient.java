@@ -648,6 +648,16 @@ public final class ControlClient {
                 break;
             case "pong":
                 missedPongs = 0;
+                if (message.payload.has("serverTimeMs")) {
+                    long clientSentAtMs = message.payload.optLong("clientSentAtMs", 0L);
+                    long receivedAtMs = System.currentTimeMillis();
+                    long serverTimeMs = message.payload.optLong("serverTimeMs", 0L);
+                    if (clientSentAtMs > 0L && serverTimeMs > 0L && receivedAtMs >= clientSentAtMs) {
+                        emitServerTime(serverTimeMs + ((receivedAtMs - clientSentAtMs) / 2L));
+                    } else {
+                        emitServerTime(serverTimeMs);
+                    }
+                }
                 break;
             case "close":
                 log("收到 close，断开连接");
@@ -857,7 +867,10 @@ public final class ControlClient {
                 return;
             }
 
-            send("ping", payload("missedPongs", missedPongs - 1));
+            send("ping", payload(
+                "missedPongs", missedPongs - 1,
+                "clientSentAtMs", System.currentTimeMillis()
+            ));
             }
         }, 2, 2, TimeUnit.SECONDS);
     }

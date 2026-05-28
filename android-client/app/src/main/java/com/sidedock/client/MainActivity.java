@@ -100,6 +100,7 @@ public final class MainActivity extends Activity implements ControlClient.Listen
     private long controlSent;
     private long controlReceived;
     private long serverTimeOffsetMs;
+    private boolean serverTimeOffsetInitialized;
     private long lastRenderedFramesSeen;
     private boolean waitingForVideoFrame = true;
     private VideoClient.VideoStats lastVideoStats;
@@ -265,6 +266,8 @@ public final class MainActivity extends Activity implements ControlClient.Listen
         videoFps = Math.max(1, fps);
         waitingForVideoFrame = true;
         lastVideoError = "";
+        lastVideoStats = null;
+        lastRenderedFramesSeen = 0L;
         videoStartReceived = true;
         hideLocalCursorOverlay();
         selectedModeWidth = videoWidth;
@@ -285,7 +288,11 @@ public final class MainActivity extends Activity implements ControlClient.Listen
 
     @Override
     public void onServerTime(long serverTimeMs) {
-        serverTimeOffsetMs = serverTimeMs - System.currentTimeMillis();
+        long nextOffsetMs = serverTimeMs - System.currentTimeMillis();
+        serverTimeOffsetMs = serverTimeOffsetInitialized
+            ? Math.round((serverTimeOffsetMs * 0.75) + (nextOffsetMs * 0.25))
+            : nextOffsetMs;
+        serverTimeOffsetInitialized = true;
         videoClient.setServerTimeOffsetMs(serverTimeOffsetMs);
         updateOverlay();
     }
@@ -1781,69 +1788,19 @@ public final class MainActivity extends Activity implements ControlClient.Listen
     }
 
     private void appendCompactOverlay(StringBuilder builder) {
+        if (lastVideoStats == null || lastVideoStats.framesRendered == 0L) {
+            builder.append("延迟 --ms  帧率 --fps");
+            return;
+        }
+
+        double currentFps = lastVideoStats.renderFps > 0.0
+            ? lastVideoStats.renderFps
+            : lastVideoStats.decodeFps;
         builder
-            .append("SideDock  ").append(controlState).append('\n')
-            .append("Video: ").append(videoState)
-            .append("  ").append(videoWidth).append('x').append(videoHeight).append('@').append(videoFps);
-
-        if (lastVideoStats != null) {
-            builder
-                .append("  latency~").append(lastVideoStats.roughLatencyMs).append("ms")
-                .append("  render=").append(String.format(Locale.ROOT, "%.0f", lastVideoStats.renderFps)).append("fps");
-        }
-        builder.append('\n');
-
-        if (lastCaptureStatus != null) {
-            builder
-                .append("Capture: ").append(lastCaptureStatus.source.length() == 0 ? "-" : lastCaptureStatus.source)
-                .append(' ').append(lastCaptureStatus.state);
-
-            long captureErrors = lastCaptureStatus.captureErrors;
-            long decodeErrors = lastVideoStats == null ? 0L : lastVideoStats.decodeErrors;
-            long droppedFrames = lastVideoStats == null ? 0L : lastVideoStats.droppedFrames;
-            long reconnects = lastVideoStats == null ? 0L : lastVideoStats.reconnects;
-            if (captureErrors > 0 || decodeErrors > 0 || droppedFrames > 0 || reconnects > 0) {
-                builder
-                    .append("  issues c=").append(captureErrors)
-                    .append(" d=").append(decodeErrors)
-                    .append(" drop=").append(droppedFrames)
-                    .append(" retry=").append(reconnects);
-            }
-            builder.append("  ").append(lastCaptureStatus.gpuPath ? "GPU" : "CPU");
-            if (lastCaptureStatus.fallback.length() > 0 && !"none".equals(lastCaptureStatus.fallback)) {
-                builder.append(" fallback=").append(lastCaptureStatus.fallback);
-            }
-            if (lastCaptureStatus.framesDropped > 0L) {
-                builder.append(" drop=").append(lastCaptureStatus.framesDropped);
-            }
-            if (lastCaptureStatus.errorCode.length() > 0) {
-                builder.append("  ").append(lastCaptureStatus.errorCode);
-            }
-            builder.append('\n');
-        }
-
-        if (lastEncoderStatus != null) {
-            builder
-                .append("Encoder: ")
-                .append(String.format(Locale.ROOT, "%.0f", lastEncoderStatus.streamFps)).append("fps")
-                .append(" enc95=").append(String.format(Locale.ROOT, "%.1f", lastEncoderStatus.p95EncodeMs)).append("ms")
-                .append(" sent=").append(lastEncoderStatus.framesSent);
-            if (lastEncoderStatus.framesDropped > 0L) {
-                builder.append(" drop=").append(lastEncoderStatus.framesDropped);
-            }
-            builder.append('\n');
-        }
-
-        if (lastDisplayMetrics != null) {
-            builder
-                .append("Display: ").append(lastDisplayMetrics.source)
-                .append("  ").append(lastDisplayMetrics.displayWidth).append('x').append(lastDisplayMetrics.displayHeight)
-                .append('@').append(lastDisplayMetrics.refreshHz);
-        } else if (lastDisplayLayout != null) {
-            builder
-                .append("Display: ").append(lastDisplayLayout.source)
-                .append("  ").append(lastDisplayLayout.width).append('x').append(lastDisplayLayout.height);
-        }
+            .append("延迟 ").append(Math.max(0L, lastVideoStats.roughLatencyMs)).append("ms")
+            .append("  帧率 ")
+            .append(String.format(Locale.ROOT, "%.0f", Math.max(0.0, currentFps)))
+            .append("fps");
     }
 
     private ControlClient.CaptureStatus mergeCaptureStatus(ControlClient.CaptureStatus previous, ControlClient.CaptureStatus next) {

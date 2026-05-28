@@ -149,6 +149,7 @@ public final class VideoClient {
     private static final int FRAME_KIND_REPEAT = 1;
     private static final int FRAME_KIND_BLACK = 2;
     private static final int FRAME_KIND_KEEPALIVE = 3;
+    private static final long FRAME_STATS_INTERVAL_MS = 500L;
 
     private final String host;
     private final Listener listener;
@@ -182,6 +183,8 @@ public final class VideoClient {
     private long reconnects;
     private long roughLatencyMs;
     private long lastFrameStatsEmitAtMs;
+    private long lastRenderedAtNanos;
+    private double instantRenderFps;
     private long lastRateSnapshotNanos;
     private long lastRateDecodedFrames;
     private long lastRateRenderedFrames;
@@ -236,6 +239,7 @@ public final class VideoClient {
             width = nextWidth;
             height = nextHeight;
             fps = Math.max(1, nextFps);
+            resetStats();
             running = true;
             final long runGeneration = ++generation;
             executor = Executors.newSingleThreadExecutor(new NamedThreadFactory("SideDock-VideoClient"));
@@ -276,6 +280,55 @@ public final class VideoClient {
             executor = null;
         }
         emitState("STOPPED");
+    }
+
+    private void resetStats() {
+        framesDecoded = 0L;
+        synchronized (timingLock) {
+            framesRendered = 0L;
+            packetTimings.clear();
+            queueToOutputSamples.clear();
+            outputToRenderSamples.clear();
+            queueToRenderSamples.clear();
+        }
+        packetsReceived = 0L;
+        newFramesReceived = 0L;
+        repeatFramesReceived = 0L;
+        blackFramesReceived = 0L;
+        keepaliveFramesReceived = 0L;
+        decodeErrors = 0L;
+        droppedFrames = 0L;
+        reconnects = 0L;
+        roughLatencyMs = 0L;
+        lastFrameStatsEmitAtMs = 0L;
+        lastRenderedAtNanos = 0L;
+        instantRenderFps = 0.0;
+        lastRateSnapshotNanos = 0L;
+        lastRateDecodedFrames = 0L;
+        lastRateRenderedFrames = 0L;
+        lastRateNewFrames = 0L;
+        lastRateRepeatFrames = 0L;
+        decodeFps = 0.0;
+        renderFps = 0.0;
+        newFrameFps = 0.0;
+        repeatFrameFps = 0.0;
+        lastFrameKind = "new";
+        lastSourceSeq = 0L;
+        lastSourceAgeMs = 0;
+        lastReceiveToQueueMs = 0.0;
+        lastQueueToOutputMs = 0.0;
+        lastOutputToRenderMs = 0.0;
+        lastQueueToRenderMs = 0.0;
+        p50QueueToOutputMs = 0.0;
+        p95QueueToOutputMs = 0.0;
+        p99QueueToOutputMs = 0.0;
+        p50OutputToRenderMs = 0.0;
+        p95OutputToRenderMs = 0.0;
+        p99OutputToRenderMs = 0.0;
+        p50QueueToRenderMs = 0.0;
+        p95QueueToRenderMs = 0.0;
+        p99QueueToRenderMs = 0.0;
+        lastEncodeMs = 0.0;
     }
 
     private boolean isCurrentGeneration(long runGeneration) {
@@ -340,7 +393,7 @@ public final class VideoClient {
                 VideoPacket packet = readPacket(input);
                 packetsReceived += 1;
                 recordPacketKind(packet);
-                roughLatencyMs = Math.max(0L, System.currentTimeMillis() - packet.timestampMs + serverTimeOffsetMs);
+                roughLatencyMs = latencySinceHostTimestampMs(packet.timestampMs);
                 codecConfig.scan(packet.payload);
                 pendingPackets.add(packet);
 
@@ -388,7 +441,7 @@ public final class VideoClient {
         codec.setOnFrameRenderedListener(new MediaCodec.OnFrameRenderedListener() {
             @Override
             public void onFrameRendered(MediaCodec codec, long presentationTimeUs, long nanoTime) {
-                recordFrameRendered(presentationTimeUs);
+                recordFrameRendered(presentationTimeUs, nanoTime);
             }
         }, mainHandler);
         codec.start();
@@ -469,7 +522,7 @@ public final class VideoClient {
                 if (render) {
                     framesDecoded += 1;
                     long now = System.currentTimeMillis();
-                    if (framesDecoded == 1L || now - lastFrameStatsEmitAtMs >= 1000L) {
+                    if (framesDecoded == 1L || now - lastFrameStatsEmitAtMs >= FRAME_STATS_INTERVAL_MS) {
                         lastFrameStatsEmitAtMs = now;
                         emitStats();
                     }
@@ -498,7 +551,7 @@ public final class VideoClient {
         }
     }
 
-    private void recordFrameRendered(long presentationTimeUs) {
+    private void recordFrameRendered(long presentationTimeUs, long renderedFrameNanos) {
         long renderAtNanos = SystemClock.elapsedRealtimeNanos();
         synchronized (timingLock) {
             framesRendered += 1;
@@ -510,11 +563,13 @@ public final class VideoClient {
                 }
                 lastQueueToRenderMs = nanosToMs(renderAtNanos - timing.queueInputElapsedRealtimeNanos);
                 addSample(queueToRenderSamples, lastQueueToRenderMs);
+                roughLatencyMs = latencySinceHostTimestampMs(timing.timestampMs);
             }
+            updateInstantRenderFpsLocked(renderedFrameNanos > 0L ? renderedFrameNanos : renderAtNanos);
         }
 
         long now = System.currentTimeMillis();
-        if (framesRendered == 1L || now - lastFrameStatsEmitAtMs >= 1000L) {
+        if (framesRendered == 1L || now - lastFrameStatsEmitAtMs >= FRAME_STATS_INTERVAL_MS) {
             lastFrameStatsEmitAtMs = now;
             emitStats();
         }
@@ -803,8 +858,12 @@ public final class VideoClient {
         synchronized (timingLock) {
             rendered = framesRendered;
         }
+        long renderedDelta = rendered - lastRateRenderedFrames;
         decodeFps = (framesDecoded - lastRateDecodedFrames) / seconds;
-        renderFps = (rendered - lastRateRenderedFrames) / seconds;
+        renderFps = renderedDelta / seconds;
+        if (renderedDelta > 0L && instantRenderFps > 0.0) {
+            renderFps = instantRenderFps;
+        }
         newFrameFps = (newFramesReceived - lastRateNewFrames) / seconds;
         repeatFrameFps = (repeatFramesReceived - lastRateRepeatFrames) / seconds;
         lastRateSnapshotNanos = nowNanos;
@@ -849,6 +908,23 @@ public final class VideoClient {
 
     private static double nanosToMs(long nanos) {
         return Math.max(0.0, nanos / 1_000_000.0);
+    }
+
+    private long latencySinceHostTimestampMs(long hostTimestampMs) {
+        long localNowOnHostClockMs = System.currentTimeMillis() + serverTimeOffsetMs;
+        return Math.max(0L, localNowOnHostClockMs - hostTimestampMs);
+    }
+
+    private void updateInstantRenderFpsLocked(long renderAtNanos) {
+        if (lastRenderedAtNanos > 0L && renderAtNanos > lastRenderedAtNanos) {
+            double sampleFps = 1_000_000_000.0 / (renderAtNanos - lastRenderedAtNanos);
+            if (!Double.isNaN(sampleFps) && !Double.isInfinite(sampleFps) && sampleFps > 0.0) {
+                instantRenderFps = instantRenderFps <= 0.0
+                    ? sampleFps
+                    : (instantRenderFps * 0.75) + (sampleFps * 0.25);
+            }
+        }
+        lastRenderedAtNanos = renderAtNanos;
     }
 
     private static void addSample(ArrayList<Double> samples, double value) {
@@ -990,10 +1066,12 @@ public final class VideoClient {
 
     private static final class PacketTiming {
         private final long queueInputElapsedRealtimeNanos;
+        private final long timestampMs;
         private long outputElapsedRealtimeNanos;
 
         private PacketTiming(VideoPacket packet, long queueInputElapsedRealtimeNanos) {
             this.queueInputElapsedRealtimeNanos = queueInputElapsedRealtimeNanos;
+            this.timestampMs = packet.timestampMs;
         }
     }
 

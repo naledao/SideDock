@@ -587,9 +587,14 @@ internal static class Program
                     break;
 
                 case "ping":
+                    var clientSentAtMs = message.Payload is JsonObject pingPayload
+                        ? ReadLong(pingPayload, "clientSentAtMs")
+                        : 0;
                     await connection.SendAsync("pong", new JsonObject
                     {
                         ["replyTo"] = message.Seq,
+                        ["clientSentAtMs"] = clientSentAtMs,
+                        ["serverTimeMs"] = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds(),
                         ["uptimeMs"] = _uptime.ElapsedMilliseconds
                     }, cancellationToken);
                     break;
