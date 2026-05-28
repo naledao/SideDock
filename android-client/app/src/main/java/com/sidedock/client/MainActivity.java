@@ -46,6 +46,7 @@ public final class MainActivity extends Activity implements ControlClient.Listen
     private static final int OVERLAY_MODE_COMPACT = 1;
     private static final int OVERLAY_MODE_HIDDEN = 2;
     private static final long OVERLAY_TAP_MAX_DURATION_MS = 500L;
+    private static final long LOCAL_POINTER_PREVIEW_TIMEOUT_MS = 120L;
     private static final String[] RESOLUTION_LABELS = new String[] { "720p", "1080p", "2K" };
     private static final int[][] RESOLUTION_PRESETS = new int[][] {
         { 1280, 720 },
@@ -62,6 +63,12 @@ public final class MainActivity extends Activity implements ControlClient.Listen
         @Override
         public void run() {
             flushPendingPointerAbs();
+        }
+    };
+    private final Runnable localPointerPreviewTimeoutRunnable = new Runnable() {
+        @Override
+        public void run() {
+            expireLocalPointerPreview();
         }
     };
     private FrameLayout rootView;
@@ -102,7 +109,9 @@ public final class MainActivity extends Activity implements ControlClient.Listen
     private ControlClient.DisplayLayout lastDisplayLayout;
     private ControlClient.DisplayMetrics lastDisplayMetrics;
     private ControlClient.DisplayModeChanged lastDisplayModeChanged;
+    private ControlClient.CursorState lastCursorState;
     private String cursorKind = "arrow";
+    private String cursorOverlayState = "hidden";
     private boolean localPointerPreviewActive;
     private int videoRectLeft;
     private int videoRectTop;
@@ -121,6 +130,7 @@ public final class MainActivity extends Activity implements ControlClient.Listen
     private float overlayTapDownX;
     private float overlayTapDownY;
     private long overlayTapDownAtMs;
+    private long lastCursorOverlayDebugAtMs;
     private boolean overlayTapCandidate;
 
     @Override
@@ -183,6 +193,7 @@ public final class MainActivity extends Activity implements ControlClient.Listen
     @Override
     protected void onDestroy() {
         mainHandler.removeCallbacks(pointerAbsFlushRunnable);
+        mainHandler.removeCallbacks(localPointerPreviewTimeoutRunnable);
         videoClient.stop();
         controlClient.shutdown();
         super.onDestroy();
@@ -369,23 +380,10 @@ public final class MainActivity extends Activity implements ControlClient.Listen
     }
 
     @Override
-    public void onCursorState(boolean visible, int x, int y) {
+    public void onCursorState(ControlClient.CursorState state) {
+        lastCursorState = state;
         if (cursorOverlayView != null && !localPointerPreviewActive) {
-            if (!isLocalCursorOverlayAllowed()) {
-                hideLocalCursorOverlay();
-                return;
-            }
-            if (!visible) {
-                cursorOverlayView.setCursorVisible(false);
-                return;
-            }
-
-            cursorOverlayView.setCursorVisible(true);
-            if (videoWidth > 0 && videoHeight > 0) {
-                float viewX = contentRectLeft + (x / (float) videoWidth) * contentRectWidth;
-                float viewY = contentRectTop + (y / (float) videoHeight) * contentRectHeight;
-                cursorOverlayView.updateCursor(viewX, viewY);
-            }
+            renderRemoteCursorState(state);
         }
     }
 
@@ -397,13 +395,17 @@ public final class MainActivity extends Activity implements ControlClient.Listen
 
         if (!isLocalCursorOverlayAllowed()) {
             hideLocalCursorOverlay();
+            cursorOverlayState = "blocked:" + localCursorOverlayBlockReason();
+            updateOverlayForCursorDebug();
             schedulePointerAbsFlush();
             return;
         }
 
         localPointerPreviewActive = true;
+        cursorOverlayState = String.format(Locale.ROOT, "local %.0f,%.0f", viewX, viewY);
         cursorOverlayView.setCursorVisible(true);
         cursorOverlayView.updateCursor(viewX, viewY);
+        scheduleLocalPointerPreviewTimeout();
         schedulePointerAbsFlush();
     }
 
@@ -688,6 +690,8 @@ public final class MainActivity extends Activity implements ControlClient.Listen
         });
 
         surfaceView = new SurfaceView(this);
+        surfaceView.setZOrderOnTop(false);
+        surfaceView.setZOrderMediaOverlay(false);
         applySurfaceFixedSize(videoWidth, videoHeight);
         surfaceView.getHolder().addCallback(this);
         surfaceView.setFocusable(true);
@@ -705,6 +709,7 @@ public final class MainActivity extends Activity implements ControlClient.Listen
             ViewGroup.LayoutParams.MATCH_PARENT,
             ViewGroup.LayoutParams.MATCH_PARENT
         ));
+        cursorOverlayView.bringToFront();
 
         connectionStatusLayer = createConnectionStatusLayer(density);
         rootView.addView(connectionStatusLayer, new FrameLayout.LayoutParams(
@@ -1320,10 +1325,129 @@ public final class MainActivity extends Activity implements ControlClient.Listen
     }
 
     private void hideLocalCursorOverlay() {
+        mainHandler.removeCallbacks(localPointerPreviewTimeoutRunnable);
         localPointerPreviewActive = false;
+        cursorOverlayState = "hidden";
         if (cursorOverlayView != null) {
             cursorOverlayView.setCursorVisible(false);
         }
+    }
+
+    private void scheduleLocalPointerPreviewTimeout() {
+        mainHandler.removeCallbacks(localPointerPreviewTimeoutRunnable);
+        mainHandler.postDelayed(localPointerPreviewTimeoutRunnable, LOCAL_POINTER_PREVIEW_TIMEOUT_MS);
+    }
+
+    private void expireLocalPointerPreview() {
+        if (!localPointerPreviewActive) {
+            return;
+        }
+
+        localPointerPreviewActive = false;
+        if (lastCursorState != null) {
+            renderRemoteCursorState(lastCursorState);
+            return;
+        }
+
+        if (cursorOverlayView != null) {
+            cursorOverlayView.setCursorVisible(false);
+        }
+        cursorOverlayState = "local-timeout";
+        updateOverlayForCursorDebug();
+    }
+
+    private void renderRemoteCursorState(ControlClient.CursorState state) {
+        if (cursorOverlayView == null) {
+            return;
+        }
+
+        if (!isLocalCursorOverlayAllowed()) {
+            hideLocalCursorOverlay();
+            cursorOverlayState = "blocked:" + localCursorOverlayBlockReason();
+            updateOverlayForCursorDebug();
+            return;
+        }
+        if (!state.visible) {
+            cursorOverlayView.setCursorVisible(false);
+            cursorOverlayState = "remote-hidden";
+            updateOverlayForCursorDebug();
+            return;
+        }
+
+        float[] normalized = normalizedCursorPosition(state);
+        if (normalized != null) {
+            cursorOverlayView.setCursorVisible(true);
+            float nx = normalized[0];
+            float ny = normalized[1];
+            float viewX = contentRectLeft + nx * contentRectWidth;
+            float viewY = contentRectTop + ny * contentRectHeight;
+            cursorOverlayView.updateCursor(viewX, viewY);
+            cursorOverlayState = String.format(Locale.ROOT, "remote %.3f,%.3f", nx, ny);
+        } else {
+            cursorOverlayState = "blocked:no-mapping";
+            cursorOverlayView.setCursorVisible(false);
+        }
+        updateOverlayForCursorDebug();
+    }
+
+    private float[] normalizedCursorPosition(ControlClient.CursorState state) {
+        if (Double.isFinite(state.nx) && Double.isFinite(state.ny)) {
+            return new float[] { clamp01((float) state.nx), clamp01((float) state.ny) };
+        }
+
+        int remoteWidth = state.displayWidth > 0
+            ? state.displayWidth
+            : lastDisplayMetrics != null && lastDisplayMetrics.displayWidth > 0
+                ? lastDisplayMetrics.displayWidth
+                : videoWidth;
+        int remoteHeight = state.displayHeight > 0
+            ? state.displayHeight
+            : lastDisplayMetrics != null && lastDisplayMetrics.displayHeight > 0
+                ? lastDisplayMetrics.displayHeight
+                : videoHeight;
+        if (remoteWidth <= 0 || remoteHeight <= 0) {
+            return null;
+        }
+
+        float nx = remoteWidth <= 1 ? 0f : state.x / (float) (remoteWidth - 1);
+        float ny = remoteHeight <= 1 ? 0f : state.y / (float) (remoteHeight - 1);
+        return new float[] { clamp01(nx), clamp01(ny) };
+    }
+
+    private String localCursorOverlayBlockReason() {
+        if (cursorOverlayView == null) {
+            return "no-overlay";
+        }
+        if (!surfaceReady) {
+            return "surface";
+        }
+        if (activeSurface == null || !activeSurface.isValid()) {
+            return "surface-invalid";
+        }
+        if (controlConnectionState != ConnectionState.CONNECTED) {
+            return "control-" + controlConnectionState;
+        }
+        if (!"CONNECTED".equals(videoState)) {
+            return "video-" + videoState;
+        }
+        if (waitingForVideoFrame) {
+            return "waiting-frame";
+        }
+        if (lastVideoError.length() > 0) {
+            return "video-error";
+        }
+
+        return "unknown";
+    }
+
+    private void updateOverlayForCursorDebug() {
+        long now = System.currentTimeMillis();
+        if (now - lastCursorOverlayDebugAtMs < 250L) {
+            return;
+        }
+
+        lastCursorOverlayDebugAtMs = now;
+        updateOverlay();
     }
 
     private void schedulePointerAbsFlush() {
@@ -1520,6 +1644,19 @@ public final class MainActivity extends Activity implements ControlClient.Listen
                 .append(' ').append(contentRectWidth).append('x').append(contentRectHeight)
                 .append("  cursor=").append(cursorKind)
                 .append('\n');
+        }
+
+        if (lastCursorState != null) {
+            builder
+                .append("Cursor: ").append(cursorOverlayState)
+                .append("  visible=").append(lastCursorState.visible)
+                .append("  pos=").append(lastCursorState.x).append(',').append(lastCursorState.y)
+                .append("  basis=").append(lastCursorState.displayWidth).append('x').append(lastCursorState.displayHeight)
+                .append("  n=").append(String.format(Locale.ROOT, "%.3f,%.3f", lastCursorState.nx, lastCursorState.ny));
+            if (lastCursorState.desktopX != 0 || lastCursorState.desktopY != 0) {
+                builder.append("  desktop=").append(lastCursorState.desktopX).append(',').append(lastCursorState.desktopY);
+            }
+            builder.append('\n');
         }
 
         if (lastDisplayModeChanged != null) {
@@ -1753,6 +1890,10 @@ public final class MainActivity extends Activity implements ControlClient.Listen
 
     private int clampInt(int value, int min, int max) {
         return Math.max(min, Math.min(max, value));
+    }
+
+    private float clamp01(float value) {
+        return Math.max(0f, Math.min(1f, value));
     }
 
     private String labelFor(ConnectionState state) {

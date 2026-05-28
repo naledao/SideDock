@@ -14,6 +14,7 @@ import java.net.SocketTimeoutException;
 import java.nio.charset.StandardCharsets;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
+import java.util.concurrent.RejectedExecutionException;
 import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.ScheduledFuture;
 import java.util.concurrent.TimeUnit;
@@ -33,7 +34,7 @@ public final class ControlClient {
         void onDisplayMetrics(DisplayMetrics metrics);
         void onDisplayModeChanged(DisplayModeChanged mode);
         void onCursorShape(String kind, boolean visible);
-        void onCursorState(boolean visible, int x, int y);
+        void onCursorState(CursorState state);
     }
 
     public static final class CaptureStatus {
@@ -277,6 +278,43 @@ public final class ControlClient {
             this.success = success;
             this.code = code;
             this.message = message;
+        }
+    }
+
+    public static final class CursorState {
+        public final boolean visible;
+        public final int x;
+        public final int y;
+        public final int displayWidth;
+        public final int displayHeight;
+        public final double nx;
+        public final double ny;
+        public final int desktopX;
+        public final int desktopY;
+        public final String source;
+
+        public CursorState(
+            boolean visible,
+            int x,
+            int y,
+            int displayWidth,
+            int displayHeight,
+            double nx,
+            double ny,
+            int desktopX,
+            int desktopY,
+            String source
+        ) {
+            this.visible = visible;
+            this.x = x;
+            this.y = y;
+            this.displayWidth = displayWidth;
+            this.displayHeight = displayHeight;
+            this.nx = nx;
+            this.ny = ny;
+            this.desktopX = desktopX;
+            this.desktopY = desktopY;
+            this.source = source;
         }
     }
 
@@ -774,11 +812,18 @@ public final class ControlClient {
                 ));
                 break;
             case "cursor_state":
-                emitCursorState(
+                emitCursorState(new CursorState(
                     message.payload.optBoolean("visible", true),
                     message.payload.optInt("x", 0),
-                    message.payload.optInt("y", 0)
-                );
+                    message.payload.optInt("y", 0),
+                    message.payload.optInt("displayWidth", 0),
+                    message.payload.optInt("displayHeight", 0),
+                    message.payload.optDouble("nx", Double.NaN),
+                    message.payload.optDouble("ny", Double.NaN),
+                    message.payload.optInt("desktopX", 0),
+                    message.payload.optInt("desktopY", 0),
+                    message.payload.optString("source", "")
+                ));
                 break;
             case "cursor_shape":
                 emitCursorShape(
@@ -847,12 +892,16 @@ public final class ControlClient {
     }
 
     private void sendFromAnyThread(String type, JSONObject payload) {
-        heartbeatExecutor.execute(new Runnable() {
-            @Override
-            public void run() {
-                send(type, payload);
-            }
-        });
+        try {
+            heartbeatExecutor.execute(new Runnable() {
+                @Override
+                public void run() {
+                    send(type, payload);
+                }
+            });
+        } catch (RejectedExecutionException ex) {
+            log("丢弃发送 " + type + ": " + ex.getMessage());
+        }
     }
 
     private void emitStatsForType(String type) {
@@ -995,11 +1044,11 @@ public final class ControlClient {
         });
     }
 
-    private void emitCursorState(boolean visible, int x, int y) {
+    private void emitCursorState(CursorState state) {
         mainHandler.post(new Runnable() {
             @Override
             public void run() {
-                listener.onCursorState(visible, x, y);
+                listener.onCursorState(state);
             }
         });
     }

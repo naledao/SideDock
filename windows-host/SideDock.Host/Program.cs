@@ -36,6 +36,11 @@ internal static class Program
     public static async Task<int> Main(string[] args)
     {
         Console.OutputEncoding = Encoding.UTF8;
+        if (OperatingSystem.IsWindows())
+        {
+            DpiAwareness.TryEnablePerMonitorV2(message => Log("DPI", message));
+        }
+
         var options = HostOptions.Parse(args);
         if (options.ListWindows)
         {
@@ -325,7 +330,15 @@ internal static class Program
                 _writeLock.Release();
             }
 
-            Log($"CONN {_connectionId}", $"发送 {type} seq={message.Seq}");
+            if (!IsHighFrequencyServerMessage(type))
+            {
+                Log($"CONN {_connectionId}", $"发送 {type} seq={message.Seq}");
+            }
+        }
+
+        private static bool IsHighFrequencyServerMessage(string type)
+        {
+            return type is "cursor_state" or "encoder_stats" or "capture_stats";
         }
     }
 
@@ -442,8 +455,11 @@ internal static class Program
         private readonly PeriodicTimer _heartbeatTimer = new(TimeSpan.FromSeconds(2));
         private readonly PeriodicTimer _inputStatsTimer = new(TimeSpan.FromSeconds(1));
         private readonly PeriodicTimer _displayLayoutTimer = new(TimeSpan.FromSeconds(2));
+        private readonly PeriodicTimer _cursorStateTimer = new(TimeSpan.FromMilliseconds(16));
         private readonly Stopwatch _uptime = Stopwatch.StartNew();
         private DisplayMetrics? _lastPublishedMetrics;
+        private CursorState? _lastPublishedCursorState;
+        private long _cursorStateLogCounter;
         private int _missedPongs;
         private DateTimeOffset _lastPong = DateTimeOffset.UtcNow;
 
@@ -488,10 +504,11 @@ internal static class Program
                 var heartbeatTask = HeartbeatAsync(connection, _connectionCts.Token);
                 var inputStatsTask = InputStatsAsync(_connectionCts.Token);
                 var displayLayoutTask = DisplayLayoutAsync(connection, _connectionCts.Token);
+                var cursorStateTask = CursorStateAsync(connection, _connectionCts.Token);
                 var readTask = ReadLoopAsync(reader, connection, _connectionCts.Token);
                 await Task.WhenAny(heartbeatTask, readTask);
                 await _connectionCts.CancelAsync();
-                await Task.WhenAll(heartbeatTask, inputStatsTask, displayLayoutTask, readTask);
+                await Task.WhenAll(heartbeatTask, inputStatsTask, displayLayoutTask, cursorStateTask, readTask);
             }
             catch (OperationCanceledException)
             {
@@ -876,6 +893,14 @@ internal static class Program
             }
         }
 
+        private async Task CursorStateAsync(ControlConnection connection, CancellationToken cancellationToken)
+        {
+            while (await _cursorStateTimer.WaitForNextTickAsync(cancellationToken))
+            {
+                await PublishCursorStateIfChangedAsync(connection, cancellationToken);
+            }
+        }
+
         private async Task HandleDisplayModeChangeAsync(
             ProtocolMessage message,
             ControlConnection connection,
@@ -1064,6 +1089,99 @@ internal static class Program
             }, cancellationToken);
         }
 
+        private async ValueTask PublishCursorStateIfChangedAsync(
+            ControlConnection connection,
+            CancellationToken cancellationToken)
+        {
+            if (_options.InputTarget != InputTargetKind.Idd && _options.VideoSource != VideoSourceKind.Idd && _options.VideoSource != VideoSourceKind.IddGpu)
+            {
+                return;
+            }
+
+            var layout = _displayLayoutProvider.GetLayout(force: false);
+            DpiAwareness.TryEnableCurrentThreadPerMonitorV2();
+            if (layout is null || !DisplayNative.GetCursorPos(out var point))
+            {
+                await SendCursorStateIfChangedAsync(connection, CursorState.Hidden(), cancellationToken);
+                return;
+            }
+
+            var insideDisplay = point.X >= layout.X
+                && point.X < layout.X + layout.Width
+                && point.Y >= layout.Y
+                && point.Y < layout.Y + layout.Height;
+            if (!insideDisplay)
+            {
+                var outsideLogCounter = Interlocked.Increment(ref _cursorStateLogCounter);
+                if (outsideLogCounter <= 5 || outsideLogCounter % 120 == 0)
+                {
+                    Log(
+                        Scope,
+                        "cursor outside display "
+                        + $"desktop=({point.X},{point.Y}) "
+                        + $"display={layout.BoundsString} "
+                        + $"virtual={layout.VirtualBoundsString} "
+                        + $"displayName={layout.DisplayName} "
+                        + $"device={layout.DeviceName} "
+                        + $"dpiScale={layout.DpiScale:F2} "
+                        + $"dpi={layout.DpiX}x{layout.DpiY} "
+                        + $"awareness={layout.ProcessDpiAwareness}");
+                }
+                await SendCursorStateIfChangedAsync(connection, CursorState.Hidden(layout.Width, layout.Height), cancellationToken);
+                return;
+            }
+
+            var displayX = Math.Clamp(point.X - layout.X, 0, Math.Max(0, layout.Width - 1));
+            var displayY = Math.Clamp(point.Y - layout.Y, 0, Math.Max(0, layout.Height - 1));
+            var cursorLogCounter = Interlocked.Increment(ref _cursorStateLogCounter);
+            if (cursorLogCounter <= 5 || cursorLogCounter % 120 == 0)
+            {
+                Log(
+                    Scope,
+                    "cursor state "
+                    + $"desktop=({point.X},{point.Y}) "
+                    + $"display=({displayX},{displayY}) "
+                    + $"n=({(layout.Width <= 1 ? 0.0 : displayX / (double)(layout.Width - 1)):F4},{(layout.Height <= 1 ? 0.0 : displayY / (double)(layout.Height - 1)):F4}) "
+                    + $"bounds={layout.BoundsString} "
+                    + $"virtual={layout.VirtualBoundsString} "
+                    + $"displayName={layout.DisplayName} "
+                    + $"device={layout.DeviceName} "
+                    + $"dpiScale={layout.DpiScale:F2} "
+                    + $"dpi={layout.DpiX}x{layout.DpiY} "
+                    + $"awareness={layout.ProcessDpiAwareness}");
+            }
+            await SendCursorStateIfChangedAsync(
+                connection,
+                CursorState.Shown(displayX, displayY, layout.Width, layout.Height, point.X, point.Y),
+                cancellationToken);
+        }
+
+        private async ValueTask SendCursorStateIfChangedAsync(
+            ControlConnection connection,
+            CursorState state,
+            CancellationToken cancellationToken)
+        {
+            if (_lastPublishedCursorState == state)
+            {
+                return;
+            }
+
+            _lastPublishedCursorState = state;
+            await connection.SendAsync("cursor_state", new JsonObject
+            {
+                ["visible"] = state.Visible,
+                ["x"] = state.X,
+                ["y"] = state.Y,
+                ["displayWidth"] = state.DisplayWidth,
+                ["displayHeight"] = state.DisplayHeight,
+                ["nx"] = state.Nx,
+                ["ny"] = state.Ny,
+                ["desktopX"] = state.DesktopX,
+                ["desktopY"] = state.DesktopY,
+                ["source"] = "host-cursor"
+            }, cancellationToken);
+        }
+
         private string Scope => $"CONN {_connectionId}";
     }
 
@@ -1221,6 +1339,7 @@ internal static class Program
                 return null;
             }
 
+            DpiAwareness.TryEnableCurrentThreadPerMonitorV2();
             var virtualLeft = DisplayNative.GetSystemMetrics(DisplayNative.SM_XVIRTUALSCREEN);
             var virtualTop = DisplayNative.GetSystemMetrics(DisplayNative.SM_YVIRTUALSCREEN);
             var virtualWidth = DisplayNative.GetSystemMetrics(DisplayNative.SM_CXVIRTUALSCREEN);
@@ -1470,6 +1589,69 @@ internal static class Program
         private sealed record DisplayCandidate(DisplayLayout Layout, int Score);
     }
 
+    private static class DpiAwareness
+    {
+        private static readonly IntPtr DpiAwarenessContextPerMonitorAwareV2 = new(-4);
+        private const int ProcessPerMonitorDpiAware = 2;
+
+        public static void TryEnablePerMonitorV2(Action<string> log)
+        {
+            try
+            {
+                if (!SetProcessDpiAwarenessContext(DpiAwarenessContextPerMonitorAwareV2))
+                {
+                    var error = Marshal.GetLastWin32Error();
+                    if (error != 0 && error != 5)
+                    {
+                        log($"SetProcessDpiAwarenessContext failed: {error}.");
+                    }
+                }
+
+                if (!TryEnableCurrentThreadPerMonitorV2())
+                {
+                    log($"SetThreadDpiAwarenessContext failed: {Marshal.GetLastWin32Error()}.");
+                }
+            }
+            catch (EntryPointNotFoundException)
+            {
+                try
+                {
+                    var hr = SetProcessDpiAwareness(ProcessPerMonitorDpiAware);
+                    if (hr != 0 && hr != unchecked((int)0x80070005))
+                    {
+                        log($"SetProcessDpiAwareness failed: 0x{hr:X8}.");
+                    }
+                }
+                catch (EntryPointNotFoundException)
+                {
+                    log("per-monitor DPI awareness APIs are unavailable.");
+                }
+            }
+        }
+
+        public static bool TryEnableCurrentThreadPerMonitorV2()
+        {
+            try
+            {
+                return SetThreadDpiAwarenessContext(DpiAwarenessContextPerMonitorAwareV2) != IntPtr.Zero;
+            }
+            catch (EntryPointNotFoundException)
+            {
+                return false;
+            }
+        }
+
+        [DllImport("user32.dll", ExactSpelling = true, SetLastError = true)]
+        [return: MarshalAs(UnmanagedType.Bool)]
+        private static extern bool SetProcessDpiAwarenessContext(IntPtr value);
+
+        [DllImport("user32.dll", ExactSpelling = true, SetLastError = true)]
+        private static extern IntPtr SetThreadDpiAwarenessContext(IntPtr dpiContext);
+
+        [DllImport("shcore.dll", ExactSpelling = true)]
+        private static extern int SetProcessDpiAwareness(int processDpiAwareness);
+    }
+
     private sealed record DisplayDpi(int DpiX, int DpiY, double Scale);
 
     private sealed record DisplayLayout(
@@ -1550,6 +1732,39 @@ internal static class Program
     }
 
     private sealed record VideoRect(int X, int Y, int Width, int Height);
+
+    private sealed record CursorState(
+        bool Visible,
+        int X,
+        int Y,
+        int DisplayWidth,
+        int DisplayHeight,
+        double Nx,
+        double Ny,
+        int DesktopX,
+        int DesktopY)
+    {
+        public static CursorState Hidden(int displayWidth = 0, int displayHeight = 0)
+        {
+            return new CursorState(false, 0, 0, displayWidth, displayHeight, 0, 0, 0, 0);
+        }
+
+        public static CursorState Shown(int x, int y, int displayWidth, int displayHeight, int desktopX, int desktopY)
+        {
+            var nx = displayWidth <= 1 ? 0.0 : x / (double)(displayWidth - 1);
+            var ny = displayHeight <= 1 ? 0.0 : y / (double)(displayHeight - 1);
+            return new CursorState(
+                true,
+                x,
+                y,
+                displayWidth,
+                displayHeight,
+                Math.Clamp(nx, 0.0, 1.0),
+                Math.Clamp(ny, 0.0, 1.0),
+                desktopX,
+                desktopY);
+        }
+    }
 
     private sealed record DisplayMetrics(
         string Source,
@@ -8023,6 +8238,10 @@ internal static class Program
         [DllImport("user32.dll", ExactSpelling = true)]
         public static extern int GetSystemMetrics(int index);
 
+        [DllImport("user32.dll", ExactSpelling = true)]
+        [return: MarshalAs(UnmanagedType.Bool)]
+        public static extern bool GetCursorPos(out Point point);
+
         [DllImport("user32.dll", ExactSpelling = true, CharSet = CharSet.Unicode)]
         [return: MarshalAs(UnmanagedType.Bool)]
         public static extern bool EnumDisplayDevicesW(
@@ -8076,6 +8295,13 @@ internal static class Program
             public int Top;
             public int Right;
             public int Bottom;
+        }
+
+        [StructLayout(LayoutKind.Sequential)]
+        public struct Point
+        {
+            public int X;
+            public int Y;
         }
 
         [StructLayout(LayoutKind.Sequential, CharSet = CharSet.Unicode)]
