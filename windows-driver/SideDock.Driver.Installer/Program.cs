@@ -3,11 +3,14 @@ using System.IO.Compression;
 using System.Reflection;
 using System.Security.Cryptography.X509Certificates;
 using System.Security.Principal;
+using System.Text.RegularExpressions;
 const string AppName = "SideDock Driver Installer";
 const string DeviceToolExe = "SideDock.Idd.DeviceTool.exe";
 const string DriverInf = "SideDock.Idd.inf";
 const string DriverCertificate = "SideDock.Idd.cer";
-const string DriverHardwareId = @"SWD\SIDEDOCKIDD\SIDEDOCKIDD";
+const string DriverCatalog = "SideDock.Idd.cat";
+const string DriverBinary = "SideDock.Idd.dll";
+const string DriverHardwareId = @"SWD\SideDockIdd\SideDockIdd";
 var options = InstallerOptions.Parse(args);
 
 try
@@ -51,8 +54,10 @@ try
     Console.WriteLine();
 
     TrustDriverCertificate(certificatePath);
-    InstallDriver(infPath);
+    StopExistingDeviceToolProcesses();
     RemoveExistingSoftwareDevice();
+    RemoveExistingDriverPackages();
+    InstallDriver(infPath);
     StartDeviceTool(deviceToolPath, options.HideDeviceTool);
 
     Console.WriteLine();
@@ -146,6 +151,37 @@ static string FailFile(string name)
     throw new FileNotFoundException($"Required file was not found in payload: {name}");
 }
 
+static void StopExistingDeviceToolProcesses()
+{
+    var processName = Path.GetFileNameWithoutExtension(DeviceToolExe);
+    var processes = Process.GetProcessesByName(processName);
+    if (processes.Length == 0)
+    {
+        return;
+    }
+
+    Console.WriteLine("Stopping existing SideDock device tool processes.");
+    foreach (var process in processes)
+    {
+        try
+        {
+            if (!process.HasExited)
+            {
+                process.Kill(entireProcessTree: true);
+                process.WaitForExit(3000);
+            }
+        }
+        catch (Exception ex)
+        {
+            Console.WriteLine($"Unable to stop {processName} (pid {process.Id}): {ex.Message}");
+        }
+        finally
+        {
+            process.Dispose();
+        }
+    }
+}
+
 static string ResolveSignedDriverInf(string driverPackageDir)
 {
     var candidates = Directory.GetFiles(driverPackageDir, DriverInf, SearchOption.AllDirectories)
@@ -227,6 +263,272 @@ static void RemoveExistingSoftwareDevice()
     Run("pnputil.exe", $"/remove-device {QuoteProcessArgument(DriverHardwareId)}", allowFailure: true);
 }
 
+static void RemoveExistingDriverPackages()
+{
+    Console.WriteLine("Scanning installed Display-class drivers for SideDock packages.");
+    var packages = EnumerateInstalledDriverPackages();
+    var sideDockPackages = packages
+        .Where(IsSideDockDriverPackage)
+        .OrderByDescending(package => package.PublishedName, StringComparer.OrdinalIgnoreCase)
+        .ToList();
+
+    if (sideDockPackages.Count == 0)
+    {
+        Console.WriteLine("No installed SideDock driver packages were found.");
+        return;
+    }
+
+    foreach (var package in sideDockPackages)
+    {
+        Console.WriteLine($"Deleting old driver package {package.PublishedName}.");
+        if (!string.IsNullOrWhiteSpace(package.OriginalName))
+        {
+            Console.WriteLine($"  Original Name: {package.OriginalName}");
+        }
+        if (!string.IsNullOrWhiteSpace(package.ProviderName))
+        {
+            Console.WriteLine($"  Provider Name: {package.ProviderName}");
+        }
+        if (!string.IsNullOrWhiteSpace(package.CatalogFile))
+        {
+            Console.WriteLine($"  Catalog File: {package.CatalogFile}");
+        }
+
+        RunChecked("pnputil.exe", $"/delete-driver {QuoteProcessArgument(package.PublishedName)} /uninstall /force");
+    }
+}
+
+static IReadOnlyList<DriverPackageInfo> EnumerateInstalledDriverPackages()
+{
+    var result = RunChecked("pnputil.exe", "/enum-drivers /class Display /files");
+    return ParseDriverPackages(result.Stdout);
+}
+
+static IReadOnlyList<DriverPackageInfo> ParseDriverPackages(string output)
+{
+    var packages = new List<DriverPackageInfo>();
+    DriverPackageBuilder? builder = null;
+    var inDriverFiles = false;
+
+    foreach (var rawLine in SplitLines(output))
+    {
+        var line = rawLine.TrimEnd();
+        if (string.IsNullOrWhiteSpace(line))
+        {
+            CommitCurrentPackage();
+            inDriverFiles = false;
+            continue;
+        }
+
+        if (line.StartsWith("Published Name:", StringComparison.OrdinalIgnoreCase))
+        {
+            CommitCurrentPackage();
+            builder = new DriverPackageBuilder
+            {
+                PublishedName = ValueAfterColon(line)
+            };
+            inDriverFiles = false;
+            continue;
+        }
+
+        if (builder is null)
+        {
+            continue;
+        }
+
+        if (TryReadField(line, "Original Name:", out var value))
+        {
+            builder.OriginalName = value;
+        }
+        else if (TryReadField(line, "Provider Name:", out value))
+        {
+            builder.ProviderName = value;
+        }
+        else if (TryReadField(line, "Class Name:", out value))
+        {
+            builder.ClassName = value;
+        }
+        else if (TryReadField(line, "Class GUID:", out value))
+        {
+            builder.ClassGuid = value;
+        }
+        else if (TryReadField(line, "Catalog File:", out value))
+        {
+            builder.CatalogFile = value;
+        }
+        else if (line.StartsWith("Driver Files:", StringComparison.OrdinalIgnoreCase))
+        {
+            inDriverFiles = true;
+        }
+        else if (inDriverFiles)
+        {
+            var file = line.Trim();
+            if (!string.IsNullOrWhiteSpace(file))
+            {
+                builder.DriverFiles.Add(file);
+            }
+        }
+    }
+
+    CommitCurrentPackage();
+    AddFallbackPackagesFromRawBlocks(output, packages);
+    return packages;
+
+    void CommitCurrentPackage()
+    {
+        if (builder is null || string.IsNullOrWhiteSpace(builder.PublishedName))
+        {
+            return;
+        }
+
+        packages.Add(builder.Build());
+        builder = null;
+    }
+}
+
+static void AddFallbackPackagesFromRawBlocks(string output, List<DriverPackageInfo> packages)
+{
+    var knownPackages = new HashSet<string>(
+        packages.Select(package => package.PublishedName),
+        StringComparer.OrdinalIgnoreCase);
+
+    foreach (var block in SplitDriverPackageBlocks(output))
+    {
+        var originalName = ContainsExactSideDockFile(block, DriverInf) ? DriverInf : null;
+        var catalogFile = ContainsExactSideDockFile(block, DriverCatalog) ? DriverCatalog : null;
+        var driverFiles = ContainsExactSideDockFile(block, DriverBinary)
+            ? new[] { DriverBinary }
+            : Array.Empty<string>();
+
+        if (originalName is null && catalogFile is null && driverFiles.Length == 0)
+        {
+            continue;
+        }
+
+        var classGuid = block.Contains(DriverPackageInfo.DisplayClassGuid, StringComparison.OrdinalIgnoreCase)
+            ? DriverPackageInfo.DisplayClassGuid
+            : null;
+        var className = block.Contains(DriverPackageInfo.DisplayClassName, StringComparison.OrdinalIgnoreCase)
+            ? DriverPackageInfo.DisplayClassName
+            : null;
+        if (classGuid is null && className is null)
+        {
+            continue;
+        }
+
+        var publishedNameMatch = Regex.Match(block, @"\boem\d+\.inf\b", RegexOptions.IgnoreCase);
+        if (!publishedNameMatch.Success)
+        {
+            continue;
+        }
+
+        var publishedName = publishedNameMatch.Value;
+        if (!knownPackages.Add(publishedName))
+        {
+            continue;
+        }
+
+        packages.Add(new DriverPackageInfo(
+            publishedName,
+            originalName,
+            ProviderName: block.Contains("SideDock", StringComparison.OrdinalIgnoreCase) ? "SideDock" : null,
+            className,
+            classGuid,
+            catalogFile,
+            driverFiles));
+    }
+}
+
+static IEnumerable<string> SplitDriverPackageBlocks(string output)
+{
+    var blockLines = new List<string>();
+    foreach (var rawLine in SplitLines(output))
+    {
+        if (string.IsNullOrWhiteSpace(rawLine))
+        {
+            if (blockLines.Count > 0)
+            {
+                yield return string.Join(Environment.NewLine, blockLines);
+                blockLines.Clear();
+            }
+
+            continue;
+        }
+
+        blockLines.Add(rawLine);
+    }
+
+    if (blockLines.Count > 0)
+    {
+        yield return string.Join(Environment.NewLine, blockLines);
+    }
+}
+
+static bool TryReadField(string line, string fieldName, out string value)
+{
+    if (!line.StartsWith(fieldName, StringComparison.OrdinalIgnoreCase))
+    {
+        value = string.Empty;
+        return false;
+    }
+
+    value = ValueAfterColon(line);
+    return true;
+}
+
+static string ValueAfterColon(string line)
+{
+    var separatorIndex = line.IndexOf(':');
+    if (separatorIndex < 0 || separatorIndex == line.Length - 1)
+    {
+        return string.Empty;
+    }
+
+    return line[(separatorIndex + 1)..].Trim();
+}
+
+static IEnumerable<string> SplitLines(string value)
+{
+    return value.Replace("\r\n", "\n").Split('\n');
+}
+
+static bool IsSideDockDriverPackage(DriverPackageInfo package)
+{
+    if (!package.IsDisplayClass)
+    {
+        return false;
+    }
+
+    return IsExactSideDockValue(package.ProviderName, "SideDock")
+        || IsExactSideDockFile(package.OriginalName, DriverInf)
+        || IsExactSideDockFile(package.CatalogFile, DriverCatalog)
+        || package.DriverFiles.Any(file => IsExactSideDockFile(file, DriverBinary));
+}
+
+static bool IsExactSideDockValue(string? value, string expected)
+{
+    return string.Equals(value?.Trim(), expected, StringComparison.OrdinalIgnoreCase);
+}
+
+static bool IsExactSideDockFile(string? value, string expectedFileName)
+{
+    if (string.IsNullOrWhiteSpace(value))
+    {
+        return false;
+    }
+
+    var normalized = value.Trim().Replace('/', Path.DirectorySeparatorChar);
+    return string.Equals(Path.GetFileName(normalized), expectedFileName, StringComparison.OrdinalIgnoreCase);
+}
+
+static bool ContainsExactSideDockFile(string value, string expectedFileName)
+{
+    return Regex.IsMatch(
+        value,
+        $@"(?<![\w.-]){Regex.Escape(expectedFileName)}(?![\w.-])",
+        RegexOptions.IgnoreCase);
+}
+
 static void StartDeviceTool(string deviceToolPath, bool hideWindow)
 {
     Console.WriteLine("Starting SideDock software device tool.");
@@ -244,13 +546,15 @@ static string QuoteProcessArgument(string value)
     return "\"" + value.Replace("\"", "\\\"") + "\"";
 }
 
-static void RunChecked(string fileName, string arguments)
+static ProcessResult RunChecked(string fileName, string arguments)
 {
     var result = Run(fileName, arguments, allowFailure: false);
     if (result.ExitCode != 0)
     {
         throw new InvalidOperationException($"{fileName} failed with exit code {result.ExitCode}.\n{result.Stdout}\n{result.Stderr}");
     }
+
+    return result;
 }
 
 static ProcessResult Run(string fileName, string arguments, bool allowFailure)
@@ -310,3 +614,49 @@ internal readonly record struct InstallerOptions(bool NoPause, bool HideDeviceTo
 }
 
 internal readonly record struct ProcessResult(int ExitCode, string Stdout, string Stderr);
+
+internal sealed class DriverPackageBuilder
+{
+    public string PublishedName { get; set; } = string.Empty;
+
+    public string? OriginalName { get; set; }
+
+    public string? ProviderName { get; set; }
+
+    public string? ClassName { get; set; }
+
+    public string? ClassGuid { get; set; }
+
+    public string? CatalogFile { get; set; }
+
+    public List<string> DriverFiles { get; } = new();
+
+    public DriverPackageInfo Build()
+    {
+        return new DriverPackageInfo(
+            PublishedName,
+            OriginalName,
+            ProviderName,
+            ClassName,
+            ClassGuid,
+            CatalogFile,
+            DriverFiles.ToArray());
+    }
+}
+
+internal sealed record DriverPackageInfo(
+    string PublishedName,
+    string? OriginalName,
+    string? ProviderName,
+    string? ClassName,
+    string? ClassGuid,
+    string? CatalogFile,
+    IReadOnlyList<string> DriverFiles)
+{
+    public const string DisplayClassName = "Display";
+    public const string DisplayClassGuid = "{4D36E968-E325-11CE-BFC1-08002BE10318}";
+
+    public bool IsDisplayClass =>
+        string.Equals(ClassName, DisplayClassName, StringComparison.OrdinalIgnoreCase)
+        || string.Equals(ClassGuid, DisplayClassGuid, StringComparison.OrdinalIgnoreCase);
+}

@@ -94,11 +94,16 @@ windows-driver\SideDock.Idd\x64\Debug\SideDock.Idd\
 
 ## Install
 
-For the desktop app flow, click `安装/修复驱动`; the app starts the elevated installer, imports the bundled self-signed certificate into the local machine trust stores, installs the driver package, and starts `SideDock.Idd.DeviceTool.exe`.
+For the desktop app flow, click `安装/修复驱动`; the app starts the elevated installer, imports the bundled self-signed certificate into the local machine trust stores, stops any stale `SideDock.Idd.DeviceTool.exe`, removes the old software device, deletes installed SideDock Display driver packages, installs the bundled driver package, and starts `SideDock.Idd.DeviceTool.exe`.
 
-For manual development installs, run an elevated PowerShell session, trust the generated `SideDock.Idd.cer` certificate, then add the signed driver package from the package directory:
+For manual development installs, run an elevated PowerShell session, import the generated certificate, remove the old software device, delete any matching SideDock `oemXX.inf` packages, and then add the signed package:
 
 ```powershell
+Import-Certificate -FilePath .\windows-driver\SideDock.Idd\x64\Debug\SideDock.Idd\SideDock.Idd.cer -CertStoreLocation Cert:\LocalMachine\Root
+Import-Certificate -FilePath .\windows-driver\SideDock.Idd\x64\Debug\SideDock.Idd\SideDock.Idd.cer -CertStoreLocation Cert:\LocalMachine\TrustedPublisher
+pnputil /remove-device SWD\SideDockIdd\SideDockIdd
+pnputil /enum-drivers /class Display /files
+pnputil /delete-driver oemXX.inf /uninstall /force
 pnputil /add-driver .\windows-driver\SideDock.Idd\x64\Debug\SideDock.Idd\SideDock.Idd.inf /install
 ```
 
@@ -139,7 +144,7 @@ pnputil /delete-driver oemXX.inf /uninstall /force
 If the software device entry remains listed after package removal, run:
 
 ```powershell
-pnputil /remove-device SWD\SIDEDOCKIDD\SIDEDOCKIDD
+pnputil /remove-device SWD\SideDockIdd\SideDockIdd
 ```
 
 ## Logs
