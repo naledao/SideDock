@@ -210,8 +210,8 @@ public sealed partial class MainWindow : Window
             "HostApp",
             GetBuildKey());
 
-        var hostPath = Path.Combine(_payloadRoot, HostExe);
-        if (File.Exists(hostPath))
+        var hostPath = FindExtractedExecutable(_payloadRoot, HostExe);
+        if (!string.IsNullOrWhiteSpace(hostPath))
         {
             return hostPath;
         }
@@ -226,11 +226,10 @@ public sealed partial class MainWindow : Window
             resource.CopyTo(output);
         }
 
-        ZipFile.ExtractToDirectory(zipPath, _payloadRoot);
+        ZipFile.ExtractToDirectory(zipPath, _payloadRoot, overwriteFiles: true);
         File.Delete(zipPath);
 
-        return Directory.GetFiles(_payloadRoot, HostExe, SearchOption.AllDirectories).FirstOrDefault()
-            ?? string.Empty;
+        return FindExtractedExecutable(_payloadRoot, HostExe);
     }
 
     private IEnumerable<string> EnumerateHostCandidates()
@@ -489,8 +488,8 @@ public sealed partial class MainWindow : Window
             "DriverInstaller",
             GetBuildKey());
 
-        var driverInstallerPath = Path.Combine(root, DriverInstallerExe);
-        if (File.Exists(driverInstallerPath))
+        var driverInstallerPath = FindExtractedExecutable(root, DriverInstallerExe);
+        if (!string.IsNullOrWhiteSpace(driverInstallerPath))
         {
             return driverInstallerPath;
         }
@@ -505,10 +504,26 @@ public sealed partial class MainWindow : Window
             resource.CopyTo(output);
         }
 
-        ZipFile.ExtractToDirectory(zipPath, root);
+        ZipFile.ExtractToDirectory(zipPath, root, overwriteFiles: true);
         File.Delete(zipPath);
 
-        return Directory.GetFiles(root, DriverInstallerExe, SearchOption.AllDirectories).FirstOrDefault()
+        return FindExtractedExecutable(root, DriverInstallerExe);
+    }
+
+    private static string FindExtractedExecutable(string root, string executableName)
+    {
+        if (!Directory.Exists(root))
+        {
+            return string.Empty;
+        }
+
+        var directPath = Path.Combine(root, executableName);
+        if (File.Exists(directPath))
+        {
+            return directPath;
+        }
+
+        return Directory.GetFiles(root, executableName, SearchOption.AllDirectories).FirstOrDefault()
             ?? string.Empty;
     }
 
