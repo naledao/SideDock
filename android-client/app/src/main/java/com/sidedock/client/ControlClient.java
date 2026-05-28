@@ -497,6 +497,7 @@ public final class ControlClient {
         long keyboardEvents,
         long pointerAbsEvents,
         long mouseMoveEvents,
+        long localPointerUpdates,
         long mouseButtonEvents,
         long mouseWheelEvents,
         String lastInputType
@@ -505,6 +506,7 @@ public final class ControlClient {
             "keyboardEvents", keyboardEvents,
             "pointerAbsEvents", pointerAbsEvents,
             "mouseMoveEvents", mouseMoveEvents,
+            "localPointerUpdates", localPointerUpdates,
             "mouseButtonEvents", mouseButtonEvents,
             "mouseWheelEvents", mouseWheelEvents,
             "inputErrors", 0,

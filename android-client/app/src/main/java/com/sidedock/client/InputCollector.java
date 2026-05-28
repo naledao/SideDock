@@ -9,6 +9,8 @@ import android.view.View;
 public final class InputCollector {
     public interface Listener {
         void onKeyboardInput(String action, int androidKeyCode, int scanCode, int metaState, int repeatCount);
+        void onLocalPointerPreview(float viewX, float viewY);
+        void onLocalPointerExit();
         void onPointerAbsInput(float nx, float ny, int buttons, float viewX, float viewY);
         void onMouseMoveInput(int dx, int dy);
         void onMouseButtonInput(String button, String action);
@@ -20,6 +22,7 @@ public final class InputCollector {
         public final long keyboardEvents;
         public final long pointerAbsEvents;
         public final long mouseMoveEvents;
+        public final long localPointerUpdates;
         public final long mouseButtonEvents;
         public final long mouseWheelEvents;
         public final String lastInputType;
@@ -28,6 +31,7 @@ public final class InputCollector {
             long keyboardEvents,
             long pointerAbsEvents,
             long mouseMoveEvents,
+            long localPointerUpdates,
             long mouseButtonEvents,
             long mouseWheelEvents,
             String lastInputType
@@ -35,6 +39,7 @@ public final class InputCollector {
             this.keyboardEvents = keyboardEvents;
             this.pointerAbsEvents = pointerAbsEvents;
             this.mouseMoveEvents = mouseMoveEvents;
+            this.localPointerUpdates = localPointerUpdates;
             this.mouseButtonEvents = mouseButtonEvents;
             this.mouseWheelEvents = mouseWheelEvents;
             this.lastInputType = lastInputType;
@@ -63,6 +68,7 @@ public final class InputCollector {
     private long keyboardEvents;
     private long pointerAbsEvents;
     private long mouseMoveEvents;
+    private long localPointerUpdates;
     private long mouseButtonEvents;
     private long mouseWheelEvents;
     private long lastStatsAtMs;
@@ -160,6 +166,7 @@ public final class InputCollector {
             handled = true;
         } else if (action == MotionEvent.ACTION_HOVER_EXIT) {
             hasLastMousePosition = false;
+            listener.onLocalPointerExit();
             handled = true;
         }
 
@@ -204,10 +211,25 @@ public final class InputCollector {
             keyboardEvents,
             pointerAbsEvents,
             mouseMoveEvents,
+            localPointerUpdates,
             mouseButtonEvents,
             mouseWheelEvents,
             lastInputType
         );
+    }
+
+    public boolean hasPendingPointerAbs() {
+        return hasPendingPointerAbs;
+    }
+
+    public long millisUntilNextPointerAbsFlush() {
+        if (!hasPendingPointerAbs) {
+            return 0L;
+        }
+
+        long elapsedMs = SystemClock.uptimeMillis() - lastPointerAbsSentAtMs;
+        long remainingMs = POINTER_ABS_MIN_INTERVAL_MS - elapsedMs;
+        return Math.max(0L, remainingMs);
     }
 
     private boolean handleMouseMove(MotionEvent event) {
@@ -222,13 +244,13 @@ public final class InputCollector {
         int dx = Math.round(x - lastMouseX);
         int dy = Math.round(y - lastMouseY);
         rememberMousePosition(event);
+        emitPointerAbsIfNeeded(event, false);
         if (dx == 0 && dy == 0) {
             return true;
         }
 
         mouseMoveEvents += 1;
         lastInputType = "mouse_move";
-        emitPointerAbsIfNeeded(event, false);
         listener.onMouseMoveInput(dx, dy);
         return true;
     }
@@ -307,6 +329,9 @@ public final class InputCollector {
         float ny = clamp((clampedY - videoRectTop) / (float) videoRectHeight, 0f, 1f);
         long now = SystemClock.uptimeMillis();
 
+        localPointerUpdates += 1;
+        listener.onLocalPointerPreview(clampedX, clampedY);
+
         if (!force && now - lastPointerAbsSentAtMs < POINTER_ABS_MIN_INTERVAL_MS) {
             pendingPointerNx = nx;
             pendingPointerNy = ny;
@@ -317,17 +342,18 @@ public final class InputCollector {
             return;
         }
 
+        hasPendingPointerAbs = false;
         sendPointerAbs(nx, ny, toButtonMask(event.getButtonState()), clampedX, clampedY, now);
     }
 
-    public void flushPendingPointerAbs() {
+    public boolean flushPendingPointerAbs() {
         if (!hasPendingPointerAbs) {
-            return;
+            return false;
         }
 
         long now = SystemClock.uptimeMillis();
         if (now - lastPointerAbsSentAtMs < POINTER_ABS_MIN_INTERVAL_MS) {
-            return;
+            return false;
         }
 
         hasPendingPointerAbs = false;
@@ -339,6 +365,7 @@ public final class InputCollector {
             pendingPointerViewY,
             now
         );
+        return true;
     }
 
     private void sendPointerAbs(float nx, float ny, int buttons, float viewX, float viewY, long nowMs) {

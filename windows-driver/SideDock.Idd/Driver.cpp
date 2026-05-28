@@ -897,9 +897,14 @@ void SharedGpuFrameRing::InitializeMetadata(Direct3DDevice& device, const D3D11_
     m_metadata->Flags = 0;
 }
 
-SwapChainProcessor::SwapChainProcessor(IDDCX_SWAPCHAIN swapChain, std::shared_ptr<Direct3DDevice> device, HANDLE newFrameEvent) :
+SwapChainProcessor::SwapChainProcessor(
+    IDDCX_SWAPCHAIN swapChain,
+    std::shared_ptr<Direct3DDevice> device,
+    HANDLE newFrameEvent,
+    MonitorContext* monitorContext) :
     m_swapChain(swapChain),
     m_device(std::move(device)),
+    m_monitorContext(monitorContext),
     m_availableBufferEvent(newFrameEvent)
 {
     m_terminateEvent.Attach(CreateEvent(nullptr, FALSE, FALSE, nullptr));
@@ -984,14 +989,16 @@ void SwapChainProcessor::RunCore()
 
         if (hr == E_PENDING)
         {
-            HANDLE waitHandles[] =
+            HANDLE waitHandles[3] =
             {
                 m_availableBufferEvent,
-                m_terminateEvent.Get()
+                m_terminateEvent.Get(),
+                m_monitorContext == nullptr ? nullptr : m_monitorContext->GetHardwareCursorEvent()
             };
+            DWORD waitHandleCount = waitHandles[2] == nullptr ? 2 : 3;
 
-            DWORD waitResult = WaitForMultipleObjects(ARRAYSIZE(waitHandles), waitHandles, FALSE, 16);
-            if (waitResult == WAIT_OBJECT_0 || waitResult == WAIT_TIMEOUT)
+            DWORD waitResult = WaitForMultipleObjects(waitHandleCount, waitHandles, FALSE, 16);
+            if (waitResult == WAIT_OBJECT_0)
             {
                 continue;
             }
@@ -999,6 +1006,20 @@ void SwapChainProcessor::RunCore()
             if (waitResult == WAIT_OBJECT_0 + 1)
             {
                 break;
+            }
+
+            if (waitHandleCount == 3 && waitResult == WAIT_OBJECT_0 + 2)
+            {
+                if (m_monitorContext != nullptr)
+                {
+                    m_monitorContext->HandleHardwareCursorUpdate();
+                }
+                continue;
+            }
+
+            if (waitResult == WAIT_TIMEOUT)
+            {
+                continue;
             }
 
             TraceEvents(TRACE_LEVEL_ERROR, TRACE_SWAPCHAIN, "%!FUNC! WaitForMultipleObjects failed: 0x%08x", waitResult);
@@ -1017,6 +1038,11 @@ void SwapChainProcessor::RunCore()
         acquiredBuffer.Attach(buffer.MetaData.pSurface);
         ProcessFrame(buffer.MetaData);
         acquiredBuffer.Reset();
+
+        if (m_monitorContext != nullptr)
+        {
+            m_monitorContext->HandleHardwareCursorUpdate();
+        }
 
         hr = IddCxSwapChainFinishedProcessingFrame(m_swapChain);
         if (FAILED(hr))
@@ -1285,6 +1311,7 @@ void DeviceContext::ReportVirtualMonitor()
 
     auto* wrapper = WdfObjectGet_MonitorContextWrapper(monitorCreateOut.MonitorObject);
     wrapper->Context = new MonitorContext(monitorCreateOut.MonitorObject);
+    m_monitorContext = wrapper->Context;
 
     IDARG_OUT_MONITORARRIVAL arrivalOut = {};
     status = IddCxMonitorArrival(monitorCreateOut.MonitorObject, &arrivalOut);
@@ -1297,6 +1324,26 @@ void DeviceContext::ReportVirtualMonitor()
     m_monitorReported = true;
 }
 
+void DeviceContext::HandleCommitModes(const IDARG_IN_COMMITMODES* inArgs)
+{
+    if (inArgs == nullptr || m_monitorContext == nullptr)
+    {
+        return;
+    }
+
+    for (UINT index = 0; index < inArgs->PathCount; ++index)
+    {
+        const IDDCX_PATH& path = inArgs->pPaths[index];
+        if (path.MonitorObject != nullptr &&
+            path.MonitorObject == m_monitorContext->GetMonitorObject() &&
+            (path.Flags & IDDCX_PATH_FLAGS_ACTIVE) == IDDCX_PATH_FLAGS_ACTIVE)
+        {
+            m_monitorContext->EnableHardwareCursor();
+            return;
+        }
+    }
+}
+
 MonitorContext::MonitorContext(IDDCX_MONITOR monitor) :
     m_monitor(monitor)
 {
@@ -1305,6 +1352,102 @@ MonitorContext::MonitorContext(IDDCX_MONITOR monitor) :
 MonitorContext::~MonitorContext()
 {
     m_processor.reset();
+    if (m_hardwareCursorEvent)
+    {
+        CloseHandle(m_hardwareCursorEvent);
+        m_hardwareCursorEvent = nullptr;
+    }
+}
+
+bool MonitorContext::EnableHardwareCursor()
+{
+    if (m_hardwareCursorEnabled)
+    {
+        return true;
+    }
+
+    if (!m_hardwareCursorEvent)
+    {
+        m_hardwareCursorEvent = CreateEvent(nullptr, FALSE, FALSE, nullptr);
+        if (!m_hardwareCursorEvent)
+        {
+            TraceEvents(TRACE_LEVEL_ERROR, TRACE_MONITOR, "%!FUNC! CreateEvent cursor failed: %lu", GetLastError());
+            return false;
+        }
+    }
+
+    IDARG_IN_SETUP_HWCURSOR setup = {};
+    setup.CursorInfo.Size = sizeof(setup.CursorInfo);
+    setup.CursorInfo.ColorXorCursorSupport = IDDCX_XOR_CURSOR_SUPPORT_EMULATION;
+    setup.CursorInfo.AlphaCursorSupport = TRUE;
+    setup.CursorInfo.MaxX = MaxHardwareCursorWidth;
+    setup.CursorInfo.MaxY = MaxHardwareCursorHeight;
+    setup.hNewCursorDataAvailable = m_hardwareCursorEvent;
+
+    NTSTATUS status = IddCxMonitorSetupHardwareCursor(m_monitor, &setup);
+    if (!NT_SUCCESS(status))
+    {
+        TraceEvents(TRACE_LEVEL_WARNING, TRACE_MONITOR, "%!FUNC! IddCxMonitorSetupHardwareCursor failed: 0x%08x", status);
+        return false;
+    }
+
+    m_hardwareCursorEnabled = true;
+    TraceEvents(TRACE_LEVEL_INFORMATION, TRACE_MONITOR, "%!FUNC! hardware cursor enabled");
+    HandleHardwareCursorUpdate();
+    return true;
+}
+
+IDDCX_MONITOR MonitorContext::GetMonitorObject() const
+{
+    return m_monitor;
+}
+
+HANDLE MonitorContext::GetHardwareCursorEvent() const
+{
+    return m_hardwareCursorEnabled ? m_hardwareCursorEvent : nullptr;
+}
+
+bool MonitorContext::HandleHardwareCursorUpdate()
+{
+    if (!m_hardwareCursorEnabled)
+    {
+        return false;
+    }
+
+    IDARG_IN_QUERY_HWCURSOR query = {};
+    query.LastShapeId = m_lastCursorShapeId;
+    query.ShapeBufferSizeInBytes = static_cast<UINT>(m_cursorShapeBuffer.size());
+    query.pShapeBuffer = m_cursorShapeBuffer.data();
+
+    IDARG_OUT_QUERY_HWCURSOR result = {};
+    NTSTATUS status = IddCxMonitorQueryHardwareCursor(m_monitor, &query, &result);
+    if (!NT_SUCCESS(status))
+    {
+        TraceEvents(TRACE_LEVEL_WARNING, TRACE_MONITOR, "%!FUNC! IddCxMonitorQueryHardwareCursor failed: 0x%08x", status);
+        return false;
+    }
+
+    m_lastCursorVisible = result.IsCursorVisible;
+    m_lastCursorX = result.X;
+    m_lastCursorY = result.Y;
+    if (result.IsCursorShapeUpdated)
+    {
+        m_lastCursorShapeInfo = result.CursorShapeInfo;
+        m_lastCursorShapeId = result.CursorShapeInfo.ShapeId;
+    }
+
+    TraceEvents(
+        TRACE_LEVEL_VERBOSE,
+        TRACE_MONITOR,
+        "%!FUNC! cursor visible=%u x=%d y=%d updated=%u shape=%u size=%ux%u",
+        m_lastCursorVisible,
+        m_lastCursorX,
+        m_lastCursorY,
+        result.IsCursorShapeUpdated,
+        m_lastCursorShapeId,
+        m_lastCursorShapeInfo.Width,
+        m_lastCursorShapeInfo.Height);
+    return true;
 }
 
 void MonitorContext::AssignSwapChain(IDDCX_SWAPCHAIN swapChain, LUID renderAdapter, HANDLE newFrameEvent)
@@ -1318,7 +1461,8 @@ void MonitorContext::AssignSwapChain(IDDCX_SWAPCHAIN swapChain, LUID renderAdapt
         return;
     }
 
-    m_processor = std::make_unique<SwapChainProcessor>(swapChain, device, newFrameEvent);
+    EnableHardwareCursor();
+    m_processor = std::make_unique<SwapChainProcessor>(swapChain, device, newFrameEvent, this);
 }
 
 void MonitorContext::UnassignSwapChain()
@@ -1345,8 +1489,11 @@ NTSTATUS SideDockAdapterInitFinished(IDDCX_ADAPTER adapterObject, const IDARG_IN
 _Use_decl_annotations_
 NTSTATUS SideDockAdapterCommitModes(IDDCX_ADAPTER adapterObject, const IDARG_IN_COMMITMODES* inArgs)
 {
-    UNREFERENCED_PARAMETER(adapterObject);
-    UNREFERENCED_PARAMETER(inArgs);
+    auto* wrapper = WdfObjectGet_DeviceContextWrapper(adapterObject);
+    if (wrapper != nullptr && wrapper->Context != nullptr)
+    {
+        wrapper->Context->HandleCommitModes(inArgs);
+    }
     TraceEvents(TRACE_LEVEL_INFORMATION, TRACE_ADAPTER, "%!FUNC! AdapterCommitModes");
     return STATUS_SUCCESS;
 }

@@ -1,11 +1,16 @@
 package com.sidedock.client;
 
 import android.app.Activity;
+import android.app.KeyguardManager;
+import android.content.Context;
 import android.content.res.Configuration;
 import android.graphics.drawable.GradientDrawable;
 import android.media.MediaCodecInfo;
 import android.media.MediaCodecList;
+import android.os.Build;
+import android.os.Handler;
 import android.os.Bundle;
+import android.os.Looper;
 import android.util.Log;
 import android.view.Gravity;
 import android.view.InputDevice;
@@ -52,6 +57,13 @@ public final class MainActivity extends Activity implements ControlClient.Listen
     private ControlClient controlClient;
     private VideoClient videoClient;
     private InputCollector inputCollector;
+    private final Handler mainHandler = new Handler(Looper.getMainLooper());
+    private final Runnable pointerAbsFlushRunnable = new Runnable() {
+        @Override
+        public void run() {
+            flushPendingPointerAbs();
+        }
+    };
     private FrameLayout rootView;
     private SurfaceView surfaceView;
     private CursorOverlayView cursorOverlayView;
@@ -91,6 +103,8 @@ public final class MainActivity extends Activity implements ControlClient.Listen
     private ControlClient.DisplayMetrics lastDisplayMetrics;
     private ControlClient.DisplayModeChanged lastDisplayModeChanged;
     private String cursorKind = "arrow";
+    private boolean cursorShapeVisible = true;
+    private boolean localPointerPreviewActive;
     private int videoRectLeft;
     private int videoRectTop;
     private int videoRectWidth = DEFAULT_VIDEO_WIDTH;
@@ -99,6 +113,8 @@ public final class MainActivity extends Activity implements ControlClient.Listen
     private int contentRectTop;
     private int contentRectWidth = DEFAULT_VIDEO_WIDTH;
     private int contentRectHeight = DEFAULT_VIDEO_HEIGHT;
+    private int surfaceFixedWidth = -1;
+    private int surfaceFixedHeight = -1;
     private int overlayMode = OVERLAY_MODE_DETAILED;
     private int selectedModeWidth = DEFAULT_VIDEO_WIDTH;
     private int selectedModeHeight = DEFAULT_VIDEO_HEIGHT;
@@ -112,7 +128,7 @@ public final class MainActivity extends Activity implements ControlClient.Listen
     protected void onCreate(Bundle savedInstanceState) {
         super.onCreate(savedInstanceState);
         requestWindowFeature(Window.FEATURE_NO_TITLE);
-        getWindow().addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON);
+        keepWindowReadyForVideoSurface();
 
         controlClient = new ControlClient(this);
         videoClient = new VideoClient(this);
@@ -121,6 +137,24 @@ public final class MainActivity extends Activity implements ControlClient.Listen
         enterImmersiveMode();
         hideSystemPointerIcon(getWindow().getDecorView());
         controlClient.start();
+    }
+
+    private void keepWindowReadyForVideoSurface() {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O_MR1) {
+            setShowWhenLocked(true);
+            setTurnScreenOn(true);
+        } else {
+            getWindow().addFlags(
+                WindowManager.LayoutParams.FLAG_SHOW_WHEN_LOCKED
+                    | WindowManager.LayoutParams.FLAG_TURN_SCREEN_ON
+            );
+        }
+        getWindow().addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON);
+
+        KeyguardManager keyguardManager = (KeyguardManager) getSystemService(Context.KEYGUARD_SERVICE);
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O && keyguardManager != null) {
+            keyguardManager.requestDismissKeyguard(this, null);
+        }
     }
 
     @Override
@@ -149,6 +183,7 @@ public final class MainActivity extends Activity implements ControlClient.Listen
 
     @Override
     protected void onDestroy() {
+        mainHandler.removeCallbacks(pointerAbsFlushRunnable);
         videoClient.stop();
         controlClient.shutdown();
         super.onDestroy();
@@ -159,6 +194,7 @@ public final class MainActivity extends Activity implements ControlClient.Listen
         activeSurface = holder.getSurface();
         surfaceReady = activeSurface != null && activeSurface.isValid();
         waitingForVideoFrame = true;
+        hideLocalCursorOverlay();
         sendVideoReadyIfSurfaceReady();
         addLog("Surface 已创建，准备接收视频");
         Log.i(TAG, "surfaceCreated ready=" + surfaceReady);
@@ -180,6 +216,7 @@ public final class MainActivity extends Activity implements ControlClient.Listen
         activeSurface = null;
         waitingForVideoFrame = true;
         videoClient.stop();
+        hideLocalCursorOverlay();
         addLog("Surface 已销毁，停止视频通道");
         Log.i(TAG, "surfaceDestroyed");
     }
@@ -190,6 +227,7 @@ public final class MainActivity extends Activity implements ControlClient.Listen
         controlState = labelFor(state);
         if (state != ConnectionState.CONNECTED) {
             waitingForVideoFrame = true;
+            hideLocalCursorOverlay();
         }
         if (state == ConnectionState.CONNECTED) {
             sendVideoReadyIfSurfaceReady();
@@ -218,10 +256,11 @@ public final class MainActivity extends Activity implements ControlClient.Listen
         waitingForVideoFrame = true;
         lastVideoError = "";
         videoStartReceived = true;
+        hideLocalCursorOverlay();
         selectedModeWidth = videoWidth;
         selectedModeHeight = videoHeight;
         selectedModeRefresh = normalizeObservedRefresh(videoFps);
-        surfaceView.getHolder().setFixedSize(videoWidth, videoHeight);
+        applySurfaceFixedSize(videoWidth, videoHeight);
         updateVideoRectForSurfaceView();
         updateModeControls();
         addLog("收到 video_start " + videoWidth + "x" + videoHeight + "@" + videoFps + " port=" + videoPort);
@@ -267,7 +306,7 @@ public final class MainActivity extends Activity implements ControlClient.Listen
             videoHeight = layout.videoHeight;
             selectedModeWidth = videoWidth;
             selectedModeHeight = videoHeight;
-            surfaceView.getHolder().setFixedSize(videoWidth, videoHeight);
+            applySurfaceFixedSize(videoWidth, videoHeight);
             updateVideoRectForSurfaceView();
         }
         updateModeControls();
@@ -283,7 +322,7 @@ public final class MainActivity extends Activity implements ControlClient.Listen
             videoHeight = metrics.videoHeight;
             selectedModeWidth = videoWidth;
             selectedModeHeight = videoHeight;
-            surfaceView.getHolder().setFixedSize(videoWidth, videoHeight);
+            applySurfaceFixedSize(videoWidth, videoHeight);
         }
         if (metrics.refreshHz > 0) {
             selectedModeRefresh = normalizeObservedRefresh(metrics.refreshHz);
@@ -307,8 +346,9 @@ public final class MainActivity extends Activity implements ControlClient.Listen
             videoHeight = selectedModeHeight;
             videoFps = selectedModeRefresh;
             waitingForVideoFrame = true;
+            hideLocalCursorOverlay();
             if (surfaceView != null) {
-                surfaceView.getHolder().setFixedSize(videoWidth, videoHeight);
+                applySurfaceFixedSize(videoWidth, videoHeight);
             }
             updateVideoRectForSurfaceView();
             videoClient.stop();
@@ -324,26 +364,53 @@ public final class MainActivity extends Activity implements ControlClient.Listen
     @Override
     public void onCursorShape(String kind, boolean visible) {
         cursorKind = kind == null || kind.length() == 0 ? "arrow" : kind;
-        if (cursorOverlayView != null && !visible) {
-            cursorOverlayView.setCursorVisible(false);
-        }
+        cursorShapeVisible = visible;
         updateOverlay();
     }
 
     @Override
     public void onCursorState(boolean visible, int x, int y) {
-        if (cursorOverlayView != null) {
+        if (cursorOverlayView != null && !localPointerPreviewActive) {
+            if (!isLocalCursorOverlayAllowed() || !cursorShapeVisible) {
+                hideLocalCursorOverlay();
+                return;
+            }
             if (!visible) {
                 cursorOverlayView.setCursorVisible(false);
                 return;
             }
 
-            if (cursorOverlayView.isCursorVisible() && videoWidth > 0 && videoHeight > 0) {
+            cursorOverlayView.setCursorVisible(true);
+            if (videoWidth > 0 && videoHeight > 0) {
                 float viewX = contentRectLeft + (x / (float) videoWidth) * contentRectWidth;
                 float viewY = contentRectTop + (y / (float) videoHeight) * contentRectHeight;
                 cursorOverlayView.updateCursor(viewX, viewY);
             }
         }
+    }
+
+    @Override
+    public void onLocalPointerPreview(float viewX, float viewY) {
+        if (cursorOverlayView == null) {
+            return;
+        }
+
+        if (!isLocalCursorOverlayAllowed()) {
+            hideLocalCursorOverlay();
+            schedulePointerAbsFlush();
+            return;
+        }
+
+        localPointerPreviewActive = true;
+        cursorOverlayView.setCursorVisible(true);
+        cursorOverlayView.updateCursor(viewX, viewY);
+        schedulePointerAbsFlush();
+    }
+
+    @Override
+    public void onLocalPointerExit() {
+        hideLocalCursorOverlay();
+        schedulePointerAbsFlush();
     }
 
     @Override
@@ -354,6 +421,7 @@ public final class MainActivity extends Activity implements ControlClient.Listen
         }
         if (!"CONNECTED".equals(state)) {
             waitingForVideoFrame = true;
+            hideLocalCursorOverlay();
         }
         updateOverlay();
     }
@@ -413,6 +481,7 @@ public final class MainActivity extends Activity implements ControlClient.Listen
     public void onVideoError(String code, String message) {
         lastVideoError = code + ": " + message;
         waitingForVideoFrame = true;
+        hideLocalCursorOverlay();
         controlClient.sendVideoError(code, message);
         addLog("视频错误 " + code + ": " + message);
     }
@@ -425,10 +494,7 @@ public final class MainActivity extends Activity implements ControlClient.Listen
     @Override
     public void onPointerAbsInput(float nx, float ny, int buttons, float viewX, float viewY) {
         controlClient.sendPointerAbsInput(nx, ny, buttons);
-        if (cursorOverlayView != null) {
-            cursorOverlayView.setCursorVisible(true);
-            cursorOverlayView.updateCursor(viewX, viewY);
-        }
+        schedulePointerAbsFlush();
     }
 
     @Override
@@ -453,6 +519,7 @@ public final class MainActivity extends Activity implements ControlClient.Listen
             stats.keyboardEvents,
             stats.pointerAbsEvents,
             stats.mouseMoveEvents,
+            stats.localPointerUpdates,
             stats.mouseButtonEvents,
             stats.mouseWheelEvents,
             stats.lastInputType
@@ -472,7 +539,7 @@ public final class MainActivity extends Activity implements ControlClient.Listen
     @Override
     public boolean dispatchGenericMotionEvent(MotionEvent event) {
         if (inputCollector != null && inputCollector.handleGenericMotionEvent(event)) {
-            inputCollector.flushPendingPointerAbs();
+            schedulePointerAbsFlush();
             return true;
         }
 
@@ -490,7 +557,7 @@ public final class MainActivity extends Activity implements ControlClient.Listen
         }
 
         if (inputCollector != null && inputCollector.handleTouchEvent(event)) {
-            inputCollector.flushPendingPointerAbs();
+            schedulePointerAbsFlush();
             return true;
         }
 
@@ -610,13 +677,18 @@ public final class MainActivity extends Activity implements ControlClient.Listen
                 int oldBottom
             ) {
                 if (right - left != oldRight - oldLeft || bottom - top != oldBottom - oldTop) {
-                    updateVideoRectForSurfaceView();
+                    rootView.post(new Runnable() {
+                        @Override
+                        public void run() {
+                            updateVideoRectForSurfaceView();
+                        }
+                    });
                 }
             }
         });
 
         surfaceView = new SurfaceView(this);
-        surfaceView.getHolder().setFixedSize(videoWidth, videoHeight);
+        applySurfaceFixedSize(videoWidth, videoHeight);
         surfaceView.getHolder().addCallback(this);
         surfaceView.setFocusable(true);
         surfaceView.setFocusableInTouchMode(true);
@@ -1040,6 +1112,7 @@ public final class MainActivity extends Activity implements ControlClient.Listen
 
         controlClient.sendVideoReady(videoWidth, videoHeight, VIDEO_CODEC_AVC);
         Log.i(TAG, "video_ready sent");
+        maybeStartVideo();
     }
 
     private void handlePreflightDecoderUnsupported() {
@@ -1141,7 +1214,7 @@ public final class MainActivity extends Activity implements ControlClient.Listen
     }
 
     private void applyVideoSurfaceLayout() {
-        if (surfaceView == null || videoRectWidth <= 0 || videoRectHeight <= 0) {
+        if (surfaceView == null || videoRectWidth <= 0 || videoRectHeight <= 0 || !videoStartReceived) {
             return;
         }
 
@@ -1215,6 +1288,67 @@ public final class MainActivity extends Activity implements ControlClient.Listen
             contentRectLeft + contentRectWidth / 2f,
             contentRectTop + contentRectHeight / 2f
         );
+    }
+
+    private void applySurfaceFixedSize(int width, int height) {
+        if (surfaceView == null || width <= 0 || height <= 0 || !videoStartReceived) {
+            return;
+        }
+
+        if (surfaceReady && activeSurface != null && activeSurface.isValid()) {
+            return;
+        }
+
+        if (surfaceFixedWidth == width && surfaceFixedHeight == height) {
+            return;
+        }
+
+        surfaceFixedWidth = width;
+        surfaceFixedHeight = height;
+        surfaceView.getHolder().setFixedSize(width, height);
+    }
+
+    private boolean isLocalCursorOverlayAllowed() {
+        return cursorOverlayView != null
+            && surfaceReady
+            && activeSurface != null
+            && activeSurface.isValid()
+            && controlConnectionState == ConnectionState.CONNECTED
+            && "CONNECTED".equals(videoState)
+            && !waitingForVideoFrame
+            && lastVideoError.length() == 0;
+    }
+
+    private void hideLocalCursorOverlay() {
+        localPointerPreviewActive = false;
+        if (cursorOverlayView != null) {
+            cursorOverlayView.setCursorVisible(false);
+        }
+    }
+
+    private void schedulePointerAbsFlush() {
+        if (inputCollector == null) {
+            return;
+        }
+
+        mainHandler.removeCallbacks(pointerAbsFlushRunnable);
+        if (!inputCollector.hasPendingPointerAbs()) {
+            return;
+        }
+
+        long delayMs = inputCollector.millisUntilNextPointerAbsFlush();
+        mainHandler.postDelayed(pointerAbsFlushRunnable, delayMs);
+    }
+
+    private void flushPendingPointerAbs() {
+        if (inputCollector == null) {
+            return;
+        }
+
+        inputCollector.flushPendingPointerAbs();
+        if (inputCollector.hasPendingPointerAbs()) {
+            schedulePointerAbsFlush();
+        }
     }
 
     private void enterImmersiveMode() {
@@ -1360,6 +1494,7 @@ public final class MainActivity extends Activity implements ControlClient.Listen
                 .append("输入: 键 ").append(inputStats.keyboardEvents)
                 .append("  绝 ").append(inputStats.pointerAbsEvents)
                 .append("  移 ").append(inputStats.mouseMoveEvents)
+                .append("  预 ").append(inputStats.localPointerUpdates)
                 .append("  键鼠 ").append(inputStats.mouseButtonEvents)
                 .append("  滚 ").append(inputStats.mouseWheelEvents)
                 .append("  最近 ").append(inputStats.lastInputType)

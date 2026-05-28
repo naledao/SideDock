@@ -14,6 +14,7 @@
 #include <wrl.h>
 
 #include <aclapi.h>
+#include <array>
 #include <cstdint>
 #include <memory>
 
@@ -50,6 +51,9 @@ namespace SideDock::Idd
     inline constexpr DWORD VirtualDisplayRefreshRate = VirtualDisplayModes[0].RefreshRate;
     inline constexpr DWORD MaxVirtualDisplayWidth = 2560;
     inline constexpr DWORD MaxVirtualDisplayHeight = 1440;
+    inline constexpr UINT MaxHardwareCursorWidth = 256;
+    inline constexpr UINT MaxHardwareCursorHeight = 256;
+    inline constexpr UINT MaxHardwareCursorShapeBytes = MaxHardwareCursorWidth * MaxHardwareCursorHeight * 4;
     inline constexpr UINT VirtualMonitorConnectorIndex = 0;
     inline constexpr UINT SharedFrameSlotCount = 3;
     inline constexpr UINT SharedGpuFrameSlotCount = 6;
@@ -186,7 +190,11 @@ namespace SideDock::Idd
     class SwapChainProcessor
     {
     public:
-        SwapChainProcessor(IDDCX_SWAPCHAIN swapChain, std::shared_ptr<Direct3DDevice> device, HANDLE newFrameEvent);
+        SwapChainProcessor(
+            IDDCX_SWAPCHAIN swapChain,
+            std::shared_ptr<Direct3DDevice> device,
+            HANDLE newFrameEvent,
+            class MonitorContext* monitorContext);
         ~SwapChainProcessor();
 
         SwapChainProcessor(const SwapChainProcessor&) = delete;
@@ -202,6 +210,7 @@ namespace SideDock::Idd
 
         IDDCX_SWAPCHAIN m_swapChain = nullptr;
         std::shared_ptr<Direct3DDevice> m_device;
+        class MonitorContext* m_monitorContext = nullptr;
         HANDLE m_availableBufferEvent = nullptr;
         Microsoft::WRL::Wrappers::Thread m_thread;
         Microsoft::WRL::Wrappers::Event m_terminateEvent;
@@ -228,10 +237,12 @@ namespace SideDock::Idd
 
         void InitAdapter();
         void ReportVirtualMonitor();
+        void HandleCommitModes(const IDARG_IN_COMMITMODES* inArgs);
 
     private:
         WDFDEVICE m_wdfDevice = nullptr;
         IDDCX_ADAPTER m_adapter = nullptr;
+        class MonitorContext* m_monitorContext = nullptr;
         bool m_monitorReported = false;
     };
 
@@ -244,11 +255,24 @@ namespace SideDock::Idd
         MonitorContext(const MonitorContext&) = delete;
         MonitorContext& operator=(const MonitorContext&) = delete;
 
+        bool EnableHardwareCursor();
+        IDDCX_MONITOR GetMonitorObject() const;
+        HANDLE GetHardwareCursorEvent() const;
+        bool HandleHardwareCursorUpdate();
+
         void AssignSwapChain(IDDCX_SWAPCHAIN swapChain, LUID renderAdapter, HANDLE newFrameEvent);
         void UnassignSwapChain();
 
     private:
         IDDCX_MONITOR m_monitor = nullptr;
+        HANDLE m_hardwareCursorEvent = nullptr;
+        bool m_hardwareCursorEnabled = false;
+        DWORD m_lastCursorShapeId = 0;
+        BOOL m_lastCursorVisible = FALSE;
+        INT m_lastCursorX = 0;
+        INT m_lastCursorY = 0;
+        IDDCX_CURSOR_SHAPE_INFO m_lastCursorShapeInfo = {};
+        std::array<BYTE, MaxHardwareCursorShapeBytes> m_cursorShapeBuffer = {};
         std::unique_ptr<SwapChainProcessor> m_processor;
     };
 }

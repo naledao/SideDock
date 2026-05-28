@@ -597,9 +597,7 @@ internal static class Program
                             && readyHeight > 0
                             && (readyWidth != readyVideoMode.Width || readyHeight != readyVideoMode.Height))
                         {
-                            Log(Scope, $"video_ready ignored until surface matches current mode {readyVideoMode.Width}x{readyVideoMode.Height}; ready={readyWidth}x{readyHeight}");
-                            await PublishDisplayMetricsIfChangedAsync(connection, force: true, cancellationToken);
-                            break;
+                            Log(Scope, $"video_ready surface={readyWidth}x{readyHeight}; starting mode {readyVideoMode.Width}x{readyVideoMode.Height}");
                         }
                     }
 
@@ -1061,7 +1059,8 @@ internal static class Program
             await connection.SendAsync("cursor_shape", new JsonObject
             {
                 ["kind"] = "arrow",
-                ["visible"] = false
+                ["visible"] = false,
+                ["source"] = "local-overlay"
             }, cancellationToken);
         }
 
