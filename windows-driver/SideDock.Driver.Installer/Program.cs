@@ -33,10 +33,7 @@ try
     var deviceToolDir = FindDirectory(payloadRoot, "SideDock.Idd.DeviceTool")
         ?? FailDirectory("SideDock.Idd.DeviceTool");
 
-    var infPath = Directory.GetFiles(driverPackageDir, DriverInf, SearchOption.AllDirectories)
-        .FirstOrDefault(path => path.Contains($"{Path.DirectorySeparatorChar}Release{Path.DirectorySeparatorChar}", StringComparison.OrdinalIgnoreCase))
-        ?? Directory.GetFiles(driverPackageDir, DriverInf, SearchOption.AllDirectories).FirstOrDefault()
-        ?? FailFile(DriverInf);
+    var infPath = ResolveSignedDriverInf(driverPackageDir);
 
     var certificatePath = Directory.GetFiles(driverPackageDir, DriverCertificate, SearchOption.AllDirectories)
         .FirstOrDefault(path => path.Contains($"{Path.DirectorySeparatorChar}Release{Path.DirectorySeparatorChar}", StringComparison.OrdinalIgnoreCase))
@@ -147,6 +144,42 @@ static string FailDirectory(string name)
 static string FailFile(string name)
 {
     throw new FileNotFoundException($"Required file was not found in payload: {name}");
+}
+
+static string ResolveSignedDriverInf(string driverPackageDir)
+{
+    var candidates = Directory.GetFiles(driverPackageDir, DriverInf, SearchOption.AllDirectories)
+        .Select(path => new
+        {
+            Path = path,
+            Directory = Path.GetDirectoryName(path) ?? string.Empty
+        })
+        .Where(candidate => HasDriverCatalog(candidate.Directory))
+        .OrderByDescending(candidate => candidate.Directory.Contains($"{Path.DirectorySeparatorChar}Release{Path.DirectorySeparatorChar}", StringComparison.OrdinalIgnoreCase))
+        .ThenBy(candidate => candidate.Path.Length)
+        .ToList();
+
+    if (candidates.Count > 0)
+    {
+        return candidates[0].Path;
+    }
+
+    var discovered = Directory.GetFiles(driverPackageDir, DriverInf, SearchOption.AllDirectories);
+    var message = discovered.Length == 0
+        ? $"Required file was not found in payload: {DriverInf}"
+        : $"No signed driver package was found for {DriverInf}. Expected a matching .cat file in the same directory.";
+
+    throw new FileNotFoundException(message);
+}
+
+static bool HasDriverCatalog(string directory)
+{
+    if (string.IsNullOrWhiteSpace(directory))
+    {
+        return false;
+    }
+
+    return Directory.GetFiles(directory, "*.cat", SearchOption.TopDirectoryOnly).Length > 0;
 }
 
 static void Fail(string message)

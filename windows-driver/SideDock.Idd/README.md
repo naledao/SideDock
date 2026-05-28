@@ -86,20 +86,20 @@ For local iterative driver builds when the installed WDK package verifier is inc
   /p:SkipPackageVerification=true
 ```
 
-Expected driver package output is under:
+Expected signed driver package output is under:
 
 ```text
-windows-driver\SideDock.Idd\x64\Debug\
+windows-driver\SideDock.Idd\x64\Debug\SideDock.Idd\
 ```
 
 ## Install
 
 For the desktop app flow, click `安装/修复驱动`; the app starts the elevated installer, imports the bundled self-signed certificate into the local machine trust stores, installs the driver package, and starts `SideDock.Idd.DeviceTool.exe`.
 
-For manual development installs, run an elevated PowerShell session, trust the generated `SideDock.Idd.cer` certificate, then add the signed driver package:
+For manual development installs, run an elevated PowerShell session, trust the generated `SideDock.Idd.cer` certificate, then add the signed driver package from the package directory:
 
 ```powershell
-pnputil /add-driver .\windows-driver\SideDock.Idd\x64\Debug\SideDock.Idd.inf /install
+pnputil /add-driver .\windows-driver\SideDock.Idd\x64\Debug\SideDock.Idd\SideDock.Idd.inf /install
 ```
 
 Create a software device instance and keep it alive:
