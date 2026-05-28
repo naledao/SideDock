@@ -103,7 +103,6 @@ public final class MainActivity extends Activity implements ControlClient.Listen
     private ControlClient.DisplayMetrics lastDisplayMetrics;
     private ControlClient.DisplayModeChanged lastDisplayModeChanged;
     private String cursorKind = "arrow";
-    private boolean cursorShapeVisible = true;
     private boolean localPointerPreviewActive;
     private int videoRectLeft;
     private int videoRectTop;
@@ -364,14 +363,15 @@ public final class MainActivity extends Activity implements ControlClient.Listen
     @Override
     public void onCursorShape(String kind, boolean visible) {
         cursorKind = kind == null || kind.length() == 0 ? "arrow" : kind;
-        cursorShapeVisible = visible;
+        // Host-side cursor_shape.visible is metadata for the remote cursor shape.
+        // It must not suppress the Android local cursor overlay.
         updateOverlay();
     }
 
     @Override
     public void onCursorState(boolean visible, int x, int y) {
         if (cursorOverlayView != null && !localPointerPreviewActive) {
-            if (!isLocalCursorOverlayAllowed() || !cursorShapeVisible) {
+            if (!isLocalCursorOverlayAllowed()) {
                 hideLocalCursorOverlay();
                 return;
             }
