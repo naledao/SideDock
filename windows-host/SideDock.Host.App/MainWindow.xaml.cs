@@ -207,11 +207,13 @@ public sealed partial class MainWindow : Window
         _payloadRoot = Path.Combine(
             Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
             "SideDock",
-            "HostApp");
+            "HostApp",
+            GetBuildKey());
 
-        if (Directory.Exists(_payloadRoot))
+        var hostPath = Path.Combine(_payloadRoot, HostExe);
+        if (File.Exists(hostPath))
         {
-            Directory.Delete(_payloadRoot, recursive: true);
+            return hostPath;
         }
 
         Directory.CreateDirectory(_payloadRoot);
@@ -484,11 +486,13 @@ public sealed partial class MainWindow : Window
         var root = Path.Combine(
             Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
             "SideDock",
-            "DriverInstaller");
+            "DriverInstaller",
+            GetBuildKey());
 
-        if (Directory.Exists(root))
+        var driverInstallerPath = Path.Combine(root, DriverInstallerExe);
+        if (File.Exists(driverInstallerPath))
         {
-            Directory.Delete(root, recursive: true);
+            return driverInstallerPath;
         }
 
         Directory.CreateDirectory(root);
@@ -506,6 +510,18 @@ public sealed partial class MainWindow : Window
 
         return Directory.GetFiles(root, DriverInstallerExe, SearchOption.AllDirectories).FirstOrDefault()
             ?? string.Empty;
+    }
+
+    private static string GetBuildKey()
+    {
+        var processPath = Environment.ProcessPath;
+        if (!string.IsNullOrWhiteSpace(processPath) && File.Exists(processPath))
+        {
+            var info = new FileInfo(processPath);
+            return $"{info.Length:x}-{info.LastWriteTimeUtc.Ticks:x}";
+        }
+
+        return "unknown";
     }
 
     private IEnumerable<string> EnumerateDriverInstallerCandidates()
