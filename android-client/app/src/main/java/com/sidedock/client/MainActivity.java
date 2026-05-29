@@ -12,6 +12,8 @@ import android.os.Handler;
 import android.os.Bundle;
 import android.os.Looper;
 import android.util.Log;
+import android.view.Choreographer;
+import android.view.Display;
 import android.view.Gravity;
 import android.view.InputDevice;
 import android.view.KeyEvent;
@@ -71,6 +73,19 @@ public final class MainActivity extends Activity implements ControlClient.Listen
             expireLocalPointerPreview();
         }
     };
+    private final Choreographer.FrameCallback displayFrameCallback = new Choreographer.FrameCallback() {
+        @Override
+        public void doFrame(long frameTimeNanos) {
+            if (!displayFrameCallbacksActive) {
+                return;
+            }
+
+            recordDisplayFrameCallback(frameTimeNanos);
+            if (displayFrameCallbacksActive) {
+                Choreographer.getInstance().postFrameCallback(this);
+            }
+        }
+    };
     private FrameLayout rootView;
     private SurfaceView surfaceView;
     private CursorOverlayView cursorOverlayView;
@@ -105,6 +120,12 @@ public final class MainActivity extends Activity implements ControlClient.Listen
     private long clockSyncErrorBoundMs = Long.MAX_VALUE;
     private long lastRenderedFramesSeen;
     private long lastVideoStatsSummaryLogAtMs;
+    private float displayRefreshHz;
+    private double displayCallbackFps;
+    private boolean displayFrameCallbacksActive;
+    private long displayFrameCallbacks;
+    private long lastDisplayRateSnapshotNanos;
+    private long lastDisplayRateFrameCallbacks;
     private boolean waitingForVideoFrame = true;
     private VideoClient.VideoStats lastVideoStats;
     private InputCollector.InputStats lastInputStats;
@@ -174,8 +195,15 @@ public final class MainActivity extends Activity implements ControlClient.Listen
     protected void onResume() {
         super.onResume();
         enterImmersiveMode();
+        startDisplayFrameSampling();
         applyDisplayTimingHints();
         maybeStartVideo();
+    }
+
+    @Override
+    protected void onPause() {
+        stopDisplayFrameSampling();
+        super.onPause();
     }
 
     @Override
@@ -184,6 +212,7 @@ public final class MainActivity extends Activity implements ControlClient.Listen
         if (hasFocus) {
             enterImmersiveMode();
             hideSystemPointerIcon(getWindow().getDecorView());
+            updateDisplayRefreshHz();
             applyDisplayTimingHints();
         }
     }
@@ -193,6 +222,7 @@ public final class MainActivity extends Activity implements ControlClient.Listen
         super.onConfigurationChanged(newConfig);
         updateVideoRectForSurfaceView();
         resetCursorToCenter();
+        updateDisplayRefreshHz();
         addLog("Configuration changed, recalculated video rect");
     }
 
@@ -200,6 +230,7 @@ public final class MainActivity extends Activity implements ControlClient.Listen
     protected void onDestroy() {
         mainHandler.removeCallbacks(pointerAbsFlushRunnable);
         mainHandler.removeCallbacks(localPointerPreviewTimeoutRunnable);
+        stopDisplayFrameSampling();
         clearDisplayTimingHints();
         videoClient.stop();
         controlClient.shutdown();
@@ -212,6 +243,7 @@ public final class MainActivity extends Activity implements ControlClient.Listen
         surfaceReady = activeSurface != null && activeSurface.isValid();
         waitingForVideoFrame = true;
         hideLocalCursorOverlay();
+        updateDisplayRefreshHz();
         applyDisplayTimingHints();
         sendVideoReadyIfSurfaceReady();
         addLog("Surface 已创建，准备接收视频");
@@ -224,6 +256,7 @@ public final class MainActivity extends Activity implements ControlClient.Listen
         activeSurface = holder.getSurface();
         surfaceReady = activeSurface != null && activeSurface.isValid();
         updateVideoRectForSurfaceView();
+        updateDisplayRefreshHz();
         applyDisplayTimingHints();
         sendVideoReadyIfSurfaceReady();
         Log.i(TAG, "surfaceChanged ready=" + surfaceReady + " size=" + width + "x" + height);
@@ -1120,12 +1153,21 @@ public final class MainActivity extends Activity implements ControlClient.Listen
         return refreshHz > 0 ? refreshHz : DEFAULT_VIDEO_FPS;
     }
 
-    private void applyDisplayTimingHints() {
-        float targetRefreshHz = selectedModeRefresh > 0
+    private int targetFps() {
+        return videoFps > 0 ? videoFps : DEFAULT_VIDEO_FPS;
+    }
+
+    private float targetRefreshHz() {
+        return selectedModeRefresh > 0
             ? selectedModeRefresh
-            : (videoFps > 0 ? videoFps : DEFAULT_VIDEO_FPS);
-        applyWindowRefreshHint(targetRefreshHz);
-        applySurfaceRefreshHint(targetRefreshHz);
+            : targetFps();
+    }
+
+    private void applyDisplayTimingHints() {
+        updateDisplayRefreshHz();
+        float refreshHz = targetRefreshHz();
+        applyWindowRefreshHint(refreshHz);
+        applySurfaceRefreshHint(refreshHz);
     }
 
     private void clearDisplayTimingHints() {
@@ -1590,6 +1632,76 @@ public final class MainActivity extends Activity implements ControlClient.Listen
         view.setPointerIcon(PointerIcon.getSystemIcon(this, PointerIcon.TYPE_NULL));
     }
 
+    private void startDisplayFrameSampling() {
+        updateDisplayRefreshHz();
+        if (displayFrameCallbacksActive) {
+            return;
+        }
+
+        displayFrameCallbacksActive = true;
+        displayFrameCallbacks = 0L;
+        lastDisplayRateSnapshotNanos = 0L;
+        lastDisplayRateFrameCallbacks = 0L;
+        displayCallbackFps = 0.0;
+        Choreographer.getInstance().postFrameCallback(displayFrameCallback);
+    }
+
+    private void stopDisplayFrameSampling() {
+        if (!displayFrameCallbacksActive) {
+            return;
+        }
+
+        displayFrameCallbacksActive = false;
+        Choreographer.getInstance().removeFrameCallback(displayFrameCallback);
+    }
+
+    private void recordDisplayFrameCallback(long frameTimeNanos) {
+        displayFrameCallbacks += 1L;
+        if (lastDisplayRateSnapshotNanos == 0L) {
+            lastDisplayRateSnapshotNanos = frameTimeNanos;
+            lastDisplayRateFrameCallbacks = displayFrameCallbacks;
+            return;
+        }
+
+        long elapsedNanos = frameTimeNanos - lastDisplayRateSnapshotNanos;
+        if (elapsedNanos < 500_000_000L) {
+            return;
+        }
+
+        long frameDelta = displayFrameCallbacks - lastDisplayRateFrameCallbacks;
+        displayCallbackFps = frameDelta / (elapsedNanos / 1_000_000_000.0);
+        lastDisplayRateSnapshotNanos = frameTimeNanos;
+        lastDisplayRateFrameCallbacks = displayFrameCallbacks;
+        updateDisplayRefreshHz();
+        updateOverlay();
+    }
+
+    private void updateDisplayRefreshHz() {
+        float refreshHz = readDisplayRefreshHz();
+        if (refreshHz > 0f) {
+            displayRefreshHz = refreshHz;
+        }
+    }
+
+    @SuppressWarnings("deprecation")
+    private float readDisplayRefreshHz() {
+        Display display = null;
+        if (surfaceView != null && Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+            display = surfaceView.getDisplay();
+        }
+        if (display == null && Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+            display = getDisplay();
+        }
+        if (display == null) {
+            WindowManager windowManager = (WindowManager) getSystemService(Context.WINDOW_SERVICE);
+            if (windowManager != null) {
+                display = windowManager.getDefaultDisplay();
+            }
+        }
+
+        return display == null ? 0f : display.getRefreshRate();
+    }
+
     private void addLog(String message) {
         String line = timeFormatter.format(new Date()) + "  " + message;
         logLines.addFirst(line);
@@ -1629,8 +1741,11 @@ public final class MainActivity extends Activity implements ControlClient.Listen
             .append("视频: ").append(videoState)
             .append("  ").append(videoWidth).append('x').append(videoHeight).append('@').append(videoFps)
             .append("  port ").append(videoPort).append('\n');
-        builder.append("FPS: ");
+        builder.append("吞吐FPS: ");
         appendFpsFields(builder);
+        builder.append('\n');
+        builder.append("显示回调: ");
+        appendDisplayTimingFields(builder);
         builder.append('\n');
 
         if (lastVideoStats != null) {
@@ -1643,9 +1758,11 @@ public final class MainActivity extends Activity implements ControlClient.Listen
                 .append("  重连: ").append(lastVideoStats.reconnects)
                 .append("  local=").append(lastVideoStats.localPipelineLatencyMs).append("ms")
                 .append("  e2e~").append(lastVideoStats.roughLatencyMs).append("ms")
-                .append("  dec/render ")
-                .append(String.format(Locale.ROOT, "%.0f/%.0f", lastVideoStats.decodeFps, lastVideoStats.renderFps))
-                .append("fps")
+                .append("  throughput ")
+                .append(String.format(Locale.ROOT, "%.0f/%.0f", lastVideoStats.newFrameFps, lastVideoStats.decodeFps))
+                .append("fps new/decode")
+                .append("  renderCb ")
+                .append(formatFpsValue(lastVideoStats.renderFps))
                 .append("  new/repeat ")
                 .append(String.format(Locale.ROOT, "%.0f/%.0f", lastVideoStats.newFrameFps, lastVideoStats.repeatFrameFps));
             builder
@@ -1885,8 +2002,10 @@ public final class MainActivity extends Activity implements ControlClient.Listen
     }
 
     private void appendCompactOverlay(StringBuilder builder) {
-        builder.append("FPS ");
+        builder.append("吞吐 ");
         appendFpsFields(builder);
+        builder.append("  | ");
+        appendDisplayTimingFields(builder);
         if (lastVideoStats != null) {
             builder
                 .append("  lat ")
@@ -1904,10 +2023,13 @@ public final class MainActivity extends Activity implements ControlClient.Listen
         lastVideoStatsSummaryLogAtMs = nowMs;
         Log.i(TAG,
             "video stats "
-                + "stream=" + formatFpsValueDetailed(currentStreamFps())
+                + "target=" + targetFps()
+                + " displayHz=" + formatRefreshValue(currentDisplayRefreshHz())
+                + " stream=" + formatFpsValueDetailed(currentStreamFps())
                 + " new=" + formatFpsValueDetailed(stats.newFrameFps)
                 + " decode=" + formatFpsValueDetailed(stats.decodeFps)
-                + " render=" + formatFpsValueDetailed(stats.renderFps)
+                + " renderCallback=" + formatFpsValueDetailed(stats.renderFps)
+                + " vsyncCallback=" + formatFpsValueDetailed(currentDisplayCallbackFps())
                 + " latency=" + Math.max(0L, stats.localPipelineLatencyMs) + "ms"
                 + " state=" + (stats.state == null ? "" : stats.state)
                 + " packets=" + stats.packetsReceived
@@ -1923,8 +2045,14 @@ public final class MainActivity extends Activity implements ControlClient.Listen
         appendFpsField(builder, "new", currentNewFrameFps());
         builder.append("  ");
         appendFpsField(builder, "decode", currentDecodeFps());
+    }
+
+    private void appendDisplayTimingFields(StringBuilder builder) {
+        appendFpsField(builder, "renderCb", currentRenderFps());
         builder.append("  ");
-        appendFpsField(builder, "render", currentRenderFps());
+        appendFpsField(builder, "vsyncCb", currentDisplayCallbackFps());
+        builder.append("  displayHz ").append(formatRefreshValue(currentDisplayRefreshHz()));
+        builder.append("  targetFps ").append(targetFps());
     }
 
     private void appendFpsField(StringBuilder builder, String label, double value) {
@@ -1947,12 +2075,28 @@ public final class MainActivity extends Activity implements ControlClient.Listen
         return lastVideoStats == null ? Double.NaN : lastVideoStats.renderFps;
     }
 
+    private double currentDisplayCallbackFps() {
+        return displayCallbackFps <= 0.0 ? Double.NaN : displayCallbackFps;
+    }
+
+    private float currentDisplayRefreshHz() {
+        return displayRefreshHz > 0f ? displayRefreshHz : readDisplayRefreshHz();
+    }
+
     private String formatFpsValue(double fps) {
         if (Double.isNaN(fps) || Double.isInfinite(fps) || fps < 0.0) {
             return "--";
         }
 
         return String.format(Locale.ROOT, "%.0f", Math.max(0.0, fps));
+    }
+
+    private String formatRefreshValue(float refreshHz) {
+        if (Float.isNaN(refreshHz) || Float.isInfinite(refreshHz) || refreshHz <= 0f) {
+            return "--";
+        }
+
+        return String.format(Locale.ROOT, "%.0f", refreshHz);
     }
 
     private String formatFpsValueDetailed(double fps) {

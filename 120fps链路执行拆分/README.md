@@ -12,10 +12,10 @@
 4. [03-synthetic-nv12.md](03-synthetic-nv12.md) - 用纯 NV12 基准源排除转换干扰。
 5. [04-idd-gpu-default.md](04-idd-gpu-default.md) - 默认切到性能路径。
 6. [05-pipeline-decouple.md](05-pipeline-decouple.md) - 把采集、转换、编码、发送拆开。
-7. [06-remove-readback.md](06-remove-readback.md) - 尽量去掉热路径 readback。
-8. [07-encoder-tuning.md](07-encoder-tuning.md) - 调编码器参数。
-9. [08-ring-pool.md](08-ring-pool.md) - 调 ring / pool / queue 容量。
-10. [09-android-diagnostics.md](09-android-diagnostics.md) - 把 Android 侧诊断补齐。
+7. [x] [06-remove-readback.md](06-remove-readback.md) - 尽量去掉热路径 readback。
+8. [x] [07-encoder-tuning.md](07-encoder-tuning.md) - 调编码器参数。
+9. [x] [08-ring-pool.md](08-ring-pool.md) - 调 ring / pool / queue 容量。
+10. [x] [09-android-diagnostics.md](09-android-diagnostics.md) - 把 Android 侧诊断补齐。
 11. [10-validation-script.md](10-validation-script.md) - 固化联调脚本和产物。
 12. [11-hevc-av1.md](11-hevc-av1.md) - 可选的后续编码器扩展。
 

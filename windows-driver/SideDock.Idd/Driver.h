@@ -56,7 +56,8 @@ namespace SideDock::Idd
     inline constexpr UINT MaxHardwareCursorShapeBytes = MaxHardwareCursorWidth * MaxHardwareCursorHeight * 4;
     inline constexpr UINT VirtualMonitorConnectorIndex = 0;
     inline constexpr UINT SharedFrameSlotCount = 3;
-    inline constexpr UINT SharedGpuFrameSlotCount = 6;
+    inline constexpr UINT DefaultSharedGpuFrameSlotCount = 6;
+    inline constexpr UINT MaxSharedGpuFrameSlotCount = 12;
     inline constexpr UINT SharedFrameFormatBgra = 1;
     inline constexpr UINT SharedFrameMagic = 0x464B4453; // SDKF
     inline constexpr UINT SharedFrameVersion = 1;
@@ -125,7 +126,7 @@ namespace SideDock::Idd
         UINT64 FrameDuration100ns;
         UINT32 ModeRefreshHz;
         UINT32 Flags;
-        SharedGpuFrameSlotHeader Slots[SharedGpuFrameSlotCount];
+        SharedGpuFrameSlotHeader Slots[MaxSharedGpuFrameSlotCount];
     };
 #pragma pack(pop)
 
@@ -162,9 +163,9 @@ namespace SideDock::Idd
         SharedGpuFrameRing(const SharedGpuFrameRing&) = delete;
         SharedGpuFrameRing& operator=(const SharedGpuFrameRing&) = delete;
 
-        bool EnsureInitialized(Direct3DDevice& device, ID3D11Texture2D* sourceTexture);
+        bool EnsureInitialized(Direct3DDevice& device, ID3D11Texture2D* sourceTexture, UINT slotCount);
         bool IsConsumerAlive() const;
-        bool WriteFrame(Direct3DDevice& device, ID3D11Texture2D* sourceTexture, UINT64 timestampQpc);
+        bool WriteFrame(Direct3DDevice& device, ID3D11Texture2D* sourceTexture, UINT64 timestampQpc, UINT slotCount);
 
     private:
         void Close();
@@ -178,9 +179,12 @@ namespace SideDock::Idd
         HANDLE m_frameReadyEvent = nullptr;
         HANDLE m_consumerAliveEvent = nullptr;
         SharedGpuFrameMetadata* m_metadata = nullptr;
-        Microsoft::WRL::ComPtr<ID3D11Texture2D> m_textures[SharedGpuFrameSlotCount];
-        Microsoft::WRL::ComPtr<IDXGIKeyedMutex> m_mutexes[SharedGpuFrameSlotCount];
-        HANDLE m_sharedHandles[SharedGpuFrameSlotCount] = {};
+        void SetSlotCount(UINT slotCount);
+
+        Microsoft::WRL::ComPtr<ID3D11Texture2D> m_textures[MaxSharedGpuFrameSlotCount];
+        Microsoft::WRL::ComPtr<IDXGIKeyedMutex> m_mutexes[MaxSharedGpuFrameSlotCount];
+        HANDLE m_sharedHandles[MaxSharedGpuFrameSlotCount] = {};
+        UINT m_slotCount = DefaultSharedGpuFrameSlotCount;
         UINT m_width = 0;
         UINT m_height = 0;
         UINT m_generation = 0;
@@ -236,6 +240,7 @@ namespace SideDock::Idd
         DeviceContext& operator=(const DeviceContext&) = delete;
 
         void InitAdapter();
+        UINT GpuRingSlotCount() const;
         void ReportVirtualMonitor();
         void HandleCommitModes(const IDARG_IN_COMMITMODES* inArgs);
 
@@ -244,12 +249,13 @@ namespace SideDock::Idd
         IDDCX_ADAPTER m_adapter = nullptr;
         class MonitorContext* m_monitorContext = nullptr;
         bool m_monitorReported = false;
+        UINT m_gpuRingSlotCount = DefaultSharedGpuFrameSlotCount;
     };
 
     class MonitorContext
     {
     public:
-        explicit MonitorContext(IDDCX_MONITOR monitor);
+        MonitorContext(IDDCX_MONITOR monitor, UINT gpuRingSlotCount);
         ~MonitorContext();
 
         MonitorContext(const MonitorContext&) = delete;
@@ -259,6 +265,7 @@ namespace SideDock::Idd
         IDDCX_MONITOR GetMonitorObject() const;
         HANDLE GetHardwareCursorEvent() const;
         bool HandleHardwareCursorUpdate();
+        UINT GpuRingSlotCount() const;
 
         void AssignSwapChain(IDDCX_SWAPCHAIN swapChain, LUID renderAdapter, HANDLE newFrameEvent);
         void UnassignSwapChain();
@@ -274,5 +281,6 @@ namespace SideDock::Idd
         IDDCX_CURSOR_SHAPE_INFO m_lastCursorShapeInfo = {};
         std::array<BYTE, MaxHardwareCursorShapeBytes> m_cursorShapeBuffer = {};
         std::unique_ptr<SwapChainProcessor> m_processor;
+        UINT m_gpuRingSlotCount = DefaultSharedGpuFrameSlotCount;
     };
 }

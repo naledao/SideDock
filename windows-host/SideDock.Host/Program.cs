@@ -30,6 +30,7 @@ internal static class Program
     private const int DefaultVideoBitrate = 4_000_000;
     private const int DefaultVideoGop = 30;
     private const int DefaultMaxVideoQueue = 2;
+    private const int DefaultNv12PoolSize = 4;
     private const VideoSourceKind DefaultVideoSource = VideoSourceKind.IddGpu;
     private const string DefaultVideoFile = "artifacts/test-videos/sidedock-720p30.h264";
     private const string DefaultResolutionPreset = "720p";
@@ -116,6 +117,8 @@ internal static class Program
 
         Console.WriteLine($"画质档位: {options.ResolutionPreset} @ {options.VideoFps}Hz");
         Console.WriteLine($"编码规格: {options.VideoWidth}x{options.VideoHeight} bitrate={options.VideoBitrate} ({(options.AutoVideoBitrate ? "auto" : "manual")})");
+        Console.WriteLine($"编码调优: {FormatEncoderTuningForLog(options)}");
+        Console.WriteLine($"链路容量: nv12Pool={options.Nv12PoolSize} encodedPacketQueue={options.EncodedPacketQueue}");
 
         if (options.RequestedDisplayMode is not null)
         {
@@ -3100,7 +3103,7 @@ internal static class Program
 
             if (videoOptions.VideoSource == VideoSourceKind.IddGpu)
             {
-                Log($"VIDEO {connectionId}", "active video-source=idd-gpu fallback=idd");
+                Log($"VIDEO {connectionId}", "active video-source=idd-gpu direct-input-probe=startup source-fallback=idd-on-gpu-init-failure");
                 return new FallbackEncodedVideoSource(
                     new MediaFoundationGpuVideoSource(
                         connectionId,
@@ -3167,7 +3170,7 @@ internal static class Program
         }
     }
 
-        private sealed class VideoSession(
+    private sealed class VideoSession(
         int connectionId,
         TcpClient client,
         IEncodedVideoSource videoSource,
@@ -3180,7 +3183,7 @@ internal static class Program
         private readonly AdaptiveFrameRateController _adaptiveController = new(videoModeState, controlPublisher, options.VideoPort, $"VIDEO {connectionId}");
         private readonly IAdaptiveVideoStatsSource? _adaptiveStatsSource = videoSource as IAdaptiveVideoStatsSource;
         private readonly LatestFrameQueue<EncodedVideoPacket> _sendQueue = new(
-            Math.Max(1, options.MaxVideoQueue),
+            Math.Max(1, options.EncodedPacketQueue),
             singleReader: true,
             singleWriter: true);
         private readonly PipelineStageStats _sendStageStats = new("send");
@@ -3391,6 +3394,9 @@ internal static class Program
                 ["p99SendMs"] = Math.Round(snapshot.P99SendMs, 2),
                 ["outputKbps"] = Math.Round(snapshot.OutputKbps, 0),
                 ["streamFps"] = Math.Round(snapshot.StreamFps, 1),
+                ["p50LocalLatencyMs"] = Math.Round(snapshot.P50LocalLatencyMs, 2),
+                ["p95LocalLatencyMs"] = Math.Round(snapshot.P95LocalLatencyMs, 2),
+                ["p99LocalLatencyMs"] = Math.Round(snapshot.P99LocalLatencyMs, 2),
                 ["p50FrameIntervalMs"] = Math.Round(snapshot.P50FrameIntervalMs, 2),
                 ["p95FrameIntervalMs"] = Math.Round(snapshot.P95FrameIntervalMs, 2),
                 ["p99FrameIntervalMs"] = Math.Round(snapshot.P99FrameIntervalMs, 2),
@@ -3408,6 +3414,36 @@ internal static class Program
             }
 
             return payload;
+        }
+
+        private static void AddEncoderTuningPayload(JsonObject payload, HostOptions options)
+        {
+            var tuning = options.EncoderTuning;
+            payload["bitrate"] = tuning.Bitrate;
+            payload["gop"] = tuning.Gop;
+            payload["h264Profile"] = tuning.Profile;
+            payload["rateControl"] = tuning.RateControl;
+            payload["lowLatency"] = tuning.LowLatency;
+            payload["bFrames"] = tuning.BFrames;
+            payload["maxBitrate"] = tuning.MaxBitrate;
+            payload["vbvBuffer"] = tuning.BufferSize;
+            payload["tuningPreset"] = tuning.PresetName;
+            payload["tuningResolution"] = tuning.ResolutionPreset;
+            payload["bitrateSource"] = tuning.BitrateSource;
+            payload["gopSource"] = tuning.GopSource;
+            payload["recommendedBitrate"] = tuning.RecommendedBitrate;
+            payload["legacyAutoBitrate"] = tuning.LegacyAutoBitrate;
+            payload["bitrateDeltaFromLegacy"] = tuning.BitrateDeltaFromLegacy;
+            payload["nv12PoolSize"] = options.Nv12PoolSize;
+            payload["encodedPacketQueue"] = options.EncodedPacketQueue;
+        }
+
+        private static string FormatEncoderTuningForLog(HostOptions options)
+        {
+            var tuning = options.EncoderTuning;
+            return string.Create(
+                CultureInfo.InvariantCulture,
+                $"preset={tuning.PresetName} profile={tuning.Profile} lowLatency={tuning.LowLatency.ToString().ToLowerInvariant()} rateControl={tuning.RateControl} gop={tuning.Gop} bFrames={tuning.BFrames} bitrate={tuning.Bitrate} maxrate={tuning.MaxBitrate} buffer={tuning.BufferSize} recommended={tuning.RecommendedBitrate} legacyAuto={tuning.LegacyAutoBitrate} delta={tuning.BitrateDeltaFromLegacy} nv12Pool={options.Nv12PoolSize} encodedPacketQueue={options.EncodedPacketQueue}");
         }
 
         private static void AddCapturePercentiles(JsonObject payload, CaptureStatsSnapshot snapshot)
@@ -3565,7 +3601,7 @@ internal static class Program
         private static RealtimeEncoderStatsSnapshot CreateEmptyEncoderSnapshot()
         {
             return new RealtimeEncoderStatsSnapshot(
-                0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0);
+                0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0);
         }
     }
 
@@ -3582,6 +3618,8 @@ internal static class Program
         int Width { get; }
 
         int Height { get; }
+
+        int SlotCount { get; }
 
         long FramesDropped { get; }
 
@@ -3642,7 +3680,7 @@ internal static class Program
             _channel = Channel.CreateBounded<T>(new BoundedChannelOptions(Math.Max(1, capacity))
             {
                 FullMode = BoundedChannelFullMode.Wait,
-                SingleReader = false,
+                SingleReader = singleReader,
                 SingleWriter = singleWriter
             });
         }
@@ -4031,6 +4069,9 @@ internal static class Program
                 0,
                 0,
                 0,
+                0,
+                0,
+                0,
                 0);
         }
     }
@@ -4132,18 +4173,19 @@ internal static class Program
             _stderrTask = Task.Run(() => DrainStderrAsync(_process.StandardError, _sourceCts.Token), _sourceCts.Token);
             _statsTask = Task.Run(() => PublishStatsLoopAsync(_sourceCts.Token), _sourceCts.Token);
 
-            Log($"ENCODER {_connectionId}", $"start source=realtime encoder=ffmpeg {_options.VideoWidth}x{_options.VideoHeight}@{_options.VideoFps} bitrate={_options.VideoBitrate}");
-            await _controlPublisher.PublishAsync("encoder_start", new JsonObject
+            Log($"ENCODER {_connectionId}", $"start source=realtime encoder=ffmpeg {_options.VideoWidth}x{_options.VideoHeight}@{_options.VideoFps} {FormatEncoderTuningForLog(_options)}");
+            var encoderStartPayload = new JsonObject
             {
                 ["source"] = "realtime_test_pattern",
                 ["encoder"] = "ffmpeg",
                 ["width"] = _options.VideoWidth,
                 ["height"] = _options.VideoHeight,
                 ["fps"] = _options.VideoFps,
-                ["bitrate"] = _options.VideoBitrate,
                 ["codec"] = "h264",
                 ["format"] = "annexb"
-            }, cancellationToken);
+            };
+            AddEncoderTuningPayload(encoderStartPayload, _options);
+            await _controlPublisher.PublishAsync("encoder_start", encoderStartPayload, cancellationToken);
         }
 
         public async IAsyncEnumerable<EncodedVideoPacket> ReadPacketsAsync(
@@ -4244,7 +4286,7 @@ internal static class Program
         private static RealtimeEncoderStatsSnapshot CreateEmptyEncoderSnapshot()
         {
             return new RealtimeEncoderStatsSnapshot(
-                0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0);
+                0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0);
         }
 
         private EncodedVideoPacket CreatePacket(byte[] payload)
@@ -4335,8 +4377,10 @@ internal static class Program
                 {
                     var snapshot = _stats.SnapshotAndResetWindow();
                     _latestEncoderSnapshot = snapshot;
-                    Log($"ENCODER {_connectionId}", $"stats generated={snapshot.FramesGenerated} encoded={snapshot.FramesEncoded} sent={snapshot.FramesSent} dropped={snapshot.FramesDropped} late={snapshot.LateFrames} streamFps={snapshot.StreamFps:F1} new={snapshot.NewFramesSent} repeat={snapshot.RepeatFramesSent} avgFrameInterval={snapshot.P50FrameIntervalMs:F2}/{snapshot.P95FrameIntervalMs:F2}/{snapshot.P99FrameIntervalMs:F2}ms avgEncode={snapshot.AvgEncodeMs:F1}ms p95Encode={snapshot.P95EncodeMs:F1}ms p99Encode={snapshot.P99EncodeMs:F1}ms avgSend={snapshot.AvgSendMs:F1}ms p95Send={snapshot.P95SendMs:F1}ms kbps={snapshot.OutputKbps:F0}");
-                    await _controlPublisher.PublishAsync("encoder_stats", CreateEncoderStatsPayload(snapshot, gpuPath: false), cancellationToken);
+                    Log($"ENCODER {_connectionId}", $"stats generated={snapshot.FramesGenerated} encoded={snapshot.FramesEncoded} sent={snapshot.FramesSent} dropped={snapshot.FramesDropped} late={snapshot.LateFrames} streamFps={snapshot.StreamFps:F1} localLatencyP95={snapshot.P95LocalLatencyMs:F1}ms new={snapshot.NewFramesSent} repeat={snapshot.RepeatFramesSent} avgFrameInterval={snapshot.P50FrameIntervalMs:F2}/{snapshot.P95FrameIntervalMs:F2}/{snapshot.P99FrameIntervalMs:F2}ms avgEncode={snapshot.AvgEncodeMs:F1}ms p95Encode={snapshot.P95EncodeMs:F1}ms p99Encode={snapshot.P99EncodeMs:F1}ms avgSend={snapshot.AvgSendMs:F1}ms p95Send={snapshot.P95SendMs:F1}ms kbps={snapshot.OutputKbps:F0}");
+                    var payload = CreateEncoderStatsPayload(snapshot, gpuPath: false);
+                    AddEncoderTuningPayload(payload, _options);
+                    await _controlPublisher.PublishAsync("encoder_stats", payload, cancellationToken);
                 }
             }
             catch (OperationCanceledException)
@@ -4357,6 +4401,7 @@ internal static class Program
 
         private string BuildArguments()
         {
+            var tuning = _options.EncoderTuning;
             return string.Join(" ", new[]
             {
                 "-hide_banner",
@@ -4370,13 +4415,15 @@ internal static class Program
                 "-c:v libx264",
                 "-preset ultrafast",
                 "-tune zerolatency",
+                $"-profile:v {tuning.Profile}",
                 "-pix_fmt yuv420p",
-                $"-b:v {_options.VideoBitrate}",
-                $"-maxrate {_options.VideoBitrate}",
-                $"-bufsize {_options.VideoBitrate}",
-                $"-g {_options.VideoGop}",
-                "-bf 0",
-                $"-x264-params keyint={_options.VideoGop}:min-keyint={_options.VideoGop}:scenecut=0:repeat-headers=1",
+                $"-b:v {tuning.Bitrate}",
+                $"-maxrate {tuning.MaxBitrate}",
+                $"-bufsize {tuning.BufferSize}",
+                $"-g {tuning.Gop}",
+                $"-bf {tuning.BFrames}",
+                "-refs 1",
+                $"-x264-params keyint={tuning.Gop}:min-keyint={tuning.Gop}:scenecut=0:repeat-headers=1:bframes={tuning.BFrames}:rc-lookahead=0:force-cfr=1:nal-hrd=cbr",
                 "-bsf:v h264_metadata=aud=insert",
                 "-f h264",
                 "pipe:1"
@@ -4447,9 +4494,9 @@ internal static class Program
             _connectionId = connectionId;
             _options = options;
             _controlPublisher = controlPublisher;
-            _framePool = new SyntheticNv12FramePool(options.VideoWidth, options.VideoHeight);
+            _framePool = new SyntheticNv12FramePool(options.VideoWidth, options.VideoHeight, options.Nv12PoolSize);
             _stats = new RealtimeEncoderStats(options.VideoFps);
-            _packets = Channel.CreateBounded<EncodedVideoPacket>(new BoundedChannelOptions(Math.Max(1, options.MaxVideoQueue))
+            _packets = Channel.CreateBounded<EncodedVideoPacket>(new BoundedChannelOptions(Math.Max(1, options.EncodedPacketQueue))
             {
                 FullMode = BoundedChannelFullMode.DropOldest,
                 SingleReader = true,
@@ -4479,20 +4526,21 @@ internal static class Program
                 _sourceCts.Token);
             _statsTask = Task.Run(() => PublishStatsLoopAsync(_sourceCts.Token), _sourceCts.Token);
 
-            Log($"ENCODER {_connectionId}", $"start source=synthetic-nv12 encoder=mediafoundation input=nv12 {_options.VideoWidth}x{_options.VideoHeight}@{_options.VideoFps} bitrate={_options.VideoBitrate}");
-            await _controlPublisher.PublishAsync("encoder_start", new JsonObject
+            Log($"ENCODER {_connectionId}", $"start source=synthetic-nv12 encoder=mediafoundation input=nv12 {_options.VideoWidth}x{_options.VideoHeight}@{_options.VideoFps} {FormatEncoderTuningForLog(_options)}");
+            var encoderStartPayload = new JsonObject
             {
                 ["source"] = "synthetic-nv12",
                 ["encoder"] = "mediafoundation",
                 ["width"] = _options.VideoWidth,
                 ["height"] = _options.VideoHeight,
                 ["fps"] = _options.VideoFps,
-                ["bitrate"] = _options.VideoBitrate,
                 ["codec"] = "h264",
                 ["format"] = "annexb",
                 ["inputFormat"] = "nv12",
                 ["synthetic"] = true
-            }, cancellationToken);
+            };
+            AddEncoderTuningPayload(encoderStartPayload, _options);
+            await _controlPublisher.PublishAsync("encoder_start", encoderStartPayload, cancellationToken);
             _encoderStarted = true;
         }
 
@@ -4636,8 +4684,9 @@ internal static class Program
                 {
                     var snapshot = _stats.SnapshotAndResetWindow();
                     _latestEncoderSnapshot = snapshot;
-                    Log($"ENCODER {_connectionId}", $"stats generated={snapshot.FramesGenerated} encoded={snapshot.FramesEncoded} sent={snapshot.FramesSent} dropped={snapshot.FramesDropped} late={snapshot.LateFrames} streamFps={snapshot.StreamFps:F1} new={snapshot.NewFramesSent} repeat={snapshot.RepeatFramesSent} avgFrameInterval={snapshot.P50FrameIntervalMs:F2}/{snapshot.P95FrameIntervalMs:F2}/{snapshot.P99FrameIntervalMs:F2}ms avgEncode={snapshot.AvgEncodeMs:F1}ms p95Encode={snapshot.P95EncodeMs:F1}ms p99Encode={snapshot.P99EncodeMs:F1}ms avgSend={snapshot.AvgSendMs:F1}ms p95Send={snapshot.P95SendMs:F1}ms kbps={snapshot.OutputKbps:F0}");
+                    Log($"ENCODER {_connectionId}", $"stats generated={snapshot.FramesGenerated} encoded={snapshot.FramesEncoded} sent={snapshot.FramesSent} dropped={snapshot.FramesDropped} late={snapshot.LateFrames} streamFps={snapshot.StreamFps:F1} localLatencyP95={snapshot.P95LocalLatencyMs:F1}ms new={snapshot.NewFramesSent} repeat={snapshot.RepeatFramesSent} avgFrameInterval={snapshot.P50FrameIntervalMs:F2}/{snapshot.P95FrameIntervalMs:F2}/{snapshot.P99FrameIntervalMs:F2}ms avgEncode={snapshot.AvgEncodeMs:F1}ms p95Encode={snapshot.P95EncodeMs:F1}ms p99Encode={snapshot.P99EncodeMs:F1}ms avgSend={snapshot.AvgSendMs:F1}ms p95Send={snapshot.P95SendMs:F1}ms kbps={snapshot.OutputKbps:F0}");
                     var payload = CreateEncoderStatsPayload(snapshot, gpuPath: false);
+                    AddEncoderTuningPayload(payload, _options);
                     payload["source"] = "synthetic-nv12";
                     payload["inputFormat"] = "nv12";
                     payload["synthetic"] = true;
@@ -4669,13 +4718,12 @@ internal static class Program
         private static RealtimeEncoderStatsSnapshot CreateEmptyEncoderSnapshot()
         {
             return new RealtimeEncoderStatsSnapshot(
-                0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0);
+                0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0);
         }
     }
 
     private sealed class SyntheticNv12FramePool
     {
-        private const int FramePoolSize = 4;
         private static readonly YuvColor White = FromRgb(255, 255, 255);
         private static readonly YuvColor Yellow = FromRgb(255, 255, 0);
         private static readonly YuvColor Cyan = FromRgb(0, 255, 255);
@@ -4694,7 +4742,7 @@ internal static class Program
         private readonly int _yPlaneSize;
         private readonly byte[][] _frames;
 
-        public SyntheticNv12FramePool(int width, int height)
+        public SyntheticNv12FramePool(int width, int height, int poolSize)
         {
             if (width <= 0 || height <= 0 || (width & 1) != 0 || (height & 1) != 0)
             {
@@ -4705,7 +4753,7 @@ internal static class Program
             _height = height;
             _yPlaneSize = checked(width * height);
             var frameSize = checked(width * height * 3 / 2);
-            _frames = new byte[FramePoolSize][];
+            _frames = new byte[Math.Max(1, poolSize)][];
             for (var index = 0; index < _frames.Length; index++)
             {
                 var frame = new byte[frameSize];
@@ -4798,7 +4846,7 @@ internal static class Program
             var x = 48;
             var y = 36;
             DrawBits(nv12, x, y, cell, unchecked((uint)(0x5A17_0000 | variant)));
-            DrawBits(nv12, x, y + cell * 6, cell, unchecked((uint)(FramePoolSize << 8 | variant)));
+            DrawBits(nv12, x, y + cell * 6, cell, unchecked((uint)(_frames.Length << 8 | variant)));
         }
 
         private void DrawBits(byte[] nv12, int x, int y, int cell, uint value)
@@ -4911,10 +4959,11 @@ internal static class Program
             _controlPublisher = controlPublisher;
             _frameSource = frameSource;
             _stats = new RealtimeEncoderStats(options.VideoFps);
-            var queueCapacity = Math.Max(1, options.MaxVideoQueue);
+            var queueCapacity = Math.Max(1, options.Nv12PoolSize);
+            var packetQueueCapacity = Math.Max(1, options.EncodedPacketQueue);
             _capturedFrames = new LatestFrameQueue<BgraFrame>(queueCapacity, disposeDropped: frame => frame.Dispose());
             _convertedFrames = new LatestFrameQueue<Nv12Frame>(queueCapacity, disposeDropped: frame => frame.Dispose());
-            _packets = new LatestFrameQueue<EncodedVideoPacket>(queueCapacity);
+            _packets = new LatestFrameQueue<EncodedVideoPacket>(packetQueueCapacity);
         }
 
         public async ValueTask StartAsync(CancellationToken cancellationToken)
@@ -4977,18 +5026,19 @@ internal static class Program
             _statsTask = Task.Run(() => PublishStatsLoopAsync(_sourceCts.Token), _sourceCts.Token);
             _captureStatsTask = Task.Run(() => PublishCaptureStatsLoopAsync(_sourceCts.Token), _sourceCts.Token);
 
-            Log($"ENCODER {_connectionId}", $"start source={_frameSource.SourceName} encoder=mediafoundation {_options.VideoWidth}x{_options.VideoHeight}@{_options.VideoFps} bitrate={_options.VideoBitrate}");
-            await _controlPublisher.PublishAsync("encoder_start", new JsonObject
+            Log($"ENCODER {_connectionId}", $"start source={_frameSource.SourceName} encoder=mediafoundation {_options.VideoWidth}x{_options.VideoHeight}@{_options.VideoFps} {FormatEncoderTuningForLog(_options)}");
+            var encoderStartPayload = new JsonObject
             {
                 ["source"] = _frameSource.SourceName,
                 ["encoder"] = "mediafoundation",
                 ["width"] = _options.VideoWidth,
                 ["height"] = _options.VideoHeight,
                 ["fps"] = _options.VideoFps,
-                ["bitrate"] = _options.VideoBitrate,
                 ["codec"] = "h264",
                 ["format"] = "annexb"
-            }, cancellationToken);
+            };
+            AddEncoderTuningPayload(encoderStartPayload, _options);
+            await _controlPublisher.PublishAsync("encoder_start", encoderStartPayload, cancellationToken);
             _encoderStarted = true;
 
             if (_options.VideoSource is VideoSourceKind.Window or VideoSourceKind.Region or VideoSourceKind.Idd)
@@ -5293,8 +5343,10 @@ internal static class Program
                 {
                     var snapshot = _stats.SnapshotAndResetWindow();
                     _latestEncoderSnapshot = snapshot;
-                    Log($"ENCODER {_connectionId}", $"stats generated={snapshot.FramesGenerated} encoded={snapshot.FramesEncoded} sent={snapshot.FramesSent} dropped={snapshot.FramesDropped} late={snapshot.LateFrames} streamFps={snapshot.StreamFps:F1} new={snapshot.NewFramesSent} repeat={snapshot.RepeatFramesSent} avgFrameInterval={snapshot.P50FrameIntervalMs:F2}/{snapshot.P95FrameIntervalMs:F2}/{snapshot.P99FrameIntervalMs:F2}ms avgEncode={snapshot.AvgEncodeMs:F1}ms p95Encode={snapshot.P95EncodeMs:F1}ms p99Encode={snapshot.P99EncodeMs:F1}ms avgSend={snapshot.AvgSendMs:F1}ms p95Send={snapshot.P95SendMs:F1}ms kbps={snapshot.OutputKbps:F0}");
-                    await _controlPublisher.PublishAsync("encoder_stats", CreateEncoderStatsPayload(snapshot, gpuPath: false), cancellationToken);
+                    Log($"ENCODER {_connectionId}", $"stats generated={snapshot.FramesGenerated} encoded={snapshot.FramesEncoded} sent={snapshot.FramesSent} dropped={snapshot.FramesDropped} late={snapshot.LateFrames} streamFps={snapshot.StreamFps:F1} localLatencyP95={snapshot.P95LocalLatencyMs:F1}ms new={snapshot.NewFramesSent} repeat={snapshot.RepeatFramesSent} avgFrameInterval={snapshot.P50FrameIntervalMs:F2}/{snapshot.P95FrameIntervalMs:F2}/{snapshot.P99FrameIntervalMs:F2}ms avgEncode={snapshot.AvgEncodeMs:F1}ms p95Encode={snapshot.P95EncodeMs:F1}ms p99Encode={snapshot.P99EncodeMs:F1}ms avgSend={snapshot.AvgSendMs:F1}ms p95Send={snapshot.P95SendMs:F1}ms kbps={snapshot.OutputKbps:F0}");
+                    var payload = CreateEncoderStatsPayload(snapshot, gpuPath: false);
+                    AddEncoderTuningPayload(payload, _options);
+                    await _controlPublisher.PublishAsync("encoder_stats", payload, cancellationToken);
                 }
             }
             catch (OperationCanceledException)
@@ -5372,7 +5424,7 @@ internal static class Program
         private static RealtimeEncoderStatsSnapshot CreateEmptyEncoderSnapshot()
         {
             return new RealtimeEncoderStatsSnapshot(
-                0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0);
+                0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0);
         }
 
         public static async Task WhenAllIgnoringCancellation(params Task?[] tasks)
@@ -5429,8 +5481,12 @@ internal static class Program
         private MediaFoundationH264Encoder? _encoder;
         private GpuNv12Readback? _nv12Readback;
         private bool _encoderUsesD3DInput;
+        private string? _encoderFallbackReason;
+        private string? _encoderMftName;
         private long _sequence;
         private int _gpuFrameDumped;
+        private const string DirectEncoderFallback = "none";
+        private const string ReadbackEncoderFallback = "gpu-convert-nv12-readback";
 
         public MediaFoundationGpuVideoSource(
             int connectionId,
@@ -5443,8 +5499,9 @@ internal static class Program
             _controlPublisher = controlPublisher;
             _frameSource = frameSource;
             _stats = new RealtimeEncoderStats(options.VideoFps);
-            var queueCapacity = Math.Max(1, options.MaxVideoQueue);
-            _packets = new LatestFrameQueue<EncodedVideoPacket>(queueCapacity);
+            var queueCapacity = Math.Max(1, options.Nv12PoolSize);
+            var packetQueueCapacity = Math.Max(1, options.EncodedPacketQueue);
+            _packets = new LatestFrameQueue<EncodedVideoPacket>(packetQueueCapacity);
             _gpuFrames = new LatestFrameQueue<GpuAcquiredFrame>(queueCapacity, disposeDropped: frame => frame.Dispose());
             _gpuConvertedFrames = new LatestFrameQueue<GpuConvertedFrame>(queueCapacity, disposeDropped: frame => frame.Dispose());
             _nv12Frames = new LatestFrameQueue<Nv12Frame>(queueCapacity, disposeDropped: frame => frame.Dispose());
@@ -5462,21 +5519,42 @@ internal static class Program
             try
             {
                 _frameSource.Start(cancellationToken);
-                _converter = new GpuBgraToNv12Converter(_frameSource.Device, _frameSource.Context, _options.VideoWidth, _options.VideoHeight, _options.VideoFps);
-                try
+                var probe = ProbeD3D11EncoderInput(_options, _frameSource.Device);
+                _encoderUsesD3DInput = probe.SupportsDirectInput;
+                _encoderFallbackReason = probe.FallbackReason;
+                _encoderMftName = probe.EncoderMftName;
+                _converter = new GpuBgraToNv12Converter(_frameSource.Device, _frameSource.Context, _options.VideoWidth, _options.VideoHeight, _options.VideoFps, _options.Nv12PoolSize);
+
+                if (_encoderUsesD3DInput)
                 {
-                    _encoder = new MediaFoundationH264Encoder(_options, _frameSource.Device);
-                    _encoder.Start();
-                    _encoderUsesD3DInput = true;
+                    try
+                    {
+                        _encoder = new MediaFoundationH264Encoder(_options, _frameSource.Device);
+                        _encoder.Start();
+                        _encoderMftName = _encoder.SelectedMftName;
+                        Log($"ENCODER {_connectionId}", $"D3D11 input probe supported=true fallback=none mft={_encoderMftName}");
+                    }
+                    catch (Exception ex) when (IsD3D11EncoderInputFailure(ex))
+                    {
+                        _encoder?.Dispose();
+                        _encoder = null;
+                        _encoderUsesD3DInput = false;
+                        _encoderFallbackReason = FormatExceptionReason(ex);
+                        Log($"ENCODER {_connectionId}", $"D3D11 input probe passed but active encoder init failed; fallback={ReadbackEncoderFallback} reason={_encoderFallbackReason}");
+                    }
                 }
-                catch (COMException ex) when ((uint)ex.HResult == 0x80004001)
+
+                if (!_encoderUsesD3DInput)
                 {
-                    _encoder?.Dispose();
+                    if (!string.IsNullOrWhiteSpace(_encoderFallbackReason))
+                    {
+                        Log($"ENCODER {_connectionId}", $"D3D11 input probe supported=false fallback={ReadbackEncoderFallback} reason={_encoderFallbackReason}");
+                    }
+
                     _encoder = new MediaFoundationH264Encoder(_options);
                     _encoder.Start();
+                    _encoderMftName = _encoder.SelectedMftName;
                     _nv12Readback = new GpuNv12Readback(_frameSource.Device, _frameSource.Context, _options.VideoWidth, _options.VideoHeight);
-                    _encoderUsesD3DInput = false;
-                    Log($"ENCODER {_connectionId}", "D3D11 encoder input is not supported by this Media Foundation MFT; using GPU convert + NV12 readback fallback.");
                 }
             }
             catch (CaptureException ex)
@@ -5558,23 +5636,29 @@ internal static class Program
             var encoderName = _encoderUsesD3DInput
                 ? "mediafoundation-d3d11"
                 : "mediafoundation-nv12-readback";
-            Log($"ENCODER {_connectionId}", $"start source={_frameSource.SourceName} encoder={encoderName} {_options.VideoWidth}x{_options.VideoHeight}@{_options.VideoFps} bitrate={_options.VideoBitrate}");
-            await _controlPublisher.PublishAsync("encoder_start", new JsonObject
+            Log($"ENCODER {_connectionId}", $"start source={_frameSource.SourceName} encoder={encoderName} mft={_encoderMftName ?? "unknown"} input={EncoderInputFormat} fallback={EncoderFallbackName}{FallbackReasonForLog} {_options.VideoWidth}x{_options.VideoHeight}@{_options.VideoFps} {FormatEncoderTuningForLog(_options)}");
+            var encoderStartPayload = new JsonObject
             {
                 ["source"] = _frameSource.SourceName,
                 ["encoder"] = encoderName,
+                ["encoderMft"] = _encoderMftName ?? string.Empty,
                 ["width"] = _options.VideoWidth,
                 ["height"] = _options.VideoHeight,
                 ["fps"] = _options.VideoFps,
-                ["bitrate"] = _options.VideoBitrate,
                 ["codec"] = "h264",
                 ["format"] = "annexb",
                 ["gpuPath"] = true,
-                ["fallback"] = _encoderUsesD3DInput ? "none" : "gpu-convert-nv12-readback"
-            }, cancellationToken);
+                ["inputFormat"] = EncoderInputFormat,
+                ["directD3DInput"] = _encoderUsesD3DInput,
+                ["fallback"] = EncoderFallbackName,
+                ["driverGpuRingSlots"] = _frameSource.SlotCount
+            };
+            AddEncoderTuningPayload(encoderStartPayload, _options);
+            AddFallbackReason(encoderStartPayload);
+            await _controlPublisher.PublishAsync("encoder_start", encoderStartPayload, cancellationToken);
             _encoderStarted = true;
 
-            await _controlPublisher.PublishAsync("capture_start", new JsonObject
+            var captureStartPayload = new JsonObject
             {
                 ["source"] = _frameSource.SourceName,
                 ["width"] = _options.VideoWidth,
@@ -5582,8 +5666,12 @@ internal static class Program
                 ["fps"] = _options.VideoFps,
                 ["target"] = _frameSource.SourceDescription,
                 ["gpuPath"] = true,
-                ["fallback"] = _encoderUsesD3DInput ? "none" : "gpu-convert-nv12-readback"
-            }, cancellationToken);
+                ["directD3DInput"] = _encoderUsesD3DInput,
+                ["fallback"] = EncoderFallbackName,
+                ["driverGpuRingSlots"] = _frameSource.SlotCount
+            };
+            AddFallbackReason(captureStartPayload);
+            await _controlPublisher.PublishAsync("capture_start", captureStartPayload, cancellationToken);
             _captureStarted = true;
         }
 
@@ -5629,7 +5717,8 @@ internal static class Program
                     ["reason"] = "video_client_disconnected",
                     ["framesGenerated"] = snapshot.FramesGenerated,
                     ["framesEncoded"] = snapshot.FramesEncoded,
-                    ["framesSent"] = snapshot.FramesSent
+                    ["framesSent"] = snapshot.FramesSent,
+                    ["fallback"] = EncoderFallbackName
                 }, CancellationToken.None);
             }
 
@@ -5639,7 +5728,8 @@ internal static class Program
                 {
                     ["reason"] = "video_client_disconnected",
                     ["source"] = _frameSource.SourceName,
-                    ["gpuPath"] = true
+                    ["gpuPath"] = true,
+                    ["fallback"] = EncoderFallbackName
                 }, CancellationToken.None);
             }
 
@@ -5778,52 +5868,78 @@ internal static class Program
                 }
 
                 var converter = _converter ?? throw new InvalidOperationException("GPU converter has not started.");
+                ID3D11Texture2D? lastNv12Texture = null;
+                ID3D11Texture2D? blackNv12Texture = null;
+                long lastSourceSequence = 0;
 
-                await foreach (var acquired in _gpuFrames.Reader.ReadAllAsync(cancellationToken))
+                try
                 {
-                    ID3D11Texture2D? pendingTexture = null;
-                    try
+                    await foreach (var acquired in _gpuFrames.Reader.ReadAllAsync(cancellationToken))
                     {
-                        if (acquired.Lease is null)
+                        ID3D11Texture2D? pendingTexture = null;
+                        Action releaseNv12Texture = static () => { };
+                        try
                         {
-                            continue;
+                            if (acquired.Lease is not null)
+                            {
+                                var convertStopwatch = Stopwatch.StartNew();
+                                pendingTexture = converter.Convert(acquired.Lease.Texture, cancellationToken, out releaseNv12Texture);
+                                convertStopwatch.Stop();
+                                _captureStats.RecordConverted(convertStopwatch.Elapsed.TotalMilliseconds);
+                                _convertStageStats.RecordProcessed(convertStopwatch.Elapsed.TotalMilliseconds);
+                                TryDumpGpuFrame(acquired.Lease.Texture, pendingTexture);
+
+                                lastNv12Texture?.Dispose();
+                                lastNv12Texture = pendingTexture.QueryInterface<ID3D11Texture2D>();
+                                lastSourceSequence = acquired.SourceSequence;
+                            }
+                            else if (lastNv12Texture is not null)
+                            {
+                                pendingTexture = lastNv12Texture.QueryInterface<ID3D11Texture2D>();
+                            }
+                            else
+                            {
+                                blackNv12Texture ??= converter.CreateBlackNv12Texture();
+                                pendingTexture = blackNv12Texture.QueryInterface<ID3D11Texture2D>();
+                            }
+
+                            var nv12Texture = pendingTexture;
+                            pendingTexture = null;
+                            var converted = new GpuConvertedFrame(
+                                nv12Texture,
+                                acquired.FrameId,
+                                acquired.FrameKind,
+                                acquired.SourceSequence == 0 ? lastSourceSequence : acquired.SourceSequence,
+                                acquired.SourceAgeMs,
+                                acquired.GeneratedTimestampMs,
+                                () =>
+                                {
+                                    nv12Texture.Dispose();
+                                    releaseNv12Texture();
+                                });
+                            var dropped = _gpuConvertedFrames.WriteLatest(converted);
+                            if (dropped > 0)
+                            {
+                                _convertStageStats.RecordDropped(dropped);
+                                _stats.RecordDropped(dropped);
+                            }
                         }
-
-                        var convertStopwatch = Stopwatch.StartNew();
-                        pendingTexture = converter.Convert(acquired.Lease.Texture);
-                        convertStopwatch.Stop();
-                        _captureStats.RecordConverted(convertStopwatch.Elapsed.TotalMilliseconds);
-                        _convertStageStats.RecordProcessed(convertStopwatch.Elapsed.TotalMilliseconds);
-                        TryDumpGpuFrame(acquired.Lease.Texture, pendingTexture);
-                        acquired.Dispose();
-
-                        var nv12Texture = pendingTexture;
-                        pendingTexture = null;
-                        var converted = new GpuConvertedFrame(
-                            nv12Texture,
-                            acquired.FrameId,
-                            acquired.FrameKind,
-                            acquired.SourceSequence,
-                            acquired.SourceAgeMs,
-                            acquired.GeneratedTimestampMs,
-                            () => nv12Texture.Dispose());
-                        var dropped = _gpuConvertedFrames.WriteLatest(converted);
-                        if (dropped > 0)
+                        catch (SharpGenException ex) when (IsTransientGpuPipelineFailure(ex))
                         {
-                            _convertStageStats.RecordDropped(dropped);
-                            _stats.RecordDropped(dropped);
+                            _captureStats.RecordError();
+                            await PublishCaptureErrorAsync("GPU_PIPELINE_TRANSIENT", FormatExceptionForLog(ex), CancellationToken.None);
+                        }
+                        finally
+                        {
+                            pendingTexture?.Dispose();
+                            acquired.Dispose();
                         }
                     }
-                    catch (SharpGenException ex) when (IsTransientGpuPipelineFailure(ex))
-                    {
-                        _captureStats.RecordError();
-                        await PublishCaptureErrorAsync("GPU_PIPELINE_TRANSIENT", FormatExceptionForLog(ex), CancellationToken.None);
-                    }
-                    finally
-                    {
-                        pendingTexture?.Dispose();
-                        acquired.Dispose();
-                    }
+                }
+                finally
+                {
+                    lastNv12Texture?.Dispose();
+                    blackNv12Texture?.Dispose();
                 }
             }
             catch (OperationCanceledException)
@@ -5864,7 +5980,7 @@ internal static class Program
                         if (acquired.Lease is not null)
                         {
                             var convertStopwatch = Stopwatch.StartNew();
-                            var nv12Texture = converter.Convert(acquired.Lease.Texture);
+                            var nv12Texture = converter.Convert(acquired.Lease.Texture, cancellationToken, out var releaseNv12Texture);
                             try
                             {
                                 var nv12Data = readback.Read(nv12Texture);
@@ -5878,7 +5994,7 @@ internal static class Program
                             }
                             finally
                             {
-                                nv12Texture.Dispose();
+                                releaseNv12Texture();
                             }
                         }
                         else if (lastNv12Frame is not null)
@@ -6104,12 +6220,15 @@ internal static class Program
                     var acquireSnapshot = _acquireStageStats.SnapshotAndResetWindow();
                     var convertSnapshot = _convertStageStats.SnapshotAndResetWindow();
                     var encodeSnapshot = _encodeStageStats.SnapshotAndResetWindow();
-                    Log($"ENCODER {_connectionId}", $"stats generated={snapshot.FramesGenerated} encoded={snapshot.FramesEncoded} sent={snapshot.FramesSent} dropped={snapshot.FramesDropped} late={snapshot.LateFrames} streamFps={snapshot.StreamFps:F1} new={snapshot.NewFramesSent} repeat={snapshot.RepeatFramesSent} avgFrameInterval={snapshot.P50FrameIntervalMs:F2}/{snapshot.P95FrameIntervalMs:F2}/{snapshot.P99FrameIntervalMs:F2}ms avgEncode={snapshot.AvgEncodeMs:F1}ms p95Encode={snapshot.P95EncodeMs:F1}ms p99Encode={snapshot.P99EncodeMs:F1}ms maxEncode={snapshot.MaxEncodeMs:F1}ms avgSend={snapshot.AvgSendMs:F1}ms p95Send={snapshot.P95SendMs:F1}ms kbps={snapshot.OutputKbps:F0} pipeline {FormatPipelineStageForLog(acquireSnapshot)} {FormatPipelineStageForLog(convertSnapshot)} {FormatPipelineStageForLog(encodeSnapshot)}");
-                    await _controlPublisher.PublishAsync("encoder_stats", CreateEncoderStatsPayload(snapshot, gpuPath: true), cancellationToken);
-                    await _controlPublisher.PublishAsync(
-                        "pipeline_stats",
-                        CreatePipelineStatsPayload(_frameSource.SourceName, gpuPath: true, acquireSnapshot, convertSnapshot, encodeSnapshot),
-                        cancellationToken);
+                    Log($"ENCODER {_connectionId}", $"stats fallback={EncoderFallbackName} generated={snapshot.FramesGenerated} encoded={snapshot.FramesEncoded} sent={snapshot.FramesSent} dropped={snapshot.FramesDropped} late={snapshot.LateFrames} streamFps={snapshot.StreamFps:F1} localLatencyP95={snapshot.P95LocalLatencyMs:F1}ms new={snapshot.NewFramesSent} repeat={snapshot.RepeatFramesSent} avgFrameInterval={snapshot.P50FrameIntervalMs:F2}/{snapshot.P95FrameIntervalMs:F2}/{snapshot.P99FrameIntervalMs:F2}ms avgEncode={snapshot.AvgEncodeMs:F1}ms p95Encode={snapshot.P95EncodeMs:F1}ms p99Encode={snapshot.P99EncodeMs:F1}ms maxEncode={snapshot.MaxEncodeMs:F1}ms avgSend={snapshot.AvgSendMs:F1}ms p95Send={snapshot.P95SendMs:F1}ms kbps={snapshot.OutputKbps:F0} pipeline {FormatPipelineStageForLog(acquireSnapshot)} {FormatPipelineStageForLog(convertSnapshot)} {FormatPipelineStageForLog(encodeSnapshot)}");
+                    var encoderStatsPayload = CreateEncoderStatsPayload(snapshot, gpuPath: true);
+                    AddEncoderTuningPayload(encoderStatsPayload, _options);
+                    AddEncoderPathPayload(encoderStatsPayload);
+                    await _controlPublisher.PublishAsync("encoder_stats", encoderStatsPayload, cancellationToken);
+
+                    var pipelineStatsPayload = CreatePipelineStatsPayload(_frameSource.SourceName, gpuPath: true, acquireSnapshot, convertSnapshot, encodeSnapshot);
+                    AddEncoderPathPayload(pipelineStatsPayload);
+                    await _controlPublisher.PublishAsync("pipeline_stats", pipelineStatsPayload, cancellationToken);
                 }
             }
             catch (OperationCanceledException)
@@ -6127,7 +6246,7 @@ internal static class Program
                 {
                     var snapshot = _captureStats.SnapshotAndResetWindow();
                     _latestCaptureSnapshot = snapshot;
-                    Log($"CAPTURE {_connectionId}", $"gpu stats captured={snapshot.FramesCaptured} converted={snapshot.FramesConverted} errors={snapshot.CaptureErrors} captureFps={snapshot.CaptureFps:F1} convertFps={snapshot.ConvertFps:F1} avgAcquire={snapshot.AvgCaptureMs:F1}ms p95Acquire={snapshot.P95CaptureMs:F1}ms avgConvert={snapshot.AvgConvertMs:F1}ms p95Convert={snapshot.P95ConvertMs:F1}ms dropped={_frameSource.FramesDropped}");
+                    Log($"CAPTURE {_connectionId}", $"gpu stats fallback={EncoderFallbackName} ringSlots={_frameSource.SlotCount} captured={snapshot.FramesCaptured} converted={snapshot.FramesConverted} errors={snapshot.CaptureErrors} captureFps={snapshot.CaptureFps:F1} convertFps={snapshot.ConvertFps:F1} avgAcquire={snapshot.AvgCaptureMs:F1}ms p95Acquire={snapshot.P95CaptureMs:F1}ms avgConvert={snapshot.AvgConvertMs:F1}ms p95Convert={snapshot.P95ConvertMs:F1}ms dropped={_frameSource.FramesDropped}");
                     var payload = new JsonObject
                     {
                         ["source"] = _frameSource.SourceName,
@@ -6140,8 +6259,11 @@ internal static class Program
                         ["framesDropped"] = _frameSource.FramesDropped,
                         ["lastFrameAgeMs"] = Math.Round(_frameSource.LastFrameAgeMs, 0),
                         ["gpuPath"] = true,
-                        ["fallback"] = _encoderUsesD3DInput ? "none" : "gpu-convert-nv12-readback"
+                        ["directD3DInput"] = _encoderUsesD3DInput,
+                        ["fallback"] = EncoderFallbackName,
+                        ["driverGpuRingSlots"] = _frameSource.SlotCount
                     };
+                    AddFallbackReason(payload);
                     AddCapturePercentiles(payload, snapshot);
                     await _controlPublisher.PublishAsync("capture_stats", payload, cancellationToken);
                 }
@@ -6159,7 +6281,8 @@ internal static class Program
             {
                 ["code"] = code,
                 ["message"] = message,
-                ["gpuPath"] = true
+                ["gpuPath"] = true,
+                ["fallback"] = EncoderFallbackName
             }, cancellationToken).AsTask();
         }
 
@@ -6171,14 +6294,100 @@ internal static class Program
                 ["code"] = code,
                 ["message"] = message,
                 ["source"] = _frameSource.SourceName,
-                ["gpuPath"] = true
+                ["gpuPath"] = true,
+                ["fallback"] = EncoderFallbackName
             }, cancellationToken).AsTask();
+        }
+
+        private string EncoderFallbackName => _encoderUsesD3DInput ? DirectEncoderFallback : ReadbackEncoderFallback;
+
+        private string EncoderInputFormat => _encoderUsesD3DInput ? "d3d11-nv12-texture" : "nv12-readback";
+
+        private string FallbackReasonForLog => string.IsNullOrWhiteSpace(_encoderFallbackReason)
+            ? string.Empty
+            : $" reason={_encoderFallbackReason}";
+
+        private void AddEncoderPathPayload(JsonObject payload)
+        {
+            payload["source"] = _frameSource.SourceName;
+            payload["inputFormat"] = EncoderInputFormat;
+            payload["directD3DInput"] = _encoderUsesD3DInput;
+            payload["fallback"] = EncoderFallbackName;
+            payload["driverGpuRingSlots"] = _frameSource.SlotCount;
+            if (!string.IsNullOrWhiteSpace(_encoderMftName))
+            {
+                payload["encoderMft"] = _encoderMftName;
+            }
+
+            AddFallbackReason(payload);
+        }
+
+        private void AddFallbackReason(JsonObject payload)
+        {
+            if (!string.IsNullOrWhiteSpace(_encoderFallbackReason))
+            {
+                payload["fallbackReason"] = _encoderFallbackReason;
+            }
+        }
+
+        [SupportedOSPlatform("windows")]
+        private static D3D11EncoderInputProbeResult ProbeD3D11EncoderInput(HostOptions options, ID3D11Device device)
+        {
+            try
+            {
+                using var encoder = new MediaFoundationH264Encoder(options, device);
+                encoder.Start();
+                using var probeTexture = CreateD3D11EncoderProbeTexture(device, options.VideoWidth, options.VideoHeight);
+                encoder.EncodeFrame(probeTexture, 0);
+                return new D3D11EncoderInputProbeResult(true, null, encoder.SelectedMftName);
+            }
+            catch (Exception ex) when (IsD3D11EncoderInputFailure(ex))
+            {
+                return new D3D11EncoderInputProbeResult(false, FormatExceptionReason(ex), null);
+            }
+        }
+
+        [SupportedOSPlatform("windows")]
+        private static ID3D11Texture2D CreateD3D11EncoderProbeTexture(ID3D11Device device, int width, int height)
+        {
+            return device.CreateTexture2D(new Texture2DDescription
+            {
+                Width = (uint)width,
+                Height = (uint)height,
+                MipLevels = 1,
+                ArraySize = 1,
+                Format = Format.NV12,
+                SampleDescription = new SampleDescription(1, 0),
+                Usage = ResourceUsage.Default,
+                BindFlags = BindFlags.RenderTarget | BindFlags.VideoEncoder,
+                CPUAccessFlags = CpuAccessFlags.None,
+                MiscFlags = ResourceOptionFlags.None
+            });
+        }
+
+        private static bool IsD3D11EncoderInputFailure(Exception ex)
+        {
+            return ex is COMException or SharpGenException or InvalidOperationException or ArgumentException;
+        }
+
+        private static string FormatExceptionReason(Exception ex)
+        {
+            var message = ex switch
+            {
+                COMException comException => $"HRESULT=0x{comException.HResult:X8}: {comException.Message}",
+                SharpGenException sharpGenException => $"HRESULT=0x{sharpGenException.HResult:X8}: {sharpGenException.Message}",
+                _ => ex.Message
+            };
+
+            return message.ReplaceLineEndings(" ");
         }
 
         private static bool IsTransientGpuCaptureMiss(string code)
         {
             return code is "IDD_GPU_FRAME_TIMEOUT" or "IDD_GPU_FRAME_STALE" or "IDD_GPU_SLOT_BUSY";
         }
+
+        private readonly record struct D3D11EncoderInputProbeResult(bool SupportsDirectInput, string? FallbackReason, string? EncoderMftName);
 
         private static bool IsTransientGpuPipelineFailure(SharpGenException ex)
         {
@@ -6220,7 +6429,7 @@ internal static class Program
         private static RealtimeEncoderStatsSnapshot CreateEmptyEncoderSnapshot()
         {
             return new RealtimeEncoderStatsSnapshot(
-                0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0);
+                0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0);
         }
     }
 
@@ -6235,8 +6444,10 @@ internal static class Program
         private readonly ID3D11VideoProcessor _processor;
         private readonly int _width;
         private readonly int _height;
+        private readonly ID3D11Texture2D[] _nv12TexturePool;
+        private readonly Channel<int> _availableNv12Textures;
 
-        public GpuBgraToNv12Converter(ID3D11Device device, ID3D11DeviceContext context, int width, int height, int fps)
+        public GpuBgraToNv12Converter(ID3D11Device device, ID3D11DeviceContext context, int width, int height, int fps, int nv12TexturePoolSize)
         {
             if (width <= 0 || height <= 0)
             {
@@ -6254,6 +6465,13 @@ internal static class Program
             _height = height;
             _videoDevice = _device.QueryInterface<ID3D11VideoDevice>();
             _videoContext = _context.QueryInterface<ID3D11VideoContext>();
+            _nv12TexturePool = new ID3D11Texture2D[Math.Max(1, nv12TexturePoolSize)];
+            _availableNv12Textures = Channel.CreateBounded<int>(new BoundedChannelOptions(_nv12TexturePool.Length)
+            {
+                FullMode = BoundedChannelFullMode.Wait,
+                SingleReader = false,
+                SingleWriter = false
+            });
 
             var description = new VideoProcessorContentDescription
             {
@@ -6269,9 +6487,14 @@ internal static class Program
 
             _enumerator = _videoDevice.CreateVideoProcessorEnumerator(description);
             _processor = _videoDevice.CreateVideoProcessor(_enumerator, 0);
+            for (var index = 0; index < _nv12TexturePool.Length; index++)
+            {
+                _nv12TexturePool[index] = CreateNv12Texture();
+                _availableNv12Textures.Writer.TryWrite(index);
+            }
         }
 
-        public ID3D11Texture2D Convert(ID3D11Texture2D bgraTexture)
+        public ID3D11Texture2D Convert(ID3D11Texture2D bgraTexture, CancellationToken cancellationToken, out Action release)
         {
             var description = bgraTexture.Description;
             if (description.Width != _width || description.Height != _height || description.Format != Format.B8G8R8A8_UNorm)
@@ -6279,6 +6502,9 @@ internal static class Program
                 throw new CaptureException("GPU_FRAME_LAYOUT_UNSUPPORTED", $"Unexpected GPU frame layout {description.Width}x{description.Height} {description.Format}.");
             }
 
+            var slotIndex = RentNv12Texture(cancellationToken);
+            release = () => ReleaseNv12Texture(slotIndex);
+            var nv12Texture = _nv12TexturePool[slotIndex];
             using var inputView = _videoDevice.CreateVideoProcessorInputView(
                 bgraTexture,
                 _enumerator,
@@ -6293,7 +6519,6 @@ internal static class Program
                     }
                 });
 
-            var nv12Texture = CreateNv12Texture();
             using var outputView = _videoDevice.CreateVideoProcessorOutputView(
                 nv12Texture,
                 _enumerator,
@@ -6318,12 +6543,64 @@ internal static class Program
 
             _videoContext.VideoProcessorBlt(_processor, outputView, 0, 1, [stream]).CheckError();
             _context.Flush();
+            return nv12Texture.QueryInterface<ID3D11Texture2D>();
+        }
+
+        public ID3D11Texture2D CreateBlackNv12Texture()
+        {
+            var uploadDescription = CreateNv12TextureDescription();
+            uploadDescription.Usage = ResourceUsage.Staging;
+            uploadDescription.BindFlags = BindFlags.None;
+            uploadDescription.CPUAccessFlags = CpuAccessFlags.Write;
+
+            using var uploadTexture = _device.CreateTexture2D(in uploadDescription);
+            MappedSubresource mapped = default;
+            _context.Map(uploadTexture, 0, MapMode.Write, Vortice.Direct3D11.MapFlags.None, out mapped).CheckError();
+            try
+            {
+                FillBlackNv12(mapped, _width, _height);
+            }
+            finally
+            {
+                _context.Unmap(uploadTexture, 0);
+            }
+
+            var nv12Texture = CreateNv12Texture();
+            _context.CopyResource(nv12Texture, uploadTexture);
+            _context.Flush();
             return nv12Texture;
         }
 
         private ID3D11Texture2D CreateNv12Texture()
         {
-            return _device.CreateTexture2D(new Texture2DDescription
+            return _device.CreateTexture2D(CreateNv12TextureDescription());
+        }
+
+        private int RentNv12Texture(CancellationToken cancellationToken)
+        {
+            while (true)
+            {
+                cancellationToken.ThrowIfCancellationRequested();
+                if (_availableNv12Textures.Reader.TryRead(out var slotIndex))
+                {
+                    return slotIndex;
+                }
+
+                if (cancellationToken.WaitHandle.WaitOne(1))
+                {
+                    cancellationToken.ThrowIfCancellationRequested();
+                }
+            }
+        }
+
+        private void ReleaseNv12Texture(int slotIndex)
+        {
+            _availableNv12Textures.Writer.TryWrite(slotIndex);
+        }
+
+        private Texture2DDescription CreateNv12TextureDescription()
+        {
+            return new Texture2DDescription
             {
                 Width = (uint)_width,
                 Height = (uint)_height,
@@ -6335,11 +6612,36 @@ internal static class Program
                 BindFlags = BindFlags.RenderTarget | BindFlags.VideoEncoder,
                 CPUAccessFlags = CpuAccessFlags.None,
                 MiscFlags = ResourceOptionFlags.None
-            });
+            };
+        }
+
+        private static void FillBlackNv12(MappedSubresource mapped, int width, int height)
+        {
+            var rowPitch = checked((int)mapped.RowPitch);
+            var yRow = new byte[width];
+            var uvRow = new byte[width];
+            Array.Fill<byte>(yRow, 16);
+            Array.Fill<byte>(uvRow, 128);
+
+            for (var y = 0; y < height; y++)
+            {
+                Marshal.Copy(yRow, 0, IntPtr.Add(mapped.DataPointer, checked(y * rowPitch)), width);
+            }
+
+            var uvBase = IntPtr.Add(mapped.DataPointer, checked(rowPitch * height));
+            for (var y = 0; y < height / 2; y++)
+            {
+                Marshal.Copy(uvRow, 0, IntPtr.Add(uvBase, checked(y * rowPitch)), width);
+            }
         }
 
         public void Dispose()
         {
+            foreach (var texture in _nv12TexturePool)
+            {
+                texture.Dispose();
+            }
+
             _processor.Dispose();
             _enumerator.Dispose();
             _videoContext.Dispose();
@@ -6603,7 +6905,7 @@ internal static class Program
         private const uint FrameMagic = 0x474B4453; // SDKG
         private const int FrameVersion = 1;
         private const int FrameFormatBgra = 1;
-        private const int SlotCountMax = 8;
+        private const int SlotCountMax = 12;
         private const int MetadataHeaderSize = 72;
         private const int SlotHeaderSize = 32;
         private const int FrameReadyTimeoutMs = 500;
@@ -6617,7 +6919,11 @@ internal static class Program
             "Global\\SideDockGpuFrameSlot4",
             "Global\\SideDockGpuFrameSlot5",
             "Global\\SideDockGpuFrameSlot6",
-            "Global\\SideDockGpuFrameSlot7"
+            "Global\\SideDockGpuFrameSlot7",
+            "Global\\SideDockGpuFrameSlot8",
+            "Global\\SideDockGpuFrameSlot9",
+            "Global\\SideDockGpuFrameSlot10",
+            "Global\\SideDockGpuFrameSlot11"
         ];
 
         private readonly HostOptions _options;
@@ -6659,6 +6965,8 @@ internal static class Program
         public int Width => _width;
 
         public int Height => _height;
+
+        public int SlotCount => _slotCount;
 
         public long FramesDropped => Interlocked.Read(ref _framesDropped);
 
@@ -7054,15 +7362,20 @@ internal static class Program
         private readonly HostOptions _options;
         private readonly ID3D11Device? _d3dDevice;
         private IMFTransform? _transform;
+        private IMFMediaEventGenerator? _eventGenerator;
         private IMFDXGIDeviceManager? _dxgiDeviceManager;
         private uint _dxgiResetToken;
         private int _outputBufferSize;
         private bool _outputProvidesSamples;
+        private bool _asyncMft;
+        private bool _asyncMftNeedsInput;
         private bool _started;
         private bool _mfStarted;
         private bool _comInitialized;
         private int _nalLengthSize = 4;
         private byte[]? _parameterSets;
+
+        public string SelectedMftName { get; private set; } = string.Empty;
 
         public MediaFoundationH264Encoder(HostOptions options, ID3D11Device? d3dDevice = null)
         {
@@ -7099,15 +7412,7 @@ internal static class Program
             ThrowIfFailed(Native.MFStartup(Native.MF_VERSION, Native.MFSTARTUP_FULL), "MFStartup failed.");
             _mfStarted = true;
 
-            var clsid = Native.CLSID_CMSH264EncoderMFT;
-            var iid = Native.IID_IMFTransform;
-            ThrowIfFailed(
-                Native.CoCreateInstance(ref clsid, IntPtr.Zero, Native.CLSCTX_INPROC_SERVER, ref iid, out _transform),
-                "Unable to create the Microsoft H.264 Media Foundation encoder MFT.");
-
-            ConfigureCodecApi();
-            ConfigureD3DManager();
-            ConfigureMediaTypes();
+            CreateAndConfigureTransform();
 
             var transform = GetTransform();
             ThrowIfFailed(transform.ProcessMessage(Native.MFT_MESSAGE_NOTIFY_BEGIN_STREAMING, IntPtr.Zero), "Unable to begin Media Foundation streaming.");
@@ -7133,6 +7438,11 @@ internal static class Program
 
             var transform = GetTransform();
             using var inputSample = CreateInputSample(nv12Frame, expectedLength, frameId);
+            if (_asyncMft)
+            {
+                return EncodeAsyncMftFrame(transform, inputSample.Sample);
+            }
+
             var hr = transform.ProcessInput(0, inputSample.Sample, 0);
             if (hr == Native.MF_E_NOTACCEPTING)
             {
@@ -7172,6 +7482,11 @@ internal static class Program
 
             var transform = GetTransform();
             using var inputSample = CreateInputSample(nv12Texture, frameId);
+            if (_asyncMft)
+            {
+                return EncodeAsyncMftFrame(transform, inputSample.Sample);
+            }
+
             var hr = transform.ProcessInput(0, inputSample.Sample, 0);
             if (hr == Native.MF_E_NOTACCEPTING)
             {
@@ -7193,6 +7508,8 @@ internal static class Program
 
         public void Dispose()
         {
+            _eventGenerator = null;
+
             if (_transform is not null)
             {
                 try
@@ -7301,6 +7618,203 @@ internal static class Program
             }
         }
 
+        private void CreateAndConfigureTransform()
+        {
+            var failures = new List<string>();
+            foreach (var candidate in EnumerateH264EncoderCandidates())
+            {
+                try
+                {
+                    CreateTransform(candidate);
+                    ConfigureAsyncUnlock();
+                    ConfigureCodecApi();
+                    ConfigureD3DManager();
+                    ConfigureMediaTypes();
+                    SelectedMftName = candidate.Name;
+                    return;
+                }
+                catch (Exception ex) when (ex is COMException or InvalidOperationException)
+                {
+                    failures.Add($"{candidate.Name}: {FormatComFailure(ex)}");
+                    ReleaseActiveTransform();
+                }
+            }
+
+            throw new InvalidOperationException($"Unable to initialize an H.264 Media Foundation encoder. {string.Join("; ", failures)}");
+        }
+
+        private void CreateTransform(H264EncoderMftCandidate candidate)
+        {
+            var clsid = candidate.Clsid;
+            var iid = Native.IID_IMFTransform;
+            ThrowIfFailed(
+                Native.CoCreateInstance(ref clsid, IntPtr.Zero, Native.CLSCTX_INPROC_SERVER, ref iid, out _transform),
+                $"Unable to create H.264 Media Foundation encoder MFT '{candidate.Name}'.");
+        }
+
+        private void ConfigureAsyncUnlock()
+        {
+            if (_transform is null)
+            {
+                return;
+            }
+
+            var hr = _transform.GetAttributes(out var attributes);
+            if (hr < 0 || attributes is null)
+            {
+                return;
+            }
+
+            try
+            {
+                var asyncAttribute = Native.MF_TRANSFORM_ASYNC;
+                _asyncMft = attributes.GetUINT32(ref asyncAttribute, out var asyncValue) >= 0 && asyncValue != 0;
+                if (_asyncMft)
+                {
+                    SetUInt32(attributes, Native.MF_TRANSFORM_ASYNC_UNLOCK, 1);
+                }
+            }
+            finally
+            {
+                ReleaseComObject(attributes);
+            }
+        }
+
+        private IReadOnlyList<H264EncoderMftCandidate> EnumerateH264EncoderCandidates()
+        {
+            var candidates = new List<H264EncoderMftCandidate>();
+            var category = Native.MFT_CATEGORY_VIDEO_ENCODER;
+            var outputType = new MFTRegisterTypeInfo
+            {
+                MajorType = Native.MFMediaType_Video,
+                Subtype = Native.MFVideoFormat_H264
+            };
+            var flags = Native.MFT_ENUM_FLAG_SYNCMFT
+                | Native.MFT_ENUM_FLAG_ASYNCMFT
+                | Native.MFT_ENUM_FLAG_HARDWARE
+                | Native.MFT_ENUM_FLAG_SORTANDFILTER;
+
+            var hr = Native.MFTEnumEx(ref category, flags, IntPtr.Zero, ref outputType, out var activateArray, out var count);
+            if (hr >= 0 && activateArray != IntPtr.Zero)
+            {
+                try
+                {
+                    for (var index = 0; index < count; index++)
+                    {
+                        var activatePtr = Marshal.ReadIntPtr(activateArray, index * IntPtr.Size);
+                        if (activatePtr == IntPtr.Zero)
+                        {
+                            continue;
+                        }
+
+                        IMFAttributes? attributes = null;
+                        try
+                        {
+                            attributes = (IMFAttributes)Marshal.GetObjectForIUnknown(activatePtr);
+                            var name = GetStringAttribute(attributes, Native.MFT_FRIENDLY_NAME_Attribute) ?? $"H.264 encoder MFT {index}";
+                            var clsid = GetGuidAttribute(attributes, Native.MFT_TRANSFORM_CLSID_Attribute);
+                            if (clsid != Guid.Empty)
+                            {
+                                candidates.Add(new H264EncoderMftCandidate(name, clsid, index));
+                            }
+                        }
+                        finally
+                        {
+                            ReleaseComObject(attributes);
+                            Marshal.Release(activatePtr);
+                        }
+                    }
+                }
+                finally
+                {
+                    Native.CoTaskMemFree(activateArray);
+                }
+            }
+
+            if (!candidates.Any(candidate => candidate.Clsid == Native.CLSID_CMSH264EncoderMFT))
+            {
+                candidates.Add(new H264EncoderMftCandidate("H264 Encoder MFT", Native.CLSID_CMSH264EncoderMFT, int.MaxValue));
+            }
+
+            return candidates
+                .OrderByDescending(ScoreEncoderCandidate)
+                .ThenBy(candidate => candidate.OriginalIndex)
+                .ToArray();
+        }
+
+        private int ScoreEncoderCandidate(H264EncoderMftCandidate candidate)
+        {
+            var name = candidate.Name;
+            if (_d3dDevice is null)
+            {
+                return candidate.Clsid == Native.CLSID_CMSH264EncoderMFT ? 100 : 10;
+            }
+
+            if (name.Contains("NVIDIA", StringComparison.OrdinalIgnoreCase))
+            {
+                return 200;
+            }
+
+            return candidate.Clsid == Native.CLSID_CMSH264EncoderMFT ? 0 : 100;
+        }
+
+        private void ReleaseActiveTransform()
+        {
+            if (_dxgiDeviceManager is not null)
+            {
+                ReleaseComObject(_dxgiDeviceManager);
+                _dxgiDeviceManager = null;
+            }
+
+            if (_transform is not null)
+            {
+                ReleaseComObject(_transform);
+                _transform = null;
+            }
+
+            _dxgiResetToken = 0;
+            _outputBufferSize = 0;
+            _outputProvidesSamples = false;
+            _asyncMft = false;
+            _asyncMftNeedsInput = false;
+            _eventGenerator = null;
+            _nalLengthSize = 4;
+            _parameterSets = null;
+            SelectedMftName = string.Empty;
+        }
+
+        private static string? GetStringAttribute(IMFAttributes attributes, Guid key)
+        {
+            var attribute = key;
+            if (attributes.GetStringLength(ref attribute, out var length) < 0 || length <= 0)
+            {
+                return null;
+            }
+
+            var value = new StringBuilder(length + 1);
+            attribute = key;
+            return attributes.GetString(ref attribute, value, value.Capacity, out _) < 0
+                ? null
+                : value.ToString();
+        }
+
+        private static Guid GetGuidAttribute(IMFAttributes attributes, Guid key)
+        {
+            var attribute = key;
+            return attributes.GetGUID(ref attribute, out var value) < 0 ? Guid.Empty : value;
+        }
+
+        private static string FormatComFailure(Exception ex)
+        {
+            var message = ex switch
+            {
+                COMException comException => $"HRESULT=0x{comException.HResult:X8}: {comException.Message}",
+                _ => ex.Message
+            };
+
+            return message.ReplaceLineEndings(" ");
+        }
+
         private void ConfigureMediaTypes()
         {
             var transform = GetTransform();
@@ -7319,23 +7833,29 @@ internal static class Program
 
             using var inputType = CreateInputMediaType();
             ThrowIfFailed(transform.SetInputType(0, inputType.MediaType, 0), "Unable to set Media Foundation NV12 input type.");
+
+            if (_asyncMft)
+            {
+                _eventGenerator = (IMFMediaEventGenerator)transform;
+            }
         }
 
         private MediaTypeHandle CreateOutputMediaType(bool includeProfile)
         {
             ThrowIfFailed(Native.MFCreateMediaType(out var mediaType), "Unable to create Media Foundation output media type.");
             var attributes = (IMFAttributes)mediaType;
+            var tuning = _options.EncoderTuning;
 
             SetGuid(attributes, Native.MF_MT_MAJOR_TYPE, Native.MFMediaType_Video);
             SetGuid(attributes, Native.MF_MT_SUBTYPE, Native.MFVideoFormat_H264);
-            SetUInt32(attributes, Native.MF_MT_AVG_BITRATE, _options.VideoBitrate);
+            SetUInt32(attributes, Native.MF_MT_AVG_BITRATE, tuning.Bitrate);
             SetUInt32(attributes, Native.MF_MT_INTERLACE_MODE, Native.MFVideoInterlace_Progressive);
-            SetUInt32(attributes, Native.MF_MT_MAX_KEYFRAME_SPACING, _options.VideoGop);
+            SetUInt32(attributes, Native.MF_MT_MAX_KEYFRAME_SPACING, tuning.Gop);
             SetUInt32(attributes, Native.MF_NALU_LENGTH_SET, 4);
 
             if (includeProfile)
             {
-                SetUInt32(attributes, Native.MF_MT_MPEG2_PROFILE, Native.H264ProfileBaseline);
+                SetUInt32(attributes, Native.MF_MT_MPEG2_PROFILE, tuning.ProfileValue);
             }
 
             SetPackedUInt32Pair(attributes, Native.MF_MT_FRAME_SIZE, _options.VideoWidth, _options.VideoHeight);
@@ -7368,12 +7888,13 @@ internal static class Program
                 return;
             }
 
-            TrySetCodecValue(codecApi, Native.CODECAPI_AVLowLatencyMode, Variant.FromBool(true));
+            var tuning = _options.EncoderTuning;
+            TrySetCodecValue(codecApi, Native.CODECAPI_AVLowLatencyMode, Variant.FromBool(tuning.LowLatency));
             TrySetCodecValue(codecApi, Native.CODECAPI_AVEncCommonRateControlMode, Variant.FromUInt32(Native.eAVEncCommonRateControlMode_CBR));
-            TrySetCodecValue(codecApi, Native.CODECAPI_AVEncCommonMeanBitRate, Variant.FromUInt32((uint)_options.VideoBitrate));
-            TrySetCodecValue(codecApi, Native.CODECAPI_AVEncMPVGOPSize, Variant.FromUInt32((uint)_options.VideoGop));
-            TrySetCodecValue(codecApi, Native.CODECAPI_AVEncMPVDefaultBPictureCount, Variant.FromUInt32(0));
-            TrySetCodecValue(codecApi, Native.CODECAPI_AVEncMPVProfile, Variant.FromUInt32(Native.H264ProfileBaseline));
+            TrySetCodecValue(codecApi, Native.CODECAPI_AVEncCommonMeanBitRate, Variant.FromUInt32((uint)tuning.Bitrate));
+            TrySetCodecValue(codecApi, Native.CODECAPI_AVEncMPVGOPSize, Variant.FromUInt32((uint)tuning.Gop));
+            TrySetCodecValue(codecApi, Native.CODECAPI_AVEncMPVDefaultBPictureCount, Variant.FromUInt32((uint)tuning.BFrames));
+            TrySetCodecValue(codecApi, Native.CODECAPI_AVEncMPVProfile, Variant.FromUInt32((uint)tuning.ProfileValue));
         }
 
         private void ConfigureD3DManager()
@@ -7446,7 +7967,8 @@ internal static class Program
 
             ApplyInputSampleTiming(sample, frameId);
 
-            if (frameId == 0 || (_options.VideoGop > 0 && frameId % _options.VideoGop == 0))
+            var gop = _options.EncoderTuning.Gop;
+            if (frameId == 0 || (gop > 0 && frameId % gop == 0))
             {
                 SetUInt32((IMFAttributes)sample, Native.MFSampleExtension_VideoEncodePictureType, Native.eAVEncH264PictureType_IDR);
                 ForceNextKeyFrame();
@@ -7468,7 +7990,8 @@ internal static class Program
                 ThrowIfFailed(sample.AddBuffer(buffer), "Unable to attach GPU input buffer to Media Foundation sample.");
                 ApplyInputSampleTiming(sample, frameId);
 
-                if (frameId == 0 || (_options.VideoGop > 0 && frameId % _options.VideoGop == 0))
+                var gop = _options.EncoderTuning.Gop;
+                if (frameId == 0 || (gop > 0 && frameId % gop == 0))
                 {
                     SetUInt32((IMFAttributes)sample, Native.MFSampleExtension_VideoEncodePictureType, Native.eAVEncH264PictureType_IDR);
                     ForceNextKeyFrame();
@@ -7499,7 +8022,135 @@ internal static class Program
             TrySetCodecValue(codecApi, Native.CODECAPI_AVEncVideoForceKeyFrame, Variant.FromBool(true));
         }
 
-        private List<byte[]> DrainOutput(IMFTransform transform)
+        private List<byte[]> EncodeAsyncMftFrame(IMFTransform transform, IMFSample sample)
+        {
+            var eventGenerator = _eventGenerator ?? throw new InvalidOperationException("Media Foundation async encoder event generator is not initialized.");
+            var packets = new List<byte[]>();
+            var inputSubmitted = false;
+            var inputDeadline = Stopwatch.GetTimestamp() + MillisecondsToStopwatchTicks(100);
+
+            while (!inputSubmitted)
+            {
+                DrainPendingAsyncMftEvents(transform, eventGenerator, sample, ref inputSubmitted, packets);
+                if (inputSubmitted)
+                {
+                    break;
+                }
+
+                if (_asyncMftNeedsInput && TrySubmitAsyncMftInput(transform, sample))
+                {
+                    inputSubmitted = true;
+                    break;
+                }
+
+                if (TrySubmitAsyncMftInput(transform, sample))
+                {
+                    inputSubmitted = true;
+                    break;
+                }
+
+                if (Stopwatch.GetTimestamp() >= inputDeadline)
+                {
+                    throw new TimeoutException("Media Foundation async encoder did not request input in time.");
+                }
+
+                Thread.Sleep(1);
+            }
+
+            var outputDeadline = Stopwatch.GetTimestamp() + MillisecondsToStopwatchTicks(GetAsyncOutputWaitMilliseconds());
+            while (true)
+            {
+                var processedEvent = DrainPendingAsyncMftEvents(transform, eventGenerator, null, ref inputSubmitted, packets);
+                if (packets.Count > 0 || Stopwatch.GetTimestamp() >= outputDeadline)
+                {
+                    return packets;
+                }
+
+                if (!processedEvent)
+                {
+                    Thread.Sleep(1);
+                }
+            }
+        }
+
+        private bool DrainPendingAsyncMftEvents(
+            IMFTransform transform,
+            IMFMediaEventGenerator eventGenerator,
+            IMFSample? pendingInputSample,
+            ref bool inputSubmitted,
+            List<byte[]> packets)
+        {
+            var processedEvent = false;
+            while (TryGetAsyncMftEvent(eventGenerator, out var mediaEvent))
+            {
+                processedEvent = true;
+                try
+                {
+                    ThrowIfFailed(mediaEvent.GetStatus(out var eventStatus), "Unable to read Media Foundation async encoder event status.");
+                    ThrowIfFailed(eventStatus, "Media Foundation async encoder event reported failure.");
+                    ThrowIfFailed(mediaEvent.GetType(out var eventType), "Unable to read Media Foundation async encoder event type.");
+
+                    switch (eventType)
+                    {
+                        case Native.METransformNeedInput:
+                            _asyncMftNeedsInput = true;
+                            if (!inputSubmitted && pendingInputSample is not null && TrySubmitAsyncMftInput(transform, pendingInputSample))
+                            {
+                                inputSubmitted = true;
+                            }
+
+                            break;
+                        case Native.METransformHaveOutput:
+                            packets.AddRange(DrainOutput(transform, singleOutput: true));
+                            break;
+                    }
+                }
+                finally
+                {
+                    ReleaseComObject(mediaEvent);
+                }
+            }
+
+            return processedEvent;
+        }
+
+        private bool TrySubmitAsyncMftInput(IMFTransform transform, IMFSample sample)
+        {
+            var hr = transform.ProcessInput(0, sample, 0);
+            if (hr == Native.MF_E_NOTACCEPTING)
+            {
+                return false;
+            }
+
+            ThrowIfFailed(hr, "Media Foundation async encoder rejected an input frame.");
+            _asyncMftNeedsInput = false;
+            return true;
+        }
+
+        private static bool TryGetAsyncMftEvent(IMFMediaEventGenerator eventGenerator, out IMFMediaEvent mediaEvent)
+        {
+            var hr = eventGenerator.GetEvent(Native.MF_EVENT_FLAG_NO_WAIT, out mediaEvent);
+            if (hr == Native.MF_E_NO_EVENTS_AVAILABLE)
+            {
+                mediaEvent = null!;
+                return false;
+            }
+
+            ThrowIfFailed(hr, "Unable to read Media Foundation async encoder event.");
+            return true;
+        }
+
+        private int GetAsyncOutputWaitMilliseconds()
+        {
+            return Math.Clamp(1000 / Math.Max(1, _options.VideoFps), 1, 8);
+        }
+
+        private static long MillisecondsToStopwatchTicks(int milliseconds)
+        {
+            return Math.Max(1, (long)Math.Round(milliseconds * Stopwatch.Frequency / 1000.0));
+        }
+
+        private List<byte[]> DrainOutput(IMFTransform transform, bool singleOutput = false)
         {
             var packets = new List<byte[]>();
 
@@ -7560,6 +8211,11 @@ internal static class Program
                             {
                                 packets.Add(NormalizeOutputSample(bytes));
                             }
+                        }
+
+                        if (singleOutput)
+                        {
+                            return packets;
                         }
                     }
                     finally
@@ -8017,6 +8673,132 @@ internal static class Program
         }
 
         [ComImport]
+        [Guid("DF598932-F10C-4E39-BBA2-C308F101DAA3")]
+        [InterfaceType(ComInterfaceType.InterfaceIsIUnknown)]
+        private interface IMFMediaEvent
+        {
+            [PreserveSig]
+            int GetItem(ref Guid guidKey, IntPtr pValue);
+
+            [PreserveSig]
+            int GetItemType(ref Guid guidKey, out int pType);
+
+            [PreserveSig]
+            int CompareItem(ref Guid guidKey, IntPtr value, out int result);
+
+            [PreserveSig]
+            int Compare([MarshalAs(UnmanagedType.Interface)] IMFAttributes theirs, int matchType, out int result);
+
+            [PreserveSig]
+            int GetUINT32(ref Guid guidKey, out int value);
+
+            [PreserveSig]
+            int GetUINT64(ref Guid guidKey, out long value);
+
+            [PreserveSig]
+            int GetDouble(ref Guid guidKey, out double value);
+
+            [PreserveSig]
+            int GetGUID(ref Guid guidKey, out Guid value);
+
+            [PreserveSig]
+            int GetStringLength(ref Guid guidKey, out int length);
+
+            [PreserveSig]
+            int GetString(ref Guid guidKey, [MarshalAs(UnmanagedType.LPWStr)] StringBuilder value, int bufferSize, out int length);
+
+            [PreserveSig]
+            int GetAllocatedString(ref Guid guidKey, out IntPtr value, out int length);
+
+            [PreserveSig]
+            int GetBlobSize(ref Guid guidKey, out int blobSize);
+
+            [PreserveSig]
+            int GetBlob(ref Guid guidKey, IntPtr buffer, int bufferSize, out int blobSize);
+
+            [PreserveSig]
+            int GetAllocatedBlob(ref Guid guidKey, out IntPtr buffer, out int size);
+
+            [PreserveSig]
+            int GetUnknown(ref Guid guidKey, ref Guid riid, out IntPtr unknown);
+
+            [PreserveSig]
+            int SetItem(ref Guid guidKey, IntPtr value);
+
+            [PreserveSig]
+            int DeleteItem(ref Guid guidKey);
+
+            [PreserveSig]
+            int DeleteAllItems();
+
+            [PreserveSig]
+            int SetUINT32(ref Guid guidKey, int value);
+
+            [PreserveSig]
+            int SetUINT64(ref Guid guidKey, long value);
+
+            [PreserveSig]
+            int SetDouble(ref Guid guidKey, double value);
+
+            [PreserveSig]
+            int SetGUID(ref Guid guidKey, ref Guid value);
+
+            [PreserveSig]
+            int SetString(ref Guid guidKey, [MarshalAs(UnmanagedType.LPWStr)] string value);
+
+            [PreserveSig]
+            int SetBlob(ref Guid guidKey, IntPtr buffer, int bufferSize);
+
+            [PreserveSig]
+            int SetUnknown(ref Guid guidKey, [MarshalAs(UnmanagedType.IUnknown)] object unknown);
+
+            [PreserveSig]
+            int LockStore();
+
+            [PreserveSig]
+            int UnlockStore();
+
+            [PreserveSig]
+            int GetCount(out int items);
+
+            [PreserveSig]
+            int GetItemByIndex(int index, out Guid guidKey, IntPtr value);
+
+            [PreserveSig]
+            int CopyAllItems([MarshalAs(UnmanagedType.Interface)] IMFAttributes destination);
+
+            [PreserveSig]
+            int GetType(out int mediaEventType);
+
+            [PreserveSig]
+            int GetExtendedType(out Guid extendedType);
+
+            [PreserveSig]
+            int GetStatus(out int status);
+
+            [PreserveSig]
+            int GetValue(IntPtr value);
+        }
+
+        [ComImport]
+        [Guid("2CD0BD52-BCD5-4B89-B62C-EADC0C031E7D")]
+        [InterfaceType(ComInterfaceType.InterfaceIsIUnknown)]
+        private interface IMFMediaEventGenerator
+        {
+            [PreserveSig]
+            int GetEvent(int flags, out IMFMediaEvent mediaEvent);
+
+            [PreserveSig]
+            int BeginGetEvent(IntPtr callback, IntPtr state);
+
+            [PreserveSig]
+            int EndGetEvent(IntPtr result, out IMFMediaEvent mediaEvent);
+
+            [PreserveSig]
+            int QueueEvent(int mediaEventType, ref Guid extendedType, int status, IntPtr value);
+        }
+
+        [ComImport]
         [Guid("2CD2D921-C447-44A7-A13C-4ADABFC247E3")]
         [InterfaceType(ComInterfaceType.InterfaceIsIUnknown)]
         private interface IMFAttributes
@@ -8419,6 +9201,17 @@ internal static class Program
         }
 
         [StructLayout(LayoutKind.Sequential)]
+        private readonly record struct H264EncoderMftCandidate(string Name, Guid Clsid, int OriginalIndex);
+
+        [StructLayout(LayoutKind.Sequential)]
+        private struct MFTRegisterTypeInfo
+        {
+            public Guid MajorType;
+
+            public Guid Subtype;
+        }
+
+        [StructLayout(LayoutKind.Sequential)]
         private struct MFTInputStreamInfo
         {
             public long MaxLatency;
@@ -8507,12 +9300,25 @@ internal static class Program
             public const int MF_E_INVALIDMEDIATYPE = unchecked((int)0xC00D36B4);
             public const int MF_E_NOTACCEPTING = unchecked((int)0xC00D36B5);
             public const int MF_E_NO_MORE_TYPES = unchecked((int)0xC00D36B9);
+            public const int MF_E_NO_EVENTS_AVAILABLE = unchecked((int)0xC00D3E80);
             public const int MF_E_TRANSFORM_STREAM_CHANGE = unchecked((int)0xC00D6D61);
             public const int MF_E_TRANSFORM_NEED_MORE_INPUT = unchecked((int)0xC00D6D72);
+            public const int MF_EVENT_FLAG_NO_WAIT = 0x00000001;
+            public const int METransformNeedInput = 601;
+            public const int METransformHaveOutput = 602;
+            public const int MFT_ENUM_FLAG_SYNCMFT = 0x00000001;
+            public const int MFT_ENUM_FLAG_ASYNCMFT = 0x00000002;
+            public const int MFT_ENUM_FLAG_HARDWARE = 0x00000004;
+            public const int MFT_ENUM_FLAG_SORTANDFILTER = 0x00000040;
             public static readonly byte[] AnnexBStartCode = [0, 0, 0, 1];
 
             public static readonly Guid CLSID_CMSH264EncoderMFT = new("6CA50344-051A-4DED-9779-A43305165E35");
             public static readonly Guid IID_IMFTransform = new("BF94C121-5B05-4E6F-8000-BA598961414D");
+            public static Guid MFT_CATEGORY_VIDEO_ENCODER = new("F79EAC7D-E545-4387-BDEE-D647D7BDE42A");
+            public static Guid MFT_FRIENDLY_NAME_Attribute = new("314FFBAE-5B41-4C95-9C19-4E7D586FACE3");
+            public static Guid MFT_TRANSFORM_CLSID_Attribute = new("6821C42B-65A4-4E82-99BC-9A88205ECD0C");
+            public static Guid MF_TRANSFORM_ASYNC = new("F81A699A-649A-497D-8C73-29F8FED6AD7A");
+            public static Guid MF_TRANSFORM_ASYNC_UNLOCK = new("E5666D6B-3422-4EB6-A421-DA7DB1F8E207");
             public static Guid IID_ID3D11Texture2D = new("6F15AAF2-D208-4E89-9AB4-489535D34F9C");
             public static readonly Guid MFMediaType_Video = new("73646976-0000-0010-8000-00AA00389B71");
             public static readonly Guid MFVideoFormat_NV12 = new("3231564E-0000-0010-8000-00AA00389B71");
@@ -8547,6 +9353,9 @@ internal static class Program
             public static extern void CoUninitialize();
 
             [DllImport("ole32.dll", ExactSpelling = true)]
+            public static extern void CoTaskMemFree(IntPtr value);
+
+            [DllImport("ole32.dll", ExactSpelling = true)]
             public static extern int CoCreateInstance(
                 ref Guid clsid,
                 IntPtr outer,
@@ -8559,6 +9368,15 @@ internal static class Program
 
             [DllImport("mfplat.dll", ExactSpelling = true)]
             public static extern int MFShutdown();
+
+            [DllImport("mfplat.dll", ExactSpelling = true)]
+            public static extern int MFTEnumEx(
+                ref Guid category,
+                int flags,
+                IntPtr inputType,
+                ref MFTRegisterTypeInfo outputType,
+                out IntPtr activateArray,
+                out int count);
 
             [DllImport("mfplat.dll", ExactSpelling = true)]
             public static extern int MFCreateMediaType(out IMFMediaType mediaType);
@@ -10468,6 +11286,8 @@ internal static class Program
         private readonly List<double> _windowEncodeSamples = new();
         private readonly List<double> _sendSamples = new();
         private readonly List<double> _windowSendSamples = new();
+        private readonly List<double> _localLatencySamples = new();
+        private readonly List<double> _windowLocalLatencySamples = new();
         private readonly List<double> _frameIntervalSamples = new();
         private readonly List<double> _windowFrameIntervalSamples = new();
 
@@ -10608,6 +11428,9 @@ internal static class Program
                     _windowSendMsMax = Math.Max(_windowSendMsMax, sendMs);
                     _sendSamples.Add(sendMs);
                     _windowSendSamples.Add(sendMs);
+                    var localLatencyMs = Math.Max(0, DateTimeOffset.UtcNow.ToUnixTimeMilliseconds() - packet.TimestampMs);
+                    _localLatencySamples.Add(localLatencyMs);
+                    _windowLocalLatencySamples.Add(localLatencyMs);
                 }
 
                 switch (packet.FrameKind)
@@ -10661,6 +11484,7 @@ internal static class Program
             {
                 var encodePercentiles = SampleStatistics.Percentiles(_encodeSamples);
                 var sendPercentiles = SampleStatistics.Percentiles(_sendSamples);
+                var localLatencyPercentiles = SampleStatistics.Percentiles(_localLatencySamples);
                 var frameIntervalPercentiles = SampleStatistics.Percentiles(_frameIntervalSamples);
                 var elapsedSeconds = Math.Max(0.001, (Stopwatch.GetTimestamp() - _startedAtTicks) / (double)Stopwatch.Frequency);
                 return CreateSnapshot(
@@ -10678,6 +11502,9 @@ internal static class Program
                     sendP50: sendPercentiles.P50,
                     sendP95: sendPercentiles.P95,
                     sendP99: sendPercentiles.P99,
+                    localLatencyP50: localLatencyPercentiles.P50,
+                    localLatencyP95: localLatencyPercentiles.P95,
+                    localLatencyP99: localLatencyPercentiles.P99,
                     frameIntervalP50: frameIntervalPercentiles.P50,
                     frameIntervalP95: frameIntervalPercentiles.P95,
                     frameIntervalP99: frameIntervalPercentiles.P99,
@@ -10696,6 +11523,7 @@ internal static class Program
             {
                 var encodePercentiles = SampleStatistics.Percentiles(_windowEncodeSamples);
                 var sendPercentiles = SampleStatistics.Percentiles(_windowSendSamples);
+                var localLatencyPercentiles = SampleStatistics.Percentiles(_windowLocalLatencySamples);
                 var frameIntervalPercentiles = SampleStatistics.Percentiles(_windowFrameIntervalSamples);
                 var elapsedSeconds = Math.Max(0.001, (Stopwatch.GetTimestamp() - _windowStartedAtTicks) / (double)Stopwatch.Frequency);
                 var snapshot = CreateSnapshot(
@@ -10713,6 +11541,9 @@ internal static class Program
                     sendP50: sendPercentiles.P50,
                     sendP95: sendPercentiles.P95,
                     sendP99: sendPercentiles.P99,
+                    localLatencyP50: localLatencyPercentiles.P50,
+                    localLatencyP95: localLatencyPercentiles.P95,
+                    localLatencyP99: localLatencyPercentiles.P99,
                     frameIntervalP50: frameIntervalPercentiles.P50,
                     frameIntervalP95: frameIntervalPercentiles.P95,
                     frameIntervalP99: frameIntervalPercentiles.P99,
@@ -10738,6 +11569,7 @@ internal static class Program
                 _windowKeepaliveFramesSent = 0;
                 _windowEncodeSamples.Clear();
                 _windowSendSamples.Clear();
+                _windowLocalLatencySamples.Clear();
                 _windowFrameIntervalSamples.Clear();
                 _windowStartedAtTicks = Stopwatch.GetTimestamp();
                 return snapshot;
@@ -10759,6 +11591,9 @@ internal static class Program
             double sendP50,
             double sendP95,
             double sendP99,
+            double localLatencyP50,
+            double localLatencyP95,
+            double localLatencyP99,
             double frameIntervalP50,
             double frameIntervalP95,
             double frameIntervalP99,
@@ -10790,6 +11625,9 @@ internal static class Program
                 outputKbps,
                 _lastKeyFrameSeq,
                 streamFps,
+                localLatencyP50,
+                localLatencyP95,
+                localLatencyP99,
                 frameIntervalP50,
                 frameIntervalP95,
                 frameIntervalP99,
@@ -10979,6 +11817,150 @@ internal static class Program
         }
     }
 
+    private sealed record H264EncoderTuning(
+        string PresetName,
+        string ResolutionPreset,
+        int Bitrate,
+        int MaxBitrate,
+        int BufferSize,
+        int Gop,
+        int BFrames,
+        string Profile,
+        int ProfileValue,
+        string RateControl,
+        bool LowLatency,
+        int RecommendedBitrate,
+        int LegacyAutoBitrate,
+        string BitrateSource,
+        string GopSource)
+    {
+        private const double LegacyBitsPerPixel = 0.145;
+        private const int H264BaselineProfileValue = 66;
+        private static readonly H264ResolutionTuning[] ResolutionTunings =
+        [
+            new("720p", 1280, 720, 4_000_000, 6_000_000, 12_000_000, 60),
+            new("1080p", 1920, 1080, 8_000_000, 14_000_000, 28_000_000, 60),
+            new("2k", 2560, 1440, 16_000_000, 28_000_000, 64_000_000, 30)
+        ];
+
+        public int BitrateDeltaFromLegacy => Bitrate - LegacyAutoBitrate;
+
+        public static H264EncoderTuning FromOptions(HostOptions options)
+        {
+            var recommendedBitrate = RecommendedBitrateForMode(options.VideoWidth, options.VideoHeight, options.VideoFps);
+            var legacyAutoBitrate = LegacyAutoBitrateForMode(options.VideoWidth, options.VideoHeight, options.VideoFps);
+            var recommendedGop = RecommendedGop(options.VideoWidth, options.VideoHeight, options.VideoFps);
+            var bitrate = options.AutoVideoBitrate ? recommendedBitrate : options.VideoBitrate;
+            var gop = options.AutoVideoGop ? recommendedGop : options.VideoGop;
+            var resolutionPreset = ResolutionPresetNameFor(options.VideoWidth, options.VideoHeight);
+            var presetName = $"{resolutionPreset}@{FpsTierName(options.VideoFps)}-low-latency";
+
+            return new H264EncoderTuning(
+                presetName,
+                resolutionPreset,
+                bitrate,
+                bitrate,
+                LowLatencyBufferSize(bitrate),
+                gop,
+                BFrames: 0,
+                Profile: "baseline",
+                ProfileValue: H264BaselineProfileValue,
+                RateControl: "cbr",
+                LowLatency: true,
+                recommendedBitrate,
+                legacyAutoBitrate,
+                options.AutoVideoBitrate ? "preset" : "manual",
+                options.AutoVideoGop ? "preset" : "manual");
+        }
+
+        public static int RecommendedBitrateForMode(int width, int height, int fps)
+        {
+            var preset = FindResolutionTuning(width, height);
+            if (preset is not null)
+            {
+                return SelectBitrateForFps(preset, fps);
+            }
+
+            var pixelsPerSecond = width * (double)height * Math.Max(1, fps);
+            var bitsPerPixel = fps >= 90 ? 0.11 : fps >= 50 ? 0.115 : 0.14;
+            var bitrate = pixelsPerSecond * bitsPerPixel;
+            return RoundBitrate(Math.Clamp((int)Math.Round(bitrate), 4_000_000, 64_000_000));
+        }
+
+        public static int RecommendedGop(int width, int height, int fps)
+        {
+            var preset = FindResolutionTuning(width, height);
+            if (preset is not null && fps >= 90)
+            {
+                return preset.Gop120Fps;
+            }
+
+            return fps >= 90 ? 60 : 30;
+        }
+
+        private static int LegacyAutoBitrateForMode(int width, int height, int fps)
+        {
+            var pixelsPerSecond = width * (double)height * fps;
+            var bitrate = pixelsPerSecond * LegacyBitsPerPixel;
+            return (int)Math.Clamp(Math.Round(bitrate / 1_000_000.0) * 1_000_000, 4_000_000, 64_000_000);
+        }
+
+        private static int SelectBitrateForFps(H264ResolutionTuning tuning, int fps)
+        {
+            if (fps >= 90)
+            {
+                return tuning.Bitrate120Fps;
+            }
+
+            return fps >= 50 ? tuning.Bitrate60Fps : tuning.Bitrate30Fps;
+        }
+
+        private static H264ResolutionTuning? FindResolutionTuning(int width, int height)
+        {
+            return ResolutionTunings.FirstOrDefault(tuning => tuning.Width == width && tuning.Height == height);
+        }
+
+        private static int LowLatencyBufferSize(int bitrate)
+        {
+            return RoundBitrate(Math.Max(2_000_000, bitrate / 2));
+        }
+
+        private static int RoundBitrate(int bitrate)
+        {
+            return (int)Math.Max(1_000_000, Math.Round(bitrate / 1_000_000.0) * 1_000_000);
+        }
+
+        private static string ResolutionPresetNameFor(int width, int height)
+        {
+            return (width, height) switch
+            {
+                (1280, 720) => "720p",
+                (1920, 1080) => "1080p",
+                (2560, 1440) => "2k",
+                _ => "custom"
+            };
+        }
+
+        private static string FpsTierName(int fps)
+        {
+            if (fps >= 90)
+            {
+                return "120fps";
+            }
+
+            return fps >= 50 ? "60fps" : "30fps";
+        }
+    }
+
+    private sealed record H264ResolutionTuning(
+        string Name,
+        int Width,
+        int Height,
+        int Bitrate30Fps,
+        int Bitrate60Fps,
+        int Bitrate120Fps,
+        int Gop120Fps);
+
     private sealed record HostOptions(
         int ControlPort,
         int VideoPort,
@@ -10992,9 +11974,12 @@ internal static class Program
         int VideoBitrate,
         string ResolutionPreset,
         bool AutoVideoBitrate,
+        bool AutoVideoGop,
         int VideoGop,
         string? DumpEncodedPath,
         int MaxVideoQueue,
+        int Nv12PoolSize,
+        int EncodedPacketQueue,
         bool EnableInputInjection,
         InputTargetKind InputTarget,
         bool ListWindows,
@@ -11005,6 +11990,8 @@ internal static class Program
         string? DumpGpuFrameDirectory)
     {
         public IReadOnlyList<int> ReversePorts { get; } = new[] { ControlPort, VideoPort };
+
+        public H264EncoderTuning EncoderTuning => H264EncoderTuning.FromOptions(this);
 
         public static HostOptions Parse(string[] args)
         {
@@ -11020,9 +12007,12 @@ internal static class Program
             string? ffmpegPath = null;
             var videoBitrate = DefaultVideoBitrate;
             var autoVideoBitrate = true;
+            var autoVideoGop = true;
             var videoGop = DefaultVideoGop;
             string? dumpEncodedPath = null;
             var maxVideoQueue = DefaultMaxVideoQueue;
+            var nv12PoolSize = DefaultNv12PoolSize;
+            var encodedPacketQueue = DefaultMaxVideoQueue;
             var enableInputInjection = false;
             InputTargetKind? inputTarget = null;
             var listWindows = false;
@@ -11137,6 +12127,7 @@ internal static class Program
                         if (int.TryParse(args[index + 1], out var parsedVideoGop) && parsedVideoGop > 0)
                         {
                             videoGop = parsedVideoGop;
+                            autoVideoGop = false;
                         }
 
                         break;
@@ -11153,6 +12144,27 @@ internal static class Program
                         if (int.TryParse(args[index + 1], out var parsedMaxVideoQueue) && parsedMaxVideoQueue > 0)
                         {
                             maxVideoQueue = parsedMaxVideoQueue;
+                            encodedPacketQueue = parsedMaxVideoQueue;
+                        }
+
+                        break;
+
+                    case "--nv12-pool-size":
+                    case "--nv12-texture-pool":
+                    case "--host-nv12-pool":
+                        if (int.TryParse(args[index + 1], out var parsedNv12PoolSize) && parsedNv12PoolSize > 0)
+                        {
+                            nv12PoolSize = parsedNv12PoolSize;
+                        }
+
+                        break;
+
+                    case "--encoded-packet-queue":
+                    case "--packet-queue":
+                        if (int.TryParse(args[index + 1], out var parsedEncodedPacketQueue) && parsedEncodedPacketQueue > 0)
+                        {
+                            encodedPacketQueue = parsedEncodedPacketQueue;
+                            maxVideoQueue = parsedEncodedPacketQueue;
                         }
 
                         break;
@@ -11188,6 +12200,11 @@ internal static class Program
                 videoBitrate = RecommendedBitrate(videoWidth, videoHeight, videoFps);
             }
 
+            if (autoVideoGop)
+            {
+                videoGop = H264EncoderTuning.RecommendedGop(videoWidth, videoHeight, videoFps);
+            }
+
             if (IsIddVideoSource(videoSource))
             {
                 requestedDisplayMode = new DisplayModeRequest(videoWidth, videoHeight, videoFps);
@@ -11220,9 +12237,12 @@ internal static class Program
                 videoBitrate,
                 resolutionPreset,
                 autoVideoBitrate,
+                autoVideoGop,
                 videoGop,
                 dumpEncodedPath,
                 maxVideoQueue,
+                nv12PoolSize,
+                encodedPacketQueue,
                 enableInputInjection,
                 inputTarget.Value,
                 listWindows,
@@ -11296,9 +12316,7 @@ internal static class Program
 
         private static int RecommendedBitrate(int width, int height, int refreshRate)
         {
-            var pixelsPerSecond = width * (double)height * refreshRate;
-            var bitrate = pixelsPerSecond * 0.145;
-            return (int)Math.Clamp(Math.Round(bitrate / 1_000_000.0) * 1_000_000, 4_000_000, 64_000_000);
+            return H264EncoderTuning.RecommendedBitrateForMode(width, height, refreshRate);
         }
 
         private static VideoSourceKind ParseVideoSource(string value)
@@ -11361,6 +12379,7 @@ internal static class Program
                 VideoHeight = mode.Height,
                 VideoFps = mode.Fps,
                 VideoBitrate = mode.Bitrate,
+                VideoGop = mode.Gop,
                 ResolutionPreset = mode.ResolutionPreset
             };
         }
@@ -11395,11 +12414,15 @@ internal static class Program
             var bitrate = _baseOptions.AutoVideoBitrate
                 ? RecommendedBitrate(width, height, normalizedFps)
                 : _baseOptions.VideoBitrate;
+            var gop = _baseOptions.AutoVideoGop
+                ? H264EncoderTuning.RecommendedGop(width, height, normalizedFps)
+                : _baseOptions.VideoGop;
             var next = new VideoMode(
                 width,
                 height,
                 normalizedFps,
                 bitrate,
+                gop,
                 ResolutionPresetNameFor(width, height));
 
             lock (_lock)
@@ -11430,9 +12453,7 @@ internal static class Program
 
         private static int RecommendedBitrate(int width, int height, int refreshRate)
         {
-            var pixelsPerSecond = width * (double)height * refreshRate;
-            var bitrate = pixelsPerSecond * 0.145;
-            return (int)Math.Clamp(Math.Round(bitrate / 1_000_000.0) * 1_000_000, 4_000_000, 64_000_000);
+            return H264EncoderTuning.RecommendedBitrateForMode(width, height, refreshRate);
         }
     }
 
@@ -11441,6 +12462,7 @@ internal static class Program
         int Height,
         int Fps,
         int Bitrate,
+        int Gop,
         string ResolutionPreset)
     {
         public static VideoMode FromOptions(HostOptions options)
@@ -11450,6 +12472,7 @@ internal static class Program
                 options.VideoHeight,
                 options.VideoFps,
                 options.VideoBitrate,
+                options.VideoGop,
                 options.ResolutionPreset);
         }
     }
@@ -11593,6 +12616,9 @@ internal static class Program
         double OutputKbps,
         long LastKeyFrameSeq,
         double StreamFps,
+        double P50LocalLatencyMs,
+        double P95LocalLatencyMs,
+        double P99LocalLatencyMs,
         double P50FrameIntervalMs,
         double P95FrameIntervalMs,
         double P99FrameIntervalMs,

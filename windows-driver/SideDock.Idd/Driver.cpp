@@ -44,14 +44,34 @@ static constexpr LPCWSTR SharedFrameConsumerAliveName = L"Global\\SideDockFrameC
 static constexpr LPCWSTR SharedGpuFrameMetadataName = L"Global\\SideDockGpuFrameMetadata";
 static constexpr LPCWSTR SharedGpuFrameReadyName = L"Global\\SideDockGpuFrameReady";
 static constexpr LPCWSTR SharedGpuConsumerAliveName = L"Global\\SideDockGpuConsumerAlive";
-static constexpr LPCWSTR SharedGpuFrameSlotNames[SharedGpuFrameSlotCount] =
+static constexpr LPCWSTR SharedGpuFrameSlotNames[MaxSharedGpuFrameSlotCount] =
 {
     L"Global\\SideDockGpuFrameSlot0",
     L"Global\\SideDockGpuFrameSlot1",
     L"Global\\SideDockGpuFrameSlot2",
     L"Global\\SideDockGpuFrameSlot3",
     L"Global\\SideDockGpuFrameSlot4",
-    L"Global\\SideDockGpuFrameSlot5"
+    L"Global\\SideDockGpuFrameSlot5",
+    L"Global\\SideDockGpuFrameSlot6",
+    L"Global\\SideDockGpuFrameSlot7",
+    L"Global\\SideDockGpuFrameSlot8",
+    L"Global\\SideDockGpuFrameSlot9",
+    L"Global\\SideDockGpuFrameSlot10",
+    L"Global\\SideDockGpuFrameSlot11"
+};
+static wchar_t GpuRingSlotsValueNameBuffer[] = L"GpuRingSlots";
+static UNICODE_STRING GpuRingSlotsValueName =
+{
+    sizeof(GpuRingSlotsValueNameBuffer) - sizeof(wchar_t),
+    sizeof(GpuRingSlotsValueNameBuffer),
+    GpuRingSlotsValueNameBuffer
+};
+static wchar_t ParametersKeyNameBuffer[] = L"Parameters";
+static UNICODE_STRING ParametersKeyName =
+{
+    sizeof(ParametersKeyNameBuffer) - sizeof(wchar_t),
+    sizeof(ParametersKeyNameBuffer),
+    ParametersKeyNameBuffer
 };
 static constexpr UINT MaxSharedFrameStride = MaxVirtualDisplayWidth * 4;
 static constexpr UINT MaxSharedFrameSlotSize = MaxSharedFrameStride * MaxVirtualDisplayHeight;
@@ -566,12 +586,14 @@ SharedGpuFrameRing::~SharedGpuFrameRing()
     Close();
 }
 
-bool SharedGpuFrameRing::EnsureInitialized(Direct3DDevice& device, ID3D11Texture2D* sourceTexture)
+bool SharedGpuFrameRing::EnsureInitialized(Direct3DDevice& device, ID3D11Texture2D* sourceTexture, UINT slotCount)
 {
     if (!sourceTexture)
     {
         return false;
     }
+
+    SetSlotCount(slotCount);
 
     D3D11_TEXTURE2D_DESC sourceDesc = {};
     sourceTexture->GetDesc(&sourceDesc);
@@ -678,9 +700,9 @@ bool SharedGpuFrameRing::IsConsumerAlive() const
     return WaitForSingleObject(m_consumerAliveEvent, 0) == WAIT_OBJECT_0;
 }
 
-bool SharedGpuFrameRing::WriteFrame(Direct3DDevice& device, ID3D11Texture2D* sourceTexture, UINT64 timestampQpc)
+bool SharedGpuFrameRing::WriteFrame(Direct3DDevice& device, ID3D11Texture2D* sourceTexture, UINT64 timestampQpc, UINT slotCount)
 {
-    if (!EnsureInitialized(device, sourceTexture))
+    if (!EnsureInitialized(device, sourceTexture, slotCount))
     {
         return false;
     }
@@ -691,7 +713,7 @@ bool SharedGpuFrameRing::WriteFrame(Direct3DDevice& device, ID3D11Texture2D* sou
     }
 
     const UINT64 seq = ++m_writeSeq;
-    const UINT slotIndex = static_cast<UINT>((seq - 1) % SharedGpuFrameSlotCount);
+    const UINT slotIndex = static_cast<UINT>((seq - 1) % m_slotCount);
     auto& texture = m_textures[slotIndex];
     auto& keyedMutex = m_mutexes[slotIndex];
     if (!texture || !keyedMutex)
@@ -721,7 +743,7 @@ bool SharedGpuFrameRing::WriteFrame(Direct3DDevice& device, ID3D11Texture2D* sou
     m_metadata->Width = m_width;
     m_metadata->Height = m_height;
     m_metadata->Format = SharedFrameFormatBgra;
-    m_metadata->SlotCount = SharedGpuFrameSlotCount;
+    m_metadata->SlotCount = m_slotCount;
     m_metadata->LatestSlot = slotIndex;
     m_metadata->TimestampQpc = timestampQpc;
     MemoryBarrier();
@@ -730,6 +752,28 @@ bool SharedGpuFrameRing::WriteFrame(Direct3DDevice& device, ID3D11Texture2D* sou
     keyedMutex->ReleaseSync(1);
     SetEvent(m_frameReadyEvent);
     return true;
+}
+
+void SharedGpuFrameRing::SetSlotCount(UINT slotCount)
+{
+    const UINT normalizedSlotCount =
+        slotCount >= 1 && slotCount <= MaxSharedGpuFrameSlotCount
+            ? slotCount
+            : DefaultSharedGpuFrameSlotCount;
+
+    if (normalizedSlotCount == m_slotCount)
+    {
+        return;
+    }
+
+    TraceEvents(
+        TRACE_LEVEL_INFORMATION,
+        TRACE_SWAPCHAIN,
+        "%!FUNC! GPU ring slot count changed old=%u new=%u",
+        m_slotCount,
+        normalizedSlotCount);
+    m_slotCount = normalizedSlotCount;
+    CloseTextures();
 }
 
 void SharedGpuFrameRing::Close()
@@ -763,7 +807,7 @@ void SharedGpuFrameRing::Close()
 
 void SharedGpuFrameRing::CloseTextures()
 {
-    for (UINT slotIndex = 0; slotIndex < SharedGpuFrameSlotCount; ++slotIndex)
+    for (UINT slotIndex = 0; slotIndex < MaxSharedGpuFrameSlotCount; ++slotIndex)
     {
         m_mutexes[slotIndex].Reset();
         m_textures[slotIndex].Reset();
@@ -785,7 +829,9 @@ bool SharedGpuFrameRing::HasMatchingTextures(const D3D11_TEXTURE2D_DESC& sourceD
     return m_metadata &&
         m_width == sourceDesc.Width &&
         m_height == sourceDesc.Height &&
-        m_textures[0];
+        m_slotCount > 0 &&
+        m_textures[0] &&
+        m_textures[m_slotCount - 1];
 }
 
 bool SharedGpuFrameRing::RecreateTextures(Direct3DDevice& device, const D3D11_TEXTURE2D_DESC& sourceDesc, SECURITY_ATTRIBUTES* securityAttributes)
@@ -821,7 +867,7 @@ bool SharedGpuFrameRing::RecreateTextures(Direct3DDevice& device, const D3D11_TE
     textureDesc.CPUAccessFlags = 0;
     textureDesc.MiscFlags = D3D11_RESOURCE_MISC_SHARED_NTHANDLE | D3D11_RESOURCE_MISC_SHARED_KEYEDMUTEX;
 
-    for (UINT slotIndex = 0; slotIndex < SharedGpuFrameSlotCount; ++slotIndex)
+    for (UINT slotIndex = 0; slotIndex < m_slotCount; ++slotIndex)
     {
         HRESULT hr = device.Device->CreateTexture2D(&textureDesc, nullptr, &m_textures[slotIndex]);
         if (FAILED(hr))
@@ -870,9 +916,10 @@ bool SharedGpuFrameRing::RecreateTextures(Direct3DDevice& device, const D3D11_TE
     TraceEvents(
         TRACE_LEVEL_INFORMATION,
         TRACE_SWAPCHAIN,
-        "%!FUNC! GPU shared texture ring ready width=%u height=%u generation=%u",
+        "%!FUNC! GPU shared texture ring ready width=%u height=%u slots=%u generation=%u",
         m_width,
         m_height,
+        m_slotCount,
         m_generation);
     return true;
 }
@@ -885,7 +932,7 @@ void SharedGpuFrameRing::InitializeMetadata(Direct3DDevice& device, const D3D11_
     m_metadata->Width = sourceDesc.Width;
     m_metadata->Height = sourceDesc.Height;
     m_metadata->Format = SharedFrameFormatBgra;
-    m_metadata->SlotCount = SharedGpuFrameSlotCount;
+    m_metadata->SlotCount = m_slotCount;
     m_metadata->LatestSlot = 0;
     m_metadata->Generation = m_generation;
     m_metadata->WriteSeq = 0;
@@ -1087,10 +1134,10 @@ void SwapChainProcessor::ProcessFrame(const IDDCX_METADATA& metadata)
         return;
     }
 
-    if (m_sharedGpuFrameRing.EnsureInitialized(*m_device, sourceTexture.Get()) &&
+    if (m_sharedGpuFrameRing.EnsureInitialized(*m_device, sourceTexture.Get(), m_monitorContext->GpuRingSlotCount()) &&
         m_sharedGpuFrameRing.IsConsumerAlive())
     {
-        if (m_sharedGpuFrameRing.WriteFrame(*m_device, sourceTexture.Get(), metadata.PresentDisplayQPCTime))
+        if (m_sharedGpuFrameRing.WriteFrame(*m_device, sourceTexture.Get(), metadata.PresentDisplayQPCTime, m_monitorContext->GpuRingSlotCount()))
         {
             ++m_gpuFramesExported;
             if ((m_gpuFramesExported % 300) == 0)
@@ -1220,9 +1267,74 @@ bool SwapChainProcessor::EnsureStagingTexture(ID3D11Texture2D* sourceTexture)
 DeviceContext::DeviceContext(WDFDEVICE wdfDevice) :
     m_wdfDevice(wdfDevice)
 {
+    m_gpuRingSlotCount = GpuRingSlotCount();
 }
 
 DeviceContext::~DeviceContext() = default;
+
+UINT DeviceContext::GpuRingSlotCount() const
+{
+    ULONG slotCount = DefaultSharedGpuFrameSlotCount;
+    WDFKEY deviceKey = nullptr;
+    NTSTATUS status = WdfDeviceOpenRegistryKey(
+        m_wdfDevice,
+        PLUGPLAY_REGKEY_DEVICE,
+        KEY_READ,
+        WDF_NO_OBJECT_ATTRIBUTES,
+        &deviceKey);
+
+    if (NT_SUCCESS(status))
+    {
+        WDFKEY parametersKey = nullptr;
+        status = WdfRegistryOpenKey(
+            deviceKey,
+            &ParametersKeyName,
+            KEY_READ,
+            WDF_NO_OBJECT_ATTRIBUTES,
+            &parametersKey);
+
+        if (NT_SUCCESS(status))
+        {
+            ULONG configuredValue = 0;
+            status = WdfRegistryQueryULong(parametersKey, &GpuRingSlotsValueName, &configuredValue);
+            if (NT_SUCCESS(status))
+            {
+                slotCount = configuredValue;
+            }
+            else if (status != STATUS_OBJECT_NAME_NOT_FOUND && status != STATUS_OBJECT_PATH_NOT_FOUND)
+            {
+                TraceEvents(TRACE_LEVEL_WARNING, TRACE_DEVICE, "%!FUNC! GpuRingSlots query failed: 0x%08x", status);
+            }
+
+            WdfRegistryClose(parametersKey);
+        }
+        else if (status != STATUS_OBJECT_NAME_NOT_FOUND && status != STATUS_OBJECT_PATH_NOT_FOUND)
+        {
+            TraceEvents(TRACE_LEVEL_WARNING, TRACE_DEVICE, "%!FUNC! Parameters key open failed: 0x%08x", status);
+        }
+
+        WdfRegistryClose(deviceKey);
+    }
+    else
+    {
+        TraceEvents(TRACE_LEVEL_WARNING, TRACE_DEVICE, "%!FUNC! device registry key open failed: 0x%08x", status);
+    }
+
+    if (slotCount < 1 || slotCount > MaxSharedGpuFrameSlotCount)
+    {
+        TraceEvents(
+            TRACE_LEVEL_WARNING,
+            TRACE_DEVICE,
+            "%!FUNC! GpuRingSlots=%lu out of range; using default=%u max=%u",
+            slotCount,
+            DefaultSharedGpuFrameSlotCount,
+            MaxSharedGpuFrameSlotCount);
+        return DefaultSharedGpuFrameSlotCount;
+    }
+
+    TraceEvents(TRACE_LEVEL_INFORMATION, TRACE_DEVICE, "%!FUNC! GpuRingSlots=%lu", slotCount);
+    return static_cast<UINT>(slotCount);
+}
 
 void DeviceContext::InitAdapter()
 {
@@ -1310,7 +1422,7 @@ void DeviceContext::ReportVirtualMonitor()
     }
 
     auto* wrapper = WdfObjectGet_MonitorContextWrapper(monitorCreateOut.MonitorObject);
-    wrapper->Context = new MonitorContext(monitorCreateOut.MonitorObject);
+    wrapper->Context = new MonitorContext(monitorCreateOut.MonitorObject, m_gpuRingSlotCount);
     m_monitorContext = wrapper->Context;
 
     IDARG_OUT_MONITORARRIVAL arrivalOut = {};
@@ -1344,8 +1456,9 @@ void DeviceContext::HandleCommitModes(const IDARG_IN_COMMITMODES* inArgs)
     }
 }
 
-MonitorContext::MonitorContext(IDDCX_MONITOR monitor) :
-    m_monitor(monitor)
+MonitorContext::MonitorContext(IDDCX_MONITOR monitor, UINT gpuRingSlotCount) :
+    m_monitor(monitor),
+    m_gpuRingSlotCount(gpuRingSlotCount)
 {
 }
 
@@ -1405,6 +1518,11 @@ IDDCX_MONITOR MonitorContext::GetMonitorObject() const
 HANDLE MonitorContext::GetHardwareCursorEvent() const
 {
     return m_hardwareCursorEnabled ? m_hardwareCursorEvent : nullptr;
+}
+
+UINT MonitorContext::GpuRingSlotCount() const
+{
+    return m_gpuRingSlotCount;
 }
 
 bool MonitorContext::HandleHardwareCursorUpdate()

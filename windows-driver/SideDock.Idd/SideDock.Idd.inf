@@ -41,6 +41,7 @@ AddReg=SideDock_Idd_HardwareDeviceSettings
 [SideDock_Idd_HardwareDeviceSettings]
 HKR,, "UpperFilters", %REG_MULTI_SZ%, "IndirectKmd"
 HKR, "WUDF", "DeviceGroupId", %REG_SZ%, "SideDockIddDriverGroup"
+HKR, "Parameters", "GpuRingSlots", %REG_DWORD%, 6
 
 [SideDock_Idd_Install.NT.Services]
 Include=WUDFRD.inf
@@ -66,3 +67,4 @@ DeviceName="SideDock Virtual Display"
 
 REG_MULTI_SZ=0x00010000
 REG_SZ=0x00000000
+REG_DWORD=0x00010001
