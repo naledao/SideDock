@@ -104,6 +104,7 @@ public final class MainActivity extends Activity implements ControlClient.Listen
     private long clockSyncRttMs = Long.MAX_VALUE;
     private long clockSyncErrorBoundMs = Long.MAX_VALUE;
     private long lastRenderedFramesSeen;
+    private long lastVideoStatsSummaryLogAtMs;
     private boolean waitingForVideoFrame = true;
     private VideoClient.VideoStats lastVideoStats;
     private InputCollector.InputStats lastInputStats;
@@ -173,6 +174,7 @@ public final class MainActivity extends Activity implements ControlClient.Listen
     protected void onResume() {
         super.onResume();
         enterImmersiveMode();
+        applyDisplayTimingHints();
         maybeStartVideo();
     }
 
@@ -182,6 +184,7 @@ public final class MainActivity extends Activity implements ControlClient.Listen
         if (hasFocus) {
             enterImmersiveMode();
             hideSystemPointerIcon(getWindow().getDecorView());
+            applyDisplayTimingHints();
         }
     }
 
@@ -197,6 +200,7 @@ public final class MainActivity extends Activity implements ControlClient.Listen
     protected void onDestroy() {
         mainHandler.removeCallbacks(pointerAbsFlushRunnable);
         mainHandler.removeCallbacks(localPointerPreviewTimeoutRunnable);
+        clearDisplayTimingHints();
         videoClient.stop();
         controlClient.shutdown();
         super.onDestroy();
@@ -208,6 +212,7 @@ public final class MainActivity extends Activity implements ControlClient.Listen
         surfaceReady = activeSurface != null && activeSurface.isValid();
         waitingForVideoFrame = true;
         hideLocalCursorOverlay();
+        applyDisplayTimingHints();
         sendVideoReadyIfSurfaceReady();
         addLog("Surface 已创建，准备接收视频");
         Log.i(TAG, "surfaceCreated ready=" + surfaceReady);
@@ -219,6 +224,7 @@ public final class MainActivity extends Activity implements ControlClient.Listen
         activeSurface = holder.getSurface();
         surfaceReady = activeSurface != null && activeSurface.isValid();
         updateVideoRectForSurfaceView();
+        applyDisplayTimingHints();
         sendVideoReadyIfSurfaceReady();
         Log.i(TAG, "surfaceChanged ready=" + surfaceReady + " size=" + width + "x" + height);
     }
@@ -226,6 +232,7 @@ public final class MainActivity extends Activity implements ControlClient.Listen
     @Override
     public void surfaceDestroyed(SurfaceHolder holder) {
         surfaceReady = false;
+        clearDisplayTimingHints();
         activeSurface = null;
         waitingForVideoFrame = true;
         videoClient.stop();
@@ -270,6 +277,7 @@ public final class MainActivity extends Activity implements ControlClient.Listen
         lastVideoError = "";
         lastVideoStats = null;
         lastRenderedFramesSeen = 0L;
+        lastVideoStatsSummaryLogAtMs = 0L;
         videoStartReceived = true;
         hideLocalCursorOverlay();
         selectedModeWidth = videoWidth;
@@ -499,6 +507,7 @@ public final class MainActivity extends Activity implements ControlClient.Listen
             stats.latencyErrorBoundMs,
             stats.state
         );
+        logVideoStatsSummary(stats);
         updateOverlay();
     }
 
@@ -1058,6 +1067,8 @@ public final class MainActivity extends Activity implements ControlClient.Listen
 
             styleSegmentButton(button, selectedModeRefresh == REFRESH_PRESETS[index], density);
         }
+
+        applyDisplayTimingHints();
     }
 
     private void updateModeControlVisibility() {
@@ -1107,6 +1118,59 @@ public final class MainActivity extends Activity implements ControlClient.Listen
         }
 
         return refreshHz > 0 ? refreshHz : DEFAULT_VIDEO_FPS;
+    }
+
+    private void applyDisplayTimingHints() {
+        float targetRefreshHz = selectedModeRefresh > 0
+            ? selectedModeRefresh
+            : (videoFps > 0 ? videoFps : DEFAULT_VIDEO_FPS);
+        applyWindowRefreshHint(targetRefreshHz);
+        applySurfaceRefreshHint(targetRefreshHz);
+    }
+
+    private void clearDisplayTimingHints() {
+        applyWindowRefreshHint(0f);
+        applySurfaceRefreshHint(0f);
+    }
+
+    private void applyWindowRefreshHint(float refreshHz) {
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.LOLLIPOP) {
+            return;
+        }
+
+        Window window = getWindow();
+        if (window == null) {
+            return;
+        }
+
+        WindowManager.LayoutParams params = window.getAttributes();
+        if (Float.compare(params.preferredRefreshRate, refreshHz) == 0) {
+            return;
+        }
+
+        params.preferredRefreshRate = refreshHz;
+        window.setAttributes(params);
+    }
+
+    private void applySurfaceRefreshHint(float refreshHz) {
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.S) {
+            return;
+        }
+
+        Surface surface = activeSurface;
+        if (surface == null && surfaceView != null && surfaceView.getHolder() != null) {
+            surface = surfaceView.getHolder().getSurface();
+        }
+
+        if (surface == null || !surface.isValid()) {
+            return;
+        }
+
+        surface.setFrameRate(
+            refreshHz,
+            Surface.FRAME_RATE_COMPATIBILITY_FIXED_SOURCE,
+            Surface.CHANGE_FRAME_RATE_ONLY_IF_SEAMLESS
+        );
     }
 
     private void maybeStartVideo() {
@@ -1161,11 +1225,18 @@ public final class MainActivity extends Activity implements ControlClient.Listen
         }
 
         if (width >= 2560 || height >= 1440) {
-            return fps > 72;
+            Log.i(TAG, "Skipping conservative 2K+ AVC preflight for " + width + "x" + height + "@" + fps);
+            return false;
         }
 
         Boolean supported = queryAvcDecoderSupport(width, height, fps);
-        return supported != null && !supported.booleanValue();
+        if (supported == null) {
+            Log.w(TAG, "Unable to query AVC decoder support, allowing startup for " + width + "x" + height + "@" + fps);
+            return false;
+        }
+
+        Log.i(TAG, "AVC decoder support " + width + "x" + height + "@" + fps + "=" + supported);
+        return !supported.booleanValue();
     }
 
     private Boolean queryAvcDecoderSupport(int width, int height, int fps) {
@@ -1558,6 +1629,9 @@ public final class MainActivity extends Activity implements ControlClient.Listen
             .append("视频: ").append(videoState)
             .append("  ").append(videoWidth).append('x').append(videoHeight).append('@').append(videoFps)
             .append("  port ").append(videoPort).append('\n');
+        builder.append("FPS: ");
+        appendFpsFields(builder);
+        builder.append('\n');
 
         if (lastVideoStats != null) {
             builder
@@ -1811,19 +1885,82 @@ public final class MainActivity extends Activity implements ControlClient.Listen
     }
 
     private void appendCompactOverlay(StringBuilder builder) {
-        if (lastVideoStats == null || lastVideoStats.framesRendered == 0L) {
-            builder.append("延迟 --ms  帧率 --fps");
+        builder.append("FPS ");
+        appendFpsFields(builder);
+        if (lastVideoStats != null) {
+            builder
+                .append("  lat ")
+                .append(Math.max(0L, lastVideoStats.localPipelineLatencyMs))
+                .append("ms");
+        }
+    }
+
+    private void logVideoStatsSummary(VideoClient.VideoStats stats) {
+        long nowMs = System.currentTimeMillis();
+        if (lastVideoStatsSummaryLogAtMs != 0L && nowMs - lastVideoStatsSummaryLogAtMs < 1000L) {
             return;
         }
 
-        double currentFps = lastVideoStats.renderFps > 0.0
-            ? lastVideoStats.renderFps
-            : lastVideoStats.decodeFps;
-        builder
-            .append("延迟 ").append(Math.max(0L, lastVideoStats.localPipelineLatencyMs)).append("ms")
-            .append("  帧率 ")
-            .append(String.format(Locale.ROOT, "%.0f", Math.max(0.0, currentFps)))
-            .append("fps");
+        lastVideoStatsSummaryLogAtMs = nowMs;
+        Log.i(TAG,
+            "video stats "
+                + "stream=" + formatFpsValueDetailed(currentStreamFps())
+                + " new=" + formatFpsValueDetailed(stats.newFrameFps)
+                + " decode=" + formatFpsValueDetailed(stats.decodeFps)
+                + " render=" + formatFpsValueDetailed(stats.renderFps)
+                + " latency=" + Math.max(0L, stats.localPipelineLatencyMs) + "ms"
+                + " state=" + (stats.state == null ? "" : stats.state)
+                + " packets=" + stats.packetsReceived
+                + " decoded=" + stats.framesDecoded
+                + " rendered=" + stats.framesRendered
+                + " errors=" + stats.decodeErrors
+                + " drops=" + stats.droppedFrames);
+    }
+
+    private void appendFpsFields(StringBuilder builder) {
+        appendFpsField(builder, "stream", currentStreamFps());
+        builder.append("  ");
+        appendFpsField(builder, "new", currentNewFrameFps());
+        builder.append("  ");
+        appendFpsField(builder, "decode", currentDecodeFps());
+        builder.append("  ");
+        appendFpsField(builder, "render", currentRenderFps());
+    }
+
+    private void appendFpsField(StringBuilder builder, String label, double value) {
+        builder.append(label).append(' ').append(formatFpsValue(value));
+    }
+
+    private double currentStreamFps() {
+        return lastEncoderStatus == null ? Double.NaN : lastEncoderStatus.streamFps;
+    }
+
+    private double currentNewFrameFps() {
+        return lastVideoStats == null ? Double.NaN : lastVideoStats.newFrameFps;
+    }
+
+    private double currentDecodeFps() {
+        return lastVideoStats == null ? Double.NaN : lastVideoStats.decodeFps;
+    }
+
+    private double currentRenderFps() {
+        return lastVideoStats == null ? Double.NaN : lastVideoStats.renderFps;
+    }
+
+    private String formatFpsValue(double fps) {
+        if (Double.isNaN(fps) || Double.isInfinite(fps) || fps < 0.0) {
+            return "--";
+        }
+
+        return String.format(Locale.ROOT, "%.0f", Math.max(0.0, fps));
+    }
+
+    private String formatFpsValueDetailed(double fps) {
+        if (Double.isNaN(fps) || Double.isInfinite(fps) || fps < 0.0) {
+            return "--";
+        }
+
+        return String.format(Locale.ROOT, "%.1f", Math.max(0.0, fps));
     }
 
     private ControlClient.CaptureStatus mergeCaptureStatus(ControlClient.CaptureStatus previous, ControlClient.CaptureStatus next) {
