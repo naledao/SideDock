@@ -1,4 +1,5 @@
 ﻿using System.Buffers.Binary;
+using System.Buffers;
 using System.Collections.Concurrent;
 using System.Diagnostics;
 using System.Globalization;
@@ -29,6 +30,7 @@ internal static class Program
     private const int DefaultVideoBitrate = 4_000_000;
     private const int DefaultVideoGop = 30;
     private const int DefaultMaxVideoQueue = 2;
+    private const VideoSourceKind DefaultVideoSource = VideoSourceKind.IddGpu;
     private const string DefaultVideoFile = "artifacts/test-videos/sidedock-720p30.h264";
     private const string DefaultResolutionPreset = "720p";
     private static readonly JsonSerializerOptions JsonOptions = new(JsonSerializerDefaults.Web);
@@ -36,6 +38,7 @@ internal static class Program
     public static async Task<int> Main(string[] args)
     {
         Console.OutputEncoding = Encoding.UTF8;
+        using var timerResolution = EnableHighResolutionTimer();
         if (OperatingSystem.IsWindows())
         {
             DpiAwareness.TryEnablePerMonitorV2(message => Log("DPI", message));
@@ -59,7 +62,8 @@ internal static class Program
         var displayLayoutProvider = new DisplayLayoutProvider(options, videoModeState, message => Log("DISPLAY", message));
 
         PrintHeader(options);
-        if (options.VideoSource == VideoSourceKind.Idd || options.InputTarget == InputTargetKind.Idd)
+        Log("VIDEO", $"startup video-source={FormatVideoSource(options.VideoSource)} input-target={options.InputTarget.ToString().ToLowerInvariant()}");
+        if (IsIddVideoSource(options.VideoSource) || options.InputTarget == InputTargetKind.Idd)
         {
             displayLayoutProvider.LogCurrentLayout();
             if (options.RequestedDisplayMode is not null)
@@ -95,7 +99,7 @@ internal static class Program
         Console.WriteLine("SideDock Windows 服务");
         Console.WriteLine($"控制通道: 127.0.0.1:{options.ControlPort}");
         Console.WriteLine($"视频通道: 127.0.0.1:{options.VideoPort}");
-        Console.WriteLine($"视频源: {options.VideoSource}");
+        Console.WriteLine($"视频源: {FormatVideoSource(options.VideoSource)}");
         Console.WriteLine($"测试视频: {options.VideoFilePath}");
         Console.WriteLine($"实时编码器: {options.Encoder}");
         Console.WriteLine($"输入目标: {options.InputTarget}");
@@ -130,6 +134,21 @@ internal static class Program
 
         Console.WriteLine("退出方式: Ctrl+C");
         Console.WriteLine();
+    }
+
+    private static string FormatVideoSource(VideoSourceKind value)
+    {
+        return value switch
+        {
+            VideoSourceKind.SyntheticNv12 => "synthetic-nv12",
+            VideoSourceKind.IddGpu => "idd-gpu",
+            _ => value.ToString().ToLowerInvariant()
+        };
+    }
+
+    private static bool IsIddVideoSource(VideoSourceKind value)
+    {
+        return value is VideoSourceKind.Idd or VideoSourceKind.IddGpu;
     }
 
     private static async Task KeepAdbReverseAliveAsync(string adbPath, IReadOnlyList<int> ports, CancellationToken cancellationToken)
@@ -259,6 +278,191 @@ internal static class Program
         Console.WriteLine($"{DateTimeOffset.Now:HH:mm:ss.fff} [{scope}] {message}");
     }
 
+    private static IDisposable EnableHighResolutionTimer()
+    {
+        return OperatingSystem.IsWindows()
+            ? HighResolutionTimerPeriod.Start(1, message => Log("TIMER", message))
+            : NoopDisposable.Instance;
+    }
+
+    private sealed class NoopDisposable : IDisposable
+    {
+        public static readonly NoopDisposable Instance = new();
+
+        public void Dispose()
+        {
+        }
+    }
+
+    private sealed class HighResolutionTimerPeriod : IDisposable
+    {
+        private readonly uint _periodMs;
+        private readonly Action<string> _log;
+        private bool _enabled;
+
+        private HighResolutionTimerPeriod(uint periodMs, Action<string> log)
+        {
+            _periodMs = periodMs;
+            _log = log;
+        }
+
+        [SupportedOSPlatform("windows")]
+        public static HighResolutionTimerPeriod Start(uint periodMs, Action<string> log)
+        {
+            var timer = new HighResolutionTimerPeriod(periodMs, log);
+            var result = timeBeginPeriod(periodMs);
+            if (result == 0)
+            {
+                timer._enabled = true;
+                log($"enabled {periodMs}ms timer resolution");
+            }
+            else
+            {
+                log($"failed to enable {periodMs}ms timer resolution, result={result}");
+            }
+
+            return timer;
+        }
+
+        public void Dispose()
+        {
+            if (!_enabled)
+            {
+                return;
+            }
+
+            var result = timeEndPeriod(_periodMs);
+            _enabled = false;
+            _log(result == 0
+                ? $"released {_periodMs}ms timer resolution"
+                : $"failed to release {_periodMs}ms timer resolution, result={result}");
+        }
+
+        [DllImport("winmm.dll")]
+        private static extern uint timeBeginPeriod(uint uPeriod);
+
+        [DllImport("winmm.dll")]
+        private static extern uint timeEndPeriod(uint uPeriod);
+    }
+
+    private sealed class FramePacer
+    {
+        private static readonly long LateThresholdTicks = MillisecondsToTicks(0.5);
+        private static readonly long ResyncThresholdTicks = MillisecondsToTicks(1000);
+        private readonly int _targetFps;
+        private readonly long _frameIntervalTicks;
+        private readonly Action<double>? _recordFrameIntervalMs;
+        private readonly Action? _recordLateFrame;
+        private readonly Action? _recordScheduleReset;
+        private long _nextFrameTicks;
+        private long _lastFrameTicks;
+        private long _lateFrames;
+
+        public FramePacer(
+            int targetFps,
+            Action<double>? recordFrameIntervalMs = null,
+            Action? recordLateFrame = null,
+            Action? recordScheduleReset = null)
+        {
+            _targetFps = Math.Max(1, targetFps);
+            _frameIntervalTicks = Math.Max(1, (long)Math.Round(Stopwatch.Frequency / (double)_targetFps));
+            _nextFrameTicks = Stopwatch.GetTimestamp();
+            _recordFrameIntervalMs = recordFrameIntervalMs;
+            _recordLateFrame = recordLateFrame;
+            _recordScheduleReset = recordScheduleReset;
+        }
+
+        public int TargetFps => _targetFps;
+
+        public long NextFrameTicks => Interlocked.Read(ref _nextFrameTicks);
+
+        public long LateFrames => Interlocked.Read(ref _lateFrames);
+
+        public DateTimeOffset MarkFrameStart()
+        {
+            var nowTicks = Stopwatch.GetTimestamp();
+            var previousTicks = Interlocked.Exchange(ref _lastFrameTicks, nowTicks);
+            if (previousTicks != 0)
+            {
+                _recordFrameIntervalMs?.Invoke(TicksToMilliseconds(nowTicks - previousTicks));
+            }
+
+            return DateTimeOffset.UtcNow;
+        }
+
+        public async ValueTask WaitForNextFrameAsync(CancellationToken cancellationToken)
+        {
+            var targetTicks = Interlocked.Add(ref _nextFrameTicks, _frameIntervalTicks);
+            var nowTicks = Stopwatch.GetTimestamp();
+            var remainingTicks = targetTicks - nowTicks;
+            if (remainingTicks <= 0)
+            {
+                RecordLateFrame();
+                ResyncIfNeeded(targetTicks, nowTicks);
+                return;
+            }
+
+            await DelayUntilAsync(targetTicks, cancellationToken);
+
+            var completedTicks = Stopwatch.GetTimestamp();
+            if (completedTicks - targetTicks > LateThresholdTicks)
+            {
+                RecordLateFrame();
+                ResyncIfNeeded(targetTicks, completedTicks);
+            }
+        }
+
+        private void ResyncIfNeeded(long targetTicks, long nowTicks)
+        {
+            if (nowTicks - targetTicks <= ResyncThresholdTicks)
+            {
+                return;
+            }
+
+            Interlocked.Exchange(ref _nextFrameTicks, nowTicks);
+            _recordScheduleReset?.Invoke();
+        }
+
+        private void RecordLateFrame()
+        {
+            Interlocked.Increment(ref _lateFrames);
+            _recordLateFrame?.Invoke();
+        }
+
+        private static async ValueTask DelayUntilAsync(long targetTicks, CancellationToken cancellationToken)
+        {
+            while (true)
+            {
+                cancellationToken.ThrowIfCancellationRequested();
+                var remainingTicks = targetTicks - Stopwatch.GetTimestamp();
+                if (remainingTicks <= 0)
+                {
+                    return;
+                }
+
+                var remainingMs = TicksToMilliseconds(remainingTicks);
+                if (remainingMs > 15.0)
+                {
+                    await Task.Delay(TimeSpan.FromMilliseconds(Math.Max(1.0, remainingMs - 2.0)), cancellationToken);
+                }
+                else
+                {
+                    Thread.SpinWait(100);
+                }
+            }
+        }
+
+        private static long MillisecondsToTicks(double milliseconds)
+        {
+            return Math.Max(1, (long)Math.Round(milliseconds * Stopwatch.Frequency / 1000.0));
+        }
+
+        private static double TicksToMilliseconds(long ticks)
+        {
+            return ticks * 1000.0 / Stopwatch.Frequency;
+        }
+    }
+
     private sealed class ControlMessagePublisher
     {
         private readonly object _lock = new();
@@ -338,7 +542,7 @@ internal static class Program
 
         private static bool IsHighFrequencyServerMessage(string type)
         {
-            return type is "cursor_state" or "encoder_stats" or "capture_stats";
+            return type is "cursor_state" or "encoder_stats" or "capture_stats" or "pipeline_stats";
         }
     }
 
@@ -579,7 +783,7 @@ internal static class Program
                         ["videoWidth"] = helloVideoMode.Width,
                         ["videoHeight"] = helloVideoMode.Height,
                         ["videoFps"] = helloVideoMode.Fps,
-                        ["videoSource"] = _options.VideoSource.ToString().ToLowerInvariant(),
+                        ["videoSource"] = FormatVideoSource(_options.VideoSource),
                         ["encoder"] = _options.Encoder.ToString().ToLowerInvariant(),
                         ["inputTarget"] = _options.InputTarget.ToString().ToLowerInvariant()
                     }, cancellationToken);
@@ -2815,6 +3019,7 @@ internal static class Program
                 try
                 {
                     var videoOptions = _videoModeState.CreateOptionsSnapshot();
+                    Log($"VIDEO {connectionId}", $"creating video source={FormatVideoSource(videoOptions.VideoSource)} {videoOptions.VideoWidth}x{videoOptions.VideoHeight}@{videoOptions.VideoFps}");
                     await using var source = OperatingSystem.IsWindows()
                         ? CreateVideoSource(connectionId, videoOptions)
                         : CreateNonWindowsVideoSource(connectionId, videoOptions);
@@ -2883,6 +3088,11 @@ internal static class Program
                 return new FileH264VideoSource(videoOptions.VideoFilePath, videoOptions.VideoFps);
             }
 
+            if (videoOptions.VideoSource == VideoSourceKind.SyntheticNv12)
+            {
+                return new MediaFoundationSyntheticNv12VideoSource(connectionId, videoOptions, _controlPublisher);
+            }
+
             if (videoOptions.VideoSource == VideoSourceKind.Realtime && videoOptions.Encoder == H264EncoderKind.Ffmpeg)
             {
                 return new FfmpegRealtimeVideoSource(connectionId, videoOptions, _controlPublisher);
@@ -2890,6 +3100,7 @@ internal static class Program
 
             if (videoOptions.VideoSource == VideoSourceKind.IddGpu)
             {
+                Log($"VIDEO {connectionId}", "active video-source=idd-gpu fallback=idd");
                 return new FallbackEncodedVideoSource(
                     new MediaFoundationGpuVideoSource(
                         connectionId,
@@ -2903,7 +3114,7 @@ internal static class Program
                         new IddBgraFrameSource(videoOptions with { VideoSource = VideoSourceKind.Idd }, message => Log($"CAPTURE {connectionId}", message))),
                     async (ex, cancellationToken) =>
                     {
-                        Log($"VIDEO {connectionId}", $"idd-gpu init failed, fallback to idd: {ex.Message}");
+                        Log($"VIDEO {connectionId}", $"active video-source=idd fallback-from=idd-gpu reason={ex.Message}");
                         await _controlPublisher.PublishAsync("encoder_error", new JsonObject
                         {
                             ["code"] = "GPU_CAPTURE_INIT_FAILED",
@@ -2928,6 +3139,11 @@ internal static class Program
                 return new FileH264VideoSource(videoOptions.VideoFilePath, videoOptions.VideoFps);
             }
 
+            if (videoOptions.VideoSource == VideoSourceKind.SyntheticNv12)
+            {
+                throw new PlatformNotSupportedException("synthetic-nv12 uses the Windows Media Foundation encoder.");
+            }
+
             if (videoOptions.VideoSource == VideoSourceKind.Realtime && videoOptions.Encoder == H264EncoderKind.Ffmpeg)
             {
                 return new FfmpegRealtimeVideoSource(connectionId, videoOptions, _controlPublisher);
@@ -2945,12 +3161,13 @@ internal static class Program
                 VideoSourceKind.Window => new WindowBgraFrameSource(videoOptions, message => Log($"CAPTURE {connectionId}", message)),
                 VideoSourceKind.Idd => new IddBgraFrameSource(videoOptions, message => Log($"CAPTURE {connectionId}", message)),
                 VideoSourceKind.IddGpu => throw new InvalidOperationException("idd-gpu uses a GPU frame source."),
+                VideoSourceKind.SyntheticNv12 => throw new InvalidOperationException("synthetic-nv12 bypasses BGRA frame sources."),
                 _ => throw new InvalidOperationException($"Unsupported BGRA video source: {videoOptions.VideoSource}")
             };
         }
     }
 
-    private sealed class VideoSession(
+        private sealed class VideoSession(
         int connectionId,
         TcpClient client,
         IEncodedVideoSource videoSource,
@@ -2962,6 +3179,11 @@ internal static class Program
         private static readonly HashSet<string> InitializedDumpPaths = new(StringComparer.OrdinalIgnoreCase);
         private readonly AdaptiveFrameRateController _adaptiveController = new(videoModeState, controlPublisher, options.VideoPort, $"VIDEO {connectionId}");
         private readonly IAdaptiveVideoStatsSource? _adaptiveStatsSource = videoSource as IAdaptiveVideoStatsSource;
+        private readonly LatestFrameQueue<EncodedVideoPacket> _sendQueue = new(
+            Math.Max(1, options.MaxVideoQueue),
+            singleReader: true,
+            singleWriter: true);
+        private readonly PipelineStageStats _sendStageStats = new("send");
 
         public async Task RunAsync(CancellationToken cancellationToken)
         {
@@ -2969,6 +3191,8 @@ internal static class Program
             client.SendBufferSize = 1024 * 1024;
 
             await using var stream = client.GetStream();
+            using var sessionCts = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
+            Task? producerTask = null;
             long packetsSent = 0;
             long framesSent = 0;
             long bytesSent = 0;
@@ -2977,55 +3201,101 @@ internal static class Program
             await using var dumpStream = OpenDumpStream(options.DumpEncodedPath);
 
             await videoSource.StartAsync(cancellationToken);
+            producerTask = Task.Run(() => PumpEncodedPacketsAsync(sessionCts.Token), sessionCts.Token);
 
-            await foreach (var packet in videoSource.ReadPacketsAsync(cancellationToken))
+            try
             {
-                cancellationToken.ThrowIfCancellationRequested();
-                var sendStopwatch = Stopwatch.StartNew();
-                await VideoPacketWriter.WriteAsync(stream, packet, cancellationToken);
-                await stream.FlushAsync(cancellationToken);
-                sendStopwatch.Stop();
-
-                if (dumpStream is not null)
+                await foreach (var packet in _sendQueue.Reader.ReadAllAsync(cancellationToken))
                 {
-                    await dumpStream.WriteAsync(packet.Payload, cancellationToken);
-                }
+                    cancellationToken.ThrowIfCancellationRequested();
+                    var sendStopwatch = Stopwatch.StartNew();
+                    await VideoPacketWriter.WriteAsync(stream, packet, cancellationToken);
+                    await stream.FlushAsync(cancellationToken);
+                    sendStopwatch.Stop();
+                    _sendStageStats.RecordProcessed(sendStopwatch.Elapsed.TotalMilliseconds);
 
-                packetsSent++;
-                bytesSent += packet.Payload.Length;
-                if (packet.ContainsPicture)
-                {
-                    framesSent++;
-                }
-
-                stats.RecordSent(packet, sendStopwatch.Elapsed.TotalMilliseconds);
-                if (videoSource is IVideoSendStatsSink sendStatsSink)
-                {
-                    sendStatsSink.RecordSent(packet, sendStopwatch.Elapsed.TotalMilliseconds);
-                }
-
-                if (_adaptiveStatsSource is not null)
-                {
-                    await _adaptiveController.ObserveCaptureAsync(_adaptiveStatsSource.LatestCaptureSnapshot, cancellationToken);
-                    await _adaptiveController.ObserveEncoderAsync(_adaptiveStatsSource.LatestEncoderSnapshot, cancellationToken);
-                }
-
-                if (sendStopwatch.Elapsed >= TimeSpan.FromMilliseconds(100))
-                {
-                    await controlPublisher.PublishAsync("encoder_error", new JsonObject
+                    if (dumpStream is not null)
                     {
-                        ["code"] = "VIDEO_SEND_BLOCKED",
-                        ["message"] = $"Socket write took {sendStopwatch.Elapsed.TotalMilliseconds:F1}ms"
-                    }, cancellationToken);
-                }
+                        await dumpStream.WriteAsync(packet.Payload, cancellationToken);
+                    }
 
-                if (lastLog.Elapsed >= TimeSpan.FromSeconds(5))
-                {
-                    var mb = bytesSent / 1024.0 / 1024.0;
-                    Log($"VIDEO {connectionId}", $"已发送 packets={packetsSent} frames={framesSent} bytes={mb:F1}MB");
-                    lastLog.Restart();
+                    packetsSent++;
+                    bytesSent += packet.Payload.Length;
+                    if (packet.ContainsPicture)
+                    {
+                        framesSent++;
+                    }
+
+                    stats.RecordSent(packet, sendStopwatch.Elapsed.TotalMilliseconds);
+                    if (videoSource is IVideoSendStatsSink sendStatsSink)
+                    {
+                        sendStatsSink.RecordSent(packet, sendStopwatch.Elapsed.TotalMilliseconds);
+                    }
+
+                    if (_adaptiveStatsSource is not null)
+                    {
+                        await _adaptiveController.ObserveCaptureAsync(_adaptiveStatsSource.LatestCaptureSnapshot, cancellationToken);
+                        await _adaptiveController.ObserveEncoderAsync(_adaptiveStatsSource.LatestEncoderSnapshot, cancellationToken);
+                    }
+
+                    if (sendStopwatch.Elapsed >= TimeSpan.FromMilliseconds(100))
+                    {
+                        await controlPublisher.PublishAsync("encoder_error", new JsonObject
+                        {
+                            ["code"] = "VIDEO_SEND_BLOCKED",
+                            ["message"] = $"Socket write took {sendStopwatch.Elapsed.TotalMilliseconds:F1}ms"
+                        }, cancellationToken);
+                    }
+
+                    if (lastLog.Elapsed >= TimeSpan.FromSeconds(5))
+                    {
+                        var mb = bytesSent / 1024.0 / 1024.0;
+                        var sendSnapshot = _sendStageStats.SnapshotAndResetWindow();
+                        Log($"VIDEO {connectionId}", $"已发送 packets={packetsSent} frames={framesSent} bytes={mb:F1}MB pipeline {FormatPipelineStageForLog(sendSnapshot)}");
+                        await controlPublisher.PublishAsync(
+                            "pipeline_stats",
+                            CreatePipelineStatsPayload("socket", gpuPath: false, sendSnapshot),
+                            cancellationToken);
+                        lastLog.Restart();
+                    }
                 }
             }
+            finally
+            {
+                await sessionCts.CancelAsync();
+                await MediaFoundationBgraVideoSource.WhenAllIgnoringCancellation(producerTask);
+            }
+        }
+
+        private async Task PumpEncodedPacketsAsync(CancellationToken cancellationToken)
+        {
+            try
+            {
+                await foreach (var packet in videoSource.ReadPacketsAsync(cancellationToken))
+                {
+                    var dropped = _sendQueue.WriteLatest(packet);
+                    if (dropped > 0)
+                    {
+                        _sendStageStats.RecordDropped(dropped);
+                        if (videoSource is IVideoSendStatsSink sendStatsSink)
+                        {
+                            sendStatsSink.RecordDropped(dropped);
+                        }
+                    }
+                }
+            }
+            catch (OperationCanceledException)
+            {
+                // Expected during teardown.
+            }
+            catch (Exception ex)
+            {
+                _sendQueue.Complete(ex);
+                Log($"VIDEO {connectionId}", $"send queue producer failed: {ex.Message}");
+                return;
+            }
+
+            _sendQueue.Complete();
         }
 
         private static FileStream? OpenDumpStream(string? path)
@@ -3090,6 +3360,8 @@ internal static class Program
     private interface IVideoSendStatsSink
     {
         void RecordSent(EncodedVideoPacket packet, double sendMs);
+
+        void RecordDropped(long count);
     }
 
         private interface IAdaptiveVideoStatsSource
@@ -3119,6 +3391,10 @@ internal static class Program
                 ["p99SendMs"] = Math.Round(snapshot.P99SendMs, 2),
                 ["outputKbps"] = Math.Round(snapshot.OutputKbps, 0),
                 ["streamFps"] = Math.Round(snapshot.StreamFps, 1),
+                ["p50FrameIntervalMs"] = Math.Round(snapshot.P50FrameIntervalMs, 2),
+                ["p95FrameIntervalMs"] = Math.Round(snapshot.P95FrameIntervalMs, 2),
+                ["p99FrameIntervalMs"] = Math.Round(snapshot.P99FrameIntervalMs, 2),
+                ["lateFrames"] = snapshot.LateFrames,
                 ["newFramesSent"] = snapshot.NewFramesSent,
                 ["repeatFramesSent"] = snapshot.RepeatFramesSent,
                 ["blackFramesSent"] = snapshot.BlackFramesSent,
@@ -3144,6 +3420,42 @@ internal static class Program
             payload["p99ConvertMs"] = Math.Round(snapshot.P99ConvertMs, 2);
             payload["captureFps"] = Math.Round(snapshot.CaptureFps, 1);
             payload["convertFps"] = Math.Round(snapshot.ConvertFps, 1);
+        }
+
+        private static JsonObject CreatePipelineStatsPayload(
+            string source,
+            bool gpuPath,
+            params PipelineStageStatsSnapshot[] snapshots)
+        {
+            var stages = new JsonArray();
+            foreach (var snapshot in snapshots)
+            {
+                stages.Add(new JsonObject
+                {
+                    ["name"] = snapshot.Name,
+                    ["fps"] = Math.Round(snapshot.Fps, 1),
+                    ["processed"] = snapshot.TotalProcessed,
+                    ["dropped"] = snapshot.TotalDropped,
+                    ["windowProcessed"] = snapshot.WindowProcessed,
+                    ["windowDropped"] = snapshot.WindowDropped,
+                    ["avgMs"] = Math.Round(snapshot.AvgMs, 2),
+                    ["p50Ms"] = Math.Round(snapshot.P50Ms, 2),
+                    ["p95Ms"] = Math.Round(snapshot.P95Ms, 2),
+                    ["p99Ms"] = Math.Round(snapshot.P99Ms, 2)
+                });
+            }
+
+            return new JsonObject
+            {
+                ["source"] = source,
+                ["gpuPath"] = gpuPath,
+                ["stages"] = stages
+            };
+        }
+
+        private static string FormatPipelineStageForLog(PipelineStageStatsSnapshot snapshot)
+        {
+            return $"{snapshot.Name}={snapshot.Fps:F1}fps drop={snapshot.WindowDropped}/{snapshot.TotalDropped} p95={snapshot.P95Ms:F1}ms";
         }
 
     private interface IBgraFrameSource : IDisposable
@@ -3229,6 +3541,14 @@ internal static class Program
             }
         }
 
+        public void RecordDropped(long count)
+        {
+            if (_active is IVideoSendStatsSink sink)
+            {
+                sink.RecordDropped(count);
+            }
+        }
+
         public CaptureStatsSnapshot LatestCaptureSnapshot => _active is IAdaptiveVideoStatsSource statsSource
             ? statsSource.LatestCaptureSnapshot
             : CreateEmptyCaptureSnapshot();
@@ -3245,7 +3565,7 @@ internal static class Program
         private static RealtimeEncoderStatsSnapshot CreateEmptyEncoderSnapshot()
         {
             return new RealtimeEncoderStatsSnapshot(
-                0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0);
+                0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0);
         }
     }
 
@@ -3311,17 +3631,314 @@ internal static class Program
         Keepalive = 3
     }
 
-    private sealed record Nv12Frame(
-        byte[] Data,
-        EncodedFrameKind FrameKind,
-        long SourceSequence,
-        double SourceAgeMs,
-        long GeneratedTimestampMs);
+    private sealed class LatestFrameQueue<T>
+    {
+        private readonly Channel<T> _channel;
+        private readonly Action<T>? _disposeDropped;
+
+        public LatestFrameQueue(int capacity, bool singleReader = true, bool singleWriter = true, Action<T>? disposeDropped = null)
+        {
+            _disposeDropped = disposeDropped;
+            _channel = Channel.CreateBounded<T>(new BoundedChannelOptions(Math.Max(1, capacity))
+            {
+                FullMode = BoundedChannelFullMode.Wait,
+                SingleReader = false,
+                SingleWriter = singleWriter
+            });
+        }
+
+        public ChannelReader<T> Reader => _channel.Reader;
+
+        public void Complete(Exception? error = null)
+        {
+            _channel.Writer.TryComplete(error);
+        }
+
+        public int WriteLatest(T item)
+        {
+            if (_channel.Writer.TryWrite(item))
+            {
+                return 0;
+            }
+
+            var dropped = 0;
+            while (_channel.Reader.TryRead(out var stale))
+            {
+                dropped++;
+                _disposeDropped?.Invoke(stale);
+            }
+
+            if (_channel.Writer.TryWrite(item))
+            {
+                return dropped;
+            }
+
+            dropped++;
+            _disposeDropped?.Invoke(item);
+            return dropped;
+        }
+    }
+
+    private sealed class PipelineStageStats(string name)
+    {
+        private readonly object _lock = new();
+        private readonly string _name = name;
+        private long _processed;
+        private long _dropped;
+        private long _windowProcessed;
+        private long _windowDropped;
+        private double _durationMsTotal;
+        private double _windowDurationMsTotal;
+        private long _windowStartedAtTicks = Stopwatch.GetTimestamp();
+        private readonly List<double> _samples = new();
+        private readonly List<double> _windowSamples = new();
+
+        public void RecordProcessed(double durationMs)
+        {
+            if (double.IsNaN(durationMs) || double.IsInfinity(durationMs) || durationMs < 0)
+            {
+                durationMs = 0;
+            }
+
+            lock (_lock)
+            {
+                _processed++;
+                _windowProcessed++;
+                _durationMsTotal += durationMs;
+                _windowDurationMsTotal += durationMs;
+                _samples.Add(durationMs);
+                _windowSamples.Add(durationMs);
+            }
+        }
+
+        public void RecordDropped(long count = 1)
+        {
+            if (count <= 0)
+            {
+                return;
+            }
+
+            lock (_lock)
+            {
+                _dropped += count;
+                _windowDropped += count;
+            }
+        }
+
+        public PipelineStageStatsSnapshot SnapshotAndResetWindow()
+        {
+            lock (_lock)
+            {
+                var percentiles = SampleStatistics.Percentiles(_windowSamples);
+                var elapsedSeconds = Math.Max(0.001, (Stopwatch.GetTimestamp() - _windowStartedAtTicks) / (double)Stopwatch.Frequency);
+                var snapshot = new PipelineStageStatsSnapshot(
+                    _name,
+                    _processed,
+                    _dropped,
+                    _windowProcessed,
+                    _windowDropped,
+                    _windowProcessed == 0 ? 0 : _windowDurationMsTotal / _windowProcessed,
+                    percentiles.P50,
+                    percentiles.P95,
+                    percentiles.P99,
+                    _windowProcessed / elapsedSeconds);
+
+                _windowProcessed = 0;
+                _windowDropped = 0;
+                _windowDurationMsTotal = 0;
+                _windowSamples.Clear();
+                _windowStartedAtTicks = Stopwatch.GetTimestamp();
+                return snapshot;
+            }
+        }
+    }
+
+    private sealed record PipelineStageStatsSnapshot(
+        string Name,
+        long TotalProcessed,
+        long TotalDropped,
+        long WindowProcessed,
+        long WindowDropped,
+        double AvgMs,
+        double P50Ms,
+        double P95Ms,
+        double P99Ms,
+        double Fps);
+
+    private sealed class BgraFrame : IDisposable
+    {
+        private bool _disposed;
+
+        public BgraFrame(byte[] data, long frameId, long timestampMs)
+        {
+            Data = data;
+            FrameId = frameId;
+            TimestampMs = timestampMs;
+        }
+
+        public byte[] Data { get; }
+
+        public long FrameId { get; }
+
+        public long TimestampMs { get; }
+
+        public void Dispose()
+        {
+            if (_disposed)
+            {
+                return;
+            }
+
+            _disposed = true;
+            ArrayPool<byte>.Shared.Return(Data);
+        }
+    }
+
+    private sealed class Nv12Frame : IDisposable
+    {
+        private readonly bool _returnToPool;
+        private bool _disposed;
+
+        public Nv12Frame(
+            byte[] data,
+            long frameId,
+            EncodedFrameKind frameKind,
+            long sourceSequence,
+            double sourceAgeMs,
+            long generatedTimestampMs,
+            bool returnToPool)
+        {
+            Data = data;
+            FrameId = frameId;
+            FrameKind = frameKind;
+            SourceSequence = sourceSequence;
+            SourceAgeMs = sourceAgeMs;
+            GeneratedTimestampMs = generatedTimestampMs;
+            _returnToPool = returnToPool;
+        }
+
+        public byte[] Data { get; }
+
+        public long FrameId { get; }
+
+        public EncodedFrameKind FrameKind { get; }
+
+        public long SourceSequence { get; }
+
+        public double SourceAgeMs { get; }
+
+        public long GeneratedTimestampMs { get; }
+
+        public void Dispose()
+        {
+            if (_disposed)
+            {
+                return;
+            }
+
+            _disposed = true;
+            if (_returnToPool)
+            {
+                ArrayPool<byte>.Shared.Return(Data);
+            }
+        }
+    }
+
+    private sealed class GpuAcquiredFrame : IDisposable
+    {
+        private bool _disposed;
+
+        public GpuAcquiredFrame(
+            GpuFrameLease? lease,
+            long frameId,
+            EncodedFrameKind frameKind,
+            long sourceSequence,
+            double sourceAgeMs,
+            long generatedTimestampMs)
+        {
+            Lease = lease;
+            FrameId = frameId;
+            FrameKind = frameKind;
+            SourceSequence = sourceSequence;
+            SourceAgeMs = sourceAgeMs;
+            GeneratedTimestampMs = generatedTimestampMs;
+        }
+
+        public GpuFrameLease? Lease { get; }
+
+        public long FrameId { get; }
+
+        public EncodedFrameKind FrameKind { get; }
+
+        public long SourceSequence { get; }
+
+        public double SourceAgeMs { get; }
+
+        public long GeneratedTimestampMs { get; }
+
+        public void Dispose()
+        {
+            if (_disposed)
+            {
+                return;
+            }
+
+            _disposed = true;
+            Lease?.Dispose();
+        }
+    }
+
+    private sealed class GpuConvertedFrame : IDisposable
+    {
+        private readonly Action? _release;
+        private bool _disposed;
+
+        public GpuConvertedFrame(
+            ID3D11Texture2D texture,
+            long frameId,
+            EncodedFrameKind frameKind,
+            long sourceSequence,
+            double sourceAgeMs,
+            long generatedTimestampMs,
+            Action release)
+        {
+            Texture = texture;
+            FrameId = frameId;
+            FrameKind = frameKind;
+            SourceSequence = sourceSequence;
+            SourceAgeMs = sourceAgeMs;
+            GeneratedTimestampMs = generatedTimestampMs;
+            _release = release;
+        }
+
+        public ID3D11Texture2D Texture { get; }
+
+        public long FrameId { get; }
+
+        public EncodedFrameKind FrameKind { get; }
+
+        public long SourceSequence { get; }
+
+        public double SourceAgeMs { get; }
+
+        public long GeneratedTimestampMs { get; }
+
+        public void Dispose()
+        {
+            if (_disposed)
+            {
+                return;
+            }
+
+            _disposed = true;
+            _release?.Invoke();
+        }
+    }
 
     private sealed class FileH264VideoSource : IEncodedVideoSource, IAdaptiveVideoStatsSource
     {
         private readonly string _path;
-        private readonly TimeSpan _frameDuration;
+        private readonly int _targetFps;
         private H264AnnexBStream? _videoStream;
         private long _sequence;
         private long _frameId;
@@ -3329,7 +3946,7 @@ internal static class Program
         public FileH264VideoSource(string path, int fps)
         {
             _path = path;
-            _frameDuration = TimeSpan.FromMilliseconds(1000.0 / Math.Max(1, fps));
+            _targetFps = Math.Max(1, fps);
         }
 
         public ValueTask StartAsync(CancellationToken cancellationToken)
@@ -3343,7 +3960,7 @@ internal static class Program
             [EnumeratorCancellation] CancellationToken cancellationToken)
         {
             var videoStream = _videoStream ?? throw new InvalidOperationException("Video source has not started.");
-            var nextFrameAt = DateTimeOffset.UtcNow;
+            var pacer = new FramePacer(_targetFps);
 
             while (!cancellationToken.IsCancellationRequested)
             {
@@ -3367,16 +3984,7 @@ internal static class Program
 
                     if (packet.ContainsPicture)
                     {
-                        nextFrameAt += _frameDuration;
-                        var delay = nextFrameAt - DateTimeOffset.UtcNow;
-                        if (delay > TimeSpan.Zero)
-                        {
-                            await Task.Delay(delay, cancellationToken);
-                        }
-                        else if (delay < TimeSpan.FromSeconds(-1))
-                        {
-                            nextFrameAt = DateTimeOffset.UtcNow;
-                        }
+                        await pacer.WaitForNextFrameAsync(cancellationToken);
                     }
                 }
             }
@@ -3399,6 +4007,10 @@ internal static class Program
         private static RealtimeEncoderStatsSnapshot CreateEmptyEncoderSnapshot()
         {
             return new RealtimeEncoderStatsSnapshot(
+                0,
+                0,
+                0,
+                0,
                 0,
                 0,
                 0,
@@ -3615,6 +4227,11 @@ internal static class Program
             _stats.RecordSent(packet, sendMs);
         }
 
+        public void RecordDropped(long count)
+        {
+            _stats.RecordDropped(count);
+        }
+
         public CaptureStatsSnapshot LatestCaptureSnapshot => _latestCaptureSnapshot;
 
         public RealtimeEncoderStatsSnapshot LatestEncoderSnapshot => _latestEncoderSnapshot;
@@ -3627,7 +4244,7 @@ internal static class Program
         private static RealtimeEncoderStatsSnapshot CreateEmptyEncoderSnapshot()
         {
             return new RealtimeEncoderStatsSnapshot(
-                0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0);
+                0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0);
         }
 
         private EncodedVideoPacket CreatePacket(byte[] payload)
@@ -3651,8 +4268,11 @@ internal static class Program
 
         private async Task WriteInputFramesAsync(Stream stdin, CancellationToken cancellationToken)
         {
-            var frameDuration = TimeSpan.FromMilliseconds(1000.0 / Math.Max(1, _options.VideoFps));
-            var nextFrameAt = DateTimeOffset.UtcNow;
+            var pacer = new FramePacer(
+                _options.VideoFps,
+                _stats.RecordFrameInterval,
+                _stats.RecordLateFrame,
+                () => _stats.RecordDropped());
             var frameBuffer = new byte[_options.VideoWidth * _options.VideoHeight * 4];
             long frameId = 0;
 
@@ -3660,7 +4280,7 @@ internal static class Program
             {
                 while (!cancellationToken.IsCancellationRequested)
                 {
-                    var generatedAt = DateTimeOffset.UtcNow;
+                    var generatedAt = pacer.MarkFrameStart();
                     _patternGenerator.Render(frameBuffer, frameId, generatedAt);
                     _stats.RecordGenerated(frameId, generatedAt.ToUnixTimeMilliseconds());
 
@@ -3668,17 +4288,7 @@ internal static class Program
                     await stdin.FlushAsync(cancellationToken);
 
                     frameId++;
-                    nextFrameAt += frameDuration;
-                    var delay = nextFrameAt - DateTimeOffset.UtcNow;
-                    if (delay > TimeSpan.Zero)
-                    {
-                        await Task.Delay(delay, cancellationToken);
-                    }
-                    else if (delay < TimeSpan.FromSeconds(-1))
-                    {
-                        nextFrameAt = DateTimeOffset.UtcNow;
-                        _stats.RecordDropped();
-                    }
+                    await pacer.WaitForNextFrameAsync(cancellationToken);
                 }
             }
             catch (OperationCanceledException)
@@ -3725,7 +4335,7 @@ internal static class Program
                 {
                     var snapshot = _stats.SnapshotAndResetWindow();
                     _latestEncoderSnapshot = snapshot;
-                    Log($"ENCODER {_connectionId}", $"stats generated={snapshot.FramesGenerated} encoded={snapshot.FramesEncoded} sent={snapshot.FramesSent} dropped={snapshot.FramesDropped} streamFps={snapshot.StreamFps:F1} new={snapshot.NewFramesSent} repeat={snapshot.RepeatFramesSent} avgEncode={snapshot.AvgEncodeMs:F1}ms p95Encode={snapshot.P95EncodeMs:F1}ms p99Encode={snapshot.P99EncodeMs:F1}ms avgSend={snapshot.AvgSendMs:F1}ms p95Send={snapshot.P95SendMs:F1}ms kbps={snapshot.OutputKbps:F0}");
+                    Log($"ENCODER {_connectionId}", $"stats generated={snapshot.FramesGenerated} encoded={snapshot.FramesEncoded} sent={snapshot.FramesSent} dropped={snapshot.FramesDropped} late={snapshot.LateFrames} streamFps={snapshot.StreamFps:F1} new={snapshot.NewFramesSent} repeat={snapshot.RepeatFramesSent} avgFrameInterval={snapshot.P50FrameIntervalMs:F2}/{snapshot.P95FrameIntervalMs:F2}/{snapshot.P99FrameIntervalMs:F2}ms avgEncode={snapshot.AvgEncodeMs:F1}ms p95Encode={snapshot.P95EncodeMs:F1}ms p99Encode={snapshot.P99EncodeMs:F1}ms avgSend={snapshot.AvgSendMs:F1}ms p95Send={snapshot.P95SendMs:F1}ms kbps={snapshot.OutputKbps:F0}");
                     await _controlPublisher.PublishAsync("encoder_stats", CreateEncoderStatsPayload(snapshot, gpuPath: false), cancellationToken);
                 }
             }
@@ -3813,6 +4423,457 @@ internal static class Program
         }
     }
 
+    private sealed class MediaFoundationSyntheticNv12VideoSource : IEncodedVideoSource, IVideoSendStatsSink, IAdaptiveVideoStatsSource
+    {
+        private readonly int _connectionId;
+        private readonly HostOptions _options;
+        private readonly ControlMessagePublisher _controlPublisher;
+        private readonly SyntheticNv12FramePool _framePool;
+        private readonly RealtimeEncoderStats _stats;
+        private readonly Channel<EncodedVideoPacket> _packets;
+        private CaptureStatsSnapshot _latestCaptureSnapshot = CreateEmptyCaptureSnapshot();
+        private RealtimeEncoderStatsSnapshot _latestEncoderSnapshot = CreateEmptyEncoderSnapshot();
+        private CancellationTokenSource? _sourceCts;
+        private Task? _encoderTask;
+        private Task? _statsTask;
+        private bool _encoderStarted;
+        private long _sequence;
+
+        public MediaFoundationSyntheticNv12VideoSource(
+            int connectionId,
+            HostOptions options,
+            ControlMessagePublisher controlPublisher)
+        {
+            _connectionId = connectionId;
+            _options = options;
+            _controlPublisher = controlPublisher;
+            _framePool = new SyntheticNv12FramePool(options.VideoWidth, options.VideoHeight);
+            _stats = new RealtimeEncoderStats(options.VideoFps);
+            _packets = Channel.CreateBounded<EncodedVideoPacket>(new BoundedChannelOptions(Math.Max(1, options.MaxVideoQueue))
+            {
+                FullMode = BoundedChannelFullMode.DropOldest,
+                SingleReader = true,
+                SingleWriter = true
+            });
+        }
+
+        public async ValueTask StartAsync(CancellationToken cancellationToken)
+        {
+            if (!OperatingSystem.IsWindows())
+            {
+                await PublishErrorAsync("ENCODER_INIT_FAILED", "Media Foundation encoder is only available on Windows.", cancellationToken);
+                throw new PlatformNotSupportedException("Media Foundation encoder is only available on Windows.");
+            }
+
+            _sourceCts = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
+            _encoderTask = Task.Run(
+                () =>
+                {
+                    if (!OperatingSystem.IsWindows())
+                    {
+                        throw new PlatformNotSupportedException("Media Foundation encoder is only available on Windows.");
+                    }
+
+                    return EncodeLoopAsync(_sourceCts.Token);
+                },
+                _sourceCts.Token);
+            _statsTask = Task.Run(() => PublishStatsLoopAsync(_sourceCts.Token), _sourceCts.Token);
+
+            Log($"ENCODER {_connectionId}", $"start source=synthetic-nv12 encoder=mediafoundation input=nv12 {_options.VideoWidth}x{_options.VideoHeight}@{_options.VideoFps} bitrate={_options.VideoBitrate}");
+            await _controlPublisher.PublishAsync("encoder_start", new JsonObject
+            {
+                ["source"] = "synthetic-nv12",
+                ["encoder"] = "mediafoundation",
+                ["width"] = _options.VideoWidth,
+                ["height"] = _options.VideoHeight,
+                ["fps"] = _options.VideoFps,
+                ["bitrate"] = _options.VideoBitrate,
+                ["codec"] = "h264",
+                ["format"] = "annexb",
+                ["inputFormat"] = "nv12",
+                ["synthetic"] = true
+            }, cancellationToken);
+            _encoderStarted = true;
+        }
+
+        public async IAsyncEnumerable<EncodedVideoPacket> ReadPacketsAsync(
+            [EnumeratorCancellation] CancellationToken cancellationToken)
+        {
+            while (await _packets.Reader.WaitToReadAsync(cancellationToken))
+            {
+                while (_packets.Reader.TryRead(out var packet))
+                {
+                    yield return packet;
+                }
+            }
+        }
+
+        public async ValueTask DisposeAsync()
+        {
+            if (_sourceCts is not null)
+            {
+                await _sourceCts.CancelAsync();
+            }
+
+            await MediaFoundationBgraVideoSource.WhenAllIgnoringCancellation(_encoderTask, _statsTask);
+            _packets.Writer.TryComplete();
+
+            var snapshot = _stats.Snapshot();
+            if (_encoderStarted)
+            {
+                Log($"ENCODER {_connectionId}", $"stop generated={snapshot.FramesGenerated} encoded={snapshot.FramesEncoded} sent={snapshot.FramesSent} dropped={snapshot.FramesDropped}");
+                await _controlPublisher.PublishAsync("encoder_stop", new JsonObject
+                {
+                    ["reason"] = "video_client_disconnected",
+                    ["source"] = "synthetic-nv12",
+                    ["framesGenerated"] = snapshot.FramesGenerated,
+                    ["framesEncoded"] = snapshot.FramesEncoded,
+                    ["framesSent"] = snapshot.FramesSent
+                }, CancellationToken.None);
+            }
+
+            _sourceCts?.Dispose();
+        }
+
+        public void RecordSent(EncodedVideoPacket packet, double sendMs)
+        {
+            _stats.RecordSent(packet, sendMs);
+        }
+
+        public void RecordDropped(long count)
+        {
+            _stats.RecordDropped(count);
+        }
+
+        public CaptureStatsSnapshot LatestCaptureSnapshot => _latestCaptureSnapshot;
+
+        public RealtimeEncoderStatsSnapshot LatestEncoderSnapshot => _latestEncoderSnapshot;
+
+        [SupportedOSPlatform("windows")]
+        private async Task EncodeLoopAsync(CancellationToken cancellationToken)
+        {
+            try
+            {
+                await Task.Yield();
+                if (!OperatingSystem.IsWindows())
+                {
+                    throw new PlatformNotSupportedException("Media Foundation encoder is only available on Windows.");
+                }
+
+                using var encoder = new MediaFoundationH264Encoder(_options);
+                encoder.Start();
+                var pacer = new FramePacer(
+                    _options.VideoFps,
+                    _stats.RecordFrameInterval,
+                    _stats.RecordLateFrame,
+                    () => _stats.RecordDropped());
+                long frameId = 0;
+
+                while (!cancellationToken.IsCancellationRequested)
+                {
+                    var generatedAt = pacer.MarkFrameStart();
+                    var nv12Frame = _framePool.GetFrame(frameId);
+                    _stats.RecordGenerated(frameId, generatedAt.ToUnixTimeMilliseconds());
+
+                    var encodeStopwatch = Stopwatch.StartNew();
+                    var payloads = encoder.EncodeFrame(nv12Frame, frameId);
+                    encodeStopwatch.Stop();
+
+                    foreach (var payload in payloads)
+                    {
+                        var packet = CreatePacket(payload, frameId, encodeStopwatch.Elapsed.TotalMilliseconds);
+                        if (!_packets.Writer.TryWrite(packet))
+                        {
+                            _stats.RecordDropped();
+                        }
+                    }
+
+                    frameId++;
+                    await pacer.WaitForNextFrameAsync(cancellationToken);
+                }
+            }
+            catch (OperationCanceledException)
+            {
+                // Expected during teardown.
+            }
+            catch (Exception ex)
+            {
+                await PublishErrorAsync("ENCODER_FAILED", ex.Message, CancellationToken.None);
+                _packets.Writer.TryComplete(ex);
+                return;
+            }
+
+            _packets.Writer.TryComplete();
+        }
+
+        private EncodedVideoPacket CreatePacket(byte[] payload, long sourceSequence, double encodeMs)
+        {
+            var containsPicture = H264AnnexBStream.ContainsPicture(payload);
+            var isKeyFrame = H264AnnexBStream.ContainsNalType(payload, 5);
+            var frameId = containsPicture
+                ? _stats.RecordEncoded(payload.Length, encodeMs)
+                : _stats.LastEncodedFrameId;
+
+            return new EncodedVideoPacket(
+                payload,
+                isKeyFrame,
+                containsPicture,
+                frameId,
+                Interlocked.Increment(ref _sequence) - 1,
+                frameId >= 0 ? _stats.GetFrameTimestamp(frameId) : DateTimeOffset.UtcNow.ToUnixTimeMilliseconds(),
+                frameId >= 0 ? _stats.GetFrameEncodeMs(frameId) : 0,
+                EncodedFrameKind.New,
+                sourceSequence,
+                0);
+        }
+
+        private async Task PublishStatsLoopAsync(CancellationToken cancellationToken)
+        {
+            using var timer = new PeriodicTimer(TimeSpan.FromSeconds(1));
+            try
+            {
+                while (await timer.WaitForNextTickAsync(cancellationToken))
+                {
+                    var snapshot = _stats.SnapshotAndResetWindow();
+                    _latestEncoderSnapshot = snapshot;
+                    Log($"ENCODER {_connectionId}", $"stats generated={snapshot.FramesGenerated} encoded={snapshot.FramesEncoded} sent={snapshot.FramesSent} dropped={snapshot.FramesDropped} late={snapshot.LateFrames} streamFps={snapshot.StreamFps:F1} new={snapshot.NewFramesSent} repeat={snapshot.RepeatFramesSent} avgFrameInterval={snapshot.P50FrameIntervalMs:F2}/{snapshot.P95FrameIntervalMs:F2}/{snapshot.P99FrameIntervalMs:F2}ms avgEncode={snapshot.AvgEncodeMs:F1}ms p95Encode={snapshot.P95EncodeMs:F1}ms p99Encode={snapshot.P99EncodeMs:F1}ms avgSend={snapshot.AvgSendMs:F1}ms p95Send={snapshot.P95SendMs:F1}ms kbps={snapshot.OutputKbps:F0}");
+                    var payload = CreateEncoderStatsPayload(snapshot, gpuPath: false);
+                    payload["source"] = "synthetic-nv12";
+                    payload["inputFormat"] = "nv12";
+                    payload["synthetic"] = true;
+                    await _controlPublisher.PublishAsync("encoder_stats", payload, cancellationToken);
+                }
+            }
+            catch (OperationCanceledException)
+            {
+                // Expected during teardown.
+            }
+        }
+
+        private Task PublishErrorAsync(string code, string message, CancellationToken cancellationToken)
+        {
+            Log($"ENCODER {_connectionId}", $"{code}: {message}");
+            return _controlPublisher.PublishAsync("encoder_error", new JsonObject
+            {
+                ["code"] = code,
+                ["message"] = message,
+                ["source"] = "synthetic-nv12"
+            }, cancellationToken).AsTask();
+        }
+
+        private static CaptureStatsSnapshot CreateEmptyCaptureSnapshot()
+        {
+            return new CaptureStatsSnapshot(0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0);
+        }
+
+        private static RealtimeEncoderStatsSnapshot CreateEmptyEncoderSnapshot()
+        {
+            return new RealtimeEncoderStatsSnapshot(
+                0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0);
+        }
+    }
+
+    private sealed class SyntheticNv12FramePool
+    {
+        private const int FramePoolSize = 4;
+        private static readonly YuvColor White = FromRgb(255, 255, 255);
+        private static readonly YuvColor Yellow = FromRgb(255, 255, 0);
+        private static readonly YuvColor Cyan = FromRgb(0, 255, 255);
+        private static readonly YuvColor Green = FromRgb(0, 255, 0);
+        private static readonly YuvColor Magenta = FromRgb(255, 0, 255);
+        private static readonly YuvColor Red = FromRgb(255, 0, 0);
+        private static readonly YuvColor Blue = FromRgb(0, 0, 255);
+        private static readonly YuvColor Black = FromRgb(0, 0, 0);
+        private static readonly YuvColor Orange = FromRgb(255, 160, 32);
+        private static readonly YuvColor Teal = FromRgb(32, 220, 220);
+        private static readonly YuvColor DarkGray = FromRgb(32, 32, 32);
+        private static readonly YuvColor[] Bars = [White, Yellow, Cyan, Green, Magenta, Red, Blue, Black];
+
+        private readonly int _width;
+        private readonly int _height;
+        private readonly int _yPlaneSize;
+        private readonly byte[][] _frames;
+
+        public SyntheticNv12FramePool(int width, int height)
+        {
+            if (width <= 0 || height <= 0 || (width & 1) != 0 || (height & 1) != 0)
+            {
+                throw new ArgumentException("synthetic-nv12 requires positive even dimensions.");
+            }
+
+            _width = width;
+            _height = height;
+            _yPlaneSize = checked(width * height);
+            var frameSize = checked(width * height * 3 / 2);
+            _frames = new byte[FramePoolSize][];
+            for (var index = 0; index < _frames.Length; index++)
+            {
+                var frame = new byte[frameSize];
+                RenderFrame(frame, index);
+                _frames[index] = frame;
+            }
+        }
+
+        public byte[] GetFrame(long frameId)
+        {
+            return _frames[(int)(frameId % _frames.Length)];
+        }
+
+        private void RenderFrame(byte[] nv12, int variant)
+        {
+            FillBackground(nv12);
+            DrawColorBars(nv12);
+            DrawMovingBlocks(nv12, variant);
+            DrawFlashMarker(nv12, variant);
+            DrawFrameCode(nv12, variant);
+        }
+
+        private void FillBackground(byte[] nv12)
+        {
+            for (var y = 0; y < _height; y++)
+            {
+                var stripe = (y / 24) % 2 == 0 ? 10 : 0;
+                var rowOffset = y * _width;
+                for (var x = 0; x < _width; x++)
+                {
+                    var bar = Bars[(x * Bars.Length) / _width];
+                    nv12[rowOffset + x] = ClampToByte(bar.Y / 3 + 32 + stripe);
+                }
+            }
+
+            for (var uvY = 0; uvY < _height / 2; uvY++)
+            {
+                var rowOffset = _yPlaneSize + uvY * _width;
+                for (var x = 0; x < _width; x += 2)
+                {
+                    var bar = Bars[(x * Bars.Length) / _width];
+                    nv12[rowOffset + x] = AverageChroma(bar.U, 128);
+                    nv12[rowOffset + x + 1] = AverageChroma(bar.V, 128);
+                }
+            }
+        }
+
+        private void DrawColorBars(byte[] nv12)
+        {
+            var top = _height / 3;
+            var barHeight = Math.Max(60, _height / 6);
+            for (var index = 0; index < Bars.Length; index++)
+            {
+                var x0 = index * _width / Bars.Length;
+                var x1 = (index + 1) * _width / Bars.Length;
+                FillRect(nv12, x0, top, x1 - x0, barHeight, Bars[index]);
+            }
+        }
+
+        private void DrawMovingBlocks(byte[] nv12, int variant)
+        {
+            var blockWidth = MakeEven(Math.Max(96, _width / 10));
+            var blockHeight = MakeEven(Math.Max(54, _height / 12));
+            var horizontalRange = Math.Max(1, _width - blockWidth);
+            var verticalRange = Math.Max(1, _height - blockHeight - 40);
+            var x = (variant * Math.Max(32, _width / 5)) % horizontalRange;
+            var y = 96 + (variant * Math.Max(24, _height / 13)) % Math.Max(1, _height / 5);
+            FillRect(nv12, x, y, blockWidth, blockHeight, Orange);
+
+            var vx = Math.Max(0, _width - blockWidth - 48);
+            var vy = 40 + (variant * Math.Max(30, _height / 9)) % verticalRange;
+            FillRect(nv12, vx, vy, blockWidth, blockHeight, Teal);
+        }
+
+        private void DrawFlashMarker(byte[] nv12, int variant)
+        {
+            var markerSize = MakeEven(Math.Max(72, _height / 9));
+            FillRect(
+                nv12,
+                48,
+                Math.Max(0, _height - markerSize - 48),
+                markerSize,
+                markerSize,
+                (variant & 1) == 0 ? Green : DarkGray);
+        }
+
+        private void DrawFrameCode(byte[] nv12, int variant)
+        {
+            var cell = MakeEven(Math.Max(10, _width / 128));
+            var x = 48;
+            var y = 36;
+            DrawBits(nv12, x, y, cell, unchecked((uint)(0x5A17_0000 | variant)));
+            DrawBits(nv12, x, y + cell * 6, cell, unchecked((uint)(FramePoolSize << 8 | variant)));
+        }
+
+        private void DrawBits(byte[] nv12, int x, int y, int cell, uint value)
+        {
+            for (var bit = 0; bit < 32; bit++)
+            {
+                var on = ((value >> bit) & 1) != 0;
+                FillRect(
+                    nv12,
+                    x + bit * (cell + 2),
+                    y,
+                    cell,
+                    cell * 4,
+                    on ? White : Black);
+            }
+        }
+
+        private void FillRect(byte[] nv12, int x, int y, int width, int height, YuvColor color)
+        {
+            var x0 = Math.Clamp(x, 0, _width);
+            var y0 = Math.Clamp(y, 0, _height);
+            var x1 = Math.Clamp(x + width, 0, _width);
+            var y1 = Math.Clamp(y + height, 0, _height);
+            if (x1 <= x0 || y1 <= y0)
+            {
+                return;
+            }
+
+            for (var row = y0; row < y1; row++)
+            {
+                nv12.AsSpan(row * _width + x0, x1 - x0).Fill(color.Y);
+            }
+
+            var uvX0 = x0 & ~1;
+            var uvX1 = Math.Min(_width, (x1 + 1) & ~1);
+            var uvY0 = y0 / 2;
+            var uvY1 = Math.Min(_height / 2, (y1 + 1) / 2);
+            for (var row = uvY0; row < uvY1; row++)
+            {
+                var offset = _yPlaneSize + row * _width + uvX0;
+                for (var col = uvX0; col < uvX1; col += 2)
+                {
+                    nv12[offset] = color.U;
+                    nv12[offset + 1] = color.V;
+                    offset += 2;
+                }
+            }
+        }
+
+        private static YuvColor FromRgb(byte r, byte g, byte b)
+        {
+            return new YuvColor(
+                ClampToByte(((66 * r + 129 * g + 25 * b + 128) >> 8) + 16),
+                ClampToByte(((-38 * r - 74 * g + 112 * b + 128) >> 8) + 128),
+                ClampToByte(((112 * r - 94 * g - 18 * b + 128) >> 8) + 128));
+        }
+
+        private static byte AverageChroma(byte value, byte neutral)
+        {
+            return (byte)((value + neutral) / 2);
+        }
+
+        private static int MakeEven(int value)
+        {
+            return Math.Max(2, value & ~1);
+        }
+
+        private static byte ClampToByte(int value)
+        {
+            return (byte)Math.Clamp(value, 0, 255);
+        }
+
+        private readonly record struct YuvColor(byte Y, byte U, byte V);
+    }
+
     private sealed class MediaFoundationBgraVideoSource : IEncodedVideoSource, IVideoSendStatsSink, IAdaptiveVideoStatsSource
     {
         private readonly int _connectionId;
@@ -3821,10 +4882,17 @@ internal static class Program
         private readonly IBgraFrameSource _frameSource;
         private readonly RealtimeEncoderStats _stats;
         private readonly CaptureStats _captureStats = new();
+        private readonly PipelineStageStats _acquireStageStats = new("acquire");
+        private readonly PipelineStageStats _convertStageStats = new("convert");
+        private readonly PipelineStageStats _encodeStageStats = new("encode");
         private CaptureStatsSnapshot _latestCaptureSnapshot = CreateEmptyCaptureSnapshot();
         private RealtimeEncoderStatsSnapshot _latestEncoderSnapshot = CreateEmptyEncoderSnapshot();
-        private readonly Channel<EncodedVideoPacket> _packets;
+        private readonly LatestFrameQueue<BgraFrame> _capturedFrames;
+        private readonly LatestFrameQueue<Nv12Frame> _convertedFrames;
+        private readonly LatestFrameQueue<EncodedVideoPacket> _packets;
         private CancellationTokenSource? _sourceCts;
+        private Task? _captureTask;
+        private Task? _convertTask;
         private Task? _encoderTask;
         private Task? _statsTask;
         private Task? _captureStatsTask;
@@ -3843,12 +4911,10 @@ internal static class Program
             _controlPublisher = controlPublisher;
             _frameSource = frameSource;
             _stats = new RealtimeEncoderStats(options.VideoFps);
-            _packets = Channel.CreateBounded<EncodedVideoPacket>(new BoundedChannelOptions(Math.Max(1, options.MaxVideoQueue))
-            {
-                FullMode = BoundedChannelFullMode.DropOldest,
-                SingleReader = true,
-                SingleWriter = true
-            });
+            var queueCapacity = Math.Max(1, options.MaxVideoQueue);
+            _capturedFrames = new LatestFrameQueue<BgraFrame>(queueCapacity, disposeDropped: frame => frame.Dispose());
+            _convertedFrames = new LatestFrameQueue<Nv12Frame>(queueCapacity, disposeDropped: frame => frame.Dispose());
+            _packets = new LatestFrameQueue<EncodedVideoPacket>(queueCapacity);
         }
 
         public async ValueTask StartAsync(CancellationToken cancellationToken)
@@ -3875,6 +4941,28 @@ internal static class Program
                 throw;
             }
 
+            _captureTask = Task.Run(
+                () =>
+                {
+                    if (!OperatingSystem.IsWindows())
+                    {
+                        throw new PlatformNotSupportedException("Media Foundation capture is only available on Windows.");
+                    }
+
+                    return CaptureLoopAsync(_sourceCts.Token);
+                },
+                _sourceCts.Token);
+            _convertTask = Task.Run(
+                () =>
+                {
+                    if (!OperatingSystem.IsWindows())
+                    {
+                        throw new PlatformNotSupportedException("Media Foundation conversion is only available on Windows.");
+                    }
+
+                    return ConvertLoopAsync(_sourceCts.Token);
+                },
+                _sourceCts.Token);
             _encoderTask = Task.Run(
                 () =>
                 {
@@ -3936,8 +5024,8 @@ internal static class Program
                 await _sourceCts.CancelAsync();
             }
 
-            await WhenAllIgnoringCancellation(_encoderTask, _statsTask, _captureStatsTask);
-            _packets.Writer.TryComplete();
+            await WhenAllIgnoringCancellation(_captureTask, _convertTask, _encoderTask, _statsTask, _captureStatsTask);
+            _packets.Complete();
             _frameSource.Dispose();
 
             var snapshot = _stats.Snapshot();
@@ -3970,9 +5058,150 @@ internal static class Program
             _stats.RecordSent(packet, sendMs);
         }
 
+        public void RecordDropped(long count)
+        {
+            _stats.RecordDropped(count);
+        }
+
         public CaptureStatsSnapshot LatestCaptureSnapshot => _latestCaptureSnapshot;
 
         public RealtimeEncoderStatsSnapshot LatestEncoderSnapshot => _latestEncoderSnapshot;
+
+        [SupportedOSPlatform("windows")]
+        private async Task CaptureLoopAsync(CancellationToken cancellationToken)
+        {
+            var frameLength = checked(_options.VideoWidth * _options.VideoHeight * 4);
+            var pacer = new FramePacer(
+                _options.VideoFps,
+                _stats.RecordFrameInterval,
+                _stats.RecordLateFrame,
+                () => _stats.RecordDropped());
+            long frameId = 0;
+
+            try
+            {
+                await Task.Yield();
+
+                while (!cancellationToken.IsCancellationRequested)
+                {
+                    var generatedAt = pacer.MarkFrameStart();
+                    var bgraFrame = ArrayPool<byte>.Shared.Rent(frameLength);
+                    var captureStopwatch = Stopwatch.StartNew();
+                    try
+                    {
+                        _frameSource.Capture(bgraFrame, _options.VideoWidth, _options.VideoHeight, cancellationToken);
+                        captureStopwatch.Stop();
+                        _captureStats.RecordCaptured(captureStopwatch.Elapsed.TotalMilliseconds);
+                        _acquireStageStats.RecordProcessed(captureStopwatch.Elapsed.TotalMilliseconds);
+                    }
+                    catch
+                    {
+                        ArrayPool<byte>.Shared.Return(bgraFrame);
+                        throw;
+                    }
+
+                    var timestampMs = generatedAt.ToUnixTimeMilliseconds();
+                    _stats.RecordGenerated(frameId, timestampMs);
+                    var dropped = _capturedFrames.WriteLatest(new BgraFrame(bgraFrame, frameId, timestampMs));
+                    if (dropped > 0)
+                    {
+                        _acquireStageStats.RecordDropped(dropped);
+                        _stats.RecordDropped(dropped);
+                    }
+
+                    frameId++;
+                    await pacer.WaitForNextFrameAsync(cancellationToken);
+                }
+            }
+            catch (OperationCanceledException)
+            {
+                // Expected during teardown.
+            }
+            catch (CaptureException ex)
+            {
+                _captureStats.RecordError();
+                await PublishCaptureErrorAsync(ex.Code, ex.Message, CancellationToken.None);
+                _capturedFrames.Complete(ex);
+                return;
+            }
+            catch (Exception ex)
+            {
+                _captureStats.RecordError();
+                await PublishCaptureErrorAsync("CAPTURE_FAILED", ex.Message, CancellationToken.None);
+                _capturedFrames.Complete(ex);
+                return;
+            }
+
+            _capturedFrames.Complete();
+        }
+
+        [SupportedOSPlatform("windows")]
+        private async Task ConvertLoopAsync(CancellationToken cancellationToken)
+        {
+            var nv12Length = MediaFoundationH264Encoder.GetNv12FrameSize(_options.VideoWidth, _options.VideoHeight);
+
+            try
+            {
+                await Task.Yield();
+                if (!OperatingSystem.IsWindows())
+                {
+                    throw new PlatformNotSupportedException("Media Foundation encoder is only available on Windows.");
+                }
+
+                await foreach (var bgraFrame in _capturedFrames.Reader.ReadAllAsync(cancellationToken))
+                {
+                    byte[]? nv12Frame = null;
+                    try
+                    {
+                        nv12Frame = ArrayPool<byte>.Shared.Rent(nv12Length);
+                        var convertStopwatch = Stopwatch.StartNew();
+                        MediaFoundationH264Encoder.ConvertBgraToNv12(bgraFrame.Data, nv12Frame, _options.VideoWidth, _options.VideoHeight);
+                        convertStopwatch.Stop();
+                        _captureStats.RecordConverted(convertStopwatch.Elapsed.TotalMilliseconds);
+                        _convertStageStats.RecordProcessed(convertStopwatch.Elapsed.TotalMilliseconds);
+
+                        var converted = new Nv12Frame(
+                            nv12Frame,
+                            bgraFrame.FrameId,
+                            EncodedFrameKind.New,
+                            bgraFrame.FrameId,
+                            0,
+                            bgraFrame.TimestampMs,
+                            returnToPool: true);
+                        nv12Frame = null;
+
+                        var dropped = _convertedFrames.WriteLatest(converted);
+                        if (dropped > 0)
+                        {
+                            _convertStageStats.RecordDropped(dropped);
+                            _stats.RecordDropped(dropped);
+                        }
+                    }
+                    finally
+                    {
+                        if (nv12Frame is not null)
+                        {
+                            ArrayPool<byte>.Shared.Return(nv12Frame);
+                        }
+
+                        bgraFrame.Dispose();
+                    }
+                }
+            }
+            catch (OperationCanceledException)
+            {
+                // Expected during teardown.
+            }
+            catch (Exception ex)
+            {
+                _captureStats.RecordError();
+                await PublishErrorAsync("CONVERT_FAILED", ex.Message, CancellationToken.None);
+                _convertedFrames.Complete(ex);
+                return;
+            }
+
+            _convertedFrames.Complete();
+        }
 
         [SupportedOSPlatform("windows")]
         private async Task EncodeLoopAsync(CancellationToken cancellationToken)
@@ -3985,70 +5214,38 @@ internal static class Program
                     throw new PlatformNotSupportedException("Media Foundation encoder is only available on Windows.");
                 }
 
-                var bgraFrame = new byte[_options.VideoWidth * _options.VideoHeight * 4];
-                var nv12Frame = new byte[MediaFoundationH264Encoder.GetNv12FrameSize(_options.VideoWidth, _options.VideoHeight)];
-                var frameDuration = TimeSpan.FromMilliseconds(1000.0 / Math.Max(1, _options.VideoFps));
-                var nextFrameAt = DateTimeOffset.UtcNow;
-                long frameId = 0;
-
                 using var encoder = new MediaFoundationH264Encoder(_options);
                 encoder.Start();
 
-                while (!cancellationToken.IsCancellationRequested)
+                await foreach (var frame in _convertedFrames.Reader.ReadAllAsync(cancellationToken))
                 {
-                    var generatedAt = DateTimeOffset.UtcNow;
-                    var captureStopwatch = Stopwatch.StartNew();
                     try
                     {
-                        _frameSource.Capture(bgraFrame, _options.VideoWidth, _options.VideoHeight, cancellationToken);
-                        captureStopwatch.Stop();
-                        _captureStats.RecordCaptured(captureStopwatch.Elapsed.TotalMilliseconds);
-                    }
-                    catch (OperationCanceledException)
-                    {
-                        throw;
-                    }
-                    catch (CaptureException ex)
-                    {
-                        captureStopwatch.Stop();
-                        _captureStats.RecordError();
-                        await PublishCaptureErrorAsync(ex.Code, ex.Message, CancellationToken.None);
-                        throw;
-                    }
-                    catch (Exception ex)
-                    {
-                        captureStopwatch.Stop();
-                        _captureStats.RecordError();
-                        await PublishCaptureErrorAsync("CAPTURE_FAILED", ex.Message, CancellationToken.None);
-                        throw;
-                    }
+                        var encodeStopwatch = Stopwatch.StartNew();
+                        var payloads = encoder.EncodeFrame(frame.Data, frame.SourceSequence);
+                        encodeStopwatch.Stop();
+                        _encodeStageStats.RecordProcessed(encodeStopwatch.Elapsed.TotalMilliseconds);
 
-                    _stats.RecordGenerated(frameId, generatedAt.ToUnixTimeMilliseconds());
-                    var convertStopwatch = Stopwatch.StartNew();
-                    MediaFoundationH264Encoder.ConvertBgraToNv12(bgraFrame, nv12Frame, _options.VideoWidth, _options.VideoHeight);
-                    convertStopwatch.Stop();
-                    _captureStats.RecordConverted(convertStopwatch.Elapsed.TotalMilliseconds);
-
-                    foreach (var payload in encoder.EncodeFrame(nv12Frame, frameId))
-                    {
-                        var packet = CreatePacket(payload);
-                        if (!_packets.Writer.TryWrite(packet))
+                        foreach (var payload in payloads)
                         {
-                            _stats.RecordDropped();
+                            var packet = CreatePacket(
+                                payload,
+                                frame.FrameKind,
+                                frame.FrameId,
+                                frame.SourceSequence,
+                                frame.SourceAgeMs,
+                                encodeStopwatch.Elapsed.TotalMilliseconds);
+                            var dropped = _packets.WriteLatest(packet);
+                            if (dropped > 0)
+                            {
+                                _encodeStageStats.RecordDropped(dropped);
+                                _stats.RecordDropped(dropped);
+                            }
                         }
                     }
-
-                    frameId++;
-                    nextFrameAt += frameDuration;
-                    var delay = nextFrameAt - DateTimeOffset.UtcNow;
-                    if (delay > TimeSpan.Zero)
+                    finally
                     {
-                        await Task.Delay(delay, cancellationToken);
-                    }
-                    else if (delay < TimeSpan.FromSeconds(-1))
-                    {
-                        nextFrameAt = DateTimeOffset.UtcNow;
-                        _stats.RecordDropped();
+                        frame.Dispose();
                     }
                 }
             }
@@ -4059,30 +5256,32 @@ internal static class Program
             catch (Exception ex)
             {
                 await PublishErrorAsync("ENCODER_FAILED", ex.Message, CancellationToken.None);
-                _packets.Writer.TryComplete(ex);
+                _packets.Complete(ex);
                 return;
             }
 
-            _packets.Writer.TryComplete();
+            _packets.Complete();
         }
 
-        private EncodedVideoPacket CreatePacket(byte[] payload)
+        private EncodedVideoPacket CreatePacket(byte[] payload, EncodedFrameKind frameKind, long frameId, long sourceSequence, double sourceAgeMs, double encodeMs)
         {
             var containsPicture = H264AnnexBStream.ContainsPicture(payload);
             var isKeyFrame = H264AnnexBStream.ContainsNalType(payload, 5);
-            var frameId = containsPicture ? _stats.RecordEncoded(payload.Length) : _stats.LastEncodedFrameId;
+            var encodedFrameId = containsPicture
+                ? _stats.RecordEncodedFrame(frameId, payload.Length, encodeMs)
+                : _stats.LastEncodedFrameId;
 
             return new EncodedVideoPacket(
                 payload,
                 isKeyFrame,
                 containsPicture,
-                frameId,
+                encodedFrameId,
                 Interlocked.Increment(ref _sequence) - 1,
-                _stats.GetFrameTimestamp(frameId),
-                _stats.GetFrameEncodeMs(frameId),
-                EncodedFrameKind.New,
-                frameId,
-                0);
+                _stats.GetFrameTimestamp(encodedFrameId),
+                _stats.GetFrameEncodeMs(encodedFrameId),
+                frameKind,
+                sourceSequence,
+                sourceAgeMs);
         }
 
         private async Task PublishStatsLoopAsync(CancellationToken cancellationToken)
@@ -4094,7 +5293,7 @@ internal static class Program
                 {
                     var snapshot = _stats.SnapshotAndResetWindow();
                     _latestEncoderSnapshot = snapshot;
-                    Log($"ENCODER {_connectionId}", $"stats generated={snapshot.FramesGenerated} encoded={snapshot.FramesEncoded} sent={snapshot.FramesSent} dropped={snapshot.FramesDropped} streamFps={snapshot.StreamFps:F1} new={snapshot.NewFramesSent} repeat={snapshot.RepeatFramesSent} avgEncode={snapshot.AvgEncodeMs:F1}ms p95Encode={snapshot.P95EncodeMs:F1}ms p99Encode={snapshot.P99EncodeMs:F1}ms avgSend={snapshot.AvgSendMs:F1}ms p95Send={snapshot.P95SendMs:F1}ms kbps={snapshot.OutputKbps:F0}");
+                    Log($"ENCODER {_connectionId}", $"stats generated={snapshot.FramesGenerated} encoded={snapshot.FramesEncoded} sent={snapshot.FramesSent} dropped={snapshot.FramesDropped} late={snapshot.LateFrames} streamFps={snapshot.StreamFps:F1} new={snapshot.NewFramesSent} repeat={snapshot.RepeatFramesSent} avgFrameInterval={snapshot.P50FrameIntervalMs:F2}/{snapshot.P95FrameIntervalMs:F2}/{snapshot.P99FrameIntervalMs:F2}ms avgEncode={snapshot.AvgEncodeMs:F1}ms p95Encode={snapshot.P95EncodeMs:F1}ms p99Encode={snapshot.P99EncodeMs:F1}ms avgSend={snapshot.AvgSendMs:F1}ms p95Send={snapshot.P95SendMs:F1}ms kbps={snapshot.OutputKbps:F0}");
                     await _controlPublisher.PublishAsync("encoder_stats", CreateEncoderStatsPayload(snapshot, gpuPath: false), cancellationToken);
                 }
             }
@@ -4173,7 +5372,7 @@ internal static class Program
         private static RealtimeEncoderStatsSnapshot CreateEmptyEncoderSnapshot()
         {
             return new RealtimeEncoderStatsSnapshot(
-                0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0);
+                0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0);
         }
 
         public static async Task WhenAllIgnoringCancellation(params Task?[] tasks)
@@ -4209,12 +5408,18 @@ internal static class Program
         private readonly IGpuFrameSource _frameSource;
         private readonly RealtimeEncoderStats _stats;
         private readonly CaptureStats _captureStats = new();
+        private readonly PipelineStageStats _acquireStageStats = new("acquire");
+        private readonly PipelineStageStats _convertStageStats = new("convert");
+        private readonly PipelineStageStats _encodeStageStats = new("encode");
         private CaptureStatsSnapshot _latestCaptureSnapshot = CreateEmptyCaptureSnapshot();
         private RealtimeEncoderStatsSnapshot _latestEncoderSnapshot = CreateEmptyEncoderSnapshot();
-        private readonly Channel<EncodedVideoPacket> _packets;
-        private readonly Channel<Nv12Frame> _nv12Frames;
+        private readonly LatestFrameQueue<EncodedVideoPacket> _packets;
+        private readonly LatestFrameQueue<GpuAcquiredFrame> _gpuFrames;
+        private readonly LatestFrameQueue<GpuConvertedFrame> _gpuConvertedFrames;
+        private readonly LatestFrameQueue<Nv12Frame> _nv12Frames;
         private CancellationTokenSource? _sourceCts;
         private Task? _captureTask;
+        private Task? _convertTask;
         private Task? _encoderTask;
         private Task? _statsTask;
         private Task? _captureStatsTask;
@@ -4238,18 +5443,11 @@ internal static class Program
             _controlPublisher = controlPublisher;
             _frameSource = frameSource;
             _stats = new RealtimeEncoderStats(options.VideoFps);
-            _packets = Channel.CreateBounded<EncodedVideoPacket>(new BoundedChannelOptions(Math.Max(1, options.MaxVideoQueue))
-            {
-                FullMode = BoundedChannelFullMode.DropOldest,
-                SingleReader = true,
-                SingleWriter = true
-            });
-            _nv12Frames = Channel.CreateBounded<Nv12Frame>(new BoundedChannelOptions(2)
-            {
-                FullMode = BoundedChannelFullMode.DropOldest,
-                SingleReader = true,
-                SingleWriter = true
-            });
+            var queueCapacity = Math.Max(1, options.MaxVideoQueue);
+            _packets = new LatestFrameQueue<EncodedVideoPacket>(queueCapacity);
+            _gpuFrames = new LatestFrameQueue<GpuAcquiredFrame>(queueCapacity, disposeDropped: frame => frame.Dispose());
+            _gpuConvertedFrames = new LatestFrameQueue<GpuConvertedFrame>(queueCapacity, disposeDropped: frame => frame.Dispose());
+            _nv12Frames = new LatestFrameQueue<Nv12Frame>(queueCapacity, disposeDropped: frame => frame.Dispose());
         }
 
         public async ValueTask StartAsync(CancellationToken cancellationToken)
@@ -4294,6 +5492,28 @@ internal static class Program
 
             if (_encoderUsesD3DInput)
             {
+                _captureTask = Task.Run(
+                    () =>
+                    {
+                        if (!OperatingSystem.IsWindows())
+                        {
+                            throw new PlatformNotSupportedException("Media Foundation GPU capture is only available on Windows.");
+                        }
+
+                        return CaptureLoopAsync(_sourceCts.Token);
+                    },
+                    _sourceCts.Token);
+                _convertTask = Task.Run(
+                    () =>
+                    {
+                        if (!OperatingSystem.IsWindows())
+                        {
+                            throw new PlatformNotSupportedException("Media Foundation GPU capture is only available on Windows.");
+                        }
+
+                        return ConvertGpuTextureLoopAsync(_sourceCts.Token);
+                    },
+                    _sourceCts.Token);
                 _encoderTask = Task.Run(
                     () =>
                     {
@@ -4316,7 +5536,18 @@ internal static class Program
                             throw new PlatformNotSupportedException("Media Foundation GPU capture is only available on Windows.");
                         }
 
-                        return CaptureConvertLoopAsync(_sourceCts.Token);
+                        return CaptureLoopAsync(_sourceCts.Token);
+                    },
+                    _sourceCts.Token);
+                _convertTask = Task.Run(
+                    () =>
+                    {
+                        if (!OperatingSystem.IsWindows())
+                        {
+                            throw new PlatformNotSupportedException("Media Foundation GPU capture is only available on Windows.");
+                        }
+
+                        return ConvertReadbackLoopAsync(_sourceCts.Token);
                     },
                     _sourceCts.Token);
                 _encoderTask = Task.Run(() => EncodeReadbackLoopAsync(_sourceCts.Token), _sourceCts.Token);
@@ -4375,8 +5606,8 @@ internal static class Program
                 await _sourceCts.CancelAsync();
             }
 
-            await MediaFoundationBgraVideoSource.WhenAllIgnoringCancellation(_captureTask, _encoderTask, _statsTask, _captureStatsTask);
-            _packets.Writer.TryComplete();
+            await MediaFoundationBgraVideoSource.WhenAllIgnoringCancellation(_captureTask, _convertTask, _encoderTask, _statsTask, _captureStatsTask);
+            _packets.Complete();
             if (OperatingSystem.IsWindows())
             {
                 _encoder?.Dispose();
@@ -4420,36 +5651,38 @@ internal static class Program
             _stats.RecordSent(packet, sendMs);
         }
 
+        public void RecordDropped(long count)
+        {
+            _stats.RecordDropped(count);
+        }
+
         public CaptureStatsSnapshot LatestCaptureSnapshot => _latestCaptureSnapshot;
 
         public RealtimeEncoderStatsSnapshot LatestEncoderSnapshot => _latestEncoderSnapshot;
 
-        private async Task EncodeLoopAsync(CancellationToken cancellationToken)
+        private async Task CaptureLoopAsync(CancellationToken cancellationToken)
         {
             try
             {
                 await Task.Yield();
                 if (!OperatingSystem.IsWindows())
                 {
-                    throw new PlatformNotSupportedException("Media Foundation GPU encoder is only available on Windows.");
+                    throw new PlatformNotSupportedException("Media Foundation GPU capture is only available on Windows.");
                 }
 
-                var frameDuration = TimeSpan.FromMilliseconds(1000.0 / Math.Max(1, _options.VideoFps));
-                var nextFrameAt = DateTimeOffset.UtcNow;
+                var pacer = new FramePacer(
+                    _options.VideoFps,
+                    _stats.RecordFrameInterval,
+                    _stats.RecordLateFrame,
+                    () => _stats.RecordDropped());
                 long frameId = 0;
-                ID3D11Texture2D? lastFrameTexture = null;
-                byte[]? lastNv12Frame = null;
-                byte[]? startupNv12Frame = null;
                 long lastSourceSequence = 0;
                 var lastVideoFrameAt = DateTimeOffset.MinValue;
                 var idleRepeatInterval = TimeSpan.FromMilliseconds(250);
 
-                var converter = _converter ?? throw new InvalidOperationException("GPU converter has not started.");
-                var encoder = _encoder ?? throw new InvalidOperationException("GPU encoder has not started.");
-
                 while (!cancellationToken.IsCancellationRequested)
                 {
-                    var generatedAt = DateTimeOffset.UtcNow;
+                    var generatedAt = pacer.MarkFrameStart();
                     GpuFrameLease? frame = null;
                     var frameKind = EncodedFrameKind.New;
                     var captureStopwatch = Stopwatch.StartNew();
@@ -4458,6 +5691,8 @@ internal static class Program
                         frame = _frameSource.AcquireLatestFrame(cancellationToken);
                         captureStopwatch.Stop();
                         _captureStats.RecordCaptured(captureStopwatch.Elapsed.TotalMilliseconds);
+                        _acquireStageStats.RecordProcessed(captureStopwatch.Elapsed.TotalMilliseconds);
+                        lastSourceSequence = frame.Sequence;
                     }
                     catch (OperationCanceledException)
                     {
@@ -4466,15 +5701,13 @@ internal static class Program
                     catch (CaptureException ex) when (IsTransientGpuCaptureMiss(ex.Code))
                     {
                         captureStopwatch.Stop();
-                        if (lastFrameTexture is null && lastNv12Frame is null)
+                        if (lastSourceSequence == 0)
                         {
-                            startupNv12Frame ??= CreateBlackNv12Frame(_options.VideoWidth, _options.VideoHeight);
-                            lastNv12Frame = startupNv12Frame;
                             frameKind = EncodedFrameKind.Black;
                         }
                         else if (DateTimeOffset.UtcNow - lastVideoFrameAt < idleRepeatInterval)
                         {
-                            nextFrameAt = await DelayUntilNextFrameAsync(nextFrameAt, frameDuration, cancellationToken);
+                            await pacer.WaitForNextFrameAsync(cancellationToken);
                             continue;
                         }
                         else
@@ -4497,192 +5730,27 @@ internal static class Program
                         throw;
                     }
 
-                    using (frame)
-                    {
-                        _stats.RecordGenerated(frameId, generatedAt.ToUnixTimeMilliseconds());
-                        ID3D11Texture2D? nv12Texture = null;
-                        if (frame is not null)
-                        {
-                            var convertStopwatch = Stopwatch.StartNew();
-                            nv12Texture = converter.Convert(frame.Texture);
-                            convertStopwatch.Stop();
-                            _captureStats.RecordConverted(convertStopwatch.Elapsed.TotalMilliseconds);
-                            TryDumpGpuFrame(frame.Texture, nv12Texture);
-                            lastSourceSequence = frame.Sequence;
-                            if (_encoderUsesD3DInput)
-                            {
-                                lastFrameTexture = nv12Texture;
-                            }
-                            else
-                            {
-                                lastNv12Frame = (_nv12Readback ?? throw new InvalidOperationException("GPU NV12 readback fallback has not started.")).Read(nv12Texture).ToArray();
-                            }
-                        }
+                    var timestampMs = generatedAt.ToUnixTimeMilliseconds();
+                    var queued = new GpuAcquiredFrame(
+                        frame,
+                        frameId,
+                        frameKind,
+                        frame?.Sequence ?? lastSourceSequence,
+                        frame is null ? _frameSource.LastFrameAgeMs : 0,
+                        timestampMs);
+                    frame = null;
 
-                        var encodedPayloads = _encoderUsesD3DInput && (nv12Texture is not null || lastFrameTexture is not null)
-                            ? encoder.EncodeFrame(nv12Texture ?? lastFrameTexture!, frameId)
-                            : encoder.EncodeFrame(
-                                lastNv12Frame ?? throw new CaptureException("IDD_GPU_FRAME_TIMEOUT", "No NV12 frame is available for keepalive encoding."),
-                                frameId);
-                        foreach (var payload in encodedPayloads)
-                        {
-                            var packet = CreatePacket(
-                                payload,
-                                frameKind,
-                                frame?.Sequence ?? lastSourceSequence,
-                                frame is null ? _frameSource.LastFrameAgeMs : 0);
-                            if (!_packets.Writer.TryWrite(packet))
-                            {
-                                _stats.RecordDropped();
-                            }
-                        }
+                    _stats.RecordGenerated(frameId, timestampMs);
+                    var dropped = _gpuFrames.WriteLatest(queued);
+                    if (dropped > 0)
+                    {
+                        _acquireStageStats.RecordDropped(dropped);
+                        _stats.RecordDropped(dropped);
                     }
 
                     lastVideoFrameAt = DateTimeOffset.UtcNow;
                     frameId++;
-                    nextFrameAt = await DelayUntilNextFrameAsync(nextFrameAt, frameDuration, cancellationToken);
-                }
-            }
-            catch (OperationCanceledException)
-            {
-                // Expected during teardown.
-            }
-            catch (Exception ex)
-            {
-                await PublishErrorAsync("ENCODER_FAILED", ex.Message, CancellationToken.None);
-                _packets.Writer.TryComplete(ex);
-                return;
-            }
-
-            _packets.Writer.TryComplete();
-        }
-
-        private async Task CaptureConvertLoopAsync(CancellationToken cancellationToken)
-        {
-            try
-            {
-                await Task.Yield();
-                if (!OperatingSystem.IsWindows())
-                {
-                    throw new PlatformNotSupportedException("Media Foundation GPU capture is only available on Windows.");
-                }
-
-                var frameDuration = TimeSpan.FromMilliseconds(1000.0 / Math.Max(1, _options.VideoFps));
-                var nextFrameAt = DateTimeOffset.UtcNow;
-                byte[]? lastNv12Frame = null;
-                byte[]? startupNv12Frame = null;
-                long lastSourceSequence = 0;
-                var lastVideoFrameAt = DateTimeOffset.MinValue;
-                var idleRepeatInterval = TimeSpan.FromMilliseconds(250);
-                var converter = _converter ?? throw new InvalidOperationException("GPU converter has not started.");
-                var readback = _nv12Readback ?? throw new InvalidOperationException("GPU NV12 readback fallback has not started.");
-
-                while (!cancellationToken.IsCancellationRequested)
-                {
-                    var generatedAt = DateTimeOffset.UtcNow;
-                    GpuFrameLease? frame = null;
-                    var frameKind = EncodedFrameKind.New;
-                    var sourceAgeMs = 0.0;
-                    var captureStopwatch = Stopwatch.StartNew();
-                    try
-                    {
-                        frame = _frameSource.AcquireLatestFrame(cancellationToken);
-                        captureStopwatch.Stop();
-                        _captureStats.RecordCaptured(captureStopwatch.Elapsed.TotalMilliseconds);
-                    }
-                    catch (OperationCanceledException)
-                    {
-                        throw;
-                    }
-                    catch (CaptureException ex) when (IsTransientGpuCaptureMiss(ex.Code))
-                    {
-                        captureStopwatch.Stop();
-                        sourceAgeMs = _frameSource.LastFrameAgeMs;
-                        if (lastNv12Frame is null)
-                        {
-                            startupNv12Frame ??= CreateBlackNv12Frame(_options.VideoWidth, _options.VideoHeight);
-                            lastNv12Frame = startupNv12Frame;
-                            frameKind = EncodedFrameKind.Black;
-                        }
-                        else if (DateTimeOffset.UtcNow - lastVideoFrameAt < idleRepeatInterval)
-                        {
-                            nextFrameAt = await DelayUntilNextFrameAsync(nextFrameAt, frameDuration, cancellationToken);
-                            continue;
-                        }
-                        else
-                        {
-                            frameKind = EncodedFrameKind.Repeat;
-                        }
-                    }
-                    catch (CaptureException ex)
-                    {
-                        captureStopwatch.Stop();
-                        _captureStats.RecordError();
-                        await PublishCaptureErrorAsync(ex.Code, ex.Message, CancellationToken.None);
-                        throw;
-                    }
-                    catch (Exception ex)
-                    {
-                        captureStopwatch.Stop();
-                        _captureStats.RecordError();
-                        await PublishCaptureErrorAsync("GPU_CAPTURE_FAILED", ex.Message, CancellationToken.None);
-                        throw;
-                    }
-
-                    using (frame)
-                    {
-                        if (frame is not null)
-                        {
-                            var convertStopwatch = Stopwatch.StartNew();
-                            try
-                            {
-                                var nv12Texture = converter.Convert(frame.Texture);
-                                var nv12Data = readback.Read(nv12Texture);
-                                convertStopwatch.Stop();
-                                _captureStats.RecordConverted(convertStopwatch.Elapsed.TotalMilliseconds);
-                                TryDumpGpuFrame(frame.Texture, nv12Texture);
-                                lastNv12Frame = nv12Data.ToArray();
-                                lastSourceSequence = frame.Sequence;
-                                sourceAgeMs = 0;
-                            }
-                            catch (SharpGenException ex) when (IsTransientGpuPipelineFailure(ex))
-                            {
-                                convertStopwatch.Stop();
-                                _captureStats.RecordError();
-                                await PublishCaptureErrorAsync("GPU_PIPELINE_TRANSIENT", FormatExceptionForLog(ex), CancellationToken.None);
-                                sourceAgeMs = _frameSource.LastFrameAgeMs;
-                                if (lastNv12Frame is null)
-                                {
-                                    startupNv12Frame ??= CreateBlackNv12Frame(_options.VideoWidth, _options.VideoHeight);
-                                    lastNv12Frame = startupNv12Frame;
-                                    frameKind = EncodedFrameKind.Black;
-                                }
-                                else if (DateTimeOffset.UtcNow - lastVideoFrameAt < idleRepeatInterval)
-                                {
-                                    nextFrameAt = await DelayUntilNextFrameAsync(nextFrameAt, frameDuration, cancellationToken);
-                                    continue;
-                                }
-                                else
-                                {
-                                    frameKind = EncodedFrameKind.Repeat;
-                                }
-                            }
-                        }
-
-                        var queued = new Nv12Frame(
-                            lastNv12Frame ?? throw new CaptureException("IDD_GPU_FRAME_TIMEOUT", "No NV12 frame is available for keepalive encoding."),
-                            frameKind,
-                            frame?.Sequence ?? lastSourceSequence,
-                            sourceAgeMs,
-                            generatedAt.ToUnixTimeMilliseconds());
-                        if (!_nv12Frames.Writer.TryWrite(queued))
-                        {
-                            _stats.RecordDropped();
-                        }
-                    }
-
-                    lastVideoFrameAt = DateTimeOffset.UtcNow;
-                    nextFrameAt = await DelayUntilNextFrameAsync(nextFrameAt, frameDuration, cancellationToken);
+                    await pacer.WaitForNextFrameAsync(cancellationToken);
                 }
             }
             catch (OperationCanceledException)
@@ -4692,12 +5760,232 @@ internal static class Program
             catch (Exception ex)
             {
                 await PublishErrorAsync("ENCODER_CAPTURE_FAILED", FormatExceptionForLog(ex), CancellationToken.None);
-                _nv12Frames.Writer.TryComplete(ex);
-                _packets.Writer.TryComplete(ex);
+                _gpuFrames.Complete(ex);
                 return;
             }
 
-            _nv12Frames.Writer.TryComplete();
+            _gpuFrames.Complete();
+        }
+
+        private async Task ConvertGpuTextureLoopAsync(CancellationToken cancellationToken)
+        {
+            try
+            {
+                await Task.Yield();
+                if (!OperatingSystem.IsWindows())
+                {
+                    throw new PlatformNotSupportedException("Media Foundation GPU capture is only available on Windows.");
+                }
+
+                var converter = _converter ?? throw new InvalidOperationException("GPU converter has not started.");
+
+                await foreach (var acquired in _gpuFrames.Reader.ReadAllAsync(cancellationToken))
+                {
+                    ID3D11Texture2D? pendingTexture = null;
+                    try
+                    {
+                        if (acquired.Lease is null)
+                        {
+                            continue;
+                        }
+
+                        var convertStopwatch = Stopwatch.StartNew();
+                        pendingTexture = converter.Convert(acquired.Lease.Texture);
+                        convertStopwatch.Stop();
+                        _captureStats.RecordConverted(convertStopwatch.Elapsed.TotalMilliseconds);
+                        _convertStageStats.RecordProcessed(convertStopwatch.Elapsed.TotalMilliseconds);
+                        TryDumpGpuFrame(acquired.Lease.Texture, pendingTexture);
+                        acquired.Dispose();
+
+                        var nv12Texture = pendingTexture;
+                        pendingTexture = null;
+                        var converted = new GpuConvertedFrame(
+                            nv12Texture,
+                            acquired.FrameId,
+                            acquired.FrameKind,
+                            acquired.SourceSequence,
+                            acquired.SourceAgeMs,
+                            acquired.GeneratedTimestampMs,
+                            () => nv12Texture.Dispose());
+                        var dropped = _gpuConvertedFrames.WriteLatest(converted);
+                        if (dropped > 0)
+                        {
+                            _convertStageStats.RecordDropped(dropped);
+                            _stats.RecordDropped(dropped);
+                        }
+                    }
+                    catch (SharpGenException ex) when (IsTransientGpuPipelineFailure(ex))
+                    {
+                        _captureStats.RecordError();
+                        await PublishCaptureErrorAsync("GPU_PIPELINE_TRANSIENT", FormatExceptionForLog(ex), CancellationToken.None);
+                    }
+                    finally
+                    {
+                        pendingTexture?.Dispose();
+                        acquired.Dispose();
+                    }
+                }
+            }
+            catch (OperationCanceledException)
+            {
+                // Expected during teardown.
+            }
+            catch (Exception ex)
+            {
+                await PublishErrorAsync("ENCODER_CONVERT_FAILED", FormatExceptionForLog(ex), CancellationToken.None);
+                _gpuConvertedFrames.Complete(ex);
+                return;
+            }
+
+            _gpuConvertedFrames.Complete();
+        }
+
+        private async Task ConvertReadbackLoopAsync(CancellationToken cancellationToken)
+        {
+            try
+            {
+                await Task.Yield();
+                if (!OperatingSystem.IsWindows())
+                {
+                    throw new PlatformNotSupportedException("Media Foundation GPU capture is only available on Windows.");
+                }
+
+                var converter = _converter ?? throw new InvalidOperationException("GPU converter has not started.");
+                var readback = _nv12Readback ?? throw new InvalidOperationException("GPU NV12 readback fallback has not started.");
+                byte[]? lastNv12Frame = null;
+                byte[]? blackNv12Frame = null;
+                long lastSourceSequence = 0;
+
+                await foreach (var acquired in _gpuFrames.Reader.ReadAllAsync(cancellationToken))
+                {
+                    byte[]? nv12Frame = null;
+                    try
+                    {
+                        if (acquired.Lease is not null)
+                        {
+                            var convertStopwatch = Stopwatch.StartNew();
+                            var nv12Texture = converter.Convert(acquired.Lease.Texture);
+                            try
+                            {
+                                var nv12Data = readback.Read(nv12Texture);
+                                convertStopwatch.Stop();
+                                _captureStats.RecordConverted(convertStopwatch.Elapsed.TotalMilliseconds);
+                                _convertStageStats.RecordProcessed(convertStopwatch.Elapsed.TotalMilliseconds);
+                                TryDumpGpuFrame(acquired.Lease.Texture, nv12Texture);
+                                nv12Frame = nv12Data.ToArray();
+                                lastNv12Frame = nv12Frame;
+                                lastSourceSequence = acquired.SourceSequence;
+                            }
+                            finally
+                            {
+                                nv12Texture.Dispose();
+                            }
+                        }
+                        else if (lastNv12Frame is not null)
+                        {
+                            nv12Frame = lastNv12Frame;
+                        }
+                        else
+                        {
+                            blackNv12Frame ??= CreateBlackNv12Frame(_options.VideoWidth, _options.VideoHeight);
+                            nv12Frame = blackNv12Frame;
+                        }
+
+                        var queued = new Nv12Frame(
+                            nv12Frame,
+                            acquired.FrameId,
+                            acquired.FrameKind,
+                            acquired.SourceSequence == 0 ? lastSourceSequence : acquired.SourceSequence,
+                            acquired.SourceAgeMs,
+                            acquired.GeneratedTimestampMs,
+                            returnToPool: false);
+                        var dropped = _nv12Frames.WriteLatest(queued);
+                        if (dropped > 0)
+                        {
+                            _convertStageStats.RecordDropped(dropped);
+                            _stats.RecordDropped(dropped);
+                        }
+                    }
+                    catch (SharpGenException ex) when (IsTransientGpuPipelineFailure(ex))
+                    {
+                        _captureStats.RecordError();
+                        await PublishCaptureErrorAsync("GPU_PIPELINE_TRANSIENT", FormatExceptionForLog(ex), CancellationToken.None);
+                    }
+                    finally
+                    {
+                        acquired.Dispose();
+                    }
+                }
+            }
+            catch (OperationCanceledException)
+            {
+                // Expected during teardown.
+            }
+            catch (Exception ex)
+            {
+                await PublishErrorAsync("ENCODER_CONVERT_FAILED", FormatExceptionForLog(ex), CancellationToken.None);
+                _nv12Frames.Complete(ex);
+                return;
+            }
+
+            _nv12Frames.Complete();
+        }
+
+        private async Task EncodeLoopAsync(CancellationToken cancellationToken)
+        {
+            try
+            {
+                await Task.Yield();
+                if (!OperatingSystem.IsWindows())
+                {
+                    throw new PlatformNotSupportedException("Media Foundation GPU encoder is only available on Windows.");
+                }
+
+                var encoder = _encoder ?? throw new InvalidOperationException("GPU encoder has not started.");
+                await foreach (var frame in _gpuConvertedFrames.Reader.ReadAllAsync(cancellationToken))
+                {
+                    try
+                    {
+                        var encodeStopwatch = Stopwatch.StartNew();
+                        var payloads = encoder.EncodeFrame(frame.Texture, frame.FrameId);
+                        encodeStopwatch.Stop();
+                        _encodeStageStats.RecordProcessed(encodeStopwatch.Elapsed.TotalMilliseconds);
+
+                        foreach (var payload in payloads)
+                        {
+                            var packet = CreatePacket(
+                                payload,
+                                frame.FrameKind,
+                                frame.FrameId,
+                                frame.SourceSequence,
+                                frame.SourceAgeMs,
+                                encodeStopwatch.Elapsed.TotalMilliseconds);
+                            var dropped = _packets.WriteLatest(packet);
+                            if (dropped > 0)
+                            {
+                                _encodeStageStats.RecordDropped(dropped);
+                                _stats.RecordDropped(dropped);
+                            }
+                        }
+                    }
+                    finally
+                    {
+                        frame.Dispose();
+                    }
+                }
+            }
+            catch (OperationCanceledException)
+            {
+                // Expected during teardown.
+            }
+            catch (Exception ex)
+            {
+                await PublishErrorAsync("ENCODER_FAILED", FormatExceptionForLog(ex), CancellationToken.None);
+                _packets.Complete(ex);
+                return;
+            }
+
+            _packets.Complete();
         }
 
         private async Task EncodeReadbackLoopAsync(CancellationToken cancellationToken)
@@ -4711,20 +5999,36 @@ internal static class Program
                 }
 
                 var encoder = _encoder ?? throw new InvalidOperationException("GPU encoder has not started.");
-                long frameId = 0;
                 await foreach (var frame in _nv12Frames.Reader.ReadAllAsync(cancellationToken))
                 {
-                    _stats.RecordGenerated(frameId, frame.GeneratedTimestampMs);
-                    foreach (var payload in encoder.EncodeFrame(frame.Data, frameId))
+                    try
                     {
-                        var packet = CreatePacket(payload, frame.FrameKind, frame.SourceSequence, frame.SourceAgeMs);
-                        if (!_packets.Writer.TryWrite(packet))
+                        var encodeStopwatch = Stopwatch.StartNew();
+                        var payloads = encoder.EncodeFrame(frame.Data, frame.FrameId);
+                        encodeStopwatch.Stop();
+                        _encodeStageStats.RecordProcessed(encodeStopwatch.Elapsed.TotalMilliseconds);
+
+                        foreach (var payload in payloads)
                         {
-                            _stats.RecordDropped();
+                            var packet = CreatePacket(
+                                payload,
+                                frame.FrameKind,
+                                frame.FrameId,
+                                frame.SourceSequence,
+                                frame.SourceAgeMs,
+                                encodeStopwatch.Elapsed.TotalMilliseconds);
+                            var dropped = _packets.WriteLatest(packet);
+                            if (dropped > 0)
+                            {
+                                _encodeStageStats.RecordDropped(dropped);
+                                _stats.RecordDropped(dropped);
+                            }
                         }
                     }
-
-                    frameId++;
+                    finally
+                    {
+                        frame.Dispose();
+                    }
                 }
             }
             catch (OperationCanceledException)
@@ -4734,44 +6038,29 @@ internal static class Program
             catch (Exception ex)
             {
                 await PublishErrorAsync("ENCODER_FAILED", FormatExceptionForLog(ex), CancellationToken.None);
-                _packets.Writer.TryComplete(ex);
+                _packets.Complete(ex);
                 return;
             }
 
-            _packets.Writer.TryComplete();
+            _packets.Complete();
         }
 
-        private async Task<DateTimeOffset> DelayUntilNextFrameAsync(DateTimeOffset nextFrameAt, TimeSpan frameDuration, CancellationToken cancellationToken)
-        {
-            nextFrameAt += frameDuration;
-            var delay = nextFrameAt - DateTimeOffset.UtcNow;
-            if (delay > TimeSpan.Zero)
-            {
-                await Task.Delay(delay, cancellationToken);
-            }
-            else if (delay < TimeSpan.FromSeconds(-1))
-            {
-                nextFrameAt = DateTimeOffset.UtcNow;
-                _stats.RecordDropped();
-            }
-
-            return nextFrameAt;
-        }
-
-        private EncodedVideoPacket CreatePacket(byte[] payload, EncodedFrameKind frameKind, long sourceSequence, double sourceAgeMs)
+        private EncodedVideoPacket CreatePacket(byte[] payload, EncodedFrameKind frameKind, long frameId, long sourceSequence, double sourceAgeMs, double encodeMs)
         {
             var containsPicture = H264AnnexBStream.ContainsPicture(payload);
             var isKeyFrame = H264AnnexBStream.ContainsNalType(payload, 5);
-            var frameId = containsPicture ? _stats.RecordEncoded(payload.Length) : _stats.LastEncodedFrameId;
+            var encodedFrameId = containsPicture
+                ? _stats.RecordEncodedFrame(frameId, payload.Length, encodeMs)
+                : _stats.LastEncodedFrameId;
 
             return new EncodedVideoPacket(
                 payload,
                 isKeyFrame,
                 containsPicture,
-                frameId,
+                encodedFrameId,
                 Interlocked.Increment(ref _sequence) - 1,
-                _stats.GetFrameTimestamp(frameId),
-                _stats.GetFrameEncodeMs(frameId),
+                _stats.GetFrameTimestamp(encodedFrameId),
+                _stats.GetFrameEncodeMs(encodedFrameId),
                 frameKind,
                 sourceSequence,
                 sourceAgeMs);
@@ -4812,8 +6101,15 @@ internal static class Program
                 {
                     var snapshot = _stats.SnapshotAndResetWindow();
                     _latestEncoderSnapshot = snapshot;
-                    Log($"ENCODER {_connectionId}", $"stats generated={snapshot.FramesGenerated} encoded={snapshot.FramesEncoded} sent={snapshot.FramesSent} dropped={snapshot.FramesDropped} streamFps={snapshot.StreamFps:F1} new={snapshot.NewFramesSent} repeat={snapshot.RepeatFramesSent} avgEncode={snapshot.AvgEncodeMs:F1}ms p95Encode={snapshot.P95EncodeMs:F1}ms p99Encode={snapshot.P99EncodeMs:F1}ms maxEncode={snapshot.MaxEncodeMs:F1}ms avgSend={snapshot.AvgSendMs:F1}ms p95Send={snapshot.P95SendMs:F1}ms kbps={snapshot.OutputKbps:F0}");
+                    var acquireSnapshot = _acquireStageStats.SnapshotAndResetWindow();
+                    var convertSnapshot = _convertStageStats.SnapshotAndResetWindow();
+                    var encodeSnapshot = _encodeStageStats.SnapshotAndResetWindow();
+                    Log($"ENCODER {_connectionId}", $"stats generated={snapshot.FramesGenerated} encoded={snapshot.FramesEncoded} sent={snapshot.FramesSent} dropped={snapshot.FramesDropped} late={snapshot.LateFrames} streamFps={snapshot.StreamFps:F1} new={snapshot.NewFramesSent} repeat={snapshot.RepeatFramesSent} avgFrameInterval={snapshot.P50FrameIntervalMs:F2}/{snapshot.P95FrameIntervalMs:F2}/{snapshot.P99FrameIntervalMs:F2}ms avgEncode={snapshot.AvgEncodeMs:F1}ms p95Encode={snapshot.P95EncodeMs:F1}ms p99Encode={snapshot.P99EncodeMs:F1}ms maxEncode={snapshot.MaxEncodeMs:F1}ms avgSend={snapshot.AvgSendMs:F1}ms p95Send={snapshot.P95SendMs:F1}ms kbps={snapshot.OutputKbps:F0} pipeline {FormatPipelineStageForLog(acquireSnapshot)} {FormatPipelineStageForLog(convertSnapshot)} {FormatPipelineStageForLog(encodeSnapshot)}");
                     await _controlPublisher.PublishAsync("encoder_stats", CreateEncoderStatsPayload(snapshot, gpuPath: true), cancellationToken);
+                    await _controlPublisher.PublishAsync(
+                        "pipeline_stats",
+                        CreatePipelineStatsPayload(_frameSource.SourceName, gpuPath: true, acquireSnapshot, convertSnapshot, encodeSnapshot),
+                        cancellationToken);
                 }
             }
             catch (OperationCanceledException)
@@ -4924,7 +6220,7 @@ internal static class Program
         private static RealtimeEncoderStatsSnapshot CreateEmptyEncoderSnapshot()
         {
             return new RealtimeEncoderStatsSnapshot(
-                0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0);
+                0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0);
         }
     }
 
@@ -4937,8 +6233,6 @@ internal static class Program
         private readonly ID3D11VideoContext _videoContext;
         private readonly ID3D11VideoProcessorEnumerator _enumerator;
         private readonly ID3D11VideoProcessor _processor;
-        private readonly ID3D11Texture2D _nv12Texture;
-        private readonly ID3D11VideoProcessorOutputView _outputView;
         private readonly int _width;
         private readonly int _height;
 
@@ -4975,31 +6269,6 @@ internal static class Program
 
             _enumerator = _videoDevice.CreateVideoProcessorEnumerator(description);
             _processor = _videoDevice.CreateVideoProcessor(_enumerator, 0);
-
-            var nv12Description = new Texture2DDescription
-            {
-                Width = (uint)width,
-                Height = (uint)height,
-                MipLevels = 1,
-                ArraySize = 1,
-                Format = Format.NV12,
-                SampleDescription = new SampleDescription(1, 0),
-                Usage = ResourceUsage.Default,
-                BindFlags = BindFlags.RenderTarget | BindFlags.VideoEncoder,
-                CPUAccessFlags = CpuAccessFlags.None,
-                MiscFlags = ResourceOptionFlags.None
-            };
-
-            _nv12Texture = _device.CreateTexture2D(in nv12Description);
-            var outputDescription = new VideoProcessorOutputViewDescription
-            {
-                ViewDimension = VideoProcessorOutputViewDimension.Texture2D,
-                Texture2D = new Texture2DVideoProcessorOutputView
-                {
-                    MipSlice = 0
-                }
-            };
-            _outputView = _videoDevice.CreateVideoProcessorOutputView(_nv12Texture, _enumerator, outputDescription);
         }
 
         public ID3D11Texture2D Convert(ID3D11Texture2D bgraTexture)
@@ -5024,6 +6293,19 @@ internal static class Program
                     }
                 });
 
+            var nv12Texture = CreateNv12Texture();
+            using var outputView = _videoDevice.CreateVideoProcessorOutputView(
+                nv12Texture,
+                _enumerator,
+                new VideoProcessorOutputViewDescription
+                {
+                    ViewDimension = VideoProcessorOutputViewDimension.Texture2D,
+                    Texture2D = new Texture2DVideoProcessorOutputView
+                    {
+                        MipSlice = 0
+                    }
+                });
+
             var stream = new VideoProcessorStream
             {
                 Enable = true,
@@ -5034,15 +6316,30 @@ internal static class Program
                 InputSurface = inputView
             };
 
-            _videoContext.VideoProcessorBlt(_processor, _outputView, 0, 1, [stream]).CheckError();
+            _videoContext.VideoProcessorBlt(_processor, outputView, 0, 1, [stream]).CheckError();
             _context.Flush();
-            return _nv12Texture;
+            return nv12Texture;
+        }
+
+        private ID3D11Texture2D CreateNv12Texture()
+        {
+            return _device.CreateTexture2D(new Texture2DDescription
+            {
+                Width = (uint)_width,
+                Height = (uint)_height,
+                MipLevels = 1,
+                ArraySize = 1,
+                Format = Format.NV12,
+                SampleDescription = new SampleDescription(1, 0),
+                Usage = ResourceUsage.Default,
+                BindFlags = BindFlags.RenderTarget | BindFlags.VideoEncoder,
+                CPUAccessFlags = CpuAccessFlags.None,
+                MiscFlags = ResourceOptionFlags.None
+            });
         }
 
         public void Dispose()
         {
-            _outputView.Dispose();
-            _nv12Texture.Dispose();
             _processor.Dispose();
             _enumerator.Dispose();
             _videoContext.Dispose();
@@ -5392,6 +6689,11 @@ internal static class Program
             while (!TryOpenSharedObjects())
             {
                 cancellationToken.ThrowIfCancellationRequested();
+                if (waitStartedAt.Elapsed >= StartupTimeout)
+                {
+                    throw new CaptureException("IDD_GPU_SHARED_OBJECTS_UNAVAILABLE", "Timed out waiting for Idd GPU shared texture ring.");
+                }
+
                 if (waitStartedAt.Elapsed >= nextLogAt)
                 {
                     _log("waiting for Idd GPU shared texture ring...");
@@ -7298,6 +8600,7 @@ internal static class Program
 
         private readonly int _width;
         private readonly int _height;
+        private byte[]? _baseFrame;
 
         public TestPatternGenerator(int width, int height)
         {
@@ -7312,7 +8615,17 @@ internal static class Program
                 throw new ArgumentException("Frame buffer is smaller than the configured video dimensions.", nameof(bgra));
             }
 
-            var timePhase = (int)((generatedAt.ToUnixTimeMilliseconds() / 20) % 256);
+            var baseFrame = _baseFrame ??= CreateBaseFrame();
+            Buffer.BlockCopy(baseFrame, 0, bgra, 0, baseFrame.Length);
+
+            DrawMovingBlocks(bgra, frameId);
+            DrawFlashMarker(bgra, generatedAt);
+            DrawFrameCode(bgra, frameId);
+        }
+
+        private byte[] CreateBaseFrame()
+        {
+            var bgra = new byte[checked(_width * _height * 4)];
             for (var y = 0; y < _height; y++)
             {
                 for (var x = 0; x < _width; x++)
@@ -7320,17 +8633,15 @@ internal static class Program
                     var offset = (y * _width + x) * 4;
                     var bar = Bars[(x * Bars.Length) / Math.Max(1, _width)];
                     var stripe = (byte)((y / 24) % 2 == 0 ? 28 : 0);
-                    bgra[offset] = (byte)Math.Min(255, (bar.B / 3) + stripe + timePhase / 8);
-                    bgra[offset + 1] = (byte)Math.Min(255, (bar.G / 3) + stripe + ((timePhase + 85) % 256) / 8);
-                    bgra[offset + 2] = (byte)Math.Min(255, (bar.R / 3) + stripe + ((timePhase + 170) % 256) / 8);
+                    bgra[offset] = (byte)Math.Min(255, (bar.B / 3) + stripe);
+                    bgra[offset + 1] = (byte)Math.Min(255, (bar.G / 3) + stripe);
+                    bgra[offset + 2] = (byte)Math.Min(255, (bar.R / 3) + stripe);
                     bgra[offset + 3] = 255;
                 }
             }
 
             DrawColorBars(bgra);
-            DrawMovingBlocks(bgra, frameId);
-            DrawFlashMarker(bgra, generatedAt);
-            DrawFrameCode(bgra, frameId);
+            return bgra;
         }
 
         private void DrawColorBars(byte[] bgra)
@@ -8606,6 +9917,13 @@ internal static class Program
             }
 
             var currentMode = _videoModeState.Current;
+            if (currentMode.Fps >= FrameRateLevels[0])
+            {
+                _badWindowStreak = 0;
+                _goodWindowStreak = 0;
+                return null;
+            }
+
             var liveIndex = LevelIndexFor(currentMode.Fps);
             if (liveIndex < 0)
             {
@@ -8643,6 +9961,7 @@ internal static class Program
                 _badWindowStreak++;
                 _goodWindowStreak = 0;
                 var immediate = encoderSnapshot.FramesDropped > 0
+                    || encoderSnapshot.LateFrames > Math.Max(2, currentMode.Fps / 20)
                     || encoderSnapshot.P99EncodeMs >= 12.0
                     || encoderSnapshot.P99SendMs >= 8.0
                     || (captureSnapshot is not null && captureSnapshot.CaptureErrors > 0);
@@ -8720,6 +10039,7 @@ internal static class Program
                     || (hasActiveNewFrames && captureSnapshot.ConvertFps < currentFps * 0.85));
 
             return encoderSnapshot.FramesDropped > 0
+                || encoderSnapshot.LateFrames > Math.Max(2, currentFps / 20)
                 || encoderSnapshot.P95EncodeMs > Math.Max(6.0, frameBudgetMs * 0.9)
                 || encoderSnapshot.P99EncodeMs > Math.Max(10.0, frameBudgetMs * 1.2)
                 || encoderSnapshot.P95SendMs > Math.Max(4.0, frameBudgetMs * 0.45)
@@ -8749,6 +10069,7 @@ internal static class Program
                 && encoderSnapshot.RepeatFramesSent >= Math.Max(encoderSnapshot.NewFramesSent * 2, 12)
                 && encoderSnapshot.P95EncodeMs < 6.0
                 && encoderSnapshot.P95SendMs < 4.0
+                && encoderSnapshot.LateFrames <= Math.Max(2, currentFps / 30)
                 && encoderSnapshot.FramesDropped == 0;
 
             return captureIdle || encoderIdle;
@@ -8772,6 +10093,7 @@ internal static class Program
                 && encoderSnapshot.P95EncodeMs < Math.Max(4.0, frameBudgetMs * 0.6)
                 && encoderSnapshot.P99EncodeMs < Math.Max(8.0, frameBudgetMs * 0.9)
                 && encoderSnapshot.P95SendMs < Math.Max(3.0, frameBudgetMs * 0.35)
+                && encoderSnapshot.LateFrames <= Math.Max(2, currentFps / 30)
                 && encoderSnapshot.StreamFps >= currentFps * 0.9;
         }
 
@@ -9140,10 +10462,14 @@ internal static class Program
         private double _windowSendMsMax;
         private long _windowFramesEncoded;
         private long _windowFramesSent;
+        private long _lateFrames;
+        private long _windowLateFrames;
         private readonly List<double> _encodeSamples = new();
         private readonly List<double> _windowEncodeSamples = new();
         private readonly List<double> _sendSamples = new();
         private readonly List<double> _windowSendSamples = new();
+        private readonly List<double> _frameIntervalSamples = new();
+        private readonly List<double> _windowFrameIntervalSamples = new();
 
         public RealtimeEncoderStats(int fps)
         {
@@ -9176,11 +10502,67 @@ internal static class Program
             }
         }
 
-        public void RecordDropped()
+        public void RecordDropped(long count = 1)
+        {
+            if (count <= 0)
+            {
+                return;
+            }
+
+            lock (_lock)
+            {
+                _framesDropped += count;
+            }
+        }
+
+        public long RecordEncodedFrame(long frameId, int payloadLength, double encodeMs = double.NaN)
         {
             lock (_lock)
             {
-                _framesDropped++;
+                _framesEncoded++;
+                _windowFramesEncoded++;
+                _encodedBytes += payloadLength;
+                _windowEncodedBytes += payloadLength;
+                _lastEncodedFrameId = Math.Max(_lastEncodedFrameId, frameId);
+
+                var timing = _frameTimings.TryGetValue(frameId, out var existing)
+                    ? existing
+                    : new FrameTiming(DateTimeOffset.UtcNow.ToUnixTimeMilliseconds(), Stopwatch.GetTimestamp(), 0);
+
+                var measuredEncodeMs = double.IsNaN(encodeMs) || encodeMs < 0
+                    ? Math.Max(0, ((Stopwatch.GetTimestamp() - timing.GeneratedStopwatchTicks) * 1000.0 / Stopwatch.Frequency) - _frameDurationMs)
+                    : encodeMs;
+                _frameTimings[frameId] = timing with { EncodeMs = measuredEncodeMs };
+                _encodeMsTotal += measuredEncodeMs;
+                _encodeMsMax = Math.Max(_encodeMsMax, measuredEncodeMs);
+                _windowEncodeMsTotal += measuredEncodeMs;
+                _windowEncodeMsMax = Math.Max(_windowEncodeMsMax, measuredEncodeMs);
+                _encodeSamples.Add(measuredEncodeMs);
+                _windowEncodeSamples.Add(measuredEncodeMs);
+                return frameId;
+            }
+        }
+
+        public void RecordLateFrame()
+        {
+            lock (_lock)
+            {
+                _lateFrames++;
+                _windowLateFrames++;
+            }
+        }
+
+        public void RecordFrameInterval(double frameIntervalMs)
+        {
+            if (frameIntervalMs <= 0 || double.IsNaN(frameIntervalMs) || double.IsInfinity(frameIntervalMs))
+            {
+                return;
+            }
+
+            lock (_lock)
+            {
+                _frameIntervalSamples.Add(frameIntervalMs);
+                _windowFrameIntervalSamples.Add(frameIntervalMs);
             }
         }
 
@@ -9279,6 +10661,7 @@ internal static class Program
             {
                 var encodePercentiles = SampleStatistics.Percentiles(_encodeSamples);
                 var sendPercentiles = SampleStatistics.Percentiles(_sendSamples);
+                var frameIntervalPercentiles = SampleStatistics.Percentiles(_frameIntervalSamples);
                 var elapsedSeconds = Math.Max(0.001, (Stopwatch.GetTimestamp() - _startedAtTicks) / (double)Stopwatch.Frequency);
                 return CreateSnapshot(
                     framesEncodedForAverage: _framesEncoded,
@@ -9295,7 +10678,11 @@ internal static class Program
                     sendP50: sendPercentiles.P50,
                     sendP95: sendPercentiles.P95,
                     sendP99: sendPercentiles.P99,
+                    frameIntervalP50: frameIntervalPercentiles.P50,
+                    frameIntervalP95: frameIntervalPercentiles.P95,
+                    frameIntervalP99: frameIntervalPercentiles.P99,
                     streamFps: _framesGenerated / elapsedSeconds,
+                    lateFrames: _lateFrames,
                     newFramesSent: _newFramesSent,
                     repeatFramesSent: _repeatFramesSent,
                     blackFramesSent: _blackFramesSent,
@@ -9309,6 +10696,7 @@ internal static class Program
             {
                 var encodePercentiles = SampleStatistics.Percentiles(_windowEncodeSamples);
                 var sendPercentiles = SampleStatistics.Percentiles(_windowSendSamples);
+                var frameIntervalPercentiles = SampleStatistics.Percentiles(_windowFrameIntervalSamples);
                 var elapsedSeconds = Math.Max(0.001, (Stopwatch.GetTimestamp() - _windowStartedAtTicks) / (double)Stopwatch.Frequency);
                 var snapshot = CreateSnapshot(
                     framesEncodedForAverage: _windowFramesEncoded,
@@ -9325,7 +10713,11 @@ internal static class Program
                     sendP50: sendPercentiles.P50,
                     sendP95: sendPercentiles.P95,
                     sendP99: sendPercentiles.P99,
+                    frameIntervalP50: frameIntervalPercentiles.P50,
+                    frameIntervalP95: frameIntervalPercentiles.P95,
+                    frameIntervalP99: frameIntervalPercentiles.P99,
                     streamFps: _windowFramesGenerated / elapsedSeconds,
+                    lateFrames: _windowLateFrames,
                     newFramesSent: _windowNewFramesSent,
                     repeatFramesSent: _windowRepeatFramesSent,
                     blackFramesSent: _windowBlackFramesSent,
@@ -9334,6 +10726,7 @@ internal static class Program
                 _windowFramesEncoded = 0;
                 _windowFramesGenerated = 0;
                 _windowFramesSent = 0;
+                _windowLateFrames = 0;
                 _windowEncodedBytes = 0;
                 _windowEncodeMsTotal = 0;
                 _windowEncodeMsMax = 0;
@@ -9345,6 +10738,7 @@ internal static class Program
                 _windowKeepaliveFramesSent = 0;
                 _windowEncodeSamples.Clear();
                 _windowSendSamples.Clear();
+                _windowFrameIntervalSamples.Clear();
                 _windowStartedAtTicks = Stopwatch.GetTimestamp();
                 return snapshot;
             }
@@ -9365,7 +10759,11 @@ internal static class Program
             double sendP50,
             double sendP95,
             double sendP99,
+            double frameIntervalP50,
+            double frameIntervalP95,
+            double frameIntervalP99,
             double streamFps,
+            long lateFrames,
             long newFramesSent,
             long repeatFramesSent,
             long blackFramesSent,
@@ -9392,6 +10790,10 @@ internal static class Program
                 outputKbps,
                 _lastKeyFrameSeq,
                 streamFps,
+                frameIntervalP50,
+                frameIntervalP95,
+                frameIntervalP99,
+                lateFrames,
                 newFramesSent,
                 repeatFramesSent,
                 blackFramesSent,
@@ -9613,7 +11015,7 @@ internal static class Program
             var videoHeight = DefaultVideoHeight;
             var videoFps = DefaultVideoFps;
             var resolutionPreset = DefaultResolutionPreset;
-            var videoSource = VideoSourceKind.File;
+            var videoSource = DefaultVideoSource;
             var encoder = H264EncoderKind.MediaFoundation;
             string? ffmpegPath = null;
             var videoBitrate = DefaultVideoBitrate;
@@ -9786,7 +11188,7 @@ internal static class Program
                 videoBitrate = RecommendedBitrate(videoWidth, videoHeight, videoFps);
             }
 
-            if (videoSource is VideoSourceKind.Idd or VideoSourceKind.IddGpu)
+            if (IsIddVideoSource(videoSource))
             {
                 requestedDisplayMode = new DisplayModeRequest(videoWidth, videoHeight, videoFps);
             }
@@ -9803,7 +11205,7 @@ internal static class Program
                 throw new ArgumentException("--window-title or --process-name is required when --video-source window is used.");
             }
 
-            inputTarget ??= videoSource is VideoSourceKind.Idd or VideoSourceKind.IddGpu ? InputTargetKind.Idd : InputTargetKind.System;
+            inputTarget ??= IsIddVideoSource(videoSource) ? InputTargetKind.Idd : InputTargetKind.System;
 
             return new HostOptions(
                 controlPort,
@@ -9905,6 +11307,7 @@ internal static class Program
             {
                 "file" => VideoSourceKind.File,
                 "realtime" => VideoSourceKind.Realtime,
+                "synthetic-nv12" => VideoSourceKind.SyntheticNv12,
                 "region" => VideoSourceKind.Region,
                 "window" => VideoSourceKind.Window,
                 "idd" => VideoSourceKind.Idd,
@@ -10055,6 +11458,7 @@ internal static class Program
     {
         File,
         Realtime,
+        SyntheticNv12,
         Region,
         Window,
         Idd,
@@ -10189,6 +11593,10 @@ internal static class Program
         double OutputKbps,
         long LastKeyFrameSeq,
         double StreamFps,
+        double P50FrameIntervalMs,
+        double P95FrameIntervalMs,
+        double P99FrameIntervalMs,
+        long LateFrames,
         long NewFramesSent,
         long RepeatFramesSent,
         long BlackFramesSent,
