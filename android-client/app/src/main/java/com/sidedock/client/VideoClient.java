@@ -1,6 +1,8 @@
 package com.sidedock.client;
 
 import android.media.MediaCodec;
+import android.media.MediaCodecInfo;
+import android.media.MediaCodecList;
 import android.media.MediaFormat;
 import android.os.Build;
 import android.os.Handler;
@@ -156,6 +158,7 @@ public final class VideoClient {
     private static final int FRAME_KIND_BLACK = 2;
     private static final int FRAME_KIND_KEEPALIVE = 3;
     private static final long FRAME_STATS_INTERVAL_MS = 500L;
+    private static final int DECODE_QUEUE_CAPACITY = 12;
 
     private final String host;
     private final Listener listener;
@@ -370,7 +373,7 @@ public final class VideoClient {
                     String code = isDecoderUnsupported(ex) ? ERROR_DECODER_UNSUPPORTED : ERROR_VIDEO_FAILED;
                     Log.e(TAG, "video failed", ex);
                     emitError(code, message);
-                    emitLog("视频通道断开: " + message);
+                    emitLog("Video channel disconnected: " + message);
                 }
             } finally {
                 closeSocket(attemptSocket);
@@ -403,51 +406,27 @@ public final class VideoClient {
             socket = nextSocket;
         }
         emitState("CONNECTED");
-        emitLog("视频通道已连接 " + host + ":" + port);
+        emitLog("Video channel connected " + host + ":" + port);
         Log.i(TAG, "connected " + host + ":" + port);
 
         InputStream input = nextSocket.getInputStream();
-        ArrayDeque<VideoPacket> pendingPackets = new ArrayDeque<>();
-        CodecConfig codecConfig = new CodecConfig();
-        MediaCodec codec = null;
-        MediaCodec.BufferInfo bufferInfo = new MediaCodec.BufferInfo();
-        long submittedPackets = 0L;
+        LatestVideoPacketQueue decodeQueue = new LatestVideoPacketQueue(DECODE_QUEUE_CAPACITY);
+        Thread decoderThread = new Thread(new Runnable() {
+            @Override
+            public void run() {
+                decodeLoop(decodeQueue);
+            }
+        }, "SideDock-VideoDecoder");
+        decoderThread.setDaemon(true);
+        decoderThread.start();
         long lastStatsAt = System.currentTimeMillis();
-        boolean decodeDisabled = false;
 
         try {
             while (running && !nextSocket.isClosed()) {
                 VideoPacket packet = readPacket(input);
                 packetsReceived += 1;
                 recordPacketKind(packet);
-
-                if (!decodeDisabled) {
-                    codecConfig.scan(packet.payload);
-                    pendingPackets.add(packet);
-
-                    try {
-                        if (codec == null && (codecConfig.isReady() || pendingPackets.size() >= 30)) {
-                            codec = createDecoder(codecConfig);
-                            emitLog("MediaCodec 已启动，csd=" + codecConfig.isReady());
-                            Log.i(TAG, "MediaCodec started csd=" + codecConfig.isReady());
-                        }
-
-                        while (codec != null && !pendingPackets.isEmpty()) {
-                            submittedPackets += 1L;
-                            queuePacket(codec, bufferInfo, pendingPackets.removeFirst(), submittedPackets);
-                        }
-                    } catch (Exception ex) {
-                        decodeErrors += 1;
-                        decodeDisabled = true;
-                        pendingPackets.clear();
-                        releaseCodecQuietly(codec);
-                        codec = null;
-                        String message = ex.getMessage() == null ? ex.getClass().getSimpleName() : ex.getMessage();
-                        Log.e(TAG, "decoder disabled; continuing receive-only", ex);
-                        emitLog("解码停用，仅接收视频流: " + message);
-                    }
-                }
-
+                droppedFrames += decodeQueue.offerLatest(packet);
                 long now = System.currentTimeMillis();
                 if (now - lastStatsAt >= 2000L) {
                     emitStats();
@@ -455,13 +434,84 @@ public final class VideoClient {
                 }
             }
         } finally {
-            if (codec != null) {
-                releaseCodecQuietly(codec);
+            decodeQueue.close();
+            decoderThread.interrupt();
+            joinQuietly(decoderThread, 1000L);
+        }
+    }
+
+    private void decodeLoop(LatestVideoPacketQueue decodeQueue) {
+        ArrayDeque<VideoPacket> pendingPackets = new ArrayDeque<>();
+        CodecConfig codecConfig = new CodecConfig();
+        MediaCodec codec = null;
+        MediaCodec.BufferInfo bufferInfo = new MediaCodec.BufferInfo();
+        long submittedPackets = 0L;
+        boolean decodeDisabled = false;
+        boolean forceSoftwareDecoder = false;
+        String decoderName = "";
+
+        try {
+            while (running) {
+                VideoPacket packet = decodeQueue.take(250L);
+                if (packet == null) {
+                    if (decodeQueue.isClosed()) {
+                        break;
+                    }
+                    if (codec != null) {
+                        drainOutput(codec, bufferInfo, 0L);
+                    }
+                    continue;
+                }
+
+                if (decodeDisabled) {
+                    continue;
+                }
+
+                codecConfig.scan(packet.payload);
+                pendingPackets.add(packet);
+
+                try {
+                    if (codec == null && (codecConfig.isReady() || pendingPackets.size() >= 30)) {
+                        codec = createDecoder(codecConfig, forceSoftwareDecoder);
+                        decoderName = codec.getName();
+                        emitLog("MediaCodec started, csd=" + codecConfig.isReady());
+                        Log.i(TAG, "MediaCodec started csd=" + codecConfig.isReady());
+                    }
+
+                    while (codec != null && !pendingPackets.isEmpty()) {
+                        submittedPackets += 1L;
+                        queuePacket(codec, bufferInfo, pendingPackets.removeFirst(), submittedPackets);
+                    }
+                } catch (Exception ex) {
+                    decodeErrors += 1;
+                    pendingPackets.clear();
+                    releaseCodecQuietly(codec);
+                    codec = null;
+                    String message = ex.getMessage() == null ? ex.getClass().getSimpleName() : ex.getMessage();
+                    if (!forceSoftwareDecoder && shouldRetryWithSoftwareDecoder(decoderName, ex)) {
+                        forceSoftwareDecoder = true;
+                        decoderName = "";
+                        Log.w(TAG, "hardware decoder failed; retrying software decoder", ex);
+                        emitLog("Hardware decoder failed; retrying software decoder: " + message);
+                        continue;
+                    }
+
+                    decodeDisabled = true;
+                    Log.e(TAG, "decoder disabled; continuing receive-only", ex);
+                    emitLog("Decoder disabled; continuing receive-only: " + message);
+                }
             }
+        } catch (InterruptedException ex) {
+            Thread.currentThread().interrupt();
+        } finally {
+            releaseCodecQuietly(codec);
         }
     }
 
     private void releaseCodecQuietly(MediaCodec codec) {
+        if (codec == null) {
+            return;
+        }
         try {
             codec.stop();
         } catch (Exception ignored) {
@@ -472,15 +522,20 @@ public final class VideoClient {
         }
     }
 
-    private MediaCodec createDecoder(CodecConfig codecConfig) throws Exception {
-        MediaCodec codec = MediaCodec.createDecoderByType("video/avc");
+    private MediaCodec createDecoder(CodecConfig codecConfig, boolean forceSoftwareDecoder) throws Exception {
+        MediaFormat format = createDecoderFormat(codecConfig, true);
+        MediaCodec codec = createDecoderInstance(forceSoftwareDecoder);
+        String decoderName = codec.getName();
         try {
-            MediaFormat format = createDecoderFormat(codecConfig, true);
+            Log.i(TAG, "configuring decoder name=" + decoderName + " format=" + format);
             codec.configure(format, surface, null, 0);
         } catch (Exception ex) {
+            Log.w(TAG, "decoder configure with low-latency failed name=" + decoderName, ex);
             codec.release();
-            codec = MediaCodec.createDecoderByType("video/avc");
             MediaFormat fallbackFormat = createDecoderFormat(codecConfig, false);
+            codec = createDecoderInstance(forceSoftwareDecoder);
+            decoderName = codec.getName();
+            Log.i(TAG, "configuring decoder fallback name=" + decoderName + " format=" + fallbackFormat);
             codec.configure(fallbackFormat, surface, null, 0);
             emitLog("MediaCodec low-latency keys ignored: " + ex.getClass().getSimpleName());
         }
@@ -492,7 +547,69 @@ public final class VideoClient {
             }
         }, mainHandler);
         codec.start();
+        Log.i(TAG, "MediaCodec started name=" + decoderName + " csd=" + codecConfig.isReady());
         return codec;
+    }
+
+    private MediaCodec createDecoderInstance(boolean forceSoftwareDecoder) throws Exception {
+        if (forceSoftwareDecoder) {
+            String softwareDecoder = findSoftwareAvcDecoder();
+            if (softwareDecoder != null) {
+                Log.i(TAG, "selected software decoder name=" + softwareDecoder);
+                return MediaCodec.createByCodecName(softwareDecoder);
+            }
+
+            Log.w(TAG, "software AVC decoder not found; falling back to decoder by type");
+        }
+
+        return MediaCodec.createDecoderByType("video/avc");
+    }
+
+    private String findSoftwareAvcDecoder() {
+        try {
+            MediaCodecList codecList = new MediaCodecList(MediaCodecList.REGULAR_CODECS);
+            MediaCodecInfo[] codecInfos = codecList.getCodecInfos();
+            for (MediaCodecInfo codecInfo : codecInfos) {
+                if (codecInfo.isEncoder() || !isSoftwareDecoder(codecInfo)) {
+                    continue;
+                }
+
+                String[] supportedTypes = codecInfo.getSupportedTypes();
+                for (String type : supportedTypes) {
+                    if ("video/avc".equalsIgnoreCase(type)) {
+                        return codecInfo.getName();
+                    }
+                }
+            }
+        } catch (Exception ex) {
+            Log.w(TAG, "unable to enumerate software AVC decoders", ex);
+        }
+
+        return null;
+    }
+
+    private boolean shouldRetryWithSoftwareDecoder(String currentDecoderName, Throwable throwable) {
+        return !isSoftwareDecoderName(currentDecoderName) && isDecoderUnsupported(throwable);
+    }
+
+    private static boolean isSoftwareDecoder(MediaCodecInfo codecInfo) {
+        if (Build.VERSION.SDK_INT >= 29) {
+            return codecInfo.isSoftwareOnly();
+        }
+
+        return isSoftwareDecoderName(codecInfo.getName());
+    }
+
+    private static boolean isSoftwareDecoderName(String decoderName) {
+        if (decoderName == null) {
+            return false;
+        }
+
+        String normalized = decoderName.toLowerCase();
+        return normalized.contains("google")
+            || normalized.contains("android")
+            || normalized.contains("software")
+            || normalized.startsWith("c2.android");
     }
 
     private MediaFormat createDecoderFormat(CodecConfig codecConfig, boolean lowLatency) {
@@ -578,7 +695,7 @@ public final class VideoClient {
                 continue;
             }
             if (outputIndex == MediaCodec.INFO_OUTPUT_FORMAT_CHANGED) {
-                emitLog("输出格式: " + codec.getOutputFormat());
+                emitLog("Output format: " + codec.getOutputFormat());
                 timeoutUs = 0L;
                 continue;
             }
@@ -797,6 +914,14 @@ public final class VideoClient {
     private void sleepQuietly(long delayMs) {
         try {
             Thread.sleep(delayMs);
+        } catch (InterruptedException ex) {
+            Thread.currentThread().interrupt();
+        }
+    }
+
+    private void joinQuietly(Thread thread, long timeoutMs) {
+        try {
+            thread.join(timeoutMs);
         } catch (InterruptedException ex) {
             Thread.currentThread().interrupt();
         }
@@ -1164,6 +1289,56 @@ public final class VideoClient {
             this.receiveElapsedRealtimeNanos = packet.receiveElapsedRealtimeNanos;
             this.receiveWallClockMs = packet.receiveWallClockMs;
             this.timestampMs = packet.timestampMs;
+        }
+    }
+
+    private static final class LatestVideoPacketQueue {
+        private final ArrayDeque<VideoPacket> packets = new ArrayDeque<>();
+        private final int capacity;
+        private boolean closed;
+
+        private LatestVideoPacketQueue(int capacity) {
+            this.capacity = Math.max(1, capacity);
+        }
+
+        private int offerLatest(VideoPacket packet) {
+            synchronized (this) {
+                if (closed) {
+                    return 0;
+                }
+
+                int dropped = 0;
+                while (packets.size() >= capacity) {
+                    packets.removeFirst();
+                    dropped += 1;
+                }
+                packets.addLast(packet);
+                notifyAll();
+                return dropped;
+            }
+        }
+
+        private VideoPacket take(long timeoutMs) throws InterruptedException {
+            synchronized (this) {
+                if (packets.isEmpty() && !closed) {
+                    wait(timeoutMs);
+                }
+                return packets.isEmpty() ? null : packets.removeFirst();
+            }
+        }
+
+        private boolean isClosed() {
+            synchronized (this) {
+                return closed;
+            }
+        }
+
+        private void close() {
+            synchronized (this) {
+                closed = true;
+                packets.clear();
+                notifyAll();
+            }
         }
     }
 

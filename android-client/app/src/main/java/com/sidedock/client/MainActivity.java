@@ -1244,8 +1244,16 @@ public final class MainActivity extends Activity implements ControlClient.Listen
 
                     MediaCodecInfo.CodecCapabilities capabilities = codecInfo.getCapabilitiesForType(type);
                     MediaCodecInfo.VideoCapabilities videoCapabilities = capabilities.getVideoCapabilities();
-                    if (videoCapabilities != null
-                        && videoCapabilities.areSizeAndRateSupported(width, height, fps)) {
+                    boolean sizeRateSupported = videoCapabilities != null
+                        && videoCapabilities.areSizeAndRateSupported(width, height, fps);
+                    String acceleration = Build.VERSION.SDK_INT >= 29
+                        ? (" hardware=" + codecInfo.isHardwareAccelerated() + " software=" + codecInfo.isSoftwareOnly())
+                        : "";
+                    Log.i(TAG, "AVC decoder candidate name=" + codecInfo.getName()
+                        + acceleration
+                        + " sizeRateSupported=" + sizeRateSupported
+                        + " bitrateRange=" + (videoCapabilities == null ? "unknown" : videoCapabilities.getBitrateRange()));
+                    if (sizeRateSupported) {
                         return Boolean.TRUE;
                     }
                 }
