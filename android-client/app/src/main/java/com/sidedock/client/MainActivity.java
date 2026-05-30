@@ -2002,16 +2002,33 @@ public final class MainActivity extends Activity implements ControlClient.Listen
     }
 
     private void appendCompactOverlay(StringBuilder builder) {
-        builder.append("吞吐 ");
-        appendFpsFields(builder);
-        builder.append("  | ");
-        appendDisplayTimingFields(builder);
+        builder
+            .append("时延 ")
+            .append(currentLatencyMs())
+            .append("ms  帧率 ")
+            .append(formatFpsValue(currentOverlayFps()))
+            .append("fps");
+    }
+
+    private long currentLatencyMs() {
         if (lastVideoStats != null) {
-            builder
-                .append("  lat ")
-                .append(Math.max(0L, lastVideoStats.localPipelineLatencyMs))
-                .append("ms");
+            return Math.max(0L, lastVideoStats.localPipelineLatencyMs);
         }
+
+        return 0L;
+    }
+
+    private double currentOverlayFps() {
+        double renderFps = currentRenderFps();
+        if (!isUsableFps(renderFps)) {
+            renderFps = currentStreamFps();
+        }
+
+        return renderFps;
+    }
+
+    private boolean isUsableFps(double fps) {
+        return !Double.isNaN(fps) && !Double.isInfinite(fps) && fps >= 0.0;
     }
 
     private void logVideoStatsSummary(VideoClient.VideoStats stats) {
