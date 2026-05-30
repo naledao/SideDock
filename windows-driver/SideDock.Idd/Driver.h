@@ -130,6 +130,15 @@ namespace SideDock::Idd
     };
 #pragma pack(pop)
 
+    struct HardwareCursorSnapshot
+    {
+        BOOL Visible = FALSE;
+        INT X = 0;
+        INT Y = 0;
+        IDDCX_CURSOR_SHAPE_INFO ShapeInfo = {};
+        std::array<BYTE, MaxHardwareCursorShapeBytes> ShapeBuffer = {};
+    };
+
     class SharedFrameBuffer
     {
     public:
@@ -210,7 +219,17 @@ namespace SideDock::Idd
         void Run();
         void RunCore();
         void ProcessFrame(const IDDCX_METADATA& metadata);
+        void ExportLatestCursorFrame();
+        bool ExportTextureWithCursor(ID3D11Texture2D* cleanTexture, UINT64 timestampQpc);
+        bool EnsureLatestDesktopTexture(ID3D11Texture2D* sourceTexture);
         bool EnsureStagingTexture(ID3D11Texture2D* sourceTexture);
+        bool EnsureCursorCompositionTextures(ID3D11Texture2D* sourceTexture);
+        bool TryComposeCursor(ID3D11Texture2D* cleanTexture, ID3D11Texture2D** outputTexture);
+        static bool BlendHardwareCursorIntoBgra(
+            const HardwareCursorSnapshot& cursor,
+            D3D11_MAPPED_SUBRESOURCE& mapped,
+            UINT width,
+            UINT height);
 
         IDDCX_SWAPCHAIN m_swapChain = nullptr;
         std::shared_ptr<Direct3DDevice> m_device;
@@ -218,6 +237,9 @@ namespace SideDock::Idd
         HANDLE m_availableBufferEvent = nullptr;
         Microsoft::WRL::Wrappers::Thread m_thread;
         Microsoft::WRL::Wrappers::Event m_terminateEvent;
+        Microsoft::WRL::ComPtr<ID3D11Texture2D> m_latestDesktopTexture;
+        Microsoft::WRL::ComPtr<ID3D11Texture2D> m_cursorCompositionTexture;
+        Microsoft::WRL::ComPtr<ID3D11Texture2D> m_cursorCompositionStagingTexture;
         Microsoft::WRL::ComPtr<ID3D11Texture2D> m_stagingTexture;
         SharedFrameBuffer m_sharedFrameBuffer;
         SharedGpuFrameRing m_sharedGpuFrameRing;
@@ -265,6 +287,7 @@ namespace SideDock::Idd
         IDDCX_MONITOR GetMonitorObject() const;
         HANDLE GetHardwareCursorEvent() const;
         bool HandleHardwareCursorUpdate();
+        bool GetHardwareCursorSnapshot(HardwareCursorSnapshot& snapshot) const;
         UINT GpuRingSlotCount() const;
 
         void AssignSwapChain(IDDCX_SWAPCHAIN swapChain, LUID renderAdapter, HANDLE newFrameEvent);

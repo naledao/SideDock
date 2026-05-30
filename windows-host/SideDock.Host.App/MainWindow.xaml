@@ -120,7 +120,7 @@
                                     <TextBlock Text="刷新率" />
                                     <ComboBox
                                         x:Name="RefreshRateCombo"
-                                        SelectedIndex="0"
+                                        SelectedIndex="2"
                                         HorizontalAlignment="Stretch">
                                         <ComboBoxItem Content="30" />
                                         <ComboBoxItem Content="60" />

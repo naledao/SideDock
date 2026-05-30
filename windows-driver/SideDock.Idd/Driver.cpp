@@ -18,6 +18,7 @@ Environment:
 #include "Driver.tmh"
 
 #include <iterator>
+#include <algorithm>
 
 using namespace Microsoft::WRL;
 using namespace SideDock::Idd;
@@ -712,21 +713,37 @@ bool SharedGpuFrameRing::WriteFrame(Direct3DDevice& device, ID3D11Texture2D* sou
         return false;
     }
 
-    const UINT64 seq = ++m_writeSeq;
-    const UINT slotIndex = static_cast<UINT>((seq - 1) % m_slotCount);
-    auto& texture = m_textures[slotIndex];
-    auto& keyedMutex = m_mutexes[slotIndex];
-    if (!texture || !keyedMutex)
+    UINT slotIndex = 0;
+    HRESULT hr = E_FAIL;
+    Microsoft::WRL::ComPtr<ID3D11Texture2D> texture;
+    Microsoft::WRL::ComPtr<IDXGIKeyedMutex> keyedMutex;
+    for (UINT attempt = 0; attempt < m_slotCount; ++attempt)
     {
+        const UINT candidateSlotIndex = static_cast<UINT>((m_writeSeq + attempt) % m_slotCount);
+        auto& candidateTexture = m_textures[candidateSlotIndex];
+        auto& candidateMutex = m_mutexes[candidateSlotIndex];
+        if (!candidateTexture || !candidateMutex)
+        {
+            continue;
+        }
+
+        hr = candidateMutex->AcquireSync(0, 0);
+        if (SUCCEEDED(hr))
+        {
+            slotIndex = candidateSlotIndex;
+            texture = candidateTexture;
+            keyedMutex = candidateMutex;
+            break;
+        }
+    }
+
+    if (!keyedMutex || !texture)
+    {
+        TraceEvents(TRACE_LEVEL_VERBOSE, TRACE_SWAPCHAIN, "%!FUNC! GPU ring has no writable slot hr=0x%08x slots=%u seq=%llu", hr, m_slotCount, m_writeSeq);
         return false;
     }
 
-    HRESULT hr = keyedMutex->AcquireSync(0, 0);
-    if (FAILED(hr))
-    {
-        TraceEvents(TRACE_LEVEL_VERBOSE, TRACE_SWAPCHAIN, "%!FUNC! GPU slot busy slot=%u hr=0x%08x", slotIndex, hr);
-        return false;
-    }
+    const UINT64 seq = m_writeSeq + 1;
 
     device.DeviceContext->CopyResource(texture.Get(), sourceTexture);
     MemoryBarrier();
@@ -748,6 +765,7 @@ bool SharedGpuFrameRing::WriteFrame(Direct3DDevice& device, ID3D11Texture2D* sou
     m_metadata->TimestampQpc = timestampQpc;
     MemoryBarrier();
     m_metadata->WriteSeq = seq;
+    m_writeSeq = seq;
 
     keyedMutex->ReleaseSync(1);
     SetEvent(m_frameReadyEvent);
@@ -1059,7 +1077,10 @@ void SwapChainProcessor::RunCore()
             {
                 if (m_monitorContext != nullptr)
                 {
-                    m_monitorContext->HandleHardwareCursorUpdate();
+                    if (m_monitorContext->HandleHardwareCursorUpdate())
+                    {
+                        ExportLatestCursorFrame();
+                    }
                 }
                 continue;
             }
@@ -1134,17 +1155,60 @@ void SwapChainProcessor::ProcessFrame(const IDDCX_METADATA& metadata)
         return;
     }
 
-    if (m_sharedGpuFrameRing.EnsureInitialized(*m_device, sourceTexture.Get(), m_monitorContext->GpuRingSlotCount()) &&
+    if (!EnsureLatestDesktopTexture(sourceTexture.Get()))
+    {
+        ++m_exportErrors;
+        ++m_framesDiscarded;
+        return;
+    }
+
+    if (!ExportTextureWithCursor(sourceTexture.Get(), metadata.PresentDisplayQPCTime))
+    {
+        ++m_framesDiscarded;
+    }
+}
+
+void SwapChainProcessor::ExportLatestCursorFrame()
+{
+    if (!m_latestDesktopTexture)
+    {
+        return;
+    }
+
+    LARGE_INTEGER qpc = {};
+    QueryPerformanceCounter(&qpc);
+    if (!ExportTextureWithCursor(m_latestDesktopTexture.Get(), static_cast<UINT64>(qpc.QuadPart)))
+    {
+        ++m_framesDiscarded;
+    }
+}
+
+bool SwapChainProcessor::ExportTextureWithCursor(ID3D11Texture2D* cleanTexture, UINT64 timestampQpc)
+{
+    if (!cleanTexture)
+    {
+        ++m_exportErrors;
+        return false;
+    }
+
+    ID3D11Texture2D* exportTexture = cleanTexture;
+    if (!TryComposeCursor(cleanTexture, &exportTexture))
+    {
+        ++m_exportErrors;
+        return false;
+    }
+
+    if (m_sharedGpuFrameRing.EnsureInitialized(*m_device, exportTexture, m_monitorContext->GpuRingSlotCount()) &&
         m_sharedGpuFrameRing.IsConsumerAlive())
     {
-        if (m_sharedGpuFrameRing.WriteFrame(*m_device, sourceTexture.Get(), metadata.PresentDisplayQPCTime, m_monitorContext->GpuRingSlotCount()))
+        if (m_sharedGpuFrameRing.WriteFrame(*m_device, exportTexture, timestampQpc, m_monitorContext->GpuRingSlotCount()))
         {
             ++m_gpuFramesExported;
             if ((m_gpuFramesExported % 300) == 0)
             {
                 TraceEvents(TRACE_LEVEL_INFORMATION, TRACE_SWAPCHAIN, "%!FUNC! GPU frame exported seq=%llu", m_gpuFramesExported);
             }
-            return;
+            return true;
         }
 
         ++m_gpuFramesDropped;
@@ -1153,35 +1217,31 @@ void SwapChainProcessor::ProcessFrame(const IDDCX_METADATA& metadata)
     if (!m_sharedFrameBuffer.EnsureInitialized())
     {
         ++m_exportErrors;
-        ++m_framesDiscarded;
-        return;
+        return false;
     }
 
     if (!m_sharedFrameBuffer.IsConsumerAlive())
     {
         ++m_framesDropped;
-        ++m_framesDiscarded;
-        return;
+        return false;
     }
 
-    if (!EnsureStagingTexture(sourceTexture.Get()))
+    if (!EnsureStagingTexture(exportTexture))
     {
         ++m_exportErrors;
-        ++m_framesDiscarded;
-        return;
+        return false;
     }
 
     auto context = m_device->DeviceContext.Get();
-    context->CopyResource(m_stagingTexture.Get(), sourceTexture.Get());
+    context->CopyResource(m_stagingTexture.Get(), exportTexture);
 
     D3D11_MAPPED_SUBRESOURCE mapped = {};
-    hr = context->Map(m_stagingTexture.Get(), 0, D3D11_MAP_READ, 0, &mapped);
+    HRESULT hr = context->Map(m_stagingTexture.Get(), 0, D3D11_MAP_READ, 0, &mapped);
     if (FAILED(hr))
     {
         ++m_exportErrors;
-        ++m_framesDiscarded;
         TraceEvents(TRACE_LEVEL_WARNING, TRACE_SWAPCHAIN, "%!FUNC! Map staging texture failed: 0x%08x", hr);
-        return;
+        return false;
     }
 
     D3D11_TEXTURE2D_DESC desc = {};
@@ -1191,7 +1251,7 @@ void SwapChainProcessor::ProcessFrame(const IDDCX_METADATA& metadata)
         desc.Width,
         desc.Height,
         mapped.RowPitch,
-        metadata.PresentDisplayQPCTime);
+        timestampQpc);
 
     context->Unmap(m_stagingTexture.Get(), 0);
 
@@ -1202,12 +1262,251 @@ void SwapChainProcessor::ProcessFrame(const IDDCX_METADATA& metadata)
         {
             TraceEvents(TRACE_LEVEL_INFORMATION, TRACE_SWAPCHAIN, "%!FUNC! frame exported seq=%llu", m_framesExported);
         }
+        return true;
     }
-    else
+
+    ++m_exportErrors;
+    return false;
+}
+
+bool SwapChainProcessor::EnsureLatestDesktopTexture(ID3D11Texture2D* sourceTexture)
+{
+    if (!sourceTexture)
     {
-        ++m_exportErrors;
-        ++m_framesDiscarded;
+        return false;
     }
+
+    D3D11_TEXTURE2D_DESC desc = {};
+    sourceTexture->GetDesc(&desc);
+
+    if (m_latestDesktopTexture)
+    {
+        D3D11_TEXTURE2D_DESC existingDesc = {};
+        m_latestDesktopTexture->GetDesc(&existingDesc);
+        if (existingDesc.Width != desc.Width || existingDesc.Height != desc.Height || existingDesc.Format != desc.Format)
+        {
+            m_latestDesktopTexture.Reset();
+        }
+    }
+
+    if (!m_latestDesktopTexture)
+    {
+        desc.Usage = D3D11_USAGE_DEFAULT;
+        desc.BindFlags = 0;
+        desc.CPUAccessFlags = 0;
+        desc.MiscFlags = 0;
+        desc.MipLevels = 1;
+        desc.ArraySize = 1;
+        desc.SampleDesc.Count = 1;
+        desc.SampleDesc.Quality = 0;
+
+        HRESULT hr = m_device->Device->CreateTexture2D(&desc, nullptr, &m_latestDesktopTexture);
+        if (FAILED(hr))
+        {
+            TraceEvents(TRACE_LEVEL_ERROR, TRACE_SWAPCHAIN, "%!FUNC! latest texture creation failed: 0x%08x", hr);
+            return false;
+        }
+    }
+
+    m_device->DeviceContext->CopyResource(m_latestDesktopTexture.Get(), sourceTexture);
+    return true;
+}
+
+bool SwapChainProcessor::EnsureCursorCompositionTextures(ID3D11Texture2D* sourceTexture)
+{
+    if (!sourceTexture)
+    {
+        return false;
+    }
+
+    D3D11_TEXTURE2D_DESC desc = {};
+    sourceTexture->GetDesc(&desc);
+
+    auto needsRecreate = [&desc](const ComPtr<ID3D11Texture2D>& texture)
+    {
+        if (!texture)
+        {
+            return true;
+        }
+
+        D3D11_TEXTURE2D_DESC existingDesc = {};
+        texture->GetDesc(&existingDesc);
+        return existingDesc.Width != desc.Width || existingDesc.Height != desc.Height || existingDesc.Format != desc.Format;
+    };
+
+    if (needsRecreate(m_cursorCompositionTexture))
+    {
+        m_cursorCompositionTexture.Reset();
+        auto textureDesc = desc;
+        textureDesc.Usage = D3D11_USAGE_DEFAULT;
+        textureDesc.BindFlags = 0;
+        textureDesc.CPUAccessFlags = 0;
+        textureDesc.MiscFlags = 0;
+        textureDesc.MipLevels = 1;
+        textureDesc.ArraySize = 1;
+        textureDesc.SampleDesc.Count = 1;
+        textureDesc.SampleDesc.Quality = 0;
+
+        HRESULT hr = m_device->Device->CreateTexture2D(&textureDesc, nullptr, &m_cursorCompositionTexture);
+        if (FAILED(hr))
+        {
+            TraceEvents(TRACE_LEVEL_ERROR, TRACE_SWAPCHAIN, "%!FUNC! cursor composition texture creation failed: 0x%08x", hr);
+            return false;
+        }
+    }
+
+    if (needsRecreate(m_cursorCompositionStagingTexture))
+    {
+        m_cursorCompositionStagingTexture.Reset();
+        auto stagingDesc = desc;
+        stagingDesc.Usage = D3D11_USAGE_STAGING;
+        stagingDesc.BindFlags = 0;
+        stagingDesc.CPUAccessFlags = D3D11_CPU_ACCESS_READ | D3D11_CPU_ACCESS_WRITE;
+        stagingDesc.MiscFlags = 0;
+        stagingDesc.MipLevels = 1;
+        stagingDesc.ArraySize = 1;
+        stagingDesc.SampleDesc.Count = 1;
+        stagingDesc.SampleDesc.Quality = 0;
+
+        HRESULT hr = m_device->Device->CreateTexture2D(&stagingDesc, nullptr, &m_cursorCompositionStagingTexture);
+        if (FAILED(hr))
+        {
+            TraceEvents(TRACE_LEVEL_ERROR, TRACE_SWAPCHAIN, "%!FUNC! cursor staging texture creation failed: 0x%08x", hr);
+            return false;
+        }
+    }
+
+    return true;
+}
+
+bool SwapChainProcessor::TryComposeCursor(ID3D11Texture2D* cleanTexture, ID3D11Texture2D** outputTexture)
+{
+    if (!outputTexture)
+    {
+        return false;
+    }
+
+    *outputTexture = cleanTexture;
+    if (!m_monitorContext)
+    {
+        return true;
+    }
+
+    HardwareCursorSnapshot cursor = {};
+    if (!m_monitorContext->GetHardwareCursorSnapshot(cursor) || !cursor.Visible)
+    {
+        return true;
+    }
+
+    if (cursor.ShapeInfo.CursorType != IDDCX_CURSOR_SHAPE_TYPE_ALPHA ||
+        cursor.ShapeInfo.Width == 0 ||
+        cursor.ShapeInfo.Height == 0 ||
+        cursor.ShapeInfo.Pitch < cursor.ShapeInfo.Width * 4)
+    {
+        return true;
+    }
+
+    if (!EnsureCursorCompositionTextures(cleanTexture))
+    {
+        return false;
+    }
+
+    auto context = m_device->DeviceContext.Get();
+    context->CopyResource(m_cursorCompositionStagingTexture.Get(), cleanTexture);
+
+    D3D11_TEXTURE2D_DESC desc = {};
+    cleanTexture->GetDesc(&desc);
+
+    D3D11_MAPPED_SUBRESOURCE mapped = {};
+    HRESULT hr = context->Map(m_cursorCompositionStagingTexture.Get(), 0, D3D11_MAP_READ_WRITE, 0, &mapped);
+    if (FAILED(hr))
+    {
+        TraceEvents(TRACE_LEVEL_WARNING, TRACE_SWAPCHAIN, "%!FUNC! Map cursor staging failed: 0x%08x", hr);
+        return false;
+    }
+
+    const bool blended = BlendHardwareCursorIntoBgra(cursor, mapped, desc.Width, desc.Height);
+    context->Unmap(m_cursorCompositionStagingTexture.Get(), 0);
+
+    if (!blended)
+    {
+        return true;
+    }
+
+    context->CopyResource(m_cursorCompositionTexture.Get(), m_cursorCompositionStagingTexture.Get());
+    *outputTexture = m_cursorCompositionTexture.Get();
+    return true;
+}
+
+bool SwapChainProcessor::BlendHardwareCursorIntoBgra(
+    const HardwareCursorSnapshot& cursor,
+    D3D11_MAPPED_SUBRESOURCE& mapped,
+    UINT width,
+    UINT height)
+{
+    if (!mapped.pData || width == 0 || height == 0)
+    {
+        return false;
+    }
+
+    const auto cursorWidth = cursor.ShapeInfo.Width;
+    const auto cursorHeight = cursor.ShapeInfo.Height;
+    const auto cursorPitch = cursor.ShapeInfo.Pitch;
+    if (cursorWidth == 0 || cursorHeight == 0 || cursorPitch < cursorWidth * 4)
+    {
+        return false;
+    }
+
+    const INT startX = cursor.X;
+    const INT startY = cursor.Y;
+    const INT endX = startX + static_cast<INT>(cursorWidth);
+    const INT endY = startY + static_cast<INT>(cursorHeight);
+    if (endX <= 0 || endY <= 0 || startX >= static_cast<INT>(width) || startY >= static_cast<INT>(height))
+    {
+        return false;
+    }
+
+    const INT clippedLeft = std::max<INT>(0, startX);
+    const INT clippedTop = std::max<INT>(0, startY);
+    const INT clippedRight = std::min<INT>(static_cast<INT>(width), endX);
+    const INT clippedBottom = std::min<INT>(static_cast<INT>(height), endY);
+    BYTE* frame = static_cast<BYTE*>(mapped.pData);
+
+    for (INT y = clippedTop; y < clippedBottom; ++y)
+    {
+        const UINT cursorY = static_cast<UINT>(y - startY);
+        const BYTE* cursorRow = cursor.ShapeBuffer.data() + static_cast<size_t>(cursorY) * cursorPitch;
+        BYTE* frameRow = frame + static_cast<size_t>(y) * mapped.RowPitch;
+
+        for (INT x = clippedLeft; x < clippedRight; ++x)
+        {
+            const UINT cursorX = static_cast<UINT>(x - startX);
+            const BYTE* source = cursorRow + static_cast<size_t>(cursorX) * 4;
+            BYTE* destination = frameRow + static_cast<size_t>(x) * 4;
+            const UINT alpha = source[3];
+            if (alpha == 0)
+            {
+                continue;
+            }
+
+            if (alpha == 255)
+            {
+                destination[0] = source[0];
+                destination[1] = source[1];
+                destination[2] = source[2];
+                destination[3] = 255;
+                continue;
+            }
+
+            const UINT inverseAlpha = 255 - alpha;
+            destination[0] = static_cast<BYTE>((source[0] * alpha + destination[0] * inverseAlpha + 127) / 255);
+            destination[1] = static_cast<BYTE>((source[1] * alpha + destination[1] * inverseAlpha + 127) / 255);
+            destination[2] = static_cast<BYTE>((source[2] * alpha + destination[2] * inverseAlpha + 127) / 255);
+            destination[3] = 255;
+        }
+    }
+
+    return true;
 }
 
 bool SwapChainProcessor::EnsureStagingTexture(ID3D11Texture2D* sourceTexture)
@@ -1518,6 +1817,21 @@ IDDCX_MONITOR MonitorContext::GetMonitorObject() const
 HANDLE MonitorContext::GetHardwareCursorEvent() const
 {
     return m_hardwareCursorEnabled ? m_hardwareCursorEvent : nullptr;
+}
+
+bool MonitorContext::GetHardwareCursorSnapshot(HardwareCursorSnapshot& snapshot) const
+{
+    if (!m_hardwareCursorEnabled)
+    {
+        return false;
+    }
+
+    snapshot.Visible = m_lastCursorVisible;
+    snapshot.X = m_lastCursorX;
+    snapshot.Y = m_lastCursorY;
+    snapshot.ShapeInfo = m_lastCursorShapeInfo;
+    snapshot.ShapeBuffer = m_cursorShapeBuffer;
+    return true;
 }
 
 UINT MonitorContext::GpuRingSlotCount() const

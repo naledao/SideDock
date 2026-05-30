@@ -292,14 +292,36 @@ public final class ControlClient {
         public final int width;
         public final int height;
         public final int refreshHz;
+        public final int requestedRefreshHz;
+        public final int displayRefreshHz;
+        public final int videoWidth;
+        public final int videoHeight;
+        public final int videoFps;
         public final boolean success;
         public final String code;
         public final String message;
 
-        public DisplayModeChanged(int width, int height, int refreshHz, boolean success, String code, String message) {
+        public DisplayModeChanged(
+            int width,
+            int height,
+            int refreshHz,
+            int requestedRefreshHz,
+            int displayRefreshHz,
+            int videoWidth,
+            int videoHeight,
+            int videoFps,
+            boolean success,
+            String code,
+            String message
+        ) {
             this.width = width;
             this.height = height;
             this.refreshHz = refreshHz;
+            this.requestedRefreshHz = requestedRefreshHz;
+            this.displayRefreshHz = displayRefreshHz;
+            this.videoWidth = videoWidth;
+            this.videoHeight = videoHeight;
+            this.videoFps = videoFps;
             this.success = success;
             this.code = code;
             this.message = message;
@@ -838,6 +860,11 @@ public final class ControlClient {
                     message.payload.optInt("width", 0),
                     message.payload.optInt("height", 0),
                     message.payload.optInt("refreshHz", 0),
+                    message.payload.optInt("requestedRefreshHz", 0),
+                    message.payload.optInt("displayRefreshHz", message.payload.optInt("refreshHz", 0)),
+                    message.payload.optInt("videoWidth", 0),
+                    message.payload.optInt("videoHeight", 0),
+                    message.payload.optInt("videoFps", 0),
                     message.payload.optBoolean("success", false),
                     message.payload.optString("code", ""),
                     message.payload.optString("message", "")

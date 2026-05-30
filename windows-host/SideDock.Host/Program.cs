@@ -26,7 +26,7 @@ internal static class Program
     private const int DefaultVideoPort = 27184;
     private const int DefaultVideoWidth = 1280;
     private const int DefaultVideoHeight = 720;
-    private const int DefaultVideoFps = 30;
+    private const int DefaultVideoFps = 120;
     private const int DefaultVideoBitrate = 4_000_000;
     private const int DefaultVideoGop = 30;
     private const int DefaultMaxVideoQueue = 2;
@@ -907,7 +907,7 @@ internal static class Program
                 + $"decodeErrors={ReadLong(payload, "decodeErrors")} reconnects={ReadLong(payload, "videoReconnects")}");
         }
 
-        private async ValueTask HandleVideoErrorAsync(
+        private ValueTask HandleVideoErrorAsync(
             ProtocolMessage message,
             ControlConnection connection,
             CancellationToken cancellationToken)
@@ -915,46 +915,25 @@ internal static class Program
             if (message.Payload is not JsonObject payload)
             {
                 Log(Scope, "video_error payload missing");
-                return;
+                return ValueTask.CompletedTask;
             }
 
             Log(Scope, $"video_error payload={payload}");
             var code = ReadString(payload, "code");
             if (!string.Equals(code, "DECODER_UNSUPPORTED", StringComparison.OrdinalIgnoreCase))
             {
-                return;
+                return ValueTask.CompletedTask;
             }
 
             var currentMode = _videoModeState.Current;
-            if (currentMode.Fps <= 60)
-            {
-                return;
-            }
-
-            var fallbackFps = SelectDecoderUnsupportedFallbackFps(currentMode);
-
-            var fallbackMode = _videoModeState.Set(currentMode.Width, currentMode.Height, fallbackFps);
-            Log(Scope, $"decoder unsupported; fallback video mode {currentMode.Width}x{currentMode.Height}@{currentMode.Fps}->{fallbackMode.Fps}");
-            await connection.SendAsync("video_start", new JsonObject
-            {
-                ["videoPort"] = _options.VideoPort,
-                ["width"] = fallbackMode.Width,
-                ["height"] = fallbackMode.Height,
-                ["fps"] = fallbackMode.Fps,
-                ["codec"] = "video/avc",
-                ["format"] = "annexb",
-                ["adaptive"] = true,
-                ["reason"] = "decoder_unsupported",
-                ["previousFps"] = currentMode.Fps,
-                ["bitrate"] = fallbackMode.Bitrate
-            }, cancellationToken);
-            await PublishDisplayMetricsIfChangedAsync(connection, force: true, cancellationToken);
+            Log(Scope, $"decoder unsupported reported; keeping video mode {currentMode.Width}x{currentMode.Height}@{currentMode.Fps}");
+            return ValueTask.CompletedTask;
         }
 
         private static int SelectDecoderUnsupportedFallbackFps(VideoMode currentMode)
         {
             var candidates = currentMode.Width >= 2560 || currentMode.Height >= 1440
-                ? new[] { 72, 60 }
+                ? new[] { 60 }
                 : new[] { 90, 72, 60 };
 
             foreach (var candidate in candidates)
@@ -1150,13 +1129,18 @@ internal static class Program
             var mode = new DisplayModeRequest(width, height, refreshHz);
             var success = _displayLayoutProvider.TryChangeMode(mode, out var resultMessage);
             var layout = _displayLayoutProvider.GetLayout(force: true);
+            var currentMode = _videoModeState.Current;
             var changedWidth = layout?.Width ?? width;
             var changedHeight = layout?.Height ?? height;
             var changedRefresh = layout?.RefreshRate ?? refreshHz;
-            var videoRefresh = NormalizeObservedRefresh(changedRefresh, refreshHz);
-            var appliedMode = success
-                ? _videoModeState.Set(changedWidth, changedHeight, videoRefresh)
-                : _videoModeState.Current;
+            var streamWidth = layout?.Width > 0
+                ? changedWidth
+                : success ? width : currentMode.Width;
+            var streamHeight = layout?.Height > 0
+                ? changedHeight
+                : success ? height : currentMode.Height;
+            var streamFps = refreshHz > 0 ? refreshHz : currentMode.Fps;
+            var appliedMode = _videoModeState.Set(streamWidth, streamHeight, streamFps);
 
             Log(
                 Scope,
@@ -1171,6 +1155,8 @@ internal static class Program
                 ["width"] = changedWidth,
                 ["height"] = changedHeight,
                 ["refreshHz"] = changedRefresh,
+                ["requestedRefreshHz"] = refreshHz,
+                ["displayRefreshHz"] = changedRefresh,
                 ["success"] = success,
                 ["code"] = success ? "OK" : "DISPLAY_MODE_CHANGE_FAILED",
                 ["message"] = resultMessage,
@@ -1181,18 +1167,17 @@ internal static class Program
                 ["sourceSeq"] = message.Seq
             }, cancellationToken);
 
-            if (success)
+            await connection.SendAsync("video_start", new JsonObject
             {
-                await connection.SendAsync("video_start", new JsonObject
-                {
-                    ["videoPort"] = _options.VideoPort,
-                    ["width"] = appliedMode.Width,
-                    ["height"] = appliedMode.Height,
-                    ["fps"] = appliedMode.Fps,
-                    ["codec"] = "video/avc",
-                    ["format"] = "annexb"
-                }, cancellationToken);
-            }
+                ["videoPort"] = _options.VideoPort,
+                ["width"] = appliedMode.Width,
+                ["height"] = appliedMode.Height,
+                ["fps"] = appliedMode.Fps,
+                ["codec"] = "video/avc",
+                ["format"] = "annexb",
+                ["displayRefreshHz"] = changedRefresh,
+                ["displayModeChanged"] = success
+            }, cancellationToken);
 
             await PublishDisplayMetricsIfChangedAsync(connection, force: true, cancellationToken);
         }
@@ -1209,13 +1194,6 @@ internal static class Program
             payload = new JsonObject();
             error = $"Message {message.Type} requires an object payload.";
             return false;
-        }
-
-        private static int NormalizeObservedRefresh(int observedRefreshHz, int requestedRefreshHz)
-        {
-            return Math.Abs(observedRefreshHz - requestedRefreshHz) <= 1
-                ? requestedRefreshHz
-                : observedRefreshHz;
         }
 
         private static bool TryReadInt(JsonObject payload, string name, out int value)
@@ -3178,6 +3156,7 @@ internal static class Program
         VideoModeState videoModeState,
         ControlMessagePublisher controlPublisher)
     {
+        private static readonly TimeSpan SocketWriteTimeout = TimeSpan.FromSeconds(1);
         private static readonly object DumpFileLock = new();
         private static readonly HashSet<string> InitializedDumpPaths = new(StringComparer.OrdinalIgnoreCase);
         private readonly AdaptiveFrameRateController _adaptiveController = new(videoModeState, controlPublisher, options.VideoPort, $"VIDEO {connectionId}");
@@ -3212,8 +3191,7 @@ internal static class Program
                 {
                     cancellationToken.ThrowIfCancellationRequested();
                     var sendStopwatch = Stopwatch.StartNew();
-                    await VideoPacketWriter.WriteAsync(stream, packet, cancellationToken);
-                    await stream.FlushAsync(cancellationToken);
+                    await WritePacketWithTimeoutAsync(stream, packet, cancellationToken);
                     sendStopwatch.Stop();
                     _sendStageStats.RecordProcessed(sendStopwatch.Elapsed.TotalMilliseconds);
 
@@ -3267,6 +3245,59 @@ internal static class Program
             {
                 await sessionCts.CancelAsync();
                 await MediaFoundationBgraVideoSource.WhenAllIgnoringCancellation(producerTask);
+            }
+        }
+
+        private async Task WritePacketWithTimeoutAsync(NetworkStream stream, EncodedVideoPacket packet, CancellationToken cancellationToken)
+        {
+            var writeTask = WritePacketAsync(stream, packet, cancellationToken);
+            var timeoutTask = Task.Delay(SocketWriteTimeout, cancellationToken);
+            var completed = await Task.WhenAny(writeTask, timeoutTask);
+            if (ReferenceEquals(completed, writeTask))
+            {
+                await writeTask;
+                return;
+            }
+
+            cancellationToken.ThrowIfCancellationRequested();
+            AbortClientSocket();
+            _ = writeTask.ContinueWith(
+                static task => _ = task.Exception,
+                CancellationToken.None,
+                TaskContinuationOptions.OnlyOnFaulted | TaskContinuationOptions.ExecuteSynchronously,
+                TaskScheduler.Default);
+            throw new TimeoutException($"Video socket write timed out after {SocketWriteTimeout.TotalMilliseconds:F0}ms.");
+        }
+
+        private static async Task WritePacketAsync(NetworkStream stream, EncodedVideoPacket packet, CancellationToken cancellationToken)
+        {
+            try
+            {
+                await VideoPacketWriter.WriteAsync(stream, packet, cancellationToken);
+                await stream.FlushAsync(cancellationToken);
+            }
+            catch (ObjectDisposedException ex)
+            {
+                throw new IOException("Video socket was closed while writing.", ex);
+            }
+        }
+
+        private void AbortClientSocket()
+        {
+            try
+            {
+                client.Client.Shutdown(SocketShutdown.Both);
+            }
+            catch (Exception ex) when (ex is SocketException or ObjectDisposedException or InvalidOperationException)
+            {
+            }
+
+            try
+            {
+                client.Close();
+            }
+            catch (ObjectDisposedException)
+            {
             }
         }
 
@@ -3511,6 +3542,7 @@ internal static class Program
         private readonly Func<IEncodedVideoSource> _fallbackFactory;
         private readonly Func<Exception, CancellationToken, ValueTask> _onFallbackAsync;
         private IEncodedVideoSource? _active;
+        private bool _usingFallback;
         private bool _primaryDisposed;
 
         public FallbackEncodedVideoSource(
@@ -3536,23 +3568,64 @@ internal static class Program
             }
             catch (Exception ex)
             {
-                await _onFallbackAsync(ex, cancellationToken);
-                await _primary.DisposeAsync();
-                _primaryDisposed = true;
-
-                var fallback = _fallbackFactory();
-                _active = fallback;
-                await fallback.StartAsync(cancellationToken);
+                await SwitchToFallbackAsync(ex, cancellationToken);
             }
         }
 
         public async IAsyncEnumerable<EncodedVideoPacket> ReadPacketsAsync(
             [EnumeratorCancellation] CancellationToken cancellationToken)
         {
-            var active = _active ?? throw new InvalidOperationException("Video source has not started.");
-            await foreach (var packet in active.ReadPacketsAsync(cancellationToken))
+            while (true)
             {
-                yield return packet;
+                var active = _active ?? throw new InvalidOperationException("Video source has not started.");
+                IAsyncEnumerator<EncodedVideoPacket>? enumerator = null;
+                Exception? fallbackException = null;
+                try
+                {
+                    enumerator = active.ReadPacketsAsync(cancellationToken).GetAsyncEnumerator(cancellationToken);
+                    while (true)
+                    {
+                        EncodedVideoPacket packet;
+                        try
+                        {
+                            if (!await enumerator.MoveNextAsync())
+                            {
+                                yield break;
+                            }
+
+                            packet = enumerator.Current;
+                        }
+                        catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
+                        {
+                            throw;
+                        }
+                        catch (Exception ex) when (!_usingFallback && ReferenceEquals(active, _primary))
+                        {
+                            fallbackException = ex;
+                            break;
+                        }
+
+                        yield return packet;
+                    }
+                }
+                finally
+                {
+                    if (enumerator is not null)
+                    {
+                        await enumerator.DisposeAsync();
+                    }
+                }
+
+                if (fallbackException is not null)
+                {
+                    await SwitchToFallbackAsync(fallbackException, cancellationToken);
+                    continue;
+                }
+
+                if (fallbackException is null)
+                {
+                    yield break;
+                }
             }
         }
 
@@ -3603,6 +3676,18 @@ internal static class Program
             return new RealtimeEncoderStatsSnapshot(
                 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0);
         }
+
+        private async ValueTask SwitchToFallbackAsync(Exception ex, CancellationToken cancellationToken)
+        {
+            _usingFallback = true;
+            await _onFallbackAsync(ex, cancellationToken);
+            await _primary.DisposeAsync();
+            _primaryDisposed = true;
+
+            var fallback = _fallbackFactory();
+            _active = fallback;
+            await fallback.StartAsync(cancellationToken);
+        }
     }
 
     private interface IGpuFrameSource : IDisposable
@@ -3628,6 +3713,8 @@ internal static class Program
         void Start(CancellationToken cancellationToken);
 
         GpuFrameLease AcquireLatestFrame(CancellationToken cancellationToken);
+
+        bool TryAcquireLatestFrame(out GpuFrameLease? frame);
     }
 
     private sealed class GpuFrameLease : IDisposable
@@ -3657,7 +3744,14 @@ internal static class Program
             }
 
             _disposed = true;
-            _release?.Invoke();
+            try
+            {
+                _release?.Invoke();
+            }
+            catch (Exception ex) when (ex is SharpGenException or COMException or ObjectDisposedException or InvalidOperationException)
+            {
+                Debug.WriteLine($"GpuFrameLease release failed: {ex.Message}");
+            }
         }
     }
 
@@ -5485,8 +5579,11 @@ internal static class Program
         private string? _encoderMftName;
         private long _sequence;
         private int _gpuFrameDumped;
+        private readonly object _encoderLock = new();
+        private int _encoderWatchdogStrikeCount;
         private const string DirectEncoderFallback = "none";
         private const string ReadbackEncoderFallback = "gpu-convert-nv12-readback";
+        private const int EncoderWatchdogStrikeThreshold = 2;
 
         public MediaFoundationGpuVideoSource(
             int connectionId,
@@ -5529,8 +5626,7 @@ internal static class Program
                 {
                     try
                     {
-                        _encoder = new MediaFoundationH264Encoder(_options, _frameSource.Device);
-                        _encoder.Start();
+                        _encoder = CreateStartedEncoder(d3dInput: true);
                         _encoderMftName = _encoder.SelectedMftName;
                         Log($"ENCODER {_connectionId}", $"D3D11 input probe supported=true fallback=none mft={_encoderMftName}");
                     }
@@ -5551,8 +5647,7 @@ internal static class Program
                         Log($"ENCODER {_connectionId}", $"D3D11 input probe supported=false fallback={ReadbackEncoderFallback} reason={_encoderFallbackReason}");
                     }
 
-                    _encoder = new MediaFoundationH264Encoder(_options);
-                    _encoder.Start();
+                    _encoder = CreateStartedEncoder(d3dInput: false);
                     _encoderMftName = _encoder.SelectedMftName;
                     _nv12Readback = new GpuNv12Readback(_frameSource.Device, _frameSource.Context, _options.VideoWidth, _options.VideoHeight);
                 }
@@ -5750,6 +5845,31 @@ internal static class Program
 
         public RealtimeEncoderStatsSnapshot LatestEncoderSnapshot => _latestEncoderSnapshot;
 
+        [SupportedOSPlatform("windows")]
+        private MediaFoundationH264Encoder CreateStartedEncoder(bool d3dInput)
+        {
+            var encoder = d3dInput
+                ? new MediaFoundationH264Encoder(_options, _frameSource.Device)
+                : new MediaFoundationH264Encoder(_options);
+            encoder.Start();
+            return encoder;
+        }
+
+        [SupportedOSPlatform("windows")]
+        private void RestartEncoder(string reason)
+        {
+            lock (_encoderLock)
+            {
+                var previous = _encoder;
+                var replacement = CreateStartedEncoder(_encoderUsesD3DInput);
+                _encoder = replacement;
+                _encoderMftName = replacement.SelectedMftName;
+                previous?.Dispose();
+                _encoderWatchdogStrikeCount = 0;
+                Log($"ENCODER {_connectionId}", $"watchdog restarted encoder reason={reason} mft={_encoderMftName}");
+            }
+        }
+
         private async Task CaptureLoopAsync(CancellationToken cancellationToken)
         {
             try
@@ -5767,8 +5887,6 @@ internal static class Program
                     () => _stats.RecordDropped());
                 long frameId = 0;
                 long lastSourceSequence = 0;
-                var lastVideoFrameAt = DateTimeOffset.MinValue;
-                var idleRepeatInterval = TimeSpan.FromMilliseconds(250);
 
                 while (!cancellationToken.IsCancellationRequested)
                 {
@@ -5778,11 +5896,20 @@ internal static class Program
                     var captureStopwatch = Stopwatch.StartNew();
                     try
                     {
-                        frame = _frameSource.AcquireLatestFrame(cancellationToken);
+                        if (!_frameSource.TryAcquireLatestFrame(out frame))
+                        {
+                            frameKind = lastSourceSequence == 0
+                                ? EncodedFrameKind.Black
+                                : EncodedFrameKind.Repeat;
+                        }
+
                         captureStopwatch.Stop();
-                        _captureStats.RecordCaptured(captureStopwatch.Elapsed.TotalMilliseconds);
-                        _acquireStageStats.RecordProcessed(captureStopwatch.Elapsed.TotalMilliseconds);
-                        lastSourceSequence = frame.Sequence;
+                        if (frame is not null)
+                        {
+                            _captureStats.RecordCaptured(captureStopwatch.Elapsed.TotalMilliseconds);
+                            _acquireStageStats.RecordProcessed(captureStopwatch.Elapsed.TotalMilliseconds);
+                            lastSourceSequence = frame.Sequence;
+                        }
                     }
                     catch (OperationCanceledException)
                     {
@@ -5791,14 +5918,10 @@ internal static class Program
                     catch (CaptureException ex) when (IsTransientGpuCaptureMiss(ex.Code))
                     {
                         captureStopwatch.Stop();
+
                         if (lastSourceSequence == 0)
                         {
                             frameKind = EncodedFrameKind.Black;
-                        }
-                        else if (DateTimeOffset.UtcNow - lastVideoFrameAt < idleRepeatInterval)
-                        {
-                            await pacer.WaitForNextFrameAsync(cancellationToken);
-                            continue;
                         }
                         else
                         {
@@ -5838,7 +5961,6 @@ internal static class Program
                         _stats.RecordDropped(dropped);
                     }
 
-                    lastVideoFrameAt = DateTimeOffset.UtcNow;
                     frameId++;
                     await pacer.WaitForNextFrameAsync(cancellationToken);
                 }
@@ -5870,6 +5992,8 @@ internal static class Program
                 var converter = _converter ?? throw new InvalidOperationException("GPU converter has not started.");
                 ID3D11Texture2D? lastNv12Texture = null;
                 ID3D11Texture2D? blackNv12Texture = null;
+                ID3D11Texture2D[]? repeatScratchTextures = null;
+                var nextRepeatScratchTexture = 0;
                 long lastSourceSequence = 0;
 
                 try
@@ -5895,12 +6019,20 @@ internal static class Program
                             }
                             else if (lastNv12Texture is not null)
                             {
-                                pendingTexture = lastNv12Texture.QueryInterface<ID3D11Texture2D>();
+                                repeatScratchTextures ??= CreateRepeatScratchTextures(converter);
+                                var repeatScratchTexture = repeatScratchTextures[nextRepeatScratchTexture];
+                                nextRepeatScratchTexture = (nextRepeatScratchTexture + 1) % repeatScratchTextures.Length;
+                                converter.CopyNv12Texture(lastNv12Texture, repeatScratchTexture);
+                                pendingTexture = repeatScratchTexture.QueryInterface<ID3D11Texture2D>();
                             }
                             else
                             {
                                 blackNv12Texture ??= converter.CreateBlackNv12Texture();
-                                pendingTexture = blackNv12Texture.QueryInterface<ID3D11Texture2D>();
+                                repeatScratchTextures ??= CreateRepeatScratchTextures(converter);
+                                var repeatScratchTexture = repeatScratchTextures[nextRepeatScratchTexture];
+                                nextRepeatScratchTexture = (nextRepeatScratchTexture + 1) % repeatScratchTextures.Length;
+                                converter.CopyNv12Texture(blackNv12Texture, repeatScratchTexture);
+                                pendingTexture = repeatScratchTexture.QueryInterface<ID3D11Texture2D>();
                             }
 
                             var nv12Texture = pendingTexture;
@@ -5940,6 +6072,13 @@ internal static class Program
                 {
                     lastNv12Texture?.Dispose();
                     blackNv12Texture?.Dispose();
+                    if (repeatScratchTextures is not null)
+                    {
+                        foreach (var repeatScratchTexture in repeatScratchTextures)
+                        {
+                            repeatScratchTexture.Dispose();
+                        }
+                    }
                 }
             }
             catch (OperationCanceledException)
@@ -6047,6 +6186,17 @@ internal static class Program
             _nv12Frames.Complete();
         }
 
+        private static ID3D11Texture2D[] CreateRepeatScratchTextures(GpuBgraToNv12Converter converter)
+        {
+            var textures = new ID3D11Texture2D[3];
+            for (var index = 0; index < textures.Length; index++)
+            {
+                textures[index] = converter.CreateNv12Texture();
+            }
+
+            return textures;
+        }
+
         private async Task EncodeLoopAsync(CancellationToken cancellationToken)
         {
             try
@@ -6057,13 +6207,18 @@ internal static class Program
                     throw new PlatformNotSupportedException("Media Foundation GPU encoder is only available on Windows.");
                 }
 
-                var encoder = _encoder ?? throw new InvalidOperationException("GPU encoder has not started.");
                 await foreach (var frame in _gpuConvertedFrames.Reader.ReadAllAsync(cancellationToken))
                 {
                     try
                     {
                         var encodeStopwatch = Stopwatch.StartNew();
-                        var payloads = encoder.EncodeFrame(frame.Texture, frame.FrameId);
+                        IReadOnlyList<byte[]> payloads;
+                        lock (_encoderLock)
+                        {
+                            var encoder = _encoder ?? throw new InvalidOperationException("GPU encoder has not started.");
+                            payloads = encoder.EncodeFrame(frame.Texture, frame.FrameId);
+                        }
+
                         encodeStopwatch.Stop();
                         _encodeStageStats.RecordProcessed(encodeStopwatch.Elapsed.TotalMilliseconds);
 
@@ -6114,13 +6269,18 @@ internal static class Program
                     throw new PlatformNotSupportedException("Media Foundation GPU encoder is only available on Windows.");
                 }
 
-                var encoder = _encoder ?? throw new InvalidOperationException("GPU encoder has not started.");
                 await foreach (var frame in _nv12Frames.Reader.ReadAllAsync(cancellationToken))
                 {
                     try
                     {
                         var encodeStopwatch = Stopwatch.StartNew();
-                        var payloads = encoder.EncodeFrame(frame.Data, frame.FrameId);
+                        IReadOnlyList<byte[]> payloads;
+                        lock (_encoderLock)
+                        {
+                            var encoder = _encoder ?? throw new InvalidOperationException("GPU encoder has not started.");
+                            payloads = encoder.EncodeFrame(frame.Data, frame.FrameId);
+                        }
+
                         encodeStopwatch.Stop();
                         _encodeStageStats.RecordProcessed(encodeStopwatch.Elapsed.TotalMilliseconds);
 
@@ -6220,6 +6380,7 @@ internal static class Program
                     var acquireSnapshot = _acquireStageStats.SnapshotAndResetWindow();
                     var convertSnapshot = _convertStageStats.SnapshotAndResetWindow();
                     var encodeSnapshot = _encodeStageStats.SnapshotAndResetWindow();
+                    MaybeRestartEncoderForCadenceLoss(snapshot);
                     Log($"ENCODER {_connectionId}", $"stats fallback={EncoderFallbackName} generated={snapshot.FramesGenerated} encoded={snapshot.FramesEncoded} sent={snapshot.FramesSent} dropped={snapshot.FramesDropped} late={snapshot.LateFrames} streamFps={snapshot.StreamFps:F1} localLatencyP95={snapshot.P95LocalLatencyMs:F1}ms new={snapshot.NewFramesSent} repeat={snapshot.RepeatFramesSent} avgFrameInterval={snapshot.P50FrameIntervalMs:F2}/{snapshot.P95FrameIntervalMs:F2}/{snapshot.P99FrameIntervalMs:F2}ms avgEncode={snapshot.AvgEncodeMs:F1}ms p95Encode={snapshot.P95EncodeMs:F1}ms p99Encode={snapshot.P99EncodeMs:F1}ms maxEncode={snapshot.MaxEncodeMs:F1}ms avgSend={snapshot.AvgSendMs:F1}ms p95Send={snapshot.P95SendMs:F1}ms kbps={snapshot.OutputKbps:F0} pipeline {FormatPipelineStageForLog(acquireSnapshot)} {FormatPipelineStageForLog(convertSnapshot)} {FormatPipelineStageForLog(encodeSnapshot)}");
                     var encoderStatsPayload = CreateEncoderStatsPayload(snapshot, gpuPath: true);
                     AddEncoderTuningPayload(encoderStatsPayload, _options);
@@ -6234,6 +6395,36 @@ internal static class Program
             catch (OperationCanceledException)
             {
                 // Expected during teardown.
+            }
+        }
+
+        private void MaybeRestartEncoderForCadenceLoss(RealtimeEncoderStatsSnapshot snapshot)
+        {
+            if (!_encoderStarted || !OperatingSystem.IsWindows() || _options.VideoFps < 90)
+            {
+                return;
+            }
+
+            var targetFps = Math.Max(1, _options.VideoFps);
+            var lowStreamFps = snapshot.StreamFps > 0 && snapshot.StreamFps < targetFps * 0.92;
+            var sendHealthy = snapshot.P95SendMs < 2.0;
+            var cadenceLooks60Hz = snapshot.P50FrameIntervalMs >= 14.0 || snapshot.P95FrameIntervalMs >= 15.0;
+            var encoderLooks60Hz = snapshot.AvgEncodeMs >= 10.0 || snapshot.P95EncodeMs >= 14.0 || snapshot.P99EncodeMs >= 15.0;
+            if (lowStreamFps && sendHealthy && (cadenceLooks60Hz || encoderLooks60Hz))
+            {
+                _encoderWatchdogStrikeCount++;
+                if (_encoderWatchdogStrikeCount >= EncoderWatchdogStrikeThreshold)
+                {
+                    RestartEncoder(
+                        $"cadence_loss streamFps={snapshot.StreamFps:F1} frameInterval={snapshot.P50FrameIntervalMs:F2}/{snapshot.P95FrameIntervalMs:F2}/{snapshot.P99FrameIntervalMs:F2}ms encode={snapshot.AvgEncodeMs:F1}/{snapshot.P95EncodeMs:F1}/{snapshot.P99EncodeMs:F1}ms sendP95={snapshot.P95SendMs:F1}ms");
+                }
+
+                return;
+            }
+
+            if (snapshot.StreamFps >= targetFps * 0.96 || !sendHealthy)
+            {
+                _encoderWatchdogStrikeCount = 0;
             }
         }
 
@@ -6571,9 +6762,26 @@ internal static class Program
             return nv12Texture;
         }
 
-        private ID3D11Texture2D CreateNv12Texture()
+        public ID3D11Texture2D CreateNv12Texture()
         {
             return _device.CreateTexture2D(CreateNv12TextureDescription());
+        }
+
+        public void CopyNv12Texture(ID3D11Texture2D source, ID3D11Texture2D destination)
+        {
+            ValidateNv12Texture(source, nameof(source));
+            ValidateNv12Texture(destination, nameof(destination));
+            _context.CopyResource(destination, source);
+            _context.Flush();
+        }
+
+        private void ValidateNv12Texture(ID3D11Texture2D texture, string parameterName)
+        {
+            var description = texture.Description;
+            if (description.Width != _width || description.Height != _height || description.Format != Format.NV12)
+            {
+                throw new ArgumentException("Texture must be an NV12 texture matching the configured video dimensions.", parameterName);
+            }
         }
 
         private int RentNv12Texture(CancellationToken cancellationToken)
@@ -6897,6 +7105,37 @@ internal static class Program
     }
 
     [SupportedOSPlatform("windows")]
+    private static class KeyedMutexNative
+    {
+        private const int AcquireSyncSlot = 8;
+        private const int ReleaseSyncSlot = 9;
+
+        [UnmanagedFunctionPointer(CallingConvention.StdCall)]
+        private delegate int AcquireSyncDelegate(IntPtr thisPtr, ulong key, int milliseconds);
+
+        [UnmanagedFunctionPointer(CallingConvention.StdCall)]
+        private delegate int ReleaseSyncDelegate(IntPtr thisPtr, ulong key);
+
+        public static int AcquireSync(IDXGIKeyedMutex mutex, ulong key, int milliseconds)
+        {
+            var thisPtr = mutex.NativePointer;
+            var vtbl = Marshal.ReadIntPtr(thisPtr);
+            var method = Marshal.ReadIntPtr(vtbl, AcquireSyncSlot * IntPtr.Size);
+            var call = Marshal.GetDelegateForFunctionPointer<AcquireSyncDelegate>(method);
+            return call(thisPtr, key, milliseconds);
+        }
+
+        public static int ReleaseSync(IDXGIKeyedMutex mutex, ulong key)
+        {
+            var thisPtr = mutex.NativePointer;
+            var vtbl = Marshal.ReadIntPtr(thisPtr);
+            var method = Marshal.ReadIntPtr(vtbl, ReleaseSyncSlot * IntPtr.Size);
+            var call = Marshal.GetDelegateForFunctionPointer<ReleaseSyncDelegate>(method);
+            return call(thisPtr, key);
+        }
+    }
+
+    [SupportedOSPlatform("windows")]
     private sealed class IddGpuFrameSource : IGpuFrameSource
     {
         private const string MetadataName = "Global\\SideDockGpuFrameMetadata";
@@ -6909,6 +7148,8 @@ internal static class Program
         private const int MetadataHeaderSize = 72;
         private const int SlotHeaderSize = 32;
         private const int FrameReadyTimeoutMs = 500;
+        private const int PollFrameReadyTimeoutMs = 0;
+        private const int DxgiErrorWaitTimeout = unchecked((int)0x887A0027);
         private static readonly TimeSpan StartupTimeout = TimeSpan.FromSeconds(10);
         private static readonly string[] SlotNames =
         [
@@ -6947,6 +7188,8 @@ internal static class Program
         private long _lastFrameStopwatchTicks;
         private long _framesCaptured;
         private long _framesDropped;
+        private long _staleSlotsReleased;
+        private long _staleSlotReleaseFailures;
 
         public IddGpuFrameSource(HostOptions options, Action<string> log)
         {
@@ -7027,11 +7270,8 @@ internal static class Program
             cancellationToken.ThrowIfCancellationRequested();
             var frameReady = _frameReady ?? throw new InvalidOperationException("Idd GPU frame-ready event has not opened.");
 
-            var signaled = frameReady.WaitOne(FrameReadyTimeoutMs);
-            if (!signaled)
-            {
-                throw new CaptureException("IDD_GPU_FRAME_TIMEOUT", "Timed out waiting for an Idd GPU frame.");
-            }
+            var waitMilliseconds = GetFrameReadyWaitMilliseconds();
+            var signaled = frameReady.WaitOne(waitMilliseconds);
 
             var metadata = ReadMetadata();
             ValidateMetadata(metadata);
@@ -7040,14 +7280,74 @@ internal static class Program
                 OpenDeviceAndTextures(metadata);
             }
 
-            var slotIndex = metadata.LatestSlot;
+            var previousSeq = Volatile.Read(ref _lastSeq);
+            var slotIndex = FindLatestReadableSlot(metadata, previousSeq);
             if (slotIndex < 0 || slotIndex >= _slotCount)
             {
-                throw new CaptureException("IDD_GPU_SLOT_INVALID", $"Invalid Idd GPU latest slot {slotIndex}.");
+                if (!signaled)
+                {
+                    throw new CaptureException("IDD_GPU_FRAME_TIMEOUT", "Timed out waiting for an Idd GPU frame.");
+                }
+
+                throw new CaptureException("IDD_GPU_FRAME_STALE", "Idd GPU did not publish a newer frame.");
             }
 
+            return AcquireSlotFrame(metadata, previousSeq, slotIndex, waitMilliseconds);
+        }
+
+        private int GetFrameReadyWaitMilliseconds()
+        {
+            return Math.Clamp(1000 / Math.Max(1, _options.VideoFps), 1, FrameReadyTimeoutMs);
+        }
+
+        public bool TryAcquireLatestFrame(out GpuFrameLease? frame)
+        {
+            frame = null;
+            var metadata = ReadMetadata();
+            ValidateMetadata(metadata);
+            if (metadata.Generation != _generation || metadata.Width != _width || metadata.Height != _height || metadata.SlotCount != _slotCount)
+            {
+                OpenDeviceAndTextures(metadata);
+            }
+
+            var previousSeq = Volatile.Read(ref _lastSeq);
+            var slotIndex = FindLatestReadableSlot(metadata, previousSeq);
+            if (slotIndex < 0 || slotIndex >= _slotCount)
+            {
+                return false;
+            }
+
+            frame = AcquireSlotFrame(metadata, previousSeq, slotIndex, PollFrameReadyTimeoutMs);
+            return true;
+        }
+
+        private int FindLatestReadableSlot(IddGpuFrameMetadata metadata, long previousSeq)
+        {
+            var bestSlotIndex = -1;
+            var bestSeq = previousSeq;
+            for (var slotIndex = 0; slotIndex < _slotCount; slotIndex++)
+            {
+                var slot = ReadSlot(slotIndex);
+                if (slot.Seq <= bestSeq ||
+                    slot.Width != metadata.Width ||
+                    slot.Height != metadata.Height ||
+                    slot.Format != FrameFormatBgra ||
+                    slot.State == 0)
+                {
+                    continue;
+                }
+
+                bestSeq = slot.Seq;
+                bestSlotIndex = slotIndex;
+            }
+
+            return bestSlotIndex;
+        }
+
+        private GpuFrameLease AcquireSlotFrame(IddGpuFrameMetadata metadata, long previousSeq, int slotIndex, int acquireTimeoutMs)
+        {
             var slot = ReadSlot(slotIndex);
-            if (slot.Seq <= Volatile.Read(ref _lastSeq))
+            if (slot.Seq <= previousSeq)
             {
                 Interlocked.Increment(ref _framesDropped);
                 throw new CaptureException("IDD_GPU_FRAME_STALE", "Idd GPU did not publish a newer frame.");
@@ -7061,21 +7361,41 @@ internal static class Program
 
             var mutex = _mutexes[slotIndex] ?? throw new InvalidOperationException($"Idd GPU slot {slotIndex} mutex has not opened.");
             var texture = _textures[slotIndex] ?? throw new InvalidOperationException($"Idd GPU slot {slotIndex} texture has not opened.");
-            try
-            {
-                mutex.AcquireSync(1, FrameReadyTimeoutMs);
-            }
-            catch (SharpGenException ex)
+            var context = _context ?? throw new InvalidOperationException("Idd GPU device context has not started.");
+            ID3D11Texture2D? frameTexture = null;
+            var acquireHr = KeyedMutexNative.AcquireSync(mutex, 1, acquireTimeoutMs);
+            if (acquireHr < 0)
             {
                 Interlocked.Increment(ref _framesDropped);
-                throw new CaptureException("IDD_GPU_SLOT_BUSY", $"Timed out acquiring Idd GPU slot {slotIndex}: {ex.Message}");
+                throw new CaptureException("IDD_GPU_SLOT_BUSY", $"Timed out acquiring Idd GPU slot {slotIndex}: HRESULT=0x{acquireHr:X8}.");
             }
 
-            var previousSeq = Volatile.Read(ref _lastSeq);
+            try
+            {
+                frameTexture = CreateFrameCopyTexture(texture);
+                context.CopyResource(frameTexture, texture);
+                context.Flush();
+            }
+            catch
+            {
+                frameTexture?.Dispose();
+                throw;
+            }
+            finally
+            {
+                ReleaseSlotMutex(mutex, slotIndex, slot.Seq);
+            }
+
+            var releasedSkipped = ReleaseSkippedSlots(metadata, previousSeq, slot.Seq, slotIndex);
             var skipped = slot.Seq - previousSeq - 1;
             if (skipped > 0)
             {
                 Interlocked.Add(ref _framesDropped, skipped);
+            }
+
+            if (releasedSkipped > skipped)
+            {
+                Interlocked.Add(ref _framesDropped, releasedSkipped - skipped);
             }
 
             Volatile.Write(ref _lastSeq, slot.Seq);
@@ -7086,7 +7406,9 @@ internal static class Program
                 _log($"gpu frames captured={_framesCaptured} dropped={_framesDropped} seq={slot.Seq} timestampQpc={slot.TimestampQpc}");
             }
 
-            return new GpuFrameLease(texture, slot.Seq, slot.TimestampQpc, () => mutex.ReleaseSync(0));
+            var ownedTexture = frameTexture;
+            frameTexture = null;
+            return new GpuFrameLease(ownedTexture, slot.Seq, slot.TimestampQpc, () => ownedTexture.Dispose());
         }
 
         public void Dispose()
@@ -7238,6 +7560,7 @@ internal static class Program
                     out _,
                     out _context).CheckError();
                 _device1 = _device.QueryInterface<ID3D11Device1>();
+                EnableMultithreadProtection(_device);
             }
 
             for (var slotIndex = 0; slotIndex < metadata.SlotCount; slotIndex++)
@@ -7260,7 +7583,7 @@ internal static class Program
             _height = metadata.Height;
             _slotCount = metadata.SlotCount;
             _generation = metadata.Generation;
-            Volatile.Write(ref _lastSeq, Math.Max(0, metadata.WriteSeq - 1));
+            Volatile.Write(ref _lastSeq, 0);
         }
 
         private bool AdapterMatches(IddGpuFrameMetadata metadata)
@@ -7294,6 +7617,111 @@ internal static class Program
             }
 
             throw new CaptureException("IDD_GPU_ADAPTER_NOT_FOUND", $"Unable to find DXGI adapter LUID=0x{metadata.AdapterLuidHigh:X8}{metadata.AdapterLuidLow:X8}.");
+        }
+
+        private void EnableMultithreadProtection(ID3D11Device device)
+        {
+            try
+            {
+                using var multithread = device.QueryInterface<ID3D11Multithread>();
+                multithread.SetMultithreadProtected(true);
+                _log("enabled D3D11 multithread protection");
+            }
+            catch (SharpGenException ex)
+            {
+                _log($"D3D11 multithread protection unavailable: {ex.Message}");
+            }
+        }
+
+        private ID3D11Texture2D CreateFrameCopyTexture(ID3D11Texture2D sourceTexture)
+        {
+            var device = _device ?? throw new InvalidOperationException("Idd GPU device has not started.");
+            var description = sourceTexture.Description;
+            description.Usage = ResourceUsage.Default;
+            description.BindFlags = BindFlags.ShaderResource | BindFlags.RenderTarget;
+            description.CPUAccessFlags = CpuAccessFlags.None;
+            description.MiscFlags = ResourceOptionFlags.None;
+            return device.CreateTexture2D(in description);
+        }
+
+        private void ReleaseSlotMutex(IDXGIKeyedMutex mutex, int slotIndex, long sequence)
+        {
+            var hr = KeyedMutexNative.ReleaseSync(mutex, 0);
+            if (hr < 0)
+            {
+                Interlocked.Increment(ref _staleSlotReleaseFailures);
+                _log($"gpu slot release ignored slot={slotIndex} seq={sequence}: HRESULT=0x{hr:X8}");
+            }
+        }
+
+        private int ReleaseSkippedSlots(IddGpuFrameMetadata metadata, long previousSeq, long currentSeq, int currentSlotIndex)
+        {
+            var released = 0;
+            var failures = 0;
+            for (var slotIndex = 0; slotIndex < _slotCount; slotIndex++)
+            {
+                if (slotIndex == currentSlotIndex)
+                {
+                    continue;
+                }
+
+                var slot = ReadSlot(slotIndex);
+                if (slot.Seq <= previousSeq ||
+                    slot.Seq >= currentSeq ||
+                    slot.Width != metadata.Width ||
+                    slot.Height != metadata.Height ||
+                    slot.Format != FrameFormatBgra ||
+                    slot.State == 0)
+                {
+                    continue;
+                }
+
+                var mutex = _mutexes[slotIndex];
+                if (mutex is null)
+                {
+                    continue;
+                }
+
+                var acquireHr = KeyedMutexNative.AcquireSync(mutex, 1, 0);
+                if (acquireHr < 0)
+                {
+                    if (acquireHr != DxgiErrorWaitTimeout)
+                    {
+                        failures++;
+                    }
+
+                    continue;
+                }
+
+                var releaseHr = KeyedMutexNative.ReleaseSync(mutex, 0);
+                if (releaseHr < 0)
+                {
+                    failures++;
+                    continue;
+                }
+
+                released++;
+            }
+
+            if (released > 0)
+            {
+                var total = Interlocked.Add(ref _staleSlotsReleased, released);
+                if ((total % 300) < released)
+                {
+                    _log($"gpu skipped slots released total={total}");
+                }
+            }
+
+            if (failures > 0)
+            {
+                var total = Interlocked.Add(ref _staleSlotReleaseFailures, failures);
+                if ((total % 300) < failures)
+                {
+                    _log($"gpu skipped slot release failures total={total}");
+                }
+            }
+
+            return released;
         }
 
         private IddGpuFrameMetadata WaitForReadyMetadata(Stopwatch waitStartedAt, CancellationToken cancellationToken)
@@ -7367,6 +7795,7 @@ internal static class Program
         private uint _dxgiResetToken;
         private int _outputBufferSize;
         private bool _outputProvidesSamples;
+        private const int AsyncMftInputWaitMs = 1000;
         private bool _asyncMft;
         private bool _asyncMftNeedsInput;
         private bool _started;
@@ -8027,7 +8456,7 @@ internal static class Program
             var eventGenerator = _eventGenerator ?? throw new InvalidOperationException("Media Foundation async encoder event generator is not initialized.");
             var packets = new List<byte[]>();
             var inputSubmitted = false;
-            var inputDeadline = Stopwatch.GetTimestamp() + MillisecondsToStopwatchTicks(100);
+            var inputDeadline = Stopwatch.GetTimestamp() + MillisecondsToStopwatchTicks(AsyncMftInputWaitMs);
 
             while (!inputSubmitted)
             {
@@ -8051,7 +8480,7 @@ internal static class Program
 
                 if (Stopwatch.GetTimestamp() >= inputDeadline)
                 {
-                    throw new TimeoutException("Media Foundation async encoder did not request input in time.");
+                    throw new TimeoutException($"Media Foundation async encoder did not accept input within {AsyncMftInputWaitMs}ms.");
                 }
 
                 Thread.Sleep(1);
@@ -11840,7 +12269,7 @@ internal static class Program
         [
             new("720p", 1280, 720, 4_000_000, 6_000_000, 12_000_000, 60),
             new("1080p", 1920, 1080, 8_000_000, 14_000_000, 28_000_000, 60),
-            new("2k", 2560, 1440, 16_000_000, 28_000_000, 64_000_000, 30)
+            new("2k", 2560, 1440, 16_000_000, 28_000_000, 56_000_000, 120)
         ];
 
         public int BitrateDeltaFromLegacy => Bitrate - LegacyAutoBitrate;

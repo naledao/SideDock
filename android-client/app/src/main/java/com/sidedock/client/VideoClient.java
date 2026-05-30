@@ -11,6 +11,7 @@ import java.io.EOFException;
 import java.io.InputStream;
 import java.net.InetSocketAddress;
 import java.net.Socket;
+import java.net.SocketTimeoutException;
 import java.nio.ByteBuffer;
 import java.util.ArrayDeque;
 import java.util.ArrayList;
@@ -346,16 +347,24 @@ public final class VideoClient {
         }
     }
 
+    private boolean isSupersededGeneration(long runGeneration) {
+        synchronized (lifecycleLock) {
+            return generation != runGeneration;
+        }
+    }
+
     private void connectLoop(long runGeneration) {
         boolean firstAttempt = true;
         while (running && isCurrentGeneration(runGeneration) && surface != null && surface.isValid()) {
             emitState(firstAttempt ? "CONNECTING" : "RECONNECTING");
             firstAttempt = false;
+            Socket attemptSocket = null;
 
             try {
-                openDecodeRead();
+                attemptSocket = new Socket();
+                openDecodeRead(attemptSocket, runGeneration);
             } catch (Exception ex) {
-                if (running) {
+                if (running && !isSupersededGeneration(runGeneration)) {
                     decodeErrors += 1;
                     String message = ex.getMessage() == null ? ex.getClass().getSimpleName() : ex.getMessage();
                     String code = isDecoderUnsupported(ex) ? ERROR_DECODER_UNSUPPORTED : ERROR_VIDEO_FAILED;
@@ -364,8 +373,10 @@ public final class VideoClient {
                     emitLog("视频通道断开: " + message);
                 }
             } finally {
-                closeSocket();
-                emitStats();
+                closeSocket(attemptSocket);
+                if (!isSupersededGeneration(runGeneration)) {
+                    emitStats();
+                }
             }
 
             if (running && isCurrentGeneration(runGeneration) && surface != null && surface.isValid()) {
@@ -379,12 +390,18 @@ public final class VideoClient {
         }
     }
 
-    private void openDecodeRead() throws Exception {
-        Socket nextSocket = new Socket();
+    private void openDecodeRead(Socket nextSocket, long runGeneration) throws Exception {
         nextSocket.setTcpNoDelay(true);
         nextSocket.connect(new InetSocketAddress(host, port), 3000);
         nextSocket.setSoTimeout(5000);
-        socket = nextSocket;
+        synchronized (lifecycleLock) {
+            if (!running || generation != runGeneration) {
+                nextSocket.close();
+                throw new IllegalStateException("Video client generation stopped before socket registration");
+            }
+
+            socket = nextSocket;
+        }
         emitState("CONNECTED");
         emitLog("视频通道已连接 " + host + ":" + port);
         Log.i(TAG, "connected " + host + ":" + port);
@@ -396,24 +413,39 @@ public final class VideoClient {
         MediaCodec.BufferInfo bufferInfo = new MediaCodec.BufferInfo();
         long submittedPackets = 0L;
         long lastStatsAt = System.currentTimeMillis();
+        boolean decodeDisabled = false;
 
         try {
             while (running && !nextSocket.isClosed()) {
                 VideoPacket packet = readPacket(input);
                 packetsReceived += 1;
                 recordPacketKind(packet);
-                codecConfig.scan(packet.payload);
-                pendingPackets.add(packet);
 
-                if (codec == null && (codecConfig.isReady() || pendingPackets.size() >= 30)) {
-                    codec = createDecoder(codecConfig);
-                    emitLog("MediaCodec 已启动，csd=" + codecConfig.isReady());
-                    Log.i(TAG, "MediaCodec started csd=" + codecConfig.isReady());
-                }
+                if (!decodeDisabled) {
+                    codecConfig.scan(packet.payload);
+                    pendingPackets.add(packet);
 
-                while (codec != null && !pendingPackets.isEmpty()) {
-                    submittedPackets += 1L;
-                    queuePacket(codec, bufferInfo, pendingPackets.removeFirst(), submittedPackets);
+                    try {
+                        if (codec == null && (codecConfig.isReady() || pendingPackets.size() >= 30)) {
+                            codec = createDecoder(codecConfig);
+                            emitLog("MediaCodec 已启动，csd=" + codecConfig.isReady());
+                            Log.i(TAG, "MediaCodec started csd=" + codecConfig.isReady());
+                        }
+
+                        while (codec != null && !pendingPackets.isEmpty()) {
+                            submittedPackets += 1L;
+                            queuePacket(codec, bufferInfo, pendingPackets.removeFirst(), submittedPackets);
+                        }
+                    } catch (Exception ex) {
+                        decodeErrors += 1;
+                        decodeDisabled = true;
+                        pendingPackets.clear();
+                        releaseCodecQuietly(codec);
+                        codec = null;
+                        String message = ex.getMessage() == null ? ex.getClass().getSimpleName() : ex.getMessage();
+                        Log.e(TAG, "decoder disabled; continuing receive-only", ex);
+                        emitLog("解码停用，仅接收视频流: " + message);
+                    }
                 }
 
                 long now = System.currentTimeMillis();
@@ -424,12 +456,19 @@ public final class VideoClient {
             }
         } finally {
             if (codec != null) {
-                try {
-                    codec.stop();
-                } catch (Exception ignored) {
-                }
-                codec.release();
+                releaseCodecQuietly(codec);
             }
+        }
+    }
+
+    private void releaseCodecQuietly(MediaCodec codec) {
+        try {
+            codec.stop();
+        } catch (Exception ignored) {
+        }
+        try {
+            codec.release();
+        } catch (Exception ignored) {
         }
     }
 
@@ -635,7 +674,12 @@ public final class VideoClient {
     private static void readFully(InputStream input, byte[] buffer, int offset, int length) throws Exception {
         int readTotal = 0;
         while (readTotal < length) {
-            int read = input.read(buffer, offset + readTotal, length - readTotal);
+            int read;
+            try {
+                read = input.read(buffer, offset + readTotal, length - readTotal);
+            } catch (SocketTimeoutException ex) {
+                continue;
+            }
             if (read < 0) {
                 throw new EOFException();
             }
@@ -716,13 +760,37 @@ public final class VideoClient {
     }
 
     private void closeSocket() {
-        try {
-            if (socket != null) {
-                socket.close();
-            }
-        } catch (Exception ignored) {
-        } finally {
+        Socket currentSocket;
+        synchronized (lifecycleLock) {
+            currentSocket = socket;
             socket = null;
+        }
+
+        closeSocketQuietly(currentSocket);
+    }
+
+    private void closeSocket(Socket targetSocket) {
+        if (targetSocket == null) {
+            return;
+        }
+
+        synchronized (lifecycleLock) {
+            if (socket == targetSocket) {
+                socket = null;
+            }
+        }
+
+        closeSocketQuietly(targetSocket);
+    }
+
+    private static void closeSocketQuietly(Socket targetSocket) {
+        if (targetSocket == null) {
+            return;
+        }
+
+        try {
+            targetSocket.close();
+        } catch (Exception ignored) {
         }
     }
 
