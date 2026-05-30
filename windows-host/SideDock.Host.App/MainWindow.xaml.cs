@@ -5,6 +5,7 @@ using Microsoft.UI;
 using Microsoft.UI.Xaml;
 using Microsoft.UI.Xaml.Controls;
 using Microsoft.UI.Xaml.Media;
+using Windows.ApplicationModel.DataTransfer;
 
 namespace SideDock.Host.App;
 
@@ -412,13 +413,18 @@ public sealed partial class MainWindow : Window
         InstallDriverButton.IsEnabled = false;
         DriverInstallStatusText.Text = "正在启动驱动安装器，请在管理员权限弹窗中选择“是”。";
 
+        // The installer runs elevated (runas), so we cannot capture its stdout/stderr
+        // directly. Instead we hand it a result-file path; it writes a full diagnostic
+        // report there that we read back after it exits.
+        var reportPath = BuildDriverInstallLogPath();
+
         try
         {
             _driverInstallerPath ??= ResolveDriverInstallerPath();
             var startInfo = new ProcessStartInfo
             {
                 FileName = _driverInstallerPath,
-                Arguments = "--from-app",
+                Arguments = $"--from-app --result {QuoteArgument(reportPath)}",
                 WorkingDirectory = Path.GetDirectoryName(_driverInstallerPath) ?? Environment.CurrentDirectory,
                 UseShellExecute = true,
                 Verb = "runas"
@@ -428,21 +434,39 @@ public sealed partial class MainWindow : Window
                 ?? throw new InvalidOperationException($"无法启动 {DriverInstallerExe}。");
 
             await process.WaitForExitAsync();
+
             if (process.ExitCode == 0)
             {
                 _deviceToolPath = null;
                 DriverInstallStatusText.Text = "驱动安装流程已完成。若显示器没有立即出现，请点“启动显示器”。";
+                TryDeleteFile(reportPath);
             }
             else
             {
-                DriverInstallStatusText.Text = $"驱动安装器退出码: {process.ExitCode}。";
-                ShowError("驱动安装未完成", $"安装器退出码: {process.ExitCode}");
+                DriverInstallStatusText.Text = $"驱动安装未完成（退出码 {process.ExitCode}）。点开详情可一键复制。";
+                var report = TryReadFile(reportPath);
+                var summary = $"安装器以退出码 {process.ExitCode} 结束。下面是详细诊断信息，点“复制详情”可一键复制后发给开发者排查。";
+                var details = !string.IsNullOrWhiteSpace(report)
+                    ? $"日志文件: {reportPath}{Environment.NewLine}{Environment.NewLine}{report}"
+                    : $"安装器以退出码 {process.ExitCode} 结束，但未生成诊断报告（{reportPath} 不存在）。{Environment.NewLine}"
+                      + $"可能原因：驱动安装器版本过旧，或无法写入日志目录。{Environment.NewLine}"
+                      + $"安装器路径: {_driverInstallerPath}";
+                ShowErrorWithDetails("驱动安装未完成", summary, details);
             }
+        }
+        catch (System.ComponentModel.Win32Exception ex) when (ex.NativeErrorCode == 1223)
+        {
+            DriverInstallStatusText.Text = "驱动安装已取消（未授予管理员权限）。";
+            ShowError("驱动安装已取消", "你在管理员权限弹窗中选择了“否”，安装未开始。请重新点击“安装/修复驱动”，并在弹窗中选择“是”。");
         }
         catch (Exception ex)
         {
             DriverInstallStatusText.Text = "驱动安装未完成。";
-            ShowError("无法安装驱动", ex.Message);
+            var report = TryReadFile(reportPath);
+            var details = !string.IsNullOrWhiteSpace(report)
+                ? $"日志文件: {reportPath}{Environment.NewLine}{Environment.NewLine}{report}"
+                : ex.ToString();
+            ShowErrorWithDetails("无法安装驱动", $"启动或执行驱动安装器时出错：{ex.Message}", details);
         }
         finally
         {
@@ -698,6 +722,114 @@ public sealed partial class MainWindow : Window
             Content = message,
             CloseButtonText = "OK",
             DefaultButton = ContentDialogButton.Close
+        };
+
+        await dialog.ShowAsync();
+    }
+
+    private static string BuildDriverInstallLogPath()
+    {
+        var directory = Path.Combine(
+            Environment.GetFolderPath(Environment.SpecialFolder.CommonApplicationData),
+            "SideDock",
+            "Logs");
+
+        // Pre-create the directory from the (non-elevated) host so the elevated installer
+        // only needs to write the file into it, and so this process reliably owns and can
+        // read the report back even when elevation runs under a different admin account.
+        try
+        {
+            Directory.CreateDirectory(directory);
+        }
+        catch
+        {
+            // The installer also creates this directory; ignore and let it try.
+        }
+
+        return Path.Combine(directory, $"driver-install-{DateTime.Now:yyyyMMdd-HHmmss}-{Guid.NewGuid():N}.log");
+    }
+
+    private static string? TryReadFile(string path)
+    {
+        try
+        {
+            return File.Exists(path) ? File.ReadAllText(path, System.Text.Encoding.UTF8) : null;
+        }
+        catch
+        {
+            return null;
+        }
+    }
+
+    private static void TryDeleteFile(string path)
+    {
+        try
+        {
+            if (File.Exists(path))
+            {
+                File.Delete(path);
+            }
+        }
+        catch
+        {
+            // Best effort: a leftover success log is harmless.
+        }
+    }
+
+    private async void ShowErrorWithDetails(string title, string summary, string details)
+    {
+        var summaryText = new TextBlock
+        {
+            Text = summary,
+            TextWrapping = TextWrapping.Wrap
+        };
+
+        // A read-only, selectable multiline TextBox: the 复制详情 button copies it in one
+        // click, and the user can still select + Ctrl+C manually if the clipboard API fails.
+        var detailBox = new TextBox
+        {
+            Text = details,
+            IsReadOnly = true,
+            AcceptsReturn = true,
+            TextWrapping = TextWrapping.NoWrap,
+            FontFamily = new FontFamily("Consolas"),
+            IsSpellCheckEnabled = false,
+            MinWidth = 560,
+            MaxHeight = 480
+        };
+        ScrollViewer.SetVerticalScrollBarVisibility(detailBox, ScrollBarVisibility.Auto);
+        ScrollViewer.SetHorizontalScrollBarVisibility(detailBox, ScrollBarVisibility.Auto);
+
+        var panel = new StackPanel { Spacing = 12 };
+        panel.Children.Add(summaryText);
+        panel.Children.Add(detailBox);
+
+        var dialog = new ContentDialog
+        {
+            XamlRoot = Content.XamlRoot,
+            Title = title,
+            Content = panel,
+            PrimaryButtonText = "复制详情",
+            CloseButtonText = "关闭",
+            DefaultButton = ContentDialogButton.Primary
+        };
+        dialog.Resources["ContentDialogMaxWidth"] = 820.0;
+
+        dialog.PrimaryButtonClick += (sender, args) =>
+        {
+            args.Cancel = true; // Keep the dialog open so the user can copy again / read on.
+            try
+            {
+                var package = new DataPackage { RequestedOperation = DataPackageOperation.Copy };
+                package.SetText(details);
+                Clipboard.SetContent(package);
+                Clipboard.Flush();
+                sender.PrimaryButtonText = "已复制 ✓";
+            }
+            catch
+            {
+                sender.PrimaryButtonText = "复制失败，请手动选择文本复制";
+            }
         };
 
         await dialog.ShowAsync();

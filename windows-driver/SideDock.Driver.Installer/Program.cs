@@ -3,7 +3,9 @@ using System.IO.Compression;
 using System.Reflection;
 using System.Security.Cryptography.X509Certificates;
 using System.Security.Principal;
+using System.Text;
 using System.Text.RegularExpressions;
+using System.Runtime.InteropServices;
 const string AppName = "SideDock Driver Installer";
 const string DeviceToolExe = "SideDock.Idd.DeviceTool.exe";
 const string DriverInf = "SideDock.Idd.inf";
@@ -12,6 +14,17 @@ const string DriverCatalog = "SideDock.Idd.cat";
 const string DriverBinary = "SideDock.Idd.dll";
 const string DriverHardwareId = @"SWD\SideDockIdd\SideDockIdd";
 var options = InstallerOptions.Parse(args);
+
+// Tee everything written to the console into a transcript buffer so a full,
+// copyable diagnostic report can be persisted for the (non-elevated) host app,
+// which cannot capture this elevated process's stdout/stderr directly.
+var transcript = new StringBuilder();
+var standardOut = Console.Out;
+var standardError = Console.Error;
+var transcriptWriter = new StringWriter(transcript);
+Console.SetOut(new TeeTextWriter(standardOut, transcriptWriter));
+Console.SetError(new TeeTextWriter(standardError, transcriptWriter));
+var currentStep = "检查运行环境";
 
 try
 {
@@ -30,12 +43,14 @@ try
         return 1;
     }
 
+    currentStep = "解压驱动负载";
     var payloadRoot = ExtractPayload();
     var driverPackageDir = FindDirectory(payloadRoot, "SideDock.Idd")
         ?? FailDirectory("SideDock.Idd");
     var deviceToolDir = FindDirectory(payloadRoot, "SideDock.Idd.DeviceTool")
         ?? FailDirectory("SideDock.Idd.DeviceTool");
 
+    currentStep = "定位已签名驱动文件";
     var infPath = ResolveSignedDriverInf(driverPackageDir);
 
     var certificatePath = Directory.GetFiles(driverPackageDir, DriverCertificate, SearchOption.AllDirectories)
@@ -53,17 +68,25 @@ try
     Console.WriteLine($"Device tool: {deviceToolPath}");
     Console.WriteLine();
 
+    currentStep = "信任驱动证书";
     TrustDriverCertificate(certificatePath);
+    currentStep = "停止已有 DeviceTool 进程";
     StopExistingDeviceToolProcesses();
+    currentStep = "移除旧的虚拟显示设备";
     RemoveExistingSoftwareDevice();
+    currentStep = "卸载旧驱动包";
     RemoveExistingDriverPackages();
+    currentStep = "安装驱动包 (pnputil /add-driver)";
     InstallDriver(infPath);
+    currentStep = "启动 DeviceTool";
     StartDeviceTool(deviceToolPath, options.HideDeviceTool);
 
+    currentStep = "完成";
     Console.WriteLine();
     Console.WriteLine("SideDock driver installation has started.");
     Console.WriteLine("Keep the SideDock.Idd.DeviceTool window running while using the virtual display.");
     Console.WriteLine("Open Windows Display Settings and look for 'SideDock Virtual Display'.");
+    WriteResultReport(options.ResultPath, BuildReport(true, 0, currentStep, null, transcript.ToString(), Environment.CommandLine));
     Pause(options.NoPause);
     return 0;
 }
@@ -71,6 +94,7 @@ catch (Exception ex)
 {
     Console.Error.WriteLine();
     Console.Error.WriteLine($"ERROR: {ex.Message}");
+    WriteResultReport(options.ResultPath, BuildReport(false, 1, currentStep, ex, transcript.ToString(), Environment.CommandLine));
     Pause(options.NoPause);
     return 1;
 }
@@ -602,18 +626,133 @@ static void Pause(bool noPause)
     }
 }
 
-internal readonly record struct InstallerOptions(bool NoPause, bool HideDeviceTool)
+static string BuildReport(bool success, int exitCode, string step, Exception? ex, string transcript, string commandLine)
+{
+    var report = new StringBuilder();
+    report.AppendLine("SideDock 驱动安装诊断报告");
+    report.AppendLine("================================");
+    report.AppendLine($"结果: {(success ? "成功" : "失败")}");
+    report.AppendLine($"退出码: {exitCode}");
+    if (!success)
+    {
+        report.AppendLine($"失败步骤: {step}");
+    }
+    report.AppendLine($"时间: {DateTimeOffset.Now:yyyy-MM-dd HH:mm:ss zzz}");
+    report.AppendLine($"安装器版本: {Assembly.GetExecutingAssembly().GetName().Version?.ToString() ?? "unknown"}");
+    report.AppendLine($"操作系统: {RuntimeInformation.OSDescription} ({RuntimeInformation.OSArchitecture})");
+    report.AppendLine($"管理员权限: {(IsAdministrator() ? "是" : "否")}");
+    report.AppendLine($"命令行: {commandLine}");
+
+    if (ex is not null)
+    {
+        report.AppendLine();
+        report.AppendLine("错误信息:");
+        report.AppendLine(ex.Message);
+        report.AppendLine();
+        report.AppendLine($"异常类型: {ex.GetType().FullName}");
+        if (!string.IsNullOrWhiteSpace(ex.StackTrace))
+        {
+            report.AppendLine("堆栈跟踪:");
+            report.AppendLine(ex.StackTrace);
+        }
+    }
+
+    report.AppendLine();
+    report.AppendLine("---- 完整安装日志 ----");
+    report.Append(transcript);
+    return report.ToString();
+}
+
+static void WriteResultReport(string? path, string content)
+{
+    if (string.IsNullOrWhiteSpace(path))
+    {
+        return;
+    }
+
+    try
+    {
+        var directory = Path.GetDirectoryName(path);
+        if (!string.IsNullOrWhiteSpace(directory))
+        {
+            Directory.CreateDirectory(directory);
+        }
+
+        File.WriteAllText(path, content, new UTF8Encoding(encoderShouldEmitUTF8Identifier: false));
+    }
+    catch (Exception ex)
+    {
+        // A failure to persist the diagnostic report must never mask the real result.
+        Console.Error.WriteLine($"WARN: 无法写入诊断报告到 {path}: {ex.Message}");
+    }
+}
+
+internal readonly record struct InstallerOptions(bool NoPause, bool HideDeviceTool, string? ResultPath)
 {
     public static InstallerOptions Parse(string[] args)
     {
         var fromApp = args.Any(arg => arg.Equals("--from-app", StringComparison.OrdinalIgnoreCase));
         var noPause = fromApp || args.Any(arg => arg.Equals("--no-pause", StringComparison.OrdinalIgnoreCase));
         var hideDeviceTool = fromApp || args.Any(arg => arg.Equals("--hide-device-tool", StringComparison.OrdinalIgnoreCase));
-        return new InstallerOptions(noPause, hideDeviceTool);
+
+        string? resultPath = null;
+        for (var i = 0; i < args.Length; i++)
+        {
+            if (args[i].Equals("--result", StringComparison.OrdinalIgnoreCase) && i + 1 < args.Length)
+            {
+                resultPath = args[i + 1];
+            }
+            else if (args[i].StartsWith("--result=", StringComparison.OrdinalIgnoreCase))
+            {
+                resultPath = args[i]["--result=".Length..];
+            }
+        }
+
+        return new InstallerOptions(noPause, hideDeviceTool, resultPath);
     }
 }
 
 internal readonly record struct ProcessResult(int ExitCode, string Stdout, string Stderr);
+
+// Mirrors everything written to one TextWriter (the real console) into a second
+// one (an in-memory transcript), so the full install log can be saved to disk.
+internal sealed class TeeTextWriter : TextWriter
+{
+    private readonly TextWriter _primary;
+    private readonly TextWriter _secondary;
+
+    public TeeTextWriter(TextWriter primary, TextWriter secondary)
+    {
+        _primary = primary;
+        _secondary = secondary;
+    }
+
+    public override Encoding Encoding => _primary.Encoding;
+
+    public override void Write(char value)
+    {
+        _primary.Write(value);
+        _secondary.Write(value);
+    }
+
+    public override void Write(string? value)
+    {
+        _primary.Write(value);
+        _secondary.Write(value);
+    }
+
+    public override void WriteLine(string? value)
+    {
+        _primary.WriteLine(value);
+        _secondary.WriteLine(value);
+    }
+
+    public override void Flush()
+    {
+        _primary.Flush();
+        _secondary.Flush();
+    }
+}
 
 internal sealed class DriverPackageBuilder
 {
