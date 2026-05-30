@@ -136,7 +136,8 @@ namespace SideDock::Idd
         INT X = 0;
         INT Y = 0;
         IDDCX_CURSOR_SHAPE_INFO ShapeInfo = {};
-        std::array<BYTE, MaxHardwareCursorShapeBytes> ShapeBuffer = {};
+        const BYTE* ShapeBuffer = nullptr;
+        UINT ShapeBufferSize = 0;
     };
 
     class SharedFrameBuffer

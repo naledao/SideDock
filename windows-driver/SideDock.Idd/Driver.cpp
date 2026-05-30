@@ -1452,7 +1452,18 @@ bool SwapChainProcessor::BlendHardwareCursorIntoBgra(
     const auto cursorWidth = cursor.ShapeInfo.Width;
     const auto cursorHeight = cursor.ShapeInfo.Height;
     const auto cursorPitch = cursor.ShapeInfo.Pitch;
-    if (cursorWidth == 0 || cursorHeight == 0 || cursorPitch < cursorWidth * 4)
+    const size_t cursorRowBytes = static_cast<size_t>(cursorWidth) * 4;
+    if (cursor.ShapeBuffer == nullptr ||
+        cursorWidth == 0 ||
+        cursorHeight == 0 ||
+        cursorPitch < cursorRowBytes)
+    {
+        return false;
+    }
+
+    const size_t requiredShapeBytes =
+        static_cast<size_t>(cursorHeight - 1) * cursorPitch + cursorRowBytes;
+    if (requiredShapeBytes > cursor.ShapeBufferSize)
     {
         return false;
     }
@@ -1475,7 +1486,7 @@ bool SwapChainProcessor::BlendHardwareCursorIntoBgra(
     for (INT y = clippedTop; y < clippedBottom; ++y)
     {
         const UINT cursorY = static_cast<UINT>(y - startY);
-        const BYTE* cursorRow = cursor.ShapeBuffer.data() + static_cast<size_t>(cursorY) * cursorPitch;
+        const BYTE* cursorRow = cursor.ShapeBuffer + static_cast<size_t>(cursorY) * cursorPitch;
         BYTE* frameRow = frame + static_cast<size_t>(y) * mapped.RowPitch;
 
         for (INT x = clippedLeft; x < clippedRight; ++x)
@@ -1830,7 +1841,8 @@ bool MonitorContext::GetHardwareCursorSnapshot(HardwareCursorSnapshot& snapshot)
     snapshot.X = m_lastCursorX;
     snapshot.Y = m_lastCursorY;
     snapshot.ShapeInfo = m_lastCursorShapeInfo;
-    snapshot.ShapeBuffer = m_cursorShapeBuffer;
+    snapshot.ShapeBuffer = m_cursorShapeBuffer.data();
+    snapshot.ShapeBufferSize = static_cast<UINT>(m_cursorShapeBuffer.size());
     return true;
 }
 
