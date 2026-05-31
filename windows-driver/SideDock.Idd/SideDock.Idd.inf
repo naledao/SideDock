@@ -13,9 +13,9 @@ CatalogFile=SideDock.Idd.cat
 DriverVer=05/24/2026,0.1.0.0
 
 [Manufacturer]
-%ManufacturerName%=Standard,NT$ARCH$.10.0...22000
+%ManufacturerName%=Standard,NT$ARCH$.10.0...18362
 
-[Standard.NT$ARCH$.10.0...22000]
+[Standard.NT$ARCH$.10.0...18362]
 %DeviceName%=SideDock_Idd_Install, Root\SideDockIdd
 %DeviceName%=SideDock_Idd_Install, SideDockIdd
 
