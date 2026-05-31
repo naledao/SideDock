@@ -81,7 +81,7 @@ try
     InstallDriver(infPath);
     currentStep = "启动 DeviceTool";
     StartDeviceTool(deviceToolPath, options.HideDeviceTool);
-    currentStep = "Verify virtual display device status";
+    currentStep = "验证虚拟显示设备状态";
     finalDeviceHealth = EnsureVirtualDisplayStarted(infPath, deviceToolPath, options.HideDeviceTool);
 
     currentStep = "完成";
@@ -261,9 +261,9 @@ static DeviceHealthSnapshot EnsureVirtualDisplayStarted(string infPath, string d
 {
     Console.WriteLine("Verifying SideDock virtual display PnP health.");
     var health = WaitForDeviceHealth(TimeSpan.FromSeconds(15));
-    if (health.IsStarted)
+    if (health.IsHealthy)
     {
-        Console.WriteLine($"SideDock virtual display started: {FormatDeviceHealth(health)}");
+        Console.WriteLine($"SideDock virtual display has no public PnP problem: {FormatDeviceHealth(health)}");
         return health;
     }
 
@@ -272,13 +272,13 @@ static DeviceHealthSnapshot EnsureVirtualDisplayStarted(string infPath, string d
     if (health.Present)
     {
         Console.WriteLine("Reapplying the driver package while the software device is present.");
-        InstallDriver(infPath);
+        ReapplyDriverToPresentDevice(infPath);
         RestartAndScanDevice();
 
         health = WaitForDeviceHealth(TimeSpan.FromSeconds(15));
-        if (health.IsStarted)
+        if (health.IsHealthy)
         {
-            Console.WriteLine($"SideDock virtual display started after driver reinstall: {FormatDeviceHealth(health)}");
+            Console.WriteLine($"SideDock virtual display recovered after driver reinstall: {FormatDeviceHealth(health)}");
             return health;
         }
 
@@ -292,20 +292,37 @@ static DeviceHealthSnapshot EnsureVirtualDisplayStarted(string infPath, string d
     StartDeviceTool(deviceToolPath, hideDeviceTool);
 
     health = WaitForDeviceHealth(TimeSpan.FromSeconds(15));
+    if (health.IsHealthy)
+    {
+        Console.WriteLine($"SideDock virtual display recovered after device recreation: {FormatDeviceHealth(health)}");
+        return health;
+    }
+
     if (health.Present)
     {
-        InstallDriver(infPath);
+        ReapplyDriverToPresentDevice(infPath);
         RestartAndScanDevice();
         health = WaitForDeviceHealth(TimeSpan.FromSeconds(15));
     }
 
-    if (health.IsStarted)
+    if (health.IsHealthy)
     {
-        Console.WriteLine($"SideDock virtual display started after device recreation: {FormatDeviceHealth(health)}");
+        Console.WriteLine($"SideDock virtual display recovered after device recreation: {FormatDeviceHealth(health)}");
         return health;
     }
 
-    throw new InvalidOperationException($"SideDock virtual display did not start. Last PnP health: {FormatDeviceHealth(health)}");
+    throw new InvalidOperationException($"SideDock virtual display still has a PnP problem. Last PnP health: {FormatDeviceHealth(health)}");
+}
+
+static ProcessResult ReapplyDriverToPresentDevice(string infPath)
+{
+    var result = Run("pnputil.exe", $"/add-driver {QuoteProcessArgument(infPath)} /install", allowFailure: true);
+    if (result.ExitCode != 0)
+    {
+        Console.WriteLine($"Warning: pnputil /add-driver /install returned {FormatExitCode(result.ExitCode)} while the device was present; continuing with PnP restart/scan.");
+    }
+
+    return result;
 }
 
 static void RestartAndScanDevice()
@@ -330,7 +347,7 @@ static DeviceHealthSnapshot WaitForDeviceHealth(TimeSpan timeout)
             lastDescription = description;
         }
 
-        if (last.IsStarted)
+        if (last.IsHealthy)
         {
             return last;
         }
@@ -405,7 +422,28 @@ static string FormatDeviceHealth(DeviceHealthSnapshot health)
         ? $"Code {code} ({ProblemCodeName(code)})"
         : "none";
 
-    return $"present={health.Present}, started={health.Started}, hasProblem={health.HasProblem}, problem={problem}, status=0x{health.Status:X8}, CM_Get_DevNode_Status=0x{(health.StatusResult ?? 0):X8}";
+    return $"present={health.Present}, started={health.Started}, hasProblem={health.HasProblem}, problem={problem}, status=0x{health.Status:X8} ({FormatStatusFlags(health.Status)}), CM_Get_DevNode_Status=0x{(health.StatusResult ?? 0):X8}";
+}
+
+static string FormatStatusFlags(uint status)
+{
+    var names = new List<string>();
+    AddFlag(NativeMethods.DN_STARTED, "DN_STARTED");
+    AddFlag(NativeMethods.DN_HAS_PROBLEM, "DN_HAS_PROBLEM");
+    AddFlag(NativeMethods.DN_PRIVATE_PROBLEM, "DN_PRIVATE_PROBLEM");
+    AddFlag(NativeMethods.DN_DISABLEABLE, "DN_DISABLEABLE");
+    AddFlag(NativeMethods.DN_REMOVABLE, "DN_REMOVABLE");
+    AddFlag(NativeMethods.DN_NT_ENUMERATOR, "DN_NT_ENUMERATOR");
+    AddFlag(NativeMethods.DN_NT_DRIVER, "DN_NT_DRIVER");
+    return names.Count == 0 ? "none" : string.Join("|", names);
+
+    void AddFlag(uint flag, string name)
+    {
+        if ((status & flag) != 0)
+        {
+            names.Add(name);
+        }
+    }
 }
 
 static string ProblemCodeName(uint code) => code switch
@@ -753,6 +791,12 @@ static string QuoteProcessArgument(string value)
     return "\"" + value.Replace("\"", "\\\"") + "\"";
 }
 
+static string FormatExitCode(int exitCode)
+{
+    var unsigned = unchecked((uint)exitCode);
+    return $"{exitCode} (0x{unsigned:X8})";
+}
+
 static ProcessResult RunChecked(string fileName, string arguments)
 {
     var result = Run(fileName, arguments, allowFailure: false);
@@ -911,6 +955,8 @@ internal readonly record struct DeviceHealthSnapshot(
     int? StatusResult)
 {
     public bool IsStarted => Present && Started && !HasProblem && StatusResult == NativeMethods.CR_SUCCESS;
+
+    public bool IsHealthy => Present && !HasProblem && StatusResult == NativeMethods.CR_SUCCESS;
 }
 
 internal static partial class NativeMethods
@@ -922,6 +968,11 @@ internal static partial class NativeMethods
 
     public const uint DN_STARTED = 0x00000008;
     public const uint DN_HAS_PROBLEM = 0x00000400;
+    public const uint DN_DISABLEABLE = 0x00002000;
+    public const uint DN_REMOVABLE = 0x00004000;
+    public const uint DN_PRIVATE_PROBLEM = 0x00008000;
+    public const uint DN_NT_ENUMERATOR = 0x00800000;
+    public const uint DN_NT_DRIVER = 0x01000000;
 
     [DllImport("cfgmgr32.dll", EntryPoint = "CM_Locate_DevNodeW", ExactSpelling = true, CharSet = CharSet.Unicode)]
     public static extern int CM_Locate_DevNodeW(out uint pdnDevInst, string pDeviceID, uint ulFlags);
