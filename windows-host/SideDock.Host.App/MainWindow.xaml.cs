@@ -358,6 +358,7 @@ public sealed partial class MainWindow : Window
                 FileName = _deviceToolPath,
                 WorkingDirectory = workingDirectory,
                 UseShellExecute = true,
+                Verb = "runas",
                 WindowStyle = ProcessWindowStyle.Hidden
             };
 
