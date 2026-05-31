@@ -102,7 +102,7 @@ For manual development installs, run an elevated PowerShell session, import the 
 Import-Certificate -FilePath .\windows-driver\SideDock.Idd\x64\Debug\SideDock.Idd\SideDock.Idd.cer -CertStoreLocation Cert:\LocalMachine\Root
 Import-Certificate -FilePath .\windows-driver\SideDock.Idd\x64\Debug\SideDock.Idd\SideDock.Idd.cer -CertStoreLocation Cert:\LocalMachine\TrustedPublisher
 pnputil /remove-device SWD\SideDockIdd\SideDockIdd
-pnputil /enum-drivers /class Display /files
+pnputil /enum-drivers   # Windows 11 only: append "/class Display /files" for a filtered, detailed list
 pnputil /delete-driver oemXX.inf /uninstall /force
 pnputil /add-driver .\windows-driver\SideDock.Idd\x64\Debug\SideDock.Idd\SideDock.Idd.inf /install
 ```
@@ -132,7 +132,7 @@ Remove the software device first by closing `SideDock.Idd.DeviceTool.exe`.
 Find the published driver package:
 
 ```powershell
-pnputil /enum-drivers /class Display /files | Select-String -Context 3,8 "SideDock.Idd"
+pnputil /enum-drivers | Select-String -Context 3,8 "SideDock.Idd"   # Windows 11 only: add "/class Display /files" before the pipe
 ```
 
 Then delete the matching `oemXX.inf`:

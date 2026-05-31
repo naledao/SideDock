@@ -324,7 +324,21 @@ static void RemoveExistingDriverPackages()
 
 static IReadOnlyList<DriverPackageInfo> EnumerateInstalledDriverPackages()
 {
-    var result = RunChecked("pnputil.exe", "/enum-drivers /class Display /files");
+    // /class and /files are Windows 11-only filters for /enum-drivers (/class
+    // since 21H2, /files since 22H2); Windows 10 pnputil rejects them, prints
+    // usage, and exits 1. Use the basic form (available since Windows 10 1607)
+    // and let the value-based fallback in ParseDriverPackages identify SideDock
+    // packages. It keys on non-localized values (oemXX.inf, SideDock.Idd.inf,
+    // the Display class GUID), so it also works on localized Windows where
+    // pnputil localizes the field labels. Enumeration is best-effort cleanup
+    // and must not abort the install before /add-driver.
+    var result = Run("pnputil.exe", "/enum-drivers", allowFailure: true);
+    if (result.ExitCode != 0)
+    {
+        Console.WriteLine("Warning: pnputil /enum-drivers failed; skipping old driver package cleanup.");
+        return Array.Empty<DriverPackageInfo>();
+    }
+
     return ParseDriverPackages(result.Stdout);
 }
 
