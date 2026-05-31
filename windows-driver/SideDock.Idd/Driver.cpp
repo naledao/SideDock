@@ -1398,7 +1398,10 @@ bool SwapChainProcessor::TryComposeCursor(ID3D11Texture2D* cleanTexture, ID3D11T
         return true;
     }
 
-    if (cursor.ShapeInfo.CursorType != IDDCX_CURSOR_SHAPE_TYPE_ALPHA ||
+    const bool supportedCursorType =
+        cursor.ShapeInfo.CursorType == IDDCX_CURSOR_SHAPE_TYPE_ALPHA ||
+        cursor.ShapeInfo.CursorType == IDDCX_CURSOR_SHAPE_TYPE_MASKED_COLOR;
+    if (!supportedCursorType ||
         cursor.ShapeInfo.Width == 0 ||
         cursor.ShapeInfo.Height == 0 ||
         cursor.ShapeInfo.Pitch < cursor.ShapeInfo.Width * 4)
@@ -1482,6 +1485,8 @@ bool SwapChainProcessor::BlendHardwareCursorIntoBgra(
     const INT clippedRight = std::min<INT>(static_cast<INT>(width), endX);
     const INT clippedBottom = std::min<INT>(static_cast<INT>(height), endY);
     BYTE* frame = static_cast<BYTE*>(mapped.pData);
+    const bool maskedColor =
+        cursor.ShapeInfo.CursorType == IDDCX_CURSOR_SHAPE_TYPE_MASKED_COLOR;
 
     for (INT y = clippedTop; y < clippedBottom; ++y)
     {
@@ -1494,6 +1499,31 @@ bool SwapChainProcessor::BlendHardwareCursorIntoBgra(
             const UINT cursorX = static_cast<UINT>(x - startX);
             const BYTE* source = cursorRow + static_cast<size_t>(cursorX) * 4;
             BYTE* destination = frameRow + static_cast<size_t>(x) * 4;
+
+            if (maskedColor)
+            {
+                // MASKED_COLOR: byte[3] is a 1-bit AND mask, not a real alpha.
+                //   mask == 0x00 -> opaque: copy the cursor color over the screen.
+                //   mask == 0xFF -> XOR the cursor color with the screen, so a zero
+                //                   color leaves the screen unchanged (transparent) and
+                //                   a set color inverts it. This is what makes the I-beam
+                //                   and other monochrome cursors blend without a black box.
+                if (source[3] == 0)
+                {
+                    destination[0] = source[0];
+                    destination[1] = source[1];
+                    destination[2] = source[2];
+                }
+                else
+                {
+                    destination[0] ^= source[0];
+                    destination[1] ^= source[1];
+                    destination[2] ^= source[2];
+                }
+                destination[3] = 255;
+                continue;
+            }
+
             const UINT alpha = source[3];
             if (alpha == 0)
             {
@@ -1883,12 +1913,13 @@ bool MonitorContext::HandleHardwareCursorUpdate()
     TraceEvents(
         TRACE_LEVEL_VERBOSE,
         TRACE_MONITOR,
-        "%!FUNC! cursor visible=%u x=%d y=%d updated=%u shape=%u size=%ux%u",
+        "%!FUNC! cursor visible=%u x=%d y=%d updated=%u shape=%u type=%u size=%ux%u",
         m_lastCursorVisible,
         m_lastCursorX,
         m_lastCursorY,
         result.IsCursorShapeUpdated,
         m_lastCursorShapeId,
+        static_cast<UINT>(m_lastCursorShapeInfo.CursorType),
         m_lastCursorShapeInfo.Width,
         m_lastCursorShapeInfo.Height);
     return true;
