@@ -225,6 +225,7 @@ jobs:
             /m `
             /p:Configuration=$env:BUILD_CONFIGURATION `
             /p:Platform=$env:DRIVER_PLATFORM `
+            /p:_NT_TARGET_VERSION=0xA000007 `
             /p:RunCodeAnalysis=false `
             /p:EnablePREfast=false `
             /p:SkipPackageVerification=true `
@@ -235,9 +236,17 @@ jobs:
         run: |
           $ErrorActionPreference = "Stop"
           $driverPackage = Resolve-Path ".\windows-driver\SideDock.Idd\x64\Release\SideDock.Idd"
+          $infPath = Join-Path $driverPackage "SideDock.Idd.inf"
           $certPath = Join-Path $driverPackage "SideDock.Idd.cer"
           $catPath = Join-Path $driverPackage "sidedock.idd.cat"
           $signtool = "${env:ProgramFiles(x86)}\Windows Kits\10\bin\10.0.26100.0\x64\signtool.exe"
+          $infContent = Get-Content -Raw $infPath
+          if ($infContent -notmatch 'NTamd64\.10\.0\.\.\.18362') {
+            throw "Driver INF was not stamped for Windows 10 1903+ (18362): $infPath"
+          }
+          if ($infContent -match 'NTamd64\.10\.0\.\.\.22000') {
+            throw "Driver INF was stamped for Windows 11 only (22000): $infPath"
+          }
           $cert = New-SelfSignedCertificate `
             -Type CodeSigningCert `
             -Subject "CN=SideDock Self-Signed Driver" `
@@ -265,6 +274,11 @@ jobs:
           New-Item -ItemType Directory -Force $driverDest, $toolDest | Out-Null
           Copy-Item -Recurse -Force .\windows-driver\SideDock.Idd\x64 $driverDest
           Copy-Item -Recurse -Force .\windows-driver\SideDock.Idd.DeviceTool\x64 $toolDest
+          $payloadInf = Join-Path $driverDest "Release\SideDock.Idd\SideDock.Idd.inf"
+          $payloadInfContent = Get-Content -Raw $payloadInf
+          if ($payloadInfContent -notmatch 'NTamd64\.10\.0\.\.\.18362') {
+            throw "Driver payload INF was not stamped for Windows 10 1903+ (18362): $payloadInf"
+          }
           Compress-Archive -Path (Join-Path $payloadRoot "*") -DestinationPath .\windows-driver\SideDock.Driver.Installer\DriverPayload.zip -Force
           dotnet publish .\windows-driver\SideDock.Driver.Installer\SideDock.Driver.Installer.csproj `
             --configuration Release `
