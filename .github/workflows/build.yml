@@ -274,7 +274,7 @@ jobs:
           New-Item -ItemType Directory -Force $driverDest, $toolDest | Out-Null
           Copy-Item -Recurse -Force .\windows-driver\SideDock.Idd\x64 $driverDest
           Copy-Item -Recurse -Force .\windows-driver\SideDock.Idd.DeviceTool\x64 $toolDest
-          $payloadInf = Join-Path $driverDest "Release\SideDock.Idd\SideDock.Idd.inf"
+          $payloadInf = Join-Path $driverDest "x64\Release\SideDock.Idd\SideDock.Idd.inf"
           $payloadInfContent = Get-Content -Raw $payloadInf
           if ($payloadInfContent -notmatch 'NTamd64\.10\.0\.\.\.18362') {
             throw "Driver payload INF was not stamped for Windows 10 1903+ (18362): $payloadInf"
