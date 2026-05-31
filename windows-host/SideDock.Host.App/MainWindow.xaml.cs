@@ -383,13 +383,13 @@ public sealed partial class MainWindow : Window
             if (showCopyableError)
             {
                 ShowErrorWithDetails(
-                    “无法启动虚拟显示器”,
-                    $”{failureAction}：{ex.Message}。下面是详细诊断信息，点”复制详情”可一键复制。”,
+                    "无法启动虚拟显示器",
+                    $"{failureAction}：{ex.Message}。下面是详细诊断信息，点“复制详情”可一键复制。",
                     details);
             }
             else
             {
-                ShowError(“无法启动虚拟显示器”, ex.Message);
+                ShowError("无法启动虚拟显示器", ex.Message);
             }
 
             return false;
