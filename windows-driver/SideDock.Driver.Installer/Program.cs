@@ -14,6 +14,7 @@ const string DriverCatalog = "SideDock.Idd.cat";
 const string DriverBinary = "SideDock.Idd.dll";
 const string DriverHardwareId = @"SWD\SideDockIdd\SideDockIdd";
 var options = InstallerOptions.Parse(args);
+DeviceHealthSnapshot? finalDeviceHealth = null;
 
 // Tee everything written to the console into a transcript buffer so a full,
 // copyable diagnostic report can be persisted for the (non-elevated) host app,
@@ -80,13 +81,15 @@ try
     InstallDriver(infPath);
     currentStep = "启动 DeviceTool";
     StartDeviceTool(deviceToolPath, options.HideDeviceTool);
+    currentStep = "Verify virtual display device status";
+    finalDeviceHealth = EnsureVirtualDisplayStarted(infPath, deviceToolPath, options.HideDeviceTool);
 
     currentStep = "完成";
     Console.WriteLine();
     Console.WriteLine("SideDock driver installation has started.");
     Console.WriteLine("Keep the SideDock.Idd.DeviceTool window running while using the virtual display.");
     Console.WriteLine("Open Windows Display Settings and look for 'SideDock Virtual Display'.");
-    WriteResultReport(options.ResultPath, BuildReport(true, 0, currentStep, null, transcript.ToString(), Environment.CommandLine));
+    WriteResultReport(options.ResultPath, BuildReport(true, 0, currentStep, null, transcript.ToString(), Environment.CommandLine, finalDeviceHealth));
     Pause(options.NoPause);
     return 0;
 }
@@ -94,7 +97,8 @@ catch (Exception ex)
 {
     Console.Error.WriteLine();
     Console.Error.WriteLine($"ERROR: {ex.Message}");
-    WriteResultReport(options.ResultPath, BuildReport(false, 1, currentStep, ex, transcript.ToString(), Environment.CommandLine));
+    finalDeviceHealth ??= TryReadDeviceHealth(allowPhantom: true);
+    WriteResultReport(options.ResultPath, BuildReport(false, 1, currentStep, ex, transcript.ToString(), Environment.CommandLine, finalDeviceHealth));
     Pause(options.NoPause);
     return 1;
 }
@@ -252,6 +256,171 @@ static void InstallDriver(string infPath)
     Console.WriteLine("Installing driver package with pnputil.");
     RunChecked("pnputil.exe", $"/add-driver {QuoteProcessArgument(infPath)} /install");
 }
+
+static DeviceHealthSnapshot EnsureVirtualDisplayStarted(string infPath, string deviceToolPath, bool hideDeviceTool)
+{
+    Console.WriteLine("Verifying SideDock virtual display PnP health.");
+    var health = WaitForDeviceHealth(TimeSpan.FromSeconds(15));
+    if (health.IsStarted)
+    {
+        Console.WriteLine($"SideDock virtual display started: {FormatDeviceHealth(health)}");
+        return health;
+    }
+
+    Console.WriteLine($"Initial PnP health is not started: {FormatDeviceHealth(health)}");
+
+    if (health.Present)
+    {
+        Console.WriteLine("Reapplying the driver package while the software device is present.");
+        InstallDriver(infPath);
+        RestartAndScanDevice();
+
+        health = WaitForDeviceHealth(TimeSpan.FromSeconds(15));
+        if (health.IsStarted)
+        {
+            Console.WriteLine($"SideDock virtual display started after driver reinstall: {FormatDeviceHealth(health)}");
+            return health;
+        }
+
+        Console.WriteLine($"PnP health after driver reinstall: {FormatDeviceHealth(health)}");
+    }
+
+    Console.WriteLine("Recreating the software device and applying the driver package again.");
+    StopExistingDeviceToolProcesses();
+    RemoveExistingSoftwareDevice();
+    InstallDriver(infPath);
+    StartDeviceTool(deviceToolPath, hideDeviceTool);
+
+    health = WaitForDeviceHealth(TimeSpan.FromSeconds(15));
+    if (health.Present)
+    {
+        InstallDriver(infPath);
+        RestartAndScanDevice();
+        health = WaitForDeviceHealth(TimeSpan.FromSeconds(15));
+    }
+
+    if (health.IsStarted)
+    {
+        Console.WriteLine($"SideDock virtual display started after device recreation: {FormatDeviceHealth(health)}");
+        return health;
+    }
+
+    throw new InvalidOperationException($"SideDock virtual display did not start. Last PnP health: {FormatDeviceHealth(health)}");
+}
+
+static void RestartAndScanDevice()
+{
+    Run("pnputil.exe", $"/restart-device {QuoteProcessArgument(DriverHardwareId)}", allowFailure: true);
+    Run("pnputil.exe", "/scan-devices", allowFailure: true);
+}
+
+static DeviceHealthSnapshot WaitForDeviceHealth(TimeSpan timeout)
+{
+    var deadline = DateTimeOffset.UtcNow + timeout;
+    var last = ReadDeviceHealth(allowPhantom: false);
+    var lastDescription = string.Empty;
+
+    while (DateTimeOffset.UtcNow < deadline)
+    {
+        last = ReadDeviceHealth(allowPhantom: false);
+        var description = FormatDeviceHealth(last);
+        if (!string.Equals(description, lastDescription, StringComparison.Ordinal))
+        {
+            Console.WriteLine($"  {description}");
+            lastDescription = description;
+        }
+
+        if (last.IsStarted)
+        {
+            return last;
+        }
+
+        Thread.Sleep(500);
+    }
+
+    return last;
+}
+
+static DeviceHealthSnapshot? TryReadDeviceHealth(bool allowPhantom)
+{
+    try
+    {
+        return ReadDeviceHealth(allowPhantom);
+    }
+    catch (Exception ex)
+    {
+        Console.WriteLine($"Unable to read SideDock PnP health: {ex.Message}");
+        return null;
+    }
+}
+
+static DeviceHealthSnapshot ReadDeviceHealth(bool allowPhantom)
+{
+    var locateFlags = allowPhantom ? NativeMethods.CM_LOCATE_DEVNODE_PHANTOM : NativeMethods.CM_LOCATE_DEVNODE_NORMAL;
+    var locateResult = NativeMethods.CM_Locate_DevNodeW(out var devInst, DriverHardwareId, locateFlags);
+    if (locateResult != NativeMethods.CR_SUCCESS)
+    {
+        return new DeviceHealthSnapshot(
+            Present: false,
+            Started: false,
+            HasProblem: false,
+            ProblemCode: null,
+            Status: 0,
+            LocateResult: locateResult,
+            StatusResult: null);
+    }
+
+    var statusResult = NativeMethods.CM_Get_DevNode_Status(out var status, out var problemCode, devInst, 0);
+    if (statusResult != NativeMethods.CR_SUCCESS)
+    {
+        return new DeviceHealthSnapshot(
+            Present: true,
+            Started: false,
+            HasProblem: false,
+            ProblemCode: null,
+            Status: 0,
+            LocateResult: locateResult,
+            StatusResult: statusResult);
+    }
+
+    var hasProblem = (status & NativeMethods.DN_HAS_PROBLEM) != 0;
+    return new DeviceHealthSnapshot(
+        Present: true,
+        Started: (status & NativeMethods.DN_STARTED) != 0,
+        HasProblem: hasProblem,
+        ProblemCode: hasProblem ? problemCode : null,
+        Status: status,
+        LocateResult: locateResult,
+        StatusResult: statusResult);
+}
+
+static string FormatDeviceHealth(DeviceHealthSnapshot health)
+{
+    if (!health.Present)
+    {
+        return $"device not present (CM_Locate_DevNode=0x{health.LocateResult:X8})";
+    }
+
+    var problem = health.ProblemCode is { } code
+        ? $"Code {code} ({ProblemCodeName(code)})"
+        : "none";
+
+    return $"present={health.Present}, started={health.Started}, hasProblem={health.HasProblem}, problem={problem}, status=0x{health.Status:X8}, CM_Get_DevNode_Status=0x{(health.StatusResult ?? 0):X8}";
+}
+
+static string ProblemCodeName(uint code) => code switch
+{
+    1 => "CM_PROB_NOT_CONFIGURED",
+    10 => "CM_PROB_FAILED_START",
+    14 => "CM_PROB_NEED_RESTART",
+    18 => "CM_PROB_REINSTALL",
+    22 => "CM_PROB_DISABLED",
+    28 => "CM_PROB_FAILED_INSTALL",
+    31 => "CM_PROB_FAILED_ADD",
+    39 => "CM_PROB_DRIVER_FAILED_LOAD",
+    52 => "CM_PROB_UNSIGNED_DRIVER",
+    _ => "CM_PROB_UNKNOWN"
+};
 
 static void TrustDriverCertificate(string certificatePath)
 {
@@ -640,7 +809,7 @@ static void Pause(bool noPause)
     }
 }
 
-static string BuildReport(bool success, int exitCode, string step, Exception? ex, string transcript, string commandLine)
+static string BuildReport(bool success, int exitCode, string step, Exception? ex, string transcript, string commandLine, DeviceHealthSnapshot? deviceHealth)
 {
     var report = new StringBuilder();
     report.AppendLine("SideDock 驱动安装诊断报告");
@@ -656,6 +825,10 @@ static string BuildReport(bool success, int exitCode, string step, Exception? ex
     report.AppendLine($"操作系统: {RuntimeInformation.OSDescription} ({RuntimeInformation.OSArchitecture})");
     report.AppendLine($"管理员权限: {(IsAdministrator() ? "是" : "否")}");
     report.AppendLine($"命令行: {commandLine}");
+    if (deviceHealth is { } health)
+    {
+        report.AppendLine($"PnP 设备状态: {FormatDeviceHealth(health)}");
+    }
 
     if (ex is not null)
     {
@@ -727,6 +900,35 @@ internal readonly record struct InstallerOptions(bool NoPause, bool HideDeviceTo
 }
 
 internal readonly record struct ProcessResult(int ExitCode, string Stdout, string Stderr);
+
+internal readonly record struct DeviceHealthSnapshot(
+    bool Present,
+    bool Started,
+    bool HasProblem,
+    uint? ProblemCode,
+    uint Status,
+    int LocateResult,
+    int? StatusResult)
+{
+    public bool IsStarted => Present && Started && !HasProblem && StatusResult == NativeMethods.CR_SUCCESS;
+}
+
+internal static partial class NativeMethods
+{
+    public const int CR_SUCCESS = 0x00000000;
+
+    public const uint CM_LOCATE_DEVNODE_NORMAL = 0x00000000;
+    public const uint CM_LOCATE_DEVNODE_PHANTOM = 0x00000001;
+
+    public const uint DN_STARTED = 0x00000008;
+    public const uint DN_HAS_PROBLEM = 0x00000400;
+
+    [DllImport("cfgmgr32.dll", EntryPoint = "CM_Locate_DevNodeW", ExactSpelling = true, CharSet = CharSet.Unicode)]
+    public static extern int CM_Locate_DevNodeW(out uint pdnDevInst, string pDeviceID, uint ulFlags);
+
+    [DllImport("cfgmgr32.dll", EntryPoint = "CM_Get_DevNode_Status", ExactSpelling = true)]
+    public static extern int CM_Get_DevNode_Status(out uint pulStatus, out uint pulProblemNumber, uint dnDevInst, uint ulFlags);
+}
 
 // Mirrors everything written to one TextWriter (the real console) into a second
 // one (an in-memory transcript), so the full install log can be saved to disk.
