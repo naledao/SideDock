@@ -309,6 +309,7 @@
                                         <RowDefinition Height="Auto" />
                                         <RowDefinition Height="Auto" />
                                         <RowDefinition Height="Auto" />
+                                        <RowDefinition Height="Auto" />
                                     </Grid.RowDefinitions>
 
                                     <FontIcon Glyph="&#xE8D7;" FontSize="14" />
@@ -326,9 +327,18 @@
                                         Foreground="{ThemeResource TextFillColorSecondaryBrush}"
                                         TextWrapping="Wrap" />
 
-                                    <FontIcon Grid.Row="2" Glyph="&#xE946;" FontSize="14" />
+                                    <FontIcon Grid.Row="2" Glyph="&#xE8D7;" FontSize="14" />
                                     <TextBlock
+                                        x:Name="AdbStatusText"
                                         Grid.Row="2"
+                                        Grid.Column="1"
+                                        Text="ADB reverse 会在启动主机前自动检查并配置。"
+                                        Foreground="{ThemeResource TextFillColorSecondaryBrush}"
+                                        TextWrapping="Wrap" />
+
+                                    <FontIcon Grid.Row="3" Glyph="&#xE946;" FontSize="14" />
+                                    <TextBlock
+                                        Grid.Row="3"
                                         Grid.Column="1"
                                         Text="Android 默认使用 27183 和 27184 端口连接。"
                                         Foreground="{ThemeResource TextFillColorSecondaryBrush}"

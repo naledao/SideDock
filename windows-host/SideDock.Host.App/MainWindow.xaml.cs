@@ -1,5 +1,6 @@
 using System.Diagnostics;
 using System.IO.Compression;
+using System.Globalization;
 using System.Reflection;
 using System.Text;
 using Microsoft.UI;
@@ -49,9 +50,9 @@ public sealed partial class MainWindow : Window
         _displayStatusTimer.Start();
     }
 
-    private void StartHostButton_Click(object sender, RoutedEventArgs e)
+    private async void StartHostButton_Click(object sender, RoutedEventArgs e)
     {
-        StartHost();
+        await StartHostAsync();
     }
 
     private void StopHostButton_Click(object sender, RoutedEventArgs e)
@@ -74,7 +75,7 @@ public sealed partial class MainWindow : Window
         StopVirtualDisplay();
     }
 
-    private void StartHost()
+    private async Task StartHostAsync()
     {
         if (_hostProcess is { HasExited: false })
         {
@@ -85,17 +86,41 @@ public sealed partial class MainWindow : Window
         string? arguments = null;
         string? workingDirectory = null;
         string? adbPath = null;
+        string? adbSerial = null;
         HostProcessLog? hostLog = null;
 
         try
         {
             _hostStopRequestedProcessId = null;
+            StartHostButton.IsEnabled = false;
+            StopHostButton.IsEnabled = false;
+            OverallStatusText.Text = "启动中";
+            OverallStatusText.Foreground = _secondaryBrush;
+            SetAdbStatus("正在检查 ADB reverse...", _secondaryBrush);
+
+            adbPath = ResolveAdbPath(AdbPathBox.Text.Trim());
+            var reversePorts = GetConfiguredReversePorts();
+            var adbPreflight = await ConfigureAdbReverseBeforeHostStartAsync(adbPath, reversePorts);
+            if (!adbPreflight.Success)
+            {
+                SetRunningState(false);
+                SetAdbStatus(adbPreflight.Summary, _dangerBrush);
+                ShowErrorWithDetails(
+                    "无法配置 ADB reverse",
+                    adbPreflight.Summary,
+                    adbPreflight.Details);
+                return;
+            }
+
+            adbSerial = adbPreflight.Serial;
+            SetAdbStatus(adbPreflight.Summary, _successBrush);
 
             if (ShouldManageVirtualDisplayWithHost())
             {
                 var displayWasRunning = IsVirtualDisplayToolRunning();
                 if (!StartVirtualDisplay(failureAction: "启动主机时无法启动虚拟显示器"))
                 {
+                    SetRunningState(false);
                     return;
                 }
 
@@ -118,13 +143,17 @@ public sealed partial class MainWindow : Window
                 StandardErrorEncoding = Encoding.UTF8
             };
 
-            adbPath = AdbPathBox.Text.Trim();
             if (!string.IsNullOrWhiteSpace(adbPath))
             {
                 startInfo.Environment["SIDEDOCK_ADB"] = adbPath;
             }
 
-            hostLog = new HostProcessLog(hostPath, arguments, workingDirectory, adbPath);
+            if (!string.IsNullOrWhiteSpace(adbSerial))
+            {
+                startInfo.Environment["ANDROID_SERIAL"] = adbSerial;
+            }
+
+            hostLog = new HostProcessLog(hostPath, arguments, workingDirectory, adbPath, adbSerial);
             var process = new Process { StartInfo = startInfo, EnableRaisingEvents = true };
             process.OutputDataReceived += (_, args) => hostLog.Append("stdout", args.Data);
             process.ErrorDataReceived += (_, args) => hostLog.Append("stderr", args.Data);
@@ -150,6 +179,7 @@ public sealed partial class MainWindow : Window
                 arguments,
                 workingDirectory,
                 adbPath,
+                adbSerial,
                 exitCode: null,
                 hostLog,
                 ex);
@@ -180,12 +210,26 @@ public sealed partial class MainWindow : Window
         return string.Join(" ", args.Select(QuoteArgument));
     }
 
+    private IReadOnlyList<int> GetConfiguredReversePorts()
+    {
+        var controlPort = PortNumber(ControlPortBox, "control");
+        var videoPort = PortNumber(VideoPortBox, "video");
+        return controlPort == videoPort
+            ? new[] { controlPort }
+            : new[] { controlPort, videoPort };
+    }
+
     private static string Selected(ComboBox comboBox)
     {
         return (comboBox.SelectedItem as ComboBoxItem)?.Content?.ToString() ?? string.Empty;
     }
 
     private static string Port(NumberBox numberBox, string name)
+    {
+        return PortNumber(numberBox, name).ToString(CultureInfo.InvariantCulture);
+    }
+
+    private static int PortNumber(NumberBox numberBox, string name)
     {
         if (double.IsNaN(numberBox.Value))
         {
@@ -198,7 +242,7 @@ public sealed partial class MainWindow : Window
             throw new InvalidOperationException($"{name} 端口无效: {port}");
         }
 
-        return port.ToString();
+        return port;
     }
 
     private static string QuoteArgument(string argument)
@@ -206,6 +250,203 @@ public sealed partial class MainWindow : Window
         return argument.Contains(' ') || argument.Contains('"')
             ? "\"" + argument.Replace("\"", "\\\"") + "\""
             : argument;
+    }
+
+    private static string ResolveAdbPath(string configuredPath)
+    {
+        if (!string.IsNullOrWhiteSpace(configuredPath))
+        {
+            return configuredPath;
+        }
+
+        var candidates = new[]
+        {
+            Environment.GetEnvironmentVariable("ANDROID_HOME"),
+            Environment.GetEnvironmentVariable("ANDROID_SDK_ROOT"),
+            Path.Combine(
+                Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
+                "Android",
+                "Sdk")
+        };
+
+        foreach (var sdkRoot in candidates)
+        {
+            if (string.IsNullOrWhiteSpace(sdkRoot))
+            {
+                continue;
+            }
+
+            var adbPath = Path.Combine(sdkRoot, "platform-tools", "adb.exe");
+            if (File.Exists(adbPath))
+            {
+                return adbPath;
+            }
+        }
+
+        return "adb";
+    }
+
+    private async Task<AdbReversePreflight> ConfigureAdbReverseBeforeHostStartAsync(string adbPath, IReadOnlyList<int> ports)
+    {
+        var report = new StringBuilder();
+        report.AppendLine("SideDock ADB reverse 诊断报告");
+        report.AppendLine($"时间: {DateTimeOffset.Now:yyyy-MM-dd HH:mm:ss zzz}");
+        report.AppendLine($"ADB 路径: {adbPath}");
+        report.AppendLine($"端口: {string.Join(", ", ports)}");
+        report.AppendLine();
+
+        var devices = await RunAdbAsync(adbPath, "devices -l", TimeSpan.FromSeconds(8));
+        AppendAdbCommand(report, adbPath, "devices -l", devices);
+        if (devices.TimedOut)
+        {
+            return new AdbReversePreflight(false, "ADB devices 检查超时，未建立 reverse。", report.ToString(), null);
+        }
+
+        if (devices.ExitCode != 0)
+        {
+            return new AdbReversePreflight(false, $"ADB devices 执行失败（退出码 {devices.ExitCode}），未建立 reverse。", report.ToString(), null);
+        }
+
+        var deviceRows = ParseAdbDevices(devices.Stdout).ToArray();
+        var authorizedDevices = deviceRows
+            .Where(row => row.State.Equals("device", StringComparison.OrdinalIgnoreCase))
+            .ToArray();
+
+        if (authorizedDevices.Length == 0)
+        {
+            var summary = deviceRows.Any(row => row.State.Equals("unauthorized", StringComparison.OrdinalIgnoreCase))
+                ? "Android 设备未授权 USB 调试，ADB reverse 没有建立。请在设备上允许 USB 调试后重新启动主机。"
+                : "未检测到已授权 Android 设备，ADB reverse 没有建立。请连接 USB 并开启 USB 调试后重新启动主机。";
+            return new AdbReversePreflight(false, summary, report.ToString(), null);
+        }
+
+        if (authorizedDevices.Length > 1)
+        {
+            return new AdbReversePreflight(
+                false,
+                "检测到多个已授权 ADB 设备，无法确定要给哪台设备配置 reverse。",
+                report.ToString(),
+                null);
+        }
+
+        var serial = authorizedDevices[0].Serial;
+        foreach (var port in ports.Distinct())
+        {
+            var arguments = $"-s {QuoteArgument(serial)} reverse tcp:{port} tcp:{port}";
+            var reverse = await RunAdbAsync(adbPath, arguments, TimeSpan.FromSeconds(8));
+            AppendAdbCommand(report, adbPath, arguments, reverse);
+            if (reverse.TimedOut)
+            {
+                return new AdbReversePreflight(false, $"ADB reverse tcp:{port} 配置超时。", report.ToString(), serial);
+            }
+
+            if (reverse.ExitCode != 0)
+            {
+                return new AdbReversePreflight(false, $"ADB reverse tcp:{port} 配置失败（退出码 {reverse.ExitCode}）。", report.ToString(), serial);
+            }
+        }
+
+        var listArguments = $"-s {QuoteArgument(serial)} reverse --list";
+        var reverseList = await RunAdbAsync(adbPath, listArguments, TimeSpan.FromSeconds(8));
+        AppendAdbCommand(report, adbPath, listArguments, reverseList);
+
+        var summaryPorts = string.Join("/", ports.Distinct().Select(port => $"tcp:{port}"));
+        return new AdbReversePreflight(true, $"ADB reverse 已配置：{serial} {summaryPorts}", report.ToString(), serial);
+    }
+
+    private static async Task<AdbCommandResult> RunAdbAsync(string adbPath, string arguments, TimeSpan timeout)
+    {
+        var startInfo = new ProcessStartInfo(adbPath, arguments)
+        {
+            RedirectStandardError = true,
+            RedirectStandardOutput = true,
+            UseShellExecute = false,
+            CreateNoWindow = true,
+            StandardOutputEncoding = Encoding.UTF8,
+            StandardErrorEncoding = Encoding.UTF8
+        };
+
+        try
+        {
+            using var process = new Process { StartInfo = startInfo };
+            if (!process.Start())
+            {
+                return new AdbCommandResult(-1, string.Empty, "无法启动 adb", TimedOut: false);
+            }
+
+            using var timeoutCts = new CancellationTokenSource(timeout);
+            var stdoutTask = process.StandardOutput.ReadToEndAsync(timeoutCts.Token);
+            var stderrTask = process.StandardError.ReadToEndAsync(timeoutCts.Token);
+
+            try
+            {
+                await process.WaitForExitAsync(timeoutCts.Token);
+            }
+            catch (OperationCanceledException)
+            {
+                TryKill(process);
+                return new AdbCommandResult(-1, string.Empty, "adb command timed out", TimedOut: true);
+            }
+
+            return new AdbCommandResult(process.ExitCode, (await stdoutTask).Trim(), (await stderrTask).Trim(), TimedOut: false);
+        }
+        catch (Exception ex)
+        {
+            return new AdbCommandResult(-1, string.Empty, ex.Message, TimedOut: false);
+        }
+    }
+
+    private static void TryKill(Process process)
+    {
+        try
+        {
+            if (!process.HasExited)
+            {
+                process.Kill(entireProcessTree: true);
+            }
+        }
+        catch
+        {
+            // Best effort cleanup after an adb timeout.
+        }
+    }
+
+    private static IEnumerable<AdbDeviceRow> ParseAdbDevices(string stdout)
+    {
+        foreach (var rawLine in stdout.Split(new[] { "\r\n", "\n" }, StringSplitOptions.None))
+        {
+            var line = rawLine.Trim();
+            if (string.IsNullOrWhiteSpace(line) ||
+                line.StartsWith("List of devices", StringComparison.OrdinalIgnoreCase))
+            {
+                continue;
+            }
+
+            var parts = line.Split(new[] { ' ', '\t' }, StringSplitOptions.RemoveEmptyEntries);
+            if (parts.Length >= 2)
+            {
+                yield return new AdbDeviceRow(parts[0], parts[1], line);
+            }
+        }
+    }
+
+    private static void AppendAdbCommand(StringBuilder report, string adbPath, string arguments, AdbCommandResult result)
+    {
+        report.AppendLine($"> {adbPath} {arguments}");
+        report.AppendLine($"exitCode={result.ExitCode}, timedOut={result.TimedOut}");
+        if (!string.IsNullOrWhiteSpace(result.Stdout))
+        {
+            report.AppendLine("stdout:");
+            report.AppendLine(result.Stdout);
+        }
+
+        if (!string.IsNullOrWhiteSpace(result.Stderr))
+        {
+            report.AppendLine("stderr:");
+            report.AppendLine(result.Stderr);
+        }
+
+        report.AppendLine();
     }
 
     private string ResolveHostPath()
@@ -755,6 +996,7 @@ public sealed partial class MainWindow : Window
             hostLog.Arguments,
             hostLog.WorkingDirectory,
             hostLog.AdbPath,
+            hostLog.AdbSerial,
             exitCode,
             hostLog,
             exception: null);
@@ -768,6 +1010,7 @@ public sealed partial class MainWindow : Window
         string? arguments,
         string? workingDirectory,
         string? adbPath,
+        string? adbSerial,
         int? exitCode,
         HostProcessLog? hostLog,
         Exception? exception)
@@ -785,6 +1028,7 @@ public sealed partial class MainWindow : Window
         report.AppendLine($"工作目录: {FormatOptional(workingDirectory)}");
         report.AppendLine($"启动参数: {FormatOptional(arguments)}");
         report.AppendLine($"ADB 路径: {FormatOptional(adbPath)}");
+        report.AppendLine($"ADB 设备: {FormatOptional(adbSerial)}");
         report.AppendLine($"视频源: {Selected(VideoSourceCombo)}");
         report.AppendLine($"分辨率: {Selected(ResolutionCombo)}");
         report.AppendLine($"刷新率: {Selected(RefreshRateCombo)}");
@@ -1034,6 +1278,12 @@ public sealed partial class MainWindow : Window
         OverallStatusText.Foreground = running ? _successBrush : _dangerBrush;
     }
 
+    private void SetAdbStatus(string text, Brush brush)
+    {
+        AdbStatusText.Text = text;
+        AdbStatusText.Foreground = brush;
+    }
+
     private async void ShowError(string title, string message)
     {
         var dialog = new ContentDialog
@@ -1160,7 +1410,8 @@ public sealed partial class MainWindow : Window
         string hostPath,
         string arguments,
         string workingDirectory,
-        string? adbPath)
+        string? adbPath,
+        string? adbSerial)
     {
         private const int MaxCharacters = 128 * 1024;
         private readonly object _gate = new();
@@ -1171,6 +1422,7 @@ public sealed partial class MainWindow : Window
         public string Arguments { get; } = arguments;
         public string WorkingDirectory { get; } = workingDirectory;
         public string? AdbPath { get; } = adbPath;
+        public string? AdbSerial { get; } = adbSerial;
 
         public void Append(string stream, string? line)
         {
@@ -1209,6 +1461,12 @@ public sealed partial class MainWindow : Window
             }
         }
     }
+
+    private sealed record AdbReversePreflight(bool Success, string Summary, string Details, string? Serial);
+
+    private sealed record AdbCommandResult(int ExitCode, string Stdout, string Stderr, bool TimedOut);
+
+    private sealed record AdbDeviceRow(string Serial, string State, string RawLine);
 
     private sealed record DeviceToolDiagnostics(int? ExitCode, string Output, bool TimedOut);
 }
