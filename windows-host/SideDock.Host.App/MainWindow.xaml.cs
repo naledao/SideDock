@@ -377,16 +377,19 @@ public sealed partial class MainWindow : Window
         }
         catch (Exception ex)
         {
+            var details = BuildVirtualDisplayFailureDetails(ex, exitCode, diagnostics);
+            SaveVirtualDisplayLog(details);
+
             if (showCopyableError)
             {
                 ShowErrorWithDetails(
-                    "无法启动虚拟显示器",
-                    $"{failureAction}：{ex.Message}。下面是详细诊断信息，点“复制详情”可一键复制。",
-                    BuildVirtualDisplayFailureDetails(ex, exitCode, diagnostics));
+                    “无法启动虚拟显示器”,
+                    $”{failureAction}：{ex.Message}。下面是详细诊断信息，点”复制详情”可一键复制。”,
+                    details);
             }
             else
             {
-                ShowError("无法启动虚拟显示器", ex.Message);
+                ShowError(“无法启动虚拟显示器”, ex.Message);
             }
 
             return false;
@@ -894,6 +897,20 @@ public sealed partial class MainWindow : Window
         }
 
         return report.ToString();
+    }
+
+    private static void SaveVirtualDisplayLog(string details)
+    {
+        try
+        {
+            var path = Path.Combine(
+                AppContext.BaseDirectory,
+                $"virtual-display-{DateTime.Now:yyyyMMdd-HHmmss}.log");
+            File.WriteAllText(path, details, System.Text.Encoding.UTF8);
+        }
+        catch
+        {
+        }
     }
 
     private static void AppendDiagnosticLine(StringBuilder output, object gate, string stream, string? line)
