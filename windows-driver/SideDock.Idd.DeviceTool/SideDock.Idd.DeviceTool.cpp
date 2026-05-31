@@ -10,10 +10,14 @@ VOID WINAPI CreationCallback(
     _In_opt_ PCWSTR deviceInstanceId)
 {
     UNREFERENCED_PARAMETER(softwareDevice);
-    UNREFERENCED_PARAMETER(deviceInstanceId);
 
     auto eventHandle = static_cast<HANDLE>(context);
     printf("SwDeviceCreate callback hr=0x%08lx\n", createResult);
+    if (deviceInstanceId != nullptr)
+    {
+        wprintf(L"SwDeviceCreate instance id=%ls\n", deviceInstanceId);
+    }
+
     SetEvent(eventHandle);
 }
 
@@ -39,8 +43,8 @@ int __cdecl wmain(int argc, wchar_t* argv[])
     SW_DEVICE_CREATE_INFO createInfo = {};
     createInfo.cbSize = sizeof(createInfo);
     createInfo.pszInstanceId = L"SideDockIdd";
-    createInfo.pszzHardwareIds = L"SideDockIdd\0\0";
-    createInfo.pszzCompatibleIds = L"SideDockIdd\0\0";
+    createInfo.pszzHardwareIds = L"SideDockIdd\0SWD\\SideDockIdd\0SWD\\SideDockIdd\\SideDockIdd\0Root\\SideDockIdd\0\0";
+    createInfo.pszzCompatibleIds = L"SideDockIdd\0SWD\\SideDockIdd\0SWD\\SideDockIdd\\SideDockIdd\0Root\\SideDockIdd\0\0";
     createInfo.pszDeviceDescription = L"SideDock Virtual Display";
     createInfo.CapabilityFlags =
         SWDeviceCapabilitiesRemovable |

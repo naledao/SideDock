@@ -311,7 +311,8 @@ static DeviceHealthSnapshot EnsureVirtualDisplayStarted(string infPath, string d
         return health;
     }
 
-    throw new InvalidOperationException($"SideDock virtual display still has a PnP problem. Last PnP health: {FormatDeviceHealth(health)}");
+    DumpDeviceDiagnostics();
+    throw new InvalidOperationException($"SideDock virtual display did not bind as a Display device. Last PnP health: {FormatDeviceHealth(health)}");
 }
 
 static ProcessResult ReapplyDriverToPresentDevice(string infPath)
@@ -329,6 +330,13 @@ static void RestartAndScanDevice()
 {
     Run("pnputil.exe", $"/restart-device {QuoteProcessArgument(DriverHardwareId)}", allowFailure: true);
     Run("pnputil.exe", "/scan-devices", allowFailure: true);
+}
+
+static void DumpDeviceDiagnostics()
+{
+    Console.WriteLine("Collecting SideDock device diagnostics.");
+    Run("pnputil.exe", $"/enum-devices /instanceid {QuoteProcessArgument(DriverHardwareId)} /deviceids", allowFailure: true);
+    Run("pnputil.exe", "/enum-devices /problem /deviceids", allowFailure: true);
 }
 
 static DeviceHealthSnapshot WaitForDeviceHealth(TimeSpan timeout)
@@ -382,6 +390,9 @@ static DeviceHealthSnapshot ReadDeviceHealth(bool allowPhantom)
             Started: false,
             HasProblem: false,
             ProblemCode: null,
+            PropertyProblemCode: null,
+            ClassName: null,
+            ServiceName: null,
             Status: 0,
             LocateResult: locateResult,
             StatusResult: null);
@@ -395,20 +406,94 @@ static DeviceHealthSnapshot ReadDeviceHealth(bool allowPhantom)
             Started: false,
             HasProblem: false,
             ProblemCode: null,
+            PropertyProblemCode: null,
+            ClassName: null,
+            ServiceName: null,
             Status: 0,
             LocateResult: locateResult,
             StatusResult: statusResult);
     }
 
     var hasProblem = (status & NativeMethods.DN_HAS_PROBLEM) != 0;
+    var propertyProblemCode = ReadUInt32DeviceProperty(devInst, NativeMethods.DEVPKEY_Device_ProblemCode);
+    var className = ReadStringDeviceProperty(devInst, NativeMethods.DEVPKEY_Device_Class);
+    var serviceName = ReadStringDeviceProperty(devInst, NativeMethods.DEVPKEY_Device_Service);
+
     return new DeviceHealthSnapshot(
         Present: true,
         Started: (status & NativeMethods.DN_STARTED) != 0,
         HasProblem: hasProblem,
         ProblemCode: hasProblem ? problemCode : null,
+        PropertyProblemCode: propertyProblemCode is > 0 ? propertyProblemCode : null,
+        ClassName: className,
+        ServiceName: serviceName,
         Status: status,
         LocateResult: locateResult,
         StatusResult: statusResult);
+}
+
+static uint? ReadUInt32DeviceProperty(uint devInst, NativeMethods.DevPropKey propertyKey)
+{
+    var property = ReadDeviceProperty(devInst, propertyKey);
+    if (property is null || property.Value.Buffer.Length < sizeof(uint))
+    {
+        return null;
+    }
+
+    return BitConverter.ToUInt32(property.Value.Buffer, 0);
+}
+
+static string? ReadStringDeviceProperty(uint devInst, NativeMethods.DevPropKey propertyKey)
+{
+    var property = ReadDeviceProperty(devInst, propertyKey);
+    if (property is null || property.Value.Buffer.Length == 0)
+    {
+        return null;
+    }
+
+    var value = Encoding.Unicode.GetString(property.Value.Buffer).TrimEnd('\0');
+    return string.IsNullOrWhiteSpace(value) ? null : value;
+}
+
+static DevicePropertyValue? ReadDeviceProperty(uint devInst, NativeMethods.DevPropKey propertyKey)
+{
+    var key = propertyKey;
+    uint propertyType;
+    uint size = 0;
+    var result = NativeMethods.CM_Get_DevNode_PropertyW(devInst, ref key, out propertyType, IntPtr.Zero, ref size, 0);
+    if (result == NativeMethods.CR_NO_SUCH_VALUE)
+    {
+        return null;
+    }
+
+    if (result != NativeMethods.CR_BUFFER_SMALL && result != NativeMethods.CR_SUCCESS)
+    {
+        return null;
+    }
+
+    if (size == 0)
+    {
+        return null;
+    }
+
+    var bufferPointer = Marshal.AllocHGlobal(checked((int)size));
+    try
+    {
+        key = propertyKey;
+        result = NativeMethods.CM_Get_DevNode_PropertyW(devInst, ref key, out propertyType, bufferPointer, ref size, 0);
+        if (result != NativeMethods.CR_SUCCESS)
+        {
+            return null;
+        }
+
+        var buffer = new byte[size];
+        Marshal.Copy(bufferPointer, buffer, 0, buffer.Length);
+        return new DevicePropertyValue(propertyType, buffer);
+    }
+    finally
+    {
+        Marshal.FreeHGlobal(bufferPointer);
+    }
 }
 
 static string FormatDeviceHealth(DeviceHealthSnapshot health)
@@ -421,8 +506,11 @@ static string FormatDeviceHealth(DeviceHealthSnapshot health)
     var problem = health.ProblemCode is { } code
         ? $"Code {code} ({ProblemCodeName(code)})"
         : "none";
+    var propertyProblem = health.PropertyProblemCode is { } propertyCode
+        ? $"Code {propertyCode} ({ProblemCodeName(propertyCode)})"
+        : "none";
 
-    return $"present={health.Present}, started={health.Started}, hasProblem={health.HasProblem}, problem={problem}, status=0x{health.Status:X8} ({FormatStatusFlags(health.Status)}), CM_Get_DevNode_Status=0x{(health.StatusResult ?? 0):X8}";
+    return $"present={health.Present}, started={health.Started}, hasProblem={health.HasProblem}, problem={problem}, propertyProblem={propertyProblem}, class={health.ClassName ?? "unknown"}, service={health.ServiceName ?? "none"}, status=0x{health.Status:X8} ({FormatStatusFlags(health.Status)}), CM_Get_DevNode_Status=0x{(health.StatusResult ?? 0):X8}";
 }
 
 static string FormatStatusFlags(uint status)
@@ -945,23 +1033,36 @@ internal readonly record struct InstallerOptions(bool NoPause, bool HideDeviceTo
 
 internal readonly record struct ProcessResult(int ExitCode, string Stdout, string Stderr);
 
+internal readonly record struct DevicePropertyValue(uint Type, byte[] Buffer);
+
 internal readonly record struct DeviceHealthSnapshot(
     bool Present,
     bool Started,
     bool HasProblem,
     uint? ProblemCode,
+    uint? PropertyProblemCode,
+    string? ClassName,
+    string? ServiceName,
     uint Status,
     int LocateResult,
     int? StatusResult)
 {
     public bool IsStarted => Present && Started && !HasProblem && StatusResult == NativeMethods.CR_SUCCESS;
 
-    public bool IsHealthy => Present && !HasProblem && StatusResult == NativeMethods.CR_SUCCESS;
+    public bool IsHealthy =>
+        Present
+        && !HasProblem
+        && ProblemCode is null or 0
+        && PropertyProblemCode is null or 0
+        && string.Equals(ClassName, DriverPackageInfo.DisplayClassName, StringComparison.OrdinalIgnoreCase)
+        && StatusResult == NativeMethods.CR_SUCCESS;
 }
 
 internal static partial class NativeMethods
 {
     public const int CR_SUCCESS = 0x00000000;
+    public const int CR_BUFFER_SMALL = 0x0000001A;
+    public const int CR_NO_SUCH_VALUE = 0x00000025;
 
     public const uint CM_LOCATE_DEVNODE_NORMAL = 0x00000000;
     public const uint CM_LOCATE_DEVNODE_PHANTOM = 0x00000001;
@@ -974,11 +1075,40 @@ internal static partial class NativeMethods
     public const uint DN_NT_ENUMERATOR = 0x00800000;
     public const uint DN_NT_DRIVER = 0x01000000;
 
+    public static readonly DevPropKey DEVPKEY_Device_Service = new(
+        new Guid("a45c254e-df1c-4efd-8020-67d146a850e0"),
+        6);
+
+    public static readonly DevPropKey DEVPKEY_Device_Class = new(
+        new Guid("a45c254e-df1c-4efd-8020-67d146a850e0"),
+        9);
+
+    public static readonly DevPropKey DEVPKEY_Device_ProblemCode = new(
+        new Guid("4340a6c5-93fa-4706-972c-7b648008a5a7"),
+        3);
+
     [DllImport("cfgmgr32.dll", EntryPoint = "CM_Locate_DevNodeW", ExactSpelling = true, CharSet = CharSet.Unicode)]
     public static extern int CM_Locate_DevNodeW(out uint pdnDevInst, string pDeviceID, uint ulFlags);
 
     [DllImport("cfgmgr32.dll", EntryPoint = "CM_Get_DevNode_Status", ExactSpelling = true)]
     public static extern int CM_Get_DevNode_Status(out uint pulStatus, out uint pulProblemNumber, uint dnDevInst, uint ulFlags);
+
+    [DllImport("cfgmgr32.dll", EntryPoint = "CM_Get_DevNode_PropertyW", ExactSpelling = true)]
+    public static extern int CM_Get_DevNode_PropertyW(uint dnDevInst, ref DevPropKey propertyKey, out uint propertyType, IntPtr propertyBuffer, ref uint propertyBufferSize, uint ulFlags);
+
+    [StructLayout(LayoutKind.Sequential)]
+    public readonly struct DevPropKey
+    {
+        public readonly Guid FormatId;
+
+        public readonly uint PropertyId;
+
+        public DevPropKey(Guid formatId, uint propertyId)
+        {
+            FormatId = formatId;
+            PropertyId = propertyId;
+        }
+    }
 }
 
 // Mirrors everything written to one TextWriter (the real console) into a second

@@ -18,6 +18,8 @@ DriverVer=05/24/2026,0.1.0.0
 [Standard.NT$ARCH$.10.0...18362]
 %DeviceName%=SideDock_Idd_Install, Root\SideDockIdd
 %DeviceName%=SideDock_Idd_Install, SideDockIdd
+%DeviceName%=SideDock_Idd_Install, SWD\SideDockIdd
+%DeviceName%=SideDock_Idd_Install, SWD\SideDockIdd\SideDockIdd
 
 [SourceDisksFiles]
 SideDock.Idd.dll=1
