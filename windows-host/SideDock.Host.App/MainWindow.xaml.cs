@@ -373,6 +373,7 @@ public sealed partial class MainWindow : Window
                 throw new InvalidOperationException($"{DeviceToolExe} exited with code {exitCode}.");
             }
 
+            SaveVirtualDisplayLog(BuildVirtualDisplayStartupDetails());
             return true;
         }
         catch (Exception ex)
@@ -911,6 +912,20 @@ public sealed partial class MainWindow : Window
         catch
         {
         }
+    }
+
+    private string BuildVirtualDisplayStartupDetails()
+    {
+        var report = new StringBuilder();
+        report.AppendLine("SideDock 虚拟显示器启动日志");
+        report.AppendLine($"时间: {DateTimeOffset.Now:yyyy-MM-dd HH:mm:ss zzz}");
+        report.AppendLine($"结果: 成功");
+        report.AppendLine($"DeviceTool 路径: {FormatOptional(_deviceToolPath)}");
+        report.AppendLine($"进程名: {DeviceToolProcessName}");
+        report.AppendLine($"进程 ID: {_deviceToolProcess?.Id}");
+        report.AppendLine($"视频源: {Selected(VideoSourceCombo)}");
+        report.AppendLine($"自动管理虚拟显示器: {ManageDisplaySwitch.IsOn}");
+        return report.ToString();
     }
 
     private static void AppendDiagnosticLine(StringBuilder output, object gate, string stream, string? line)
