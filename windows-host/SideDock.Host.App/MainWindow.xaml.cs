@@ -61,7 +61,7 @@ public sealed partial class MainWindow : Window
 
     private void StartDisplayButton_Click(object sender, RoutedEventArgs e)
     {
-        StartVirtualDisplay();
+        StartVirtualDisplay(failureAction: "启动虚拟显示器失败");
     }
 
     private async void InstallDriverButton_Click(object sender, RoutedEventArgs e)
@@ -94,7 +94,7 @@ public sealed partial class MainWindow : Window
             if (ShouldManageVirtualDisplayWithHost())
             {
                 var displayWasRunning = IsVirtualDisplayToolRunning();
-                if (!StartVirtualDisplay(showCopyableError: true))
+                if (!StartVirtualDisplay(failureAction: "启动主机时无法启动虚拟显示器"))
                 {
                     return;
                 }
@@ -338,7 +338,7 @@ public sealed partial class MainWindow : Window
         }
     }
 
-    private bool StartVirtualDisplay(bool showCopyableError = false)
+    private bool StartVirtualDisplay(bool showCopyableError = true, string failureAction = "启动虚拟显示器失败")
     {
         if (IsVirtualDisplayToolRunning())
         {
@@ -346,13 +346,17 @@ public sealed partial class MainWindow : Window
             return true;
         }
 
+        int? exitCode = null;
+        DeviceToolDiagnostics? diagnostics = null;
+
         try
         {
             _deviceToolPath ??= ResolveDeviceToolPath();
+            var workingDirectory = Path.GetDirectoryName(_deviceToolPath) ?? Environment.CurrentDirectory;
             var startInfo = new ProcessStartInfo
             {
                 FileName = _deviceToolPath,
-                WorkingDirectory = Path.GetDirectoryName(_deviceToolPath) ?? Environment.CurrentDirectory,
+                WorkingDirectory = workingDirectory,
                 UseShellExecute = true,
                 WindowStyle = ProcessWindowStyle.Hidden
             };
@@ -362,8 +366,9 @@ public sealed partial class MainWindow : Window
 
             if (_deviceToolProcess.WaitForExit(2500))
             {
-                var exitCode = _deviceToolProcess.ExitCode;
+                exitCode = _deviceToolProcess.ExitCode;
                 _deviceToolProcess = null;
+                diagnostics = CaptureDeviceToolDiagnostics(_deviceToolPath, workingDirectory);
                 throw new InvalidOperationException($"{DeviceToolExe} exited with code {exitCode}.");
             }
 
@@ -375,8 +380,8 @@ public sealed partial class MainWindow : Window
             {
                 ShowErrorWithDetails(
                     "无法启动虚拟显示器",
-                    $"启动主机时无法启动虚拟显示器：{ex.Message}。下面是详细诊断信息，点“复制详情”可一键复制。",
-                    BuildVirtualDisplayFailureDetails(ex));
+                    $"{failureAction}：{ex.Message}。下面是详细诊断信息，点“复制详情”可一键复制。",
+                    BuildVirtualDisplayFailureDetails(ex, exitCode, diagnostics));
             }
             else
             {
@@ -800,19 +805,113 @@ public sealed partial class MainWindow : Window
         return report.ToString();
     }
 
-    private string BuildVirtualDisplayFailureDetails(Exception exception)
+    private DeviceToolDiagnostics CaptureDeviceToolDiagnostics(string deviceToolPath, string workingDirectory)
+    {
+        var output = new StringBuilder();
+        var outputGate = new object();
+        try
+        {
+            var startInfo = new ProcessStartInfo
+            {
+                FileName = deviceToolPath,
+                Arguments = "--oneshot",
+                WorkingDirectory = workingDirectory,
+                UseShellExecute = false,
+                CreateNoWindow = true,
+                RedirectStandardOutput = true,
+                RedirectStandardError = true,
+                StandardOutputEncoding = Encoding.UTF8,
+                StandardErrorEncoding = Encoding.UTF8
+            };
+
+            using var process = new Process { StartInfo = startInfo };
+            process.OutputDataReceived += (_, args) => AppendDiagnosticLine(output, outputGate, "stdout", args.Data);
+            process.ErrorDataReceived += (_, args) => AppendDiagnosticLine(output, outputGate, "stderr", args.Data);
+
+            if (!process.Start())
+            {
+                return new DeviceToolDiagnostics(null, "无法启动诊断进程。", TimedOut: false);
+            }
+
+            process.BeginOutputReadLine();
+            process.BeginErrorReadLine();
+
+            if (!process.WaitForExit(12_000))
+            {
+                process.Kill(entireProcessTree: true);
+                process.WaitForExit(3000);
+                return new DeviceToolDiagnostics(TryGetExitCode(process), SnapshotOutput(output, outputGate), TimedOut: true);
+            }
+
+            process.WaitForExit();
+            return new DeviceToolDiagnostics(TryGetExitCode(process), SnapshotOutput(output, outputGate), TimedOut: false);
+        }
+        catch (Exception ex)
+        {
+            AppendDiagnosticLine(output, outputGate, "exception", ex.ToString());
+            return new DeviceToolDiagnostics(null, SnapshotOutput(output, outputGate), TimedOut: false);
+        }
+    }
+
+    private string BuildVirtualDisplayFailureDetails(
+        Exception exception,
+        int? exitCode,
+        DeviceToolDiagnostics? diagnostics)
     {
         var report = new StringBuilder();
         report.AppendLine("SideDock 虚拟显示器启动失败诊断报告");
         report.AppendLine($"时间: {DateTimeOffset.Now:yyyy-MM-dd HH:mm:ss zzz}");
         report.AppendLine($"DeviceTool 路径: {FormatOptional(_deviceToolPath)}");
         report.AppendLine($"进程名: {DeviceToolProcessName}");
+        if (exitCode.HasValue)
+        {
+            report.AppendLine($"原始退出码: {exitCode.Value}");
+        }
+
         report.AppendLine($"视频源: {Selected(VideoSourceCombo)}");
         report.AppendLine($"自动管理虚拟显示器: {ManageDisplaySwitch.IsOn}");
         report.AppendLine();
         report.AppendLine("---- 异常 ----");
         report.AppendLine(exception.ToString());
+        if (diagnostics is not null)
+        {
+            report.AppendLine();
+            report.AppendLine("---- DeviceTool --oneshot 诊断输出 ----");
+            if (diagnostics.ExitCode.HasValue)
+            {
+                report.AppendLine($"诊断退出码: {diagnostics.ExitCode.Value}");
+            }
+
+            if (diagnostics.TimedOut)
+            {
+                report.AppendLine("诊断运行超时，已停止诊断进程。");
+            }
+
+            report.AppendLine(string.IsNullOrWhiteSpace(diagnostics.Output)
+                ? "(没有捕获到 stdout/stderr 输出)"
+                : diagnostics.Output.TrimEnd());
+        }
+
         return report.ToString();
+    }
+
+    private static void AppendDiagnosticLine(StringBuilder output, object gate, string stream, string? line)
+    {
+        if (line is not null)
+        {
+            lock (gate)
+            {
+                output.AppendLine($"{stream}: {line}");
+            }
+        }
+    }
+
+    private static string SnapshotOutput(StringBuilder output, object gate)
+    {
+        lock (gate)
+        {
+            return output.ToString();
+        }
     }
 
     private static int? TryGetProcessId(Process process)
@@ -1077,4 +1176,6 @@ public sealed partial class MainWindow : Window
             }
         }
     }
+
+    private sealed record DeviceToolDiagnostics(int? ExitCode, string Output, bool TimedOut);
 }
