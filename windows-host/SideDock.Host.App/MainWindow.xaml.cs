@@ -1,6 +1,7 @@
 using System.Diagnostics;
 using System.IO.Compression;
 using System.Reflection;
+using System.Text;
 using Microsoft.UI;
 using Microsoft.UI.Xaml;
 using Microsoft.UI.Xaml.Controls;
@@ -28,6 +29,7 @@ public sealed partial class MainWindow : Window
     private string? _deviceToolPath;
     private string? _driverInstallerPath;
     private bool _hostOwnsVirtualDisplay;
+    private int? _hostStopRequestedProcessId;
 
     public MainWindow()
     {
@@ -79,12 +81,20 @@ public sealed partial class MainWindow : Window
             return;
         }
 
+        string? hostPath = null;
+        string? arguments = null;
+        string? workingDirectory = null;
+        string? adbPath = null;
+        HostProcessLog? hostLog = null;
+
         try
         {
+            _hostStopRequestedProcessId = null;
+
             if (ShouldManageVirtualDisplayWithHost())
             {
                 var displayWasRunning = IsVirtualDisplayToolRunning();
-                if (!StartVirtualDisplay())
+                if (!StartVirtualDisplay(showCopyableError: true))
                 {
                     return;
                 }
@@ -92,37 +102,61 @@ public sealed partial class MainWindow : Window
                 _hostOwnsVirtualDisplay = !displayWasRunning && IsVirtualDisplayToolRunning();
             }
 
-            _hostPath ??= ResolveHostPath();
-            var arguments = BuildArguments();
+            hostPath = _hostPath ??= ResolveHostPath();
+            arguments = BuildArguments();
+            workingDirectory = Path.GetDirectoryName(hostPath) ?? Environment.CurrentDirectory;
             var startInfo = new ProcessStartInfo
             {
-                FileName = _hostPath,
+                FileName = hostPath,
                 Arguments = arguments,
-                WorkingDirectory = Path.GetDirectoryName(_hostPath) ?? Environment.CurrentDirectory,
+                WorkingDirectory = workingDirectory,
                 UseShellExecute = false,
-                CreateNoWindow = true
+                CreateNoWindow = true,
+                RedirectStandardOutput = true,
+                RedirectStandardError = true,
+                StandardOutputEncoding = Encoding.UTF8,
+                StandardErrorEncoding = Encoding.UTF8
             };
 
-            var adbPath = AdbPathBox.Text.Trim();
+            adbPath = AdbPathBox.Text.Trim();
             if (!string.IsNullOrWhiteSpace(adbPath))
             {
                 startInfo.Environment["SIDEDOCK_ADB"] = adbPath;
             }
 
-            _hostProcess = new Process { StartInfo = startInfo, EnableRaisingEvents = true };
-            _hostProcess.Exited += (_, _) => DispatcherQueue.TryEnqueue(() =>
-            {
-                StopHostOwnedVirtualDisplay();
-                SetRunningState(false);
-            });
+            hostLog = new HostProcessLog(hostPath, arguments, workingDirectory, adbPath);
+            var process = new Process { StartInfo = startInfo, EnableRaisingEvents = true };
+            process.OutputDataReceived += (_, args) => hostLog.Append("stdout", args.Data);
+            process.ErrorDataReceived += (_, args) => hostLog.Append("stderr", args.Data);
+            process.Exited += (_, _) => DispatcherQueue.TryEnqueue(() => HandleHostExited(process, hostLog));
 
-            _hostProcess.Start();
+            if (!process.Start())
+            {
+                throw new InvalidOperationException($"无法启动 {HostExe}。");
+            }
+
+            _hostProcess = process;
+            process.BeginOutputReadLine();
+            process.BeginErrorReadLine();
             SetRunningState(true);
         }
         catch (Exception ex)
         {
             StopHostOwnedVirtualDisplay();
-            ShowError("无法启动 SideDock 主机", ex.Message);
+            _hostProcess = null;
+            var details = BuildHostFailureDetails(
+                "启动主机时发生异常",
+                hostPath,
+                arguments,
+                workingDirectory,
+                adbPath,
+                exitCode: null,
+                hostLog,
+                ex);
+            ShowErrorWithDetails(
+                "无法启动 SideDock 主机",
+                $"启动 SideDock 主机时出错：{ex.Message}。下面是详细诊断信息，点“复制详情”可一键复制后发给开发者排查。",
+                details);
             SetRunningState(false);
         }
     }
@@ -284,6 +318,7 @@ public sealed partial class MainWindow : Window
         {
             if (process is not null && !process.HasExited)
             {
+                _hostStopRequestedProcessId = TryGetProcessId(process);
                 process.Kill(entireProcessTree: true);
                 process.WaitForExit(3000);
             }
@@ -293,12 +328,17 @@ public sealed partial class MainWindow : Window
         }
         finally
         {
+            if (ReferenceEquals(_hostProcess, process))
+            {
+                _hostProcess = null;
+            }
+
             StopHostOwnedVirtualDisplay();
             SetRunningState(false);
         }
     }
 
-    private bool StartVirtualDisplay()
+    private bool StartVirtualDisplay(bool showCopyableError = false)
     {
         if (IsVirtualDisplayToolRunning())
         {
@@ -331,7 +371,18 @@ public sealed partial class MainWindow : Window
         }
         catch (Exception ex)
         {
-            ShowError("无法启动虚拟显示器", ex.Message);
+            if (showCopyableError)
+            {
+                ShowErrorWithDetails(
+                    "无法启动虚拟显示器",
+                    $"启动主机时无法启动虚拟显示器：{ex.Message}。下面是详细诊断信息，点“复制详情”可一键复制。",
+                    BuildVirtualDisplayFailureDetails(ex));
+            }
+            else
+            {
+                ShowError("无法启动虚拟显示器", ex.Message);
+            }
+
             return false;
         }
         finally
@@ -660,6 +711,144 @@ public sealed partial class MainWindow : Window
             || videoSource.Equals("idd-gpu", StringComparison.OrdinalIgnoreCase);
     }
 
+    private void HandleHostExited(Process process, HostProcessLog hostLog)
+    {
+        var isCurrentHost = ReferenceEquals(_hostProcess, process);
+        var processId = TryGetProcessId(process);
+        var expectedStop = processId.HasValue && _hostStopRequestedProcessId == processId;
+        if (expectedStop)
+        {
+            _hostStopRequestedProcessId = null;
+        }
+
+        if (!isCurrentHost)
+        {
+            return;
+        }
+
+        _hostProcess = null;
+        StopHostOwnedVirtualDisplay();
+        SetRunningState(false);
+
+        if (expectedStop)
+        {
+            return;
+        }
+
+        var exitCode = TryGetExitCode(process);
+        var summary = exitCode.HasValue
+            ? $"SideDock 主机进程已退出（退出码 {exitCode.Value}）。下面是详细诊断信息，点“复制详情”可一键复制后发给开发者排查。"
+            : "SideDock 主机进程已退出。下面是详细诊断信息，点“复制详情”可一键复制后发给开发者排查。";
+        var details = BuildHostFailureDetails(
+            "主机进程退出",
+            hostLog.HostPath,
+            hostLog.Arguments,
+            hostLog.WorkingDirectory,
+            hostLog.AdbPath,
+            exitCode,
+            hostLog,
+            exception: null);
+
+        ShowErrorWithDetails("SideDock 主机已退出", summary, details);
+    }
+
+    private string BuildHostFailureDetails(
+        string reason,
+        string? hostPath,
+        string? arguments,
+        string? workingDirectory,
+        string? adbPath,
+        int? exitCode,
+        HostProcessLog? hostLog,
+        Exception? exception)
+    {
+        var report = new StringBuilder();
+        report.AppendLine("SideDock 主机启动失败诊断报告");
+        report.AppendLine($"时间: {DateTimeOffset.Now:yyyy-MM-dd HH:mm:ss zzz}");
+        report.AppendLine($"原因: {reason}");
+        if (exitCode.HasValue)
+        {
+            report.AppendLine($"退出码: {exitCode.Value}");
+        }
+
+        report.AppendLine($"Host 路径: {FormatOptional(hostPath)}");
+        report.AppendLine($"工作目录: {FormatOptional(workingDirectory)}");
+        report.AppendLine($"启动参数: {FormatOptional(arguments)}");
+        report.AppendLine($"ADB 路径: {FormatOptional(adbPath)}");
+        report.AppendLine($"视频源: {Selected(VideoSourceCombo)}");
+        report.AppendLine($"分辨率: {Selected(ResolutionCombo)}");
+        report.AppendLine($"刷新率: {Selected(RefreshRateCombo)}");
+        report.AppendLine($"控制端口: {FormatNumberBox(ControlPortBox)}");
+        report.AppendLine($"视频端口: {FormatNumberBox(VideoPortBox)}");
+        report.AppendLine($"启用触控输入: {InputInjectionSwitch.IsOn}");
+        report.AppendLine($"自动管理虚拟显示器: {ManageDisplaySwitch.IsOn}");
+
+        if (exception is not null)
+        {
+            report.AppendLine();
+            report.AppendLine("---- 异常 ----");
+            report.AppendLine(exception.ToString());
+        }
+
+        if (hostLog is not null)
+        {
+            report.AppendLine();
+            report.AppendLine("---- stdout/stderr ----");
+            report.Append(hostLog.Snapshot());
+        }
+
+        return report.ToString();
+    }
+
+    private string BuildVirtualDisplayFailureDetails(Exception exception)
+    {
+        var report = new StringBuilder();
+        report.AppendLine("SideDock 虚拟显示器启动失败诊断报告");
+        report.AppendLine($"时间: {DateTimeOffset.Now:yyyy-MM-dd HH:mm:ss zzz}");
+        report.AppendLine($"DeviceTool 路径: {FormatOptional(_deviceToolPath)}");
+        report.AppendLine($"进程名: {DeviceToolProcessName}");
+        report.AppendLine($"视频源: {Selected(VideoSourceCombo)}");
+        report.AppendLine($"自动管理虚拟显示器: {ManageDisplaySwitch.IsOn}");
+        report.AppendLine();
+        report.AppendLine("---- 异常 ----");
+        report.AppendLine(exception.ToString());
+        return report.ToString();
+    }
+
+    private static int? TryGetProcessId(Process process)
+    {
+        try
+        {
+            return process.Id;
+        }
+        catch
+        {
+            return null;
+        }
+    }
+
+    private static int? TryGetExitCode(Process process)
+    {
+        try
+        {
+            return process.ExitCode;
+        }
+        catch
+        {
+            return null;
+        }
+    }
+
+    private static string FormatOptional(string? value)
+    {
+        return string.IsNullOrWhiteSpace(value) ? "(空)" : value;
+    }
+
+    private static string FormatNumberBox(NumberBox numberBox)
+    {
+        return double.IsNaN(numberBox.Value) ? "(无效)" : ((int)numberBox.Value).ToString();
+    }
+
     private void RefreshVirtualDisplayState()
     {
         var running = IsVirtualDisplayToolRunning();
@@ -833,5 +1022,59 @@ public sealed partial class MainWindow : Window
         };
 
         await dialog.ShowAsync();
+    }
+
+    private sealed class HostProcessLog(
+        string hostPath,
+        string arguments,
+        string workingDirectory,
+        string? adbPath)
+    {
+        private const int MaxCharacters = 128 * 1024;
+        private readonly object _gate = new();
+        private readonly StringBuilder _buffer = new();
+        private bool _truncated;
+
+        public string HostPath { get; } = hostPath;
+        public string Arguments { get; } = arguments;
+        public string WorkingDirectory { get; } = workingDirectory;
+        public string? AdbPath { get; } = adbPath;
+
+        public void Append(string stream, string? line)
+        {
+            if (line is null)
+            {
+                return;
+            }
+
+            var entry = $"[{DateTimeOffset.Now:HH:mm:ss.fff}] {stream}: {line}{Environment.NewLine}";
+            lock (_gate)
+            {
+                if (_buffer.Length + entry.Length > MaxCharacters)
+                {
+                    var overflow = _buffer.Length + entry.Length - MaxCharacters;
+                    _buffer.Remove(0, Math.Min(overflow, _buffer.Length));
+                    _truncated = true;
+                }
+
+                _buffer.Append(entry);
+            }
+        }
+
+        public string Snapshot()
+        {
+            lock (_gate)
+            {
+                if (_buffer.Length == 0)
+                {
+                    return "(没有捕获到 stdout/stderr 输出)" + Environment.NewLine;
+                }
+
+                var prefix = _truncated
+                    ? $"(日志较长，已保留最后 {MaxCharacters / 1024} KB){Environment.NewLine}"
+                    : string.Empty;
+                return prefix + _buffer;
+            }
+        }
     }
 }
