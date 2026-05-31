@@ -117,6 +117,19 @@ jobs:
           Copy-Item -Recurse -Force $out (Join-Path $payloadRoot "SideDock.Host")
           Compress-Archive -Path (Join-Path $payloadRoot "*") -DestinationPath .\windows-host\SideDock.Host.App\HostPayload.zip -Force
 
+          $platformToolsZip = Join-Path $env:RUNNER_TEMP "platform-tools-latest-windows.zip"
+          $platformToolsExtract = Join-Path $env:RUNNER_TEMP "platform-tools-latest-windows"
+          $bundledPlatformTools = Join-Path (Resolve-Path ".\windows-host\SideDock.Host.App") "platform-tools\win-x64"
+          Invoke-WebRequest `
+            -Uri "https://dl.google.com/android/repository/platform-tools-latest-windows.zip" `
+            -OutFile $platformToolsZip
+          Expand-Archive -Path $platformToolsZip -DestinationPath $platformToolsExtract -Force
+          Remove-Item -Recurse -Force $bundledPlatformTools -ErrorAction SilentlyContinue
+          New-Item -ItemType Directory -Force $bundledPlatformTools | Out-Null
+          Copy-Item -Force (Join-Path $platformToolsExtract "platform-tools\adb.exe") $bundledPlatformTools
+          Copy-Item -Force (Join-Path $platformToolsExtract "platform-tools\AdbWinApi.dll") $bundledPlatformTools
+          Copy-Item -Force (Join-Path $platformToolsExtract "platform-tools\AdbWinUsbApi.dll") $bundledPlatformTools
+
           $driverInstallerPayload = Join-Path $env:RUNNER_TEMP "driver-installer-payload"
           New-Item -ItemType Directory -Force $driverInstallerPayload | Out-Null
           Copy-Item -Recurse -Force "${env:RUNNER_TEMP}\sidedock-driver-installer" (Join-Path $driverInstallerPayload "SideDock.Driver.Installer")

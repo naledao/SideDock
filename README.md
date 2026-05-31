@@ -42,7 +42,7 @@ Drops are counted, never silent. The host reports `framesDropped` alongside per-
 - Windows 10/11
 - .NET 8 SDK
 - Android device with USB debugging enabled
-- Android SDK platform tools (`adb`)
+- Android SDK platform tools (`adb`) for source builds and manual CLI runs. Release builds of `SideDock.Host.App.exe` bundle the Windows platform-tools files needed for ADB reverse.
 - Android Gradle/Gradle build environment
 - Visual Studio and Windows Driver Kit, required only when building the virtual display driver
 
@@ -68,7 +68,7 @@ windows-driver\SideDock.Driver.sln
 
 ## Run
 
-Connect the Android device over USB, enable USB debugging, and configure ADB reverse ports:
+Connect the Android device over USB and enable USB debugging. Release builds of the Windows host app automatically use bundled platform-tools to configure ADB reverse before the host starts. For source builds or manual CLI runs, configure the reverse ports yourself:
 
 ```powershell
 adb reverse tcp:27183 tcp:27183
@@ -83,7 +83,7 @@ dotnet run --project .\windows-host\SideDock.Host\SideDock.Host.csproj
 
 The host defaults to the `idd-gpu` source at 720p @ 120 fps. Common options include `--video-source` (`idd-gpu`, `realtime`, `synthetic-nv12`, ...), `--resolution` (`720p`, `1080p`, `2k`), `--refresh-rate` (`30`, `60`, `120`), and the queue-depth knobs in the table above.
 
-Install and open the Android client, then keep the Windows host running while the device is connected.
+Install and open the Android client, then keep the Windows host running while the device is connected. If the host app reports that no authorized device was found, confirm the Android USB debugging prompt and install the device's ADB USB driver if Windows does not expose it as an ADB device.
 
 ## Status
 
@@ -137,7 +137,7 @@ SideDock 面向高刷新率推流(最高 2K @ 120fps)。整条「采集 → 编�
 - Windows 10/11
 - .NET 8 SDK
 - 已开启 USB 调试的 Android 设备
-- Android SDK 平台工具(`adb`)
+- Android SDK 平台工具(`adb`),用于源码构建和手动 CLI 运行。发布版 `SideDock.Host.App.exe` 会内置 ADB reverse 所需的 Windows platform-tools 文件。
 - Android Gradle / Gradle 构建环境
 - Visual Studio 与 Windows Driver Kit,仅在构建虚拟显示驱动时需要
 
@@ -163,7 +163,7 @@ windows-driver\SideDock.Driver.sln
 
 ## 运行
 
-通过 USB 连接 Android 设备,开启 USB 调试,并配置 ADB reverse 端口:
+通过 USB 连接 Android 设备并开启 USB 调试。发布版 Windows Host App 会在启动主机前使用内置 platform-tools 自动配置 ADB reverse。源码构建或手动 CLI 运行时,需要自行配置 reverse 端口:
 
 ```powershell
 adb reverse tcp:27183 tcp:27183

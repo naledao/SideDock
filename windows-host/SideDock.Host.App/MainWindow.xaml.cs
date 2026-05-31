@@ -16,6 +16,7 @@ public sealed partial class MainWindow : Window
     private const string HostExe = "SideDock.Host.exe";
     private const string DeviceToolExe = "SideDock.Idd.DeviceTool.exe";
     private const string DriverInstallerExe = "SideDock.Driver.Installer.exe";
+    private const string AdbExe = "adb.exe";
     private static readonly string DeviceToolProcessName = Path.GetFileNameWithoutExtension(DeviceToolExe);
 
     private readonly DispatcherTimer _displayStatusTimer = new();
@@ -256,7 +257,15 @@ public sealed partial class MainWindow : Window
     {
         if (!string.IsNullOrWhiteSpace(configuredPath))
         {
-            return configuredPath;
+            return ResolveExplicitAdbPath(configuredPath);
+        }
+
+        foreach (var adbPath in EnumerateBundledAdbCandidates())
+        {
+            if (File.Exists(adbPath))
+            {
+                return adbPath;
+            }
         }
 
         var candidates = new[]
@@ -276,7 +285,7 @@ public sealed partial class MainWindow : Window
                 continue;
             }
 
-            var adbPath = Path.Combine(sdkRoot, "platform-tools", "adb.exe");
+            var adbPath = Path.Combine(sdkRoot, "platform-tools", AdbExe);
             if (File.Exists(adbPath))
             {
                 return adbPath;
@@ -284,6 +293,48 @@ public sealed partial class MainWindow : Window
         }
 
         return "adb";
+    }
+
+    private static string ResolveExplicitAdbPath(string configuredPath)
+    {
+        var expandedPath = Environment.ExpandEnvironmentVariables(configuredPath.Trim().Trim('"'));
+        if (Directory.Exists(expandedPath))
+        {
+            foreach (var adbPath in EnumerateAdbCandidatesFromRoot(expandedPath))
+            {
+                if (File.Exists(adbPath))
+                {
+                    return adbPath;
+                }
+            }
+        }
+
+        return expandedPath;
+    }
+
+    private static IEnumerable<string> EnumerateBundledAdbCandidates()
+    {
+        var roots = new[]
+        {
+            AppContext.BaseDirectory,
+            Path.GetDirectoryName(Environment.ProcessPath ?? string.Empty),
+            Environment.CurrentDirectory
+        };
+
+        foreach (var root in roots.Where(root => !string.IsNullOrWhiteSpace(root)).Distinct(StringComparer.OrdinalIgnoreCase))
+        {
+            foreach (var adbPath in EnumerateAdbCandidatesFromRoot(root!))
+            {
+                yield return adbPath;
+            }
+        }
+    }
+
+    private static IEnumerable<string> EnumerateAdbCandidatesFromRoot(string root)
+    {
+        yield return Path.Combine(root, "platform-tools", "win-x64", AdbExe);
+        yield return Path.Combine(root, "platform-tools", AdbExe);
+        yield return Path.Combine(root, AdbExe);
     }
 
     private async Task<AdbReversePreflight> ConfigureAdbReverseBeforeHostStartAsync(string adbPath, IReadOnlyList<int> ports)

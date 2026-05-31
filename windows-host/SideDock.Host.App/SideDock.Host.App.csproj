@@ -26,6 +26,13 @@
     <EmbeddedResource Include="DriverInstallerPayload.zip" Condition="Exists('DriverInstallerPayload.zip')" />
   </ItemGroup>
 
+  <ItemGroup>
+    <Content Include="platform-tools\win-x64\**\*" Condition="Exists('platform-tools\win-x64')">
+      <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
+      <CopyToPublishDirectory>PreserveNewest</CopyToPublishDirectory>
+    </Content>
+  </ItemGroup>
+
   <Target Name="RequireHostPayload" BeforeTargets="BeforeBuild" Condition="'$(CI)' == 'true' and !Exists('HostPayload.zip')">
     <Error Text="HostPayload.zip is required for CI app builds." />
   </Target>

@@ -34,6 +34,7 @@ internal static class Program
     private const VideoSourceKind DefaultVideoSource = VideoSourceKind.IddGpu;
     private const string DefaultVideoFile = "artifacts/test-videos/sidedock-720p30.h264";
     private const string DefaultResolutionPreset = "720p";
+    private static readonly string AdbExecutableName = OperatingSystem.IsWindows() ? "adb.exe" : "adb";
     private static readonly JsonSerializerOptions JsonOptions = new(JsonSerializerDefaults.Web);
 
     public static async Task<int> Main(string[] args)
@@ -246,7 +247,15 @@ internal static class Program
         var configuredPath = Environment.GetEnvironmentVariable("SIDEDOCK_ADB");
         if (!string.IsNullOrWhiteSpace(configuredPath))
         {
-            return configuredPath;
+            return ResolveExplicitAdbPath(configuredPath);
+        }
+
+        foreach (var adbPath in EnumerateBundledAdbCandidates())
+        {
+            if (File.Exists(adbPath))
+            {
+                return adbPath;
+            }
         }
 
         var candidates = new[]
@@ -266,7 +275,7 @@ internal static class Program
                 continue;
             }
 
-            var adbPath = Path.Combine(sdkRoot, "platform-tools", OperatingSystem.IsWindows() ? "adb.exe" : "adb");
+            var adbPath = Path.Combine(sdkRoot, "platform-tools", AdbExecutableName);
             if (File.Exists(adbPath))
             {
                 return adbPath;
@@ -274,6 +283,52 @@ internal static class Program
         }
 
         return "adb";
+    }
+
+    private static string ResolveExplicitAdbPath(string configuredPath)
+    {
+        var expandedPath = Environment.ExpandEnvironmentVariables(configuredPath.Trim().Trim('"'));
+        if (Directory.Exists(expandedPath))
+        {
+            foreach (var adbPath in EnumerateAdbCandidatesFromRoot(expandedPath))
+            {
+                if (File.Exists(adbPath))
+                {
+                    return adbPath;
+                }
+            }
+        }
+
+        return expandedPath;
+    }
+
+    private static IEnumerable<string> EnumerateBundledAdbCandidates()
+    {
+        var roots = new[]
+        {
+            AppContext.BaseDirectory,
+            Path.GetDirectoryName(Environment.ProcessPath ?? string.Empty),
+            Environment.CurrentDirectory
+        };
+
+        foreach (var root in roots.Where(root => !string.IsNullOrWhiteSpace(root)).Distinct(StringComparer.OrdinalIgnoreCase))
+        {
+            foreach (var adbPath in EnumerateAdbCandidatesFromRoot(root!))
+            {
+                yield return adbPath;
+            }
+        }
+    }
+
+    private static IEnumerable<string> EnumerateAdbCandidatesFromRoot(string root)
+    {
+        if (OperatingSystem.IsWindows())
+        {
+            yield return Path.Combine(root, "platform-tools", "win-x64", AdbExecutableName);
+        }
+
+        yield return Path.Combine(root, "platform-tools", AdbExecutableName);
+        yield return Path.Combine(root, AdbExecutableName);
     }
 
     private static void Log(string scope, string message)
