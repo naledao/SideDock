@@ -46,8 +46,7 @@ HKR, "WUDF", "DeviceGroupId", %REG_SZ%, "SideDockIddDriverGroup"
 HKR, "Parameters", "GpuRingSlots", %REG_DWORD%, 6
 
 [SideDock_Idd_Install.NT.Services]
-Include=WUDFRD.inf
-Needs=WUDFRD.NT.Services
+AddService=WUDFRd,0x000001fa,WUDFRD_ServiceInstall
 
 [SideDock_Idd_Install.NT.Wdf]
 UmdfService=SideDock.Idd,SideDock_Idd_ServiceInstall
@@ -59,6 +58,13 @@ UmdfLibraryVersion=$UMDFVERSION$
 ServiceBinary=%12%\UMDF\SideDock.Idd.dll
 UmdfExtensions=IddCx0102
 
+[WUDFRD_ServiceInstall]
+DisplayName=%WudfRdDisplayName%
+ServiceType=1
+StartType=3
+ErrorControl=1
+ServiceBinary=%12%\WUDFRd.sys
+
 [UMDriverCopy]
 SideDock.Idd.dll
 
@@ -66,6 +72,7 @@ SideDock.Idd.dll
 ManufacturerName="SideDock"
 DiskName="SideDock IddCx Driver Installation Disk"
 DeviceName="SideDock Virtual Display"
+WudfRdDisplayName="Windows Driver Foundation - User-mode Driver Framework Reflector"
 
 REG_MULTI_SZ=0x00010000
 REG_SZ=0x00000000

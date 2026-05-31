@@ -273,6 +273,7 @@ static DeviceHealthSnapshot EnsureVirtualDisplayStarted(string infPath, string d
     {
         Console.WriteLine("Reapplying the driver package while the software device is present.");
         ReapplyDriverToPresentDevice(infPath);
+        UpdatePresentDeviceDriver(infPath);
         RestartAndScanDevice();
 
         health = WaitForDeviceHealth(TimeSpan.FromSeconds(15));
@@ -301,6 +302,7 @@ static DeviceHealthSnapshot EnsureVirtualDisplayStarted(string infPath, string d
     if (health.Present)
     {
         ReapplyDriverToPresentDevice(infPath);
+        UpdatePresentDeviceDriver(infPath);
         RestartAndScanDevice();
         health = WaitForDeviceHealth(TimeSpan.FromSeconds(15));
     }
@@ -326,6 +328,38 @@ static ProcessResult ReapplyDriverToPresentDevice(string infPath)
     return result;
 }
 
+static void UpdatePresentDeviceDriver(string infPath)
+{
+    Console.WriteLine("Trying explicit SideDock device driver update.");
+    var matchingHardwareIds = new[]
+    {
+        "SideDockIdd",
+        @"SWD\SideDockIdd",
+        @"SWD\SideDockIdd\SideDockIdd",
+        @"Root\SideDockIdd",
+    };
+
+    foreach (var hardwareId in matchingHardwareIds)
+    {
+        var rebootRequired = false;
+        Console.WriteLine($"> UpdateDriverForPlugAndPlayDevices {QuoteProcessArgument(hardwareId)} {QuoteProcessArgument(infPath)}");
+        var updated = NativeMethods.UpdateDriverForPlugAndPlayDevicesW(
+            IntPtr.Zero,
+            hardwareId,
+            infPath,
+            NativeMethods.INSTALLFLAG_FORCE | NativeMethods.INSTALLFLAG_NONINTERACTIVE,
+            ref rebootRequired);
+        if (updated)
+        {
+            Console.WriteLine($"Updated SideDock device driver using hardware id '{hardwareId}'. Reboot required: {rebootRequired}.");
+            return;
+        }
+
+        var error = Marshal.GetLastWin32Error();
+        Console.WriteLine($"UpdateDriverForPlugAndPlayDevices did not bind '{hardwareId}': {FormatExitCode(error)}");
+    }
+}
+
 static void RestartAndScanDevice()
 {
     Run("pnputil.exe", $"/restart-device {QuoteProcessArgument(DriverHardwareId)}", allowFailure: true);
@@ -335,8 +369,8 @@ static void RestartAndScanDevice()
 static void DumpDeviceDiagnostics()
 {
     Console.WriteLine("Collecting SideDock device diagnostics.");
-    Run("pnputil.exe", $"/enum-devices /instanceid {QuoteProcessArgument(DriverHardwareId)} /deviceids", allowFailure: true);
-    Run("pnputil.exe", "/enum-devices /problem /deviceids", allowFailure: true);
+    Run("pnputil.exe", $"/enum-devices /instanceid {QuoteProcessArgument(DriverHardwareId)} /ids", allowFailure: true);
+    Run("pnputil.exe", "/enum-devices /problem /ids", allowFailure: true);
 }
 
 static DeviceHealthSnapshot WaitForDeviceHealth(TimeSpan timeout)
@@ -1075,6 +1109,9 @@ internal static partial class NativeMethods
     public const uint DN_NT_ENUMERATOR = 0x00800000;
     public const uint DN_NT_DRIVER = 0x01000000;
 
+    public const uint INSTALLFLAG_FORCE = 0x00000001;
+    public const uint INSTALLFLAG_NONINTERACTIVE = 0x00000004;
+
     public static readonly DevPropKey DEVPKEY_Device_Service = new(
         new Guid("a45c254e-df1c-4efd-8020-67d146a850e0"),
         6);
@@ -1095,6 +1132,9 @@ internal static partial class NativeMethods
 
     [DllImport("cfgmgr32.dll", EntryPoint = "CM_Get_DevNode_PropertyW", ExactSpelling = true)]
     public static extern int CM_Get_DevNode_PropertyW(uint dnDevInst, ref DevPropKey propertyKey, out uint propertyType, IntPtr propertyBuffer, ref uint propertyBufferSize, uint ulFlags);
+
+    [DllImport("newdev.dll", EntryPoint = "UpdateDriverForPlugAndPlayDevicesW", ExactSpelling = true, CharSet = CharSet.Unicode, SetLastError = true)]
+    public static extern bool UpdateDriverForPlugAndPlayDevicesW(IntPtr hwndParent, string hardwareId, string fullInfPath, uint installFlags, ref bool rebootRequired);
 
     [StructLayout(LayoutKind.Sequential)]
     public readonly struct DevPropKey
