@@ -226,11 +226,13 @@ namespace SideDock::Idd
         bool EnsureStagingTexture(ID3D11Texture2D* sourceTexture);
         bool EnsureCursorCompositionTextures(ID3D11Texture2D* sourceTexture);
         bool TryComposeCursor(ID3D11Texture2D* cleanTexture, ID3D11Texture2D** outputTexture);
-        static bool BlendHardwareCursorIntoBgra(
+        static bool BlendHardwareCursorIntoBgraPatch(
             const HardwareCursorSnapshot& cursor,
             D3D11_MAPPED_SUBRESOURCE& mapped,
-            UINT width,
-            UINT height);
+            UINT patchWidth,
+            UINT patchHeight,
+            INT screenLeft,
+            INT screenTop);
 
         IDDCX_SWAPCHAIN m_swapChain = nullptr;
         std::shared_ptr<Direct3DDevice> m_device;

@@ -1414,11 +1414,41 @@ bool SwapChainProcessor::TryComposeCursor(ID3D11Texture2D* cleanTexture, ID3D11T
         return false;
     }
 
-    auto context = m_device->DeviceContext.Get();
-    context->CopyResource(m_cursorCompositionStagingTexture.Get(), cleanTexture);
-
     D3D11_TEXTURE2D_DESC desc = {};
     cleanTexture->GetDesc(&desc);
+
+    const INT cursorLeft = cursor.X;
+    const INT cursorTop = cursor.Y;
+    const INT cursorRight = cursorLeft + static_cast<INT>(cursor.ShapeInfo.Width);
+    const INT cursorBottom = cursorTop + static_cast<INT>(cursor.ShapeInfo.Height);
+    const INT clippedLeft = std::max<INT>(0, cursorLeft);
+    const INT clippedTop = std::max<INT>(0, cursorTop);
+    const INT clippedRight = std::min<INT>(static_cast<INT>(desc.Width), cursorRight);
+    const INT clippedBottom = std::min<INT>(static_cast<INT>(desc.Height), cursorBottom);
+    if (clippedLeft >= clippedRight || clippedTop >= clippedBottom)
+    {
+        return true;
+    }
+
+    auto context = m_device->DeviceContext.Get();
+    context->CopyResource(m_cursorCompositionTexture.Get(), cleanTexture);
+
+    D3D11_BOX cursorBox = {};
+    cursorBox.left = static_cast<UINT>(clippedLeft);
+    cursorBox.top = static_cast<UINT>(clippedTop);
+    cursorBox.front = 0;
+    cursorBox.right = static_cast<UINT>(clippedRight);
+    cursorBox.bottom = static_cast<UINT>(clippedBottom);
+    cursorBox.back = 1;
+    context->CopySubresourceRegion(
+        m_cursorCompositionStagingTexture.Get(),
+        0,
+        0,
+        0,
+        0,
+        cleanTexture,
+        0,
+        &cursorBox);
 
     D3D11_MAPPED_SUBRESOURCE mapped = {};
     HRESULT hr = context->Map(m_cursorCompositionStagingTexture.Get(), 0, D3D11_MAP_READ_WRITE, 0, &mapped);
@@ -1428,7 +1458,13 @@ bool SwapChainProcessor::TryComposeCursor(ID3D11Texture2D* cleanTexture, ID3D11T
         return false;
     }
 
-    const bool blended = BlendHardwareCursorIntoBgra(cursor, mapped, desc.Width, desc.Height);
+    const bool blended = BlendHardwareCursorIntoBgraPatch(
+        cursor,
+        mapped,
+        cursorBox.right - cursorBox.left,
+        cursorBox.bottom - cursorBox.top,
+        clippedLeft,
+        clippedTop);
     context->Unmap(m_cursorCompositionStagingTexture.Get(), 0);
 
     if (!blended)
@@ -1436,18 +1472,35 @@ bool SwapChainProcessor::TryComposeCursor(ID3D11Texture2D* cleanTexture, ID3D11T
         return true;
     }
 
-    context->CopyResource(m_cursorCompositionTexture.Get(), m_cursorCompositionStagingTexture.Get());
+    D3D11_BOX patchBox = {};
+    patchBox.left = 0;
+    patchBox.top = 0;
+    patchBox.front = 0;
+    patchBox.right = cursorBox.right - cursorBox.left;
+    patchBox.bottom = cursorBox.bottom - cursorBox.top;
+    patchBox.back = 1;
+    context->CopySubresourceRegion(
+        m_cursorCompositionTexture.Get(),
+        0,
+        cursorBox.left,
+        cursorBox.top,
+        0,
+        m_cursorCompositionStagingTexture.Get(),
+        0,
+        &patchBox);
     *outputTexture = m_cursorCompositionTexture.Get();
     return true;
 }
 
-bool SwapChainProcessor::BlendHardwareCursorIntoBgra(
+bool SwapChainProcessor::BlendHardwareCursorIntoBgraPatch(
     const HardwareCursorSnapshot& cursor,
     D3D11_MAPPED_SUBRESOURCE& mapped,
-    UINT width,
-    UINT height)
+    UINT patchWidth,
+    UINT patchHeight,
+    INT screenLeft,
+    INT screenTop)
 {
-    if (!mapped.pData || width == 0 || height == 0)
+    if (!mapped.pData || patchWidth == 0 || patchHeight == 0)
     {
         return false;
     }
@@ -1471,32 +1524,21 @@ bool SwapChainProcessor::BlendHardwareCursorIntoBgra(
         return false;
     }
 
-    const INT startX = cursor.X;
-    const INT startY = cursor.Y;
-    const INT endX = startX + static_cast<INT>(cursorWidth);
-    const INT endY = startY + static_cast<INT>(cursorHeight);
-    if (endX <= 0 || endY <= 0 || startX >= static_cast<INT>(width) || startY >= static_cast<INT>(height))
-    {
-        return false;
-    }
-
-    const INT clippedLeft = std::max<INT>(0, startX);
-    const INT clippedTop = std::max<INT>(0, startY);
-    const INT clippedRight = std::min<INT>(static_cast<INT>(width), endX);
-    const INT clippedBottom = std::min<INT>(static_cast<INT>(height), endY);
     BYTE* frame = static_cast<BYTE*>(mapped.pData);
     const bool maskedColor =
         cursor.ShapeInfo.CursorType == IDDCX_CURSOR_SHAPE_TYPE_MASKED_COLOR;
 
-    for (INT y = clippedTop; y < clippedBottom; ++y)
+    for (UINT y = 0; y < patchHeight; ++y)
     {
-        const UINT cursorY = static_cast<UINT>(y - startY);
+        const INT screenY = screenTop + static_cast<INT>(y);
+        const UINT cursorY = static_cast<UINT>(screenY - cursor.Y);
         const BYTE* cursorRow = cursor.ShapeBuffer + static_cast<size_t>(cursorY) * cursorPitch;
         BYTE* frameRow = frame + static_cast<size_t>(y) * mapped.RowPitch;
 
-        for (INT x = clippedLeft; x < clippedRight; ++x)
+        for (UINT x = 0; x < patchWidth; ++x)
         {
-            const UINT cursorX = static_cast<UINT>(x - startX);
+            const INT screenX = screenLeft + static_cast<INT>(x);
+            const UINT cursorX = static_cast<UINT>(screenX - cursor.X);
             const BYTE* source = cursorRow + static_cast<size_t>(cursorX) * 4;
             BYTE* destination = frameRow + static_cast<size_t>(x) * 4;
 
@@ -1831,7 +1873,11 @@ bool MonitorContext::EnableHardwareCursor()
 
     IDARG_IN_SETUP_HWCURSOR setup = {};
     setup.CursorInfo.Size = sizeof(setup.CursorInfo);
-    setup.CursorInfo.ColorXorCursorSupport = IDDCX_XOR_CURSOR_SUPPORT_EMULATION;
+    // SideDock streams the desktop at low latency, so let Windows draw XOR/monochrome
+    // cursors into the desktop image instead of using IddCx's alpha emulation. The
+    // emulated path adds a solid border around cursors such as the I-beam, which shows
+    // up on Android as the black square seen over text fields.
+    setup.CursorInfo.ColorXorCursorSupport = IDDCX_XOR_CURSOR_SUPPORT_NONE;
     setup.CursorInfo.AlphaCursorSupport = TRUE;
     setup.CursorInfo.MaxX = MaxHardwareCursorWidth;
     setup.CursorInfo.MaxY = MaxHardwareCursorHeight;

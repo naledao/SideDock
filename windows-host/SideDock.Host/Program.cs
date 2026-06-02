@@ -1438,6 +1438,23 @@ internal static class Program
         private const int DisplayDevicePrimaryDevice = 0x00000004;
         private const int DisplayDeviceMirroringDriver = 0x00000008;
         private const int DispChangeSuccessful = 0;
+        private const int ErrorSuccess = 0;
+        private const uint CdsUpdateRegistry = 0x00000001;
+        private const uint CdsNoReset = 0x10000000;
+        private const uint QdcOnlyActivePaths = 0x00000002;
+        private const uint SdcUseSuppliedDisplayConfig = 0x00000020;
+        private const uint SdcValidate = 0x00000040;
+        private const uint SdcApply = 0x00000080;
+        private const uint SdcSaveToDatabase = 0x00000200;
+        private const uint SdcAllowChanges = 0x00000400;
+        private const uint DisplayConfigPathActive = 0x00000001;
+        private const uint DisplayConfigPathModeIdxInvalid = 0xffffffff;
+        private const uint DisplayConfigModeInfoTypeSource = 1;
+        private const uint DisplayConfigModeInfoTypeTarget = 2;
+        private const uint DisplayConfigPixelFormat32Bpp = 4;
+        private const int DmPosition = 0x00000020;
+        private const int DmDisplayOrientation = 0x00000080;
+        private const int DmBitsPerPel = 0x00040000;
         private const int DmPelsWidth = 0x00080000;
         private const int DmPelsHeight = 0x00100000;
         private const int DmDisplayFrequency = 0x00400000;
@@ -1522,37 +1539,519 @@ internal static class Program
                 return false;
             }
 
-            var devMode = DisplayNative.DevMode.Create();
-            if (!DisplayNative.EnumDisplaySettingsW(layout.DeviceName, EnumCurrentSettings, ref devMode))
+            if (IsLayoutMatch(layout, mode))
+            {
+                message = "Display mode already active.";
+                return true;
+            }
+
+            var currentMode = DisplayNative.DevMode.Create();
+            if (!DisplayNative.EnumDisplaySettingsW(layout.DeviceName, EnumCurrentSettings, ref currentMode))
             {
                 message = $"Unable to read current mode for {layout.DeviceName}: {Marshal.GetLastWin32Error()}.";
                 return false;
             }
 
-            devMode.Fields |= DmPelsWidth | DmPelsHeight | DmDisplayFrequency;
-            devMode.PelsWidth = (uint)mode.Width;
-            devMode.PelsHeight = (uint)mode.Height;
-            devMode.DisplayFrequency = (uint)mode.RefreshHz;
-
-            var result = DisplayNative.ChangeDisplaySettingsExW(layout.DeviceName, ref devMode, IntPtr.Zero, 0, IntPtr.Zero);
-            _cachedLayout = null;
-            _lastQueryTicks = 0;
-            var changedLayout = GetLayout(force: true);
-            var changed = changedLayout is not null
-                && changedLayout.Width == mode.Width
-                && changedLayout.Height == mode.Height
-                && Math.Abs(changedLayout.RefreshRate - mode.RefreshHz) <= 1;
-
-            if (result != DispChangeSuccessful)
+            var advertisedModes = EnumerateDisplayModes(layout.DeviceName);
+            var selectedMode = SelectDisplayMode(advertisedModes, mode);
+            if (selectedMode is null)
             {
-                message = $"ChangeDisplaySettingsEx returned {result}.";
+                message = $"Requested mode is not advertised by {layout.DeviceName}. {FormatAdvertisedModes(advertisedModes, mode.Width, mode.Height)}";
                 return false;
             }
 
-            message = changed
-                ? "Display mode applied."
-                : $"Windows accepted the request but current mode is {changedLayout?.Width ?? 0}x{changedLayout?.Height ?? 0}@{changedLayout?.RefreshRate ?? 0}.";
+            var preparedMode = selectedMode.Value;
+            PrepareDisplayModeForApply(ref preparedMode, currentMode, mode);
+            _log(
+                "display mode apply "
+                + $"request={mode} "
+                + $"current={FormatDevMode(currentMode)} "
+                + $"selected={FormatDevMode(preparedMode)} "
+                + FormatAdvertisedModes(advertisedModes, mode.Width, mode.Height));
+
+            var attempts = new List<string>();
+            if (TryApplyDisplayMode(layout.DeviceName, preparedMode, mode, flags: 0, "dynamic", attempts, out var changedLayout))
+            {
+                message = $"Display mode applied. Current mode is {FormatLayoutMode(changedLayout)}.";
+                return true;
+            }
+
+            preparedMode = selectedMode.Value;
+            PrepareDisplayModeForApply(ref preparedMode, currentMode, mode);
+            if (TryApplyDisplayMode(layout.DeviceName, preparedMode, mode, CdsUpdateRegistry, "registry", attempts, out changedLayout))
+            {
+                message = $"Display mode applied. Current mode is {FormatLayoutMode(changedLayout)}.";
+                return true;
+            }
+
+            preparedMode = selectedMode.Value;
+            PrepareDisplayModeForApply(ref preparedMode, currentMode, mode);
+            if (TryStageAndApplyDisplayMode(layout.DeviceName, preparedMode, mode, attempts, out changedLayout))
+            {
+                message = $"Display mode applied. Current mode is {FormatLayoutMode(changedLayout)}.";
+                return true;
+            }
+
+            if (TryDisplayConfigChangeMode(layout, currentMode, mode, attempts, out changedLayout))
+            {
+                message = $"Display mode applied. Current mode is {FormatLayoutMode(changedLayout)}.";
+                return true;
+            }
+
+            message = string.Join("; ", attempts) + $". Current mode is {FormatLayoutMode(changedLayout)}.";
+            return false;
+        }
+
+        private bool TryApplyDisplayMode(
+            string deviceName,
+            DisplayNative.DevMode devMode,
+            DisplayModeRequest requestedMode,
+            uint flags,
+            string attemptName,
+            List<string> attempts,
+            out DisplayLayout? changedLayout)
+        {
+            var result = DisplayNative.ChangeDisplaySettingsExW(deviceName, ref devMode, IntPtr.Zero, flags, IntPtr.Zero);
+            var win32Error = Marshal.GetLastWin32Error();
+            changedLayout = WaitForAppliedLayout(requestedMode, result == DispChangeSuccessful);
+            var changed = result == DispChangeSuccessful && IsLayoutMatch(changedLayout, requestedMode);
+            attempts.Add(
+                $"{attemptName}={DescribeDispChangeResult(result)}({result}) "
+                + $"win32={win32Error} "
+                + $"mode={FormatLayoutMode(changedLayout)}");
             return changed;
+        }
+
+        private bool TryStageAndApplyDisplayMode(
+            string deviceName,
+            DisplayNative.DevMode devMode,
+            DisplayModeRequest requestedMode,
+            List<string> attempts,
+            out DisplayLayout? changedLayout)
+        {
+            var stageResult = DisplayNative.ChangeDisplaySettingsExW(
+                deviceName,
+                ref devMode,
+                IntPtr.Zero,
+                CdsUpdateRegistry | CdsNoReset,
+                IntPtr.Zero);
+            var stageWin32Error = Marshal.GetLastWin32Error();
+            if (stageResult != DispChangeSuccessful)
+            {
+                changedLayout = WaitForAppliedLayout(requestedMode, poll: false);
+                attempts.Add(
+                    $"staged={DescribeDispChangeResult(stageResult)}({stageResult}) "
+                    + $"win32={stageWin32Error} "
+                    + $"mode={FormatLayoutMode(changedLayout)}");
+                return false;
+            }
+
+            var applyResult = DisplayNative.ChangeDisplaySettingsExW(
+                null,
+                IntPtr.Zero,
+                IntPtr.Zero,
+                0,
+                IntPtr.Zero);
+            var applyWin32Error = Marshal.GetLastWin32Error();
+            changedLayout = WaitForAppliedLayout(requestedMode, applyResult == DispChangeSuccessful);
+            var changed = applyResult == DispChangeSuccessful && IsLayoutMatch(changedLayout, requestedMode);
+            attempts.Add(
+                $"staged={DescribeDispChangeResult(stageResult)}({stageResult}) "
+                + $"stageWin32={stageWin32Error} "
+                + $"global={DescribeDispChangeResult(applyResult)}({applyResult}) "
+                + $"globalWin32={applyWin32Error} "
+                + $"mode={FormatLayoutMode(changedLayout)}");
+            return changed;
+        }
+
+        private bool TryDisplayConfigChangeMode(
+            DisplayLayout layout,
+            DisplayNative.DevMode currentMode,
+            DisplayModeRequest requestedMode,
+            List<string> attempts,
+            out DisplayLayout? changedLayout)
+        {
+            var queryResult = TryQueryActiveDisplayConfig(out var paths, out var modes, out var queryMessage);
+            if (queryResult != ErrorSuccess)
+            {
+                changedLayout = WaitForAppliedLayout(requestedMode, poll: false);
+                attempts.Add($"displayConfigQuery={queryMessage} mode={FormatLayoutMode(changedLayout)}");
+                return false;
+            }
+
+            var sourceNameResult = TryFindDisplayConfigPath(layout.DeviceName, paths, out var pathIndex, out var sourceNameMessage);
+            if (sourceNameResult != ErrorSuccess)
+            {
+                changedLayout = WaitForAppliedLayout(requestedMode, poll: false);
+                attempts.Add($"displayConfigFind={sourceNameMessage} mode={FormatLayoutMode(changedLayout)}");
+                return false;
+            }
+
+            var path = paths[pathIndex];
+            var sourceModeIndex = EnsureDisplayConfigSourceMode(modes, path.sourceInfo.adapterId, path.sourceInfo.id);
+            var targetModeIndex = EnsureDisplayConfigTargetMode(modes, path.targetInfo.adapterId, path.targetInfo.id);
+            if (sourceModeIndex < 0 || targetModeIndex < 0)
+            {
+                changedLayout = WaitForAppliedLayout(requestedMode, poll: false);
+                attempts.Add(
+                    $"displayConfigModeIdx=missing sourceIdx={sourceModeIndex} targetIdx={targetModeIndex} "
+                    + $"path={FormatDisplayConfigPath(path)} mode={FormatLayoutMode(changedLayout)}");
+                return false;
+            }
+
+            var updatedModes = modes.ToArray();
+            updatedModes[sourceModeIndex].sourceMode.width = (uint)requestedMode.Width;
+            updatedModes[sourceModeIndex].sourceMode.height = (uint)requestedMode.Height;
+            updatedModes[sourceModeIndex].sourceMode.pixelFormat = DisplayConfigPixelFormat32Bpp;
+            updatedModes[sourceModeIndex].sourceMode.position.X = currentMode.PositionX;
+            updatedModes[sourceModeIndex].sourceMode.position.Y = currentMode.PositionY;
+
+            var targetSignal = updatedModes[targetModeIndex].targetMode.targetVideoSignalInfo;
+            targetSignal.activeSize.cx = (uint)requestedMode.Width;
+            targetSignal.activeSize.cy = (uint)requestedMode.Height;
+            if (targetSignal.totalSize.cx == 0 || targetSignal.totalSize.cx < targetSignal.activeSize.cx)
+            {
+                targetSignal.totalSize.cx = targetSignal.activeSize.cx;
+            }
+
+            if (targetSignal.totalSize.cy == 0 || targetSignal.totalSize.cy < targetSignal.activeSize.cy)
+            {
+                targetSignal.totalSize.cy = targetSignal.activeSize.cy;
+            }
+
+            targetSignal.vSyncFreq.Numerator = (uint)requestedMode.RefreshHz;
+            targetSignal.vSyncFreq.Denominator = 1;
+            targetSignal.hSyncFreq.Numerator = (uint)(requestedMode.RefreshHz * Math.Max(1, requestedMode.Height));
+            targetSignal.hSyncFreq.Denominator = 1;
+            targetSignal.pixelRate = (ulong)requestedMode.RefreshHz * (ulong)requestedMode.Width * (ulong)requestedMode.Height;
+            targetSignal.scanLineOrdering = DisplayNative.DisplayConfigScanlineOrderingProgressive;
+            updatedModes[targetModeIndex].targetMode.targetVideoSignalInfo = targetSignal;
+
+            var updatedPaths = paths.ToArray();
+            updatedPaths[pathIndex].sourceInfo.modeInfoIdx = (uint)sourceModeIndex;
+            updatedPaths[pathIndex].targetInfo.modeInfoIdx = (uint)targetModeIndex;
+            updatedPaths[pathIndex].targetInfo.refreshRate.Numerator = (uint)requestedMode.RefreshHz;
+            updatedPaths[pathIndex].targetInfo.refreshRate.Denominator = 1;
+            updatedPaths[pathIndex].targetInfo.scanLineOrdering = DisplayNative.DisplayConfigScanlineOrderingProgressive;
+            updatedPaths[pathIndex].flags |= DisplayConfigPathActive;
+
+            var validateFlags = SdcUseSuppliedDisplayConfig | SdcValidate | SdcAllowChanges;
+            var validateResult = DisplayNative.SetDisplayConfig(
+                (uint)updatedPaths.Length,
+                updatedPaths,
+                (uint)updatedModes.Length,
+                updatedModes,
+                validateFlags);
+            if (validateResult != ErrorSuccess)
+            {
+                changedLayout = WaitForAppliedLayout(requestedMode, poll: false);
+                attempts.Add(
+                    $"displayConfigValidate={validateResult} "
+                    + $"path={FormatDisplayConfigPath(updatedPaths[pathIndex])} "
+                    + $"sourceIdx={sourceModeIndex} targetIdx={targetModeIndex} mode={FormatLayoutMode(changedLayout)}");
+                return false;
+            }
+
+            var applyFlags = SdcUseSuppliedDisplayConfig | SdcApply | SdcSaveToDatabase | SdcAllowChanges;
+            var applyResult = DisplayNative.SetDisplayConfig(
+                (uint)updatedPaths.Length,
+                updatedPaths,
+                (uint)updatedModes.Length,
+                updatedModes,
+                applyFlags);
+            changedLayout = WaitForAppliedLayout(requestedMode, applyResult == ErrorSuccess);
+            var changed = applyResult == ErrorSuccess && IsLayoutMatch(changedLayout, requestedMode);
+            attempts.Add(
+                $"displayConfigValidate={validateResult} displayConfigApply={applyResult} "
+                + $"path={FormatDisplayConfigPath(updatedPaths[pathIndex])} "
+                + $"sourceIdx={sourceModeIndex} targetIdx={targetModeIndex} mode={FormatLayoutMode(changedLayout)}");
+            return changed;
+        }
+
+        private static int TryQueryActiveDisplayConfig(
+            out DisplayNative.DisplayConfigPathInfo[] paths,
+            out DisplayNative.DisplayConfigModeInfo[] modes,
+            out string message)
+        {
+            paths = [];
+            modes = [];
+
+            var sizeResult = DisplayNative.GetDisplayConfigBufferSizes(
+                QdcOnlyActivePaths,
+                out var pathCount,
+                out var modeCount);
+            if (sizeResult != ErrorSuccess)
+            {
+                message = $"GetDisplayConfigBufferSizes={sizeResult}";
+                return sizeResult;
+            }
+
+            for (var attempt = 0; attempt < 3; attempt++)
+            {
+                paths = new DisplayNative.DisplayConfigPathInfo[pathCount];
+                modes = new DisplayNative.DisplayConfigModeInfo[modeCount];
+                var queryPathCount = pathCount;
+                var queryModeCount = modeCount;
+                var queryResult = DisplayNative.QueryDisplayConfig(
+                    QdcOnlyActivePaths,
+                    ref queryPathCount,
+                    paths,
+                    ref queryModeCount,
+                    modes,
+                    IntPtr.Zero);
+                if (queryResult == ErrorSuccess)
+                {
+                    if (queryPathCount != paths.Length)
+                    {
+                        Array.Resize(ref paths, (int)queryPathCount);
+                    }
+
+                    if (queryModeCount != modes.Length)
+                    {
+                        Array.Resize(ref modes, (int)queryModeCount);
+                    }
+
+                    message = $"paths={paths.Length} modes={modes.Length}";
+                    return ErrorSuccess;
+                }
+
+                sizeResult = DisplayNative.GetDisplayConfigBufferSizes(
+                    QdcOnlyActivePaths,
+                    out pathCount,
+                    out modeCount);
+                if (sizeResult != ErrorSuccess)
+                {
+                    message = $"QueryDisplayConfig={queryResult}; resize={sizeResult}";
+                    return sizeResult;
+                }
+            }
+
+            message = "QueryDisplayConfig retried without a stable path list.";
+            return -1;
+        }
+
+        private static int TryFindDisplayConfigPath(
+            string deviceName,
+            IReadOnlyList<DisplayNative.DisplayConfigPathInfo> paths,
+            out int pathIndex,
+            out string message)
+        {
+            pathIndex = -1;
+            var inspected = new List<string>();
+            for (var index = 0; index < paths.Count; index++)
+            {
+                var path = paths[index];
+                var sourceName = DisplayNative.DisplayConfigSourceDeviceName.Create(path.sourceInfo.adapterId, path.sourceInfo.id);
+                var result = DisplayNative.DisplayConfigGetDeviceInfo(ref sourceName);
+                if (result != ErrorSuccess)
+                {
+                    inspected.Add($"#{index}:{FormatDisplayConfigPath(path)} sourceNameResult={result}");
+                    continue;
+                }
+
+                var viewName = CleanString(sourceName.viewGdiDeviceName);
+                inspected.Add($"#{index}:{viewName} {FormatDisplayConfigPath(path)}");
+                if (viewName.Equals(deviceName, StringComparison.OrdinalIgnoreCase))
+                {
+                    pathIndex = index;
+                    message = $"found {viewName} at #{index}";
+                    return ErrorSuccess;
+                }
+            }
+
+            message = $"device={deviceName} not found; inspected=[{string.Join("; ", inspected)}]";
+            return -1;
+        }
+
+        private static int EnsureDisplayConfigSourceMode(
+            IReadOnlyList<DisplayNative.DisplayConfigModeInfo> modes,
+            DisplayNative.Luid adapterId,
+            uint sourceId)
+        {
+            for (var index = 0; index < modes.Count; index++)
+            {
+                if (modes[index].infoType == DisplayConfigModeInfoTypeSource
+                    && modes[index].id == sourceId
+                    && modes[index].adapterId == adapterId)
+                {
+                    return index;
+                }
+            }
+
+            return -1;
+        }
+
+        private static int EnsureDisplayConfigTargetMode(
+            IReadOnlyList<DisplayNative.DisplayConfigModeInfo> modes,
+            DisplayNative.Luid adapterId,
+            uint targetId)
+        {
+            for (var index = 0; index < modes.Count; index++)
+            {
+                if (modes[index].infoType == DisplayConfigModeInfoTypeTarget
+                    && modes[index].id == targetId
+                    && modes[index].adapterId == adapterId)
+                {
+                    return index;
+                }
+            }
+
+            return -1;
+        }
+
+        private static string FormatDisplayConfigPath(DisplayNative.DisplayConfigPathInfo path)
+        {
+            return $"source={path.sourceInfo.id}/{path.sourceInfo.modeInfoIdx} target={path.targetInfo.id}/{path.targetInfo.modeInfoIdx} refresh={FormatRational(path.targetInfo.refreshRate)} flags=0x{path.flags:X}";
+        }
+
+        private static string FormatRational(DisplayNative.DisplayConfigRational rational)
+        {
+            return rational.Denominator == 0
+                ? $"{rational.Numerator}/0"
+                : $"{rational.Numerator / (double)rational.Denominator:F3}";
+        }
+
+        private DisplayLayout? WaitForAppliedLayout(DisplayModeRequest requestedMode, bool poll)
+        {
+            DisplayLayout? layout = null;
+            var attempts = poll ? 8 : 1;
+            for (var attempt = 0; attempt < attempts; attempt++)
+            {
+                if (attempt > 0)
+                {
+                    Thread.Sleep(125);
+                }
+
+                _cachedLayout = null;
+                _lastQueryTicks = 0;
+                layout = GetLayout(force: true);
+                if (IsLayoutMatch(layout, requestedMode))
+                {
+                    break;
+                }
+            }
+
+            return layout;
+        }
+
+        private static IReadOnlyList<DisplayNative.DevMode> EnumerateDisplayModes(string deviceName)
+        {
+            var modes = new List<DisplayNative.DevMode>();
+            for (var index = 0; ; index++)
+            {
+                var mode = DisplayNative.DevMode.Create();
+                if (!DisplayNative.EnumDisplaySettingsW(deviceName, index, ref mode))
+                {
+                    break;
+                }
+
+                if (mode.PelsWidth == 0 || mode.PelsHeight == 0)
+                {
+                    continue;
+                }
+
+                modes.Add(mode);
+            }
+
+            return modes;
+        }
+
+        private static DisplayNative.DevMode? SelectDisplayMode(IReadOnlyList<DisplayNative.DevMode> modes, DisplayModeRequest requestedMode)
+        {
+            return modes
+                .Where(mode =>
+                    mode.PelsWidth == requestedMode.Width
+                    && mode.PelsHeight == requestedMode.Height
+                    && (mode.DisplayFrequency == 0 || Math.Abs((int)mode.DisplayFrequency - requestedMode.RefreshHz) <= 1))
+                .OrderBy(mode => mode.DisplayFrequency == requestedMode.RefreshHz ? 0 : mode.DisplayFrequency == 0 ? 2 : 1)
+                .ThenBy(mode => mode.DisplayFrequency == 0 ? int.MaxValue : Math.Abs((int)mode.DisplayFrequency - requestedMode.RefreshHz))
+                .ThenByDescending(mode => mode.BitsPerPel)
+                .Select(mode => (DisplayNative.DevMode?)mode)
+                .FirstOrDefault();
+        }
+
+        private static void PrepareDisplayModeForApply(
+            ref DisplayNative.DevMode devMode,
+            DisplayNative.DevMode currentMode,
+            DisplayModeRequest requestedMode)
+        {
+            devMode.Size = (ushort)Marshal.SizeOf<DisplayNative.DevMode>();
+            devMode.DriverExtra = 0;
+            devMode.Fields = DmPosition | DmBitsPerPel | DmPelsWidth | DmPelsHeight | DmDisplayFrequency;
+            devMode.PelsWidth = (uint)requestedMode.Width;
+            devMode.PelsHeight = (uint)requestedMode.Height;
+            devMode.DisplayFrequency = (uint)requestedMode.RefreshHz;
+            if (devMode.BitsPerPel == 0)
+            {
+                devMode.BitsPerPel = currentMode.BitsPerPel == 0 ? 32u : currentMode.BitsPerPel;
+            }
+
+            devMode.PositionX = currentMode.PositionX;
+            devMode.PositionY = currentMode.PositionY;
+
+            if ((currentMode.Fields & DmDisplayOrientation) != 0)
+            {
+                devMode.Fields |= DmDisplayOrientation;
+                devMode.DisplayOrientation = currentMode.DisplayOrientation;
+            }
+        }
+
+        private static bool IsLayoutMatch(DisplayLayout? layout, DisplayModeRequest mode)
+        {
+            return layout is not null
+                && layout.Width == mode.Width
+                && layout.Height == mode.Height
+                && Math.Abs(layout.RefreshRate - mode.RefreshHz) <= 1;
+        }
+
+        private static string FormatAdvertisedModes(IReadOnlyList<DisplayNative.DevMode> modes, int width, int height)
+        {
+            var matchingRefreshRates = modes
+                .Where(mode => mode.PelsWidth == width && mode.PelsHeight == height)
+                .Select(mode => mode.DisplayFrequency == 0 ? "default" : $"{mode.DisplayFrequency}Hz")
+                .Distinct(StringComparer.Ordinal)
+                .OrderBy(value => value, StringComparer.Ordinal)
+                .ToArray();
+            if (matchingRefreshRates.Length > 0)
+            {
+                return $"{width}x{height} advertised refresh=[{string.Join(", ", matchingRefreshRates)}].";
+            }
+
+            var advertisedModes = modes
+                .GroupBy(mode => $"{mode.PelsWidth}x{mode.PelsHeight}@{mode.DisplayFrequency}Hz")
+                .Select(group => group.Key)
+                .OrderBy(value => value, StringComparer.Ordinal)
+                .Take(12)
+                .ToArray();
+            return advertisedModes.Length == 0
+                ? "No display modes were advertised."
+                : $"Advertised modes=[{string.Join(", ", advertisedModes)}].";
+        }
+
+        private static string FormatDevMode(DisplayNative.DevMode mode)
+        {
+            return $"{mode.PelsWidth}x{mode.PelsHeight}@{mode.DisplayFrequency}Hz bpp={mode.BitsPerPel} pos=({mode.PositionX},{mode.PositionY}) fields=0x{mode.Fields:X}";
+        }
+
+        private static string FormatLayoutMode(DisplayLayout? layout)
+        {
+            return layout is null ? "missing" : $"{layout.Width}x{layout.Height}@{layout.RefreshRate}Hz";
+        }
+
+        private static string DescribeDispChangeResult(int result)
+        {
+            return result switch
+            {
+                0 => "DISP_CHANGE_SUCCESSFUL",
+                1 => "DISP_CHANGE_RESTART",
+                -1 => "DISP_CHANGE_FAILED",
+                -2 => "DISP_CHANGE_BADMODE",
+                -3 => "DISP_CHANGE_NOTUPDATED",
+                -4 => "DISP_CHANGE_BADFLAGS",
+                -5 => "DISP_CHANGE_BADPARAM",
+                -6 => "DISP_CHANGE_BADDUALVIEW",
+                _ => "DISP_CHANGE_UNKNOWN"
+            };
         }
 
         private void LogLayoutChange(DisplayLayout? layout)
@@ -10878,11 +11377,47 @@ internal static class Program
 
         [DllImport("user32.dll", ExactSpelling = true, CharSet = CharSet.Unicode, SetLastError = true)]
         public static extern int ChangeDisplaySettingsExW(
-            string lpszDeviceName,
+            string? lpszDeviceName,
             ref DevMode lpDevMode,
             IntPtr hwnd,
             uint dwflags,
             IntPtr lParam);
+
+        [DllImport("user32.dll", ExactSpelling = true, CharSet = CharSet.Unicode, SetLastError = true)]
+        public static extern int ChangeDisplaySettingsExW(
+            string? lpszDeviceName,
+            IntPtr lpDevMode,
+            IntPtr hwnd,
+            uint dwflags,
+            IntPtr lParam);
+
+        public const uint DisplayConfigScanlineOrderingProgressive = 1;
+
+        [DllImport("user32.dll", ExactSpelling = true)]
+        public static extern int GetDisplayConfigBufferSizes(
+            uint flags,
+            out uint numPathArrayElements,
+            out uint numModeInfoArrayElements);
+
+        [DllImport("user32.dll", ExactSpelling = true)]
+        public static extern int QueryDisplayConfig(
+            uint flags,
+            ref uint numPathArrayElements,
+            [Out] DisplayConfigPathInfo[] pathArray,
+            ref uint numModeInfoArrayElements,
+            [Out] DisplayConfigModeInfo[] modeInfoArray,
+            IntPtr currentTopologyId);
+
+        [DllImport("user32.dll", ExactSpelling = true)]
+        public static extern int SetDisplayConfig(
+            uint numPathArrayElements,
+            [In] DisplayConfigPathInfo[] pathArray,
+            uint numModeInfoArrayElements,
+            [In] DisplayConfigModeInfo[] modeInfoArray,
+            uint flags);
+
+        [DllImport("user32.dll", ExactSpelling = true)]
+        public static extern int DisplayConfigGetDeviceInfo(ref DisplayConfigSourceDeviceName requestPacket);
 
         public const uint MONITOR_DEFAULTTONEAREST = 0x00000002;
 
@@ -10921,6 +11456,192 @@ internal static class Program
         {
             public int X;
             public int Y;
+        }
+
+        [StructLayout(LayoutKind.Sequential)]
+        public struct Luid : IEquatable<Luid>
+        {
+            public uint LowPart;
+            public int HighPart;
+
+            public bool Equals(Luid other)
+            {
+                return LowPart == other.LowPart && HighPart == other.HighPart;
+            }
+
+            public override bool Equals(object? obj)
+            {
+                return obj is Luid other && Equals(other);
+            }
+
+            public override int GetHashCode()
+            {
+                return HashCode.Combine(LowPart, HighPart);
+            }
+
+            public static bool operator ==(Luid left, Luid right)
+            {
+                return left.Equals(right);
+            }
+
+            public static bool operator !=(Luid left, Luid right)
+            {
+                return !left.Equals(right);
+            }
+        }
+
+        [StructLayout(LayoutKind.Sequential)]
+        public struct PointL
+        {
+            public int X;
+            public int Y;
+        }
+
+        [StructLayout(LayoutKind.Sequential)]
+        public struct RectL
+        {
+            public int Left;
+            public int Top;
+            public int Right;
+            public int Bottom;
+        }
+
+        [StructLayout(LayoutKind.Sequential)]
+        public struct DisplayConfigRational
+        {
+            public uint Numerator;
+            public uint Denominator;
+        }
+
+        [StructLayout(LayoutKind.Sequential)]
+        public struct DisplayConfig2DRegion
+        {
+            public uint cx;
+            public uint cy;
+        }
+
+        [StructLayout(LayoutKind.Sequential)]
+        public struct DisplayConfigVideoSignalInfo
+        {
+            public ulong pixelRate;
+            public DisplayConfigRational hSyncFreq;
+            public DisplayConfigRational vSyncFreq;
+            public DisplayConfig2DRegion activeSize;
+            public DisplayConfig2DRegion totalSize;
+            public uint videoStandard;
+            public uint scanLineOrdering;
+        }
+
+        [StructLayout(LayoutKind.Sequential)]
+        public struct DisplayConfigTargetMode
+        {
+            public DisplayConfigVideoSignalInfo targetVideoSignalInfo;
+        }
+
+        [StructLayout(LayoutKind.Sequential)]
+        public struct DisplayConfigSourceMode
+        {
+            public uint width;
+            public uint height;
+            public uint pixelFormat;
+            public PointL position;
+        }
+
+        [StructLayout(LayoutKind.Sequential)]
+        public struct DisplayConfigDesktopImageInfo
+        {
+            public PointL PathSourceSize;
+            public RectL DesktopImageRegion;
+            public RectL DesktopImageClip;
+        }
+
+        [StructLayout(LayoutKind.Explicit)]
+        public struct DisplayConfigModeInfo
+        {
+            [FieldOffset(0)]
+            public uint infoType;
+
+            [FieldOffset(4)]
+            public uint id;
+
+            [FieldOffset(8)]
+            public Luid adapterId;
+
+            [FieldOffset(16)]
+            public DisplayConfigTargetMode targetMode;
+
+            [FieldOffset(16)]
+            public DisplayConfigSourceMode sourceMode;
+
+            [FieldOffset(16)]
+            public DisplayConfigDesktopImageInfo desktopImageInfo;
+        }
+
+        [StructLayout(LayoutKind.Sequential)]
+        public struct DisplayConfigPathSourceInfo
+        {
+            public Luid adapterId;
+            public uint id;
+            public uint modeInfoIdx;
+            public uint statusFlags;
+        }
+
+        [StructLayout(LayoutKind.Sequential)]
+        public struct DisplayConfigPathTargetInfo
+        {
+            public Luid adapterId;
+            public uint id;
+            public uint modeInfoIdx;
+            public uint outputTechnology;
+            public uint rotation;
+            public uint scaling;
+            public DisplayConfigRational refreshRate;
+            public uint scanLineOrdering;
+            public int targetAvailable;
+            public uint statusFlags;
+        }
+
+        [StructLayout(LayoutKind.Sequential)]
+        public struct DisplayConfigPathInfo
+        {
+            public DisplayConfigPathSourceInfo sourceInfo;
+            public DisplayConfigPathTargetInfo targetInfo;
+            public uint flags;
+        }
+
+        [StructLayout(LayoutKind.Sequential)]
+        public struct DisplayConfigDeviceInfoHeader
+        {
+            public uint type;
+            public uint size;
+            public Luid adapterId;
+            public uint id;
+        }
+
+        [StructLayout(LayoutKind.Sequential, CharSet = CharSet.Unicode)]
+        public struct DisplayConfigSourceDeviceName
+        {
+            private const uint DisplayConfigDeviceInfoGetSourceName = 1;
+
+            public DisplayConfigDeviceInfoHeader header;
+
+            [MarshalAs(UnmanagedType.ByValTStr, SizeConst = 32)]
+            public string viewGdiDeviceName;
+
+            public static DisplayConfigSourceDeviceName Create(Luid adapterId, uint sourceId)
+            {
+                return new DisplayConfigSourceDeviceName
+                {
+                    header = new DisplayConfigDeviceInfoHeader
+                    {
+                        type = DisplayConfigDeviceInfoGetSourceName,
+                        size = (uint)Marshal.SizeOf<DisplayConfigSourceDeviceName>(),
+                        adapterId = adapterId,
+                        id = sourceId
+                    },
+                    viewGdiDeviceName = string.Empty
+                };
+            }
         }
 
         [StructLayout(LayoutKind.Sequential, CharSet = CharSet.Unicode)]
