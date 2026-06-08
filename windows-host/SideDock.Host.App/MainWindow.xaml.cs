@@ -2,12 +2,15 @@ using System.Diagnostics;
 using System.IO.Compression;
 using System.Globalization;
 using System.Reflection;
+using System.Runtime.InteropServices;
 using System.Text;
 using Microsoft.UI;
+using Microsoft.UI.Windowing;
 using Microsoft.UI.Xaml;
 using Microsoft.UI.Xaml.Controls;
 using Microsoft.UI.Xaml.Media;
 using Windows.ApplicationModel.DataTransfer;
+using WinRT.Interop;
 
 namespace SideDock.Host.App;
 
@@ -17,31 +20,77 @@ public sealed partial class MainWindow : Window
     private const string DeviceToolExe = "SideDock.Idd.DeviceTool.exe";
     private const string DriverInstallerExe = "SideDock.Driver.Installer.exe";
     private const string AdbExe = "adb.exe";
+    private const int SwHide = 0;
+    private const int SwShow = 5;
+    private const int SwRestore = 9;
+    private const uint TrayIconId = 1;
+    private const uint WmNull = 0x0000;
+    private const uint WmUser = 0x0400;
+    private const uint WmApp = 0x8000;
+    private const uint WmTrayIcon = WmApp + 1;
+    private const uint WmContextMenu = 0x007B;
+    private const uint WmLButtonUp = 0x0202;
+    private const uint WmLButtonDoubleClick = 0x0203;
+    private const uint WmRButtonUp = 0x0205;
+    private const uint NinSelect = WmUser;
+    private const uint NinKeySelect = WmUser + 1;
+    private const uint NifMessage = 0x00000001;
+    private const uint NifIcon = 0x00000002;
+    private const uint NifTip = 0x00000004;
+    private const uint NimAdd = 0x00000000;
+    private const uint NimDelete = 0x00000002;
+    private const uint NimSetVersion = 0x00000004;
+    private const uint NotifyIconVersion4 = 4;
+    private const uint MfString = 0x00000000;
+    private const uint MfSeparator = 0x00000800;
+    private const uint TpmRightButton = 0x0002;
+    private const uint TpmNonotify = 0x0080;
+    private const uint TpmReturnCmd = 0x0100;
+    private const uint ImageIcon = 1;
+    private const uint LrShared = 0x00008000;
+    private const int IdiApplication = 32512;
+    private const int TrayMenuOpen = 1001;
+    private const int TrayMenuExit = 1002;
     private static readonly string DeviceToolProcessName = Path.GetFileNameWithoutExtension(DeviceToolExe);
+    private static readonly UIntPtr WindowSubclassId = new(1);
 
     private readonly DispatcherTimer _displayStatusTimer = new();
     private readonly Brush _successBrush = new SolidColorBrush(ColorHelper.FromArgb(255, 18, 132, 86));
     private readonly Brush _dangerBrush = new SolidColorBrush(ColorHelper.FromArgb(255, 196, 43, 28));
     private readonly Brush _secondaryBrush = new SolidColorBrush(ColorHelper.FromArgb(255, 96, 96, 96));
+    private readonly IntPtr _windowHandle;
 
     private Process? _hostProcess;
     private Process? _deviceToolProcess;
+    private SubclassProc? _subclassProc;
+    private IntPtr _trayIconHandle;
     private string? _payloadRoot;
     private string? _hostPath;
     private string? _deviceToolPath;
     private string? _driverInstallerPath;
     private bool _hostOwnsVirtualDisplay;
     private int? _hostStopRequestedProcessId;
+    private bool _exitRequested;
+    private bool _trayIconAdded;
+    private bool _windowSubclassed;
+    private bool _ownsTrayIconHandle;
 
     public MainWindow()
     {
         InitializeComponent();
 
+        _windowHandle = WindowNative.GetWindowHandle(this);
         ExtendsContentIntoTitleBar = true;
         SetTitleBar(null);
         AppWindow.Resize(new Windows.Graphics.SizeInt32(1080, 760));
 
-        Closed += (_, _) => StopHost();
+        InitializeTrayIcon();
+        AppWindow.Closing += OnAppWindowClosing;
+        Closed += (_, _) =>
+        {
+            DisposeTrayIcon();
+            StopHost();
+        };
 
         SetRunningState(false);
         RefreshVirtualDisplayState();
@@ -49,6 +98,213 @@ public sealed partial class MainWindow : Window
         _displayStatusTimer.Interval = TimeSpan.FromSeconds(2);
         _displayStatusTimer.Tick += (_, _) => RefreshVirtualDisplayState();
         _displayStatusTimer.Start();
+    }
+
+    private void InitializeTrayIcon()
+    {
+        _trayIconHandle = LoadTrayIconHandle();
+        if (_trayIconHandle == IntPtr.Zero)
+        {
+            return;
+        }
+
+        _subclassProc = TrayWindowSubclassProc;
+        _windowSubclassed = SetWindowSubclass(_windowHandle, _subclassProc, WindowSubclassId, UIntPtr.Zero);
+        if (!_windowSubclassed)
+        {
+            return;
+        }
+
+        var data = CreateNotifyIconData(NifMessage | NifIcon | NifTip);
+        _trayIconAdded = Shell_NotifyIcon(NimAdd, ref data);
+        if (_trayIconAdded)
+        {
+            data.uTimeoutOrVersion = NotifyIconVersion4;
+            Shell_NotifyIcon(NimSetVersion, ref data);
+        }
+    }
+
+    private void OnAppWindowClosing(AppWindow sender, AppWindowClosingEventArgs args)
+    {
+        if (_exitRequested)
+        {
+            return;
+        }
+
+        if (!_trayIconAdded)
+        {
+            return;
+        }
+
+        args.Cancel = true;
+        HideToTray();
+    }
+
+    private void HideToTray()
+    {
+        ShowWindow(_windowHandle, SwHide);
+    }
+
+    private void RestoreFromTray()
+    {
+        DispatcherQueue.TryEnqueue(() =>
+        {
+            ShowWindow(_windowHandle, SwShow);
+            ShowWindow(_windowHandle, SwRestore);
+            Activate();
+            SetForegroundWindow(_windowHandle);
+        });
+    }
+
+    private void ExitFromTray()
+    {
+        DispatcherQueue.TryEnqueue(() =>
+        {
+            _exitRequested = true;
+            DisposeTrayIcon();
+            Close();
+        });
+    }
+
+    private void DisposeTrayIcon()
+    {
+        if (_trayIconAdded)
+        {
+            var data = CreateNotifyIconData(0);
+            Shell_NotifyIcon(NimDelete, ref data);
+            _trayIconAdded = false;
+        }
+
+        if (_windowSubclassed && _subclassProc is not null)
+        {
+            RemoveWindowSubclass(_windowHandle, _subclassProc, WindowSubclassId);
+            _windowSubclassed = false;
+            _subclassProc = null;
+        }
+
+        if (_ownsTrayIconHandle && _trayIconHandle != IntPtr.Zero)
+        {
+            DestroyIcon(_trayIconHandle);
+        }
+
+        _trayIconHandle = IntPtr.Zero;
+        _ownsTrayIconHandle = false;
+    }
+
+    private IntPtr TrayWindowSubclassProc(
+        IntPtr hWnd,
+        uint message,
+        UIntPtr wParam,
+        IntPtr lParam,
+        UIntPtr subclassId,
+        UIntPtr refData)
+    {
+        if (message == WmTrayIcon)
+        {
+            HandleTrayIconMessage(unchecked((uint)((long)lParam & 0xffff)));
+            return IntPtr.Zero;
+        }
+
+        return DefSubclassProc(hWnd, message, wParam, lParam);
+    }
+
+    private void HandleTrayIconMessage(uint message)
+    {
+        switch (message)
+        {
+            case WmLButtonUp:
+            case WmLButtonDoubleClick:
+            case NinSelect:
+            case NinKeySelect:
+                RestoreFromTray();
+                break;
+            case WmRButtonUp:
+            case WmContextMenu:
+                ShowTrayMenu();
+                break;
+        }
+    }
+
+    private void ShowTrayMenu()
+    {
+        DispatcherQueue.TryEnqueue(() =>
+        {
+            var menu = CreatePopupMenu();
+            if (menu == IntPtr.Zero)
+            {
+                return;
+            }
+
+            try
+            {
+                AppendMenu(menu, MfString, new UIntPtr(TrayMenuOpen), "打开 SideDock");
+                AppendMenu(menu, MfSeparator, UIntPtr.Zero, string.Empty);
+                AppendMenu(menu, MfString, new UIntPtr(TrayMenuExit), "退出");
+
+                if (!GetCursorPos(out var point))
+                {
+                    return;
+                }
+
+                SetForegroundWindow(_windowHandle);
+                var command = TrackPopupMenu(
+                    menu,
+                    TpmRightButton | TpmNonotify | TpmReturnCmd,
+                    point.X,
+                    point.Y,
+                    0,
+                    _windowHandle,
+                    IntPtr.Zero);
+                PostMessage(_windowHandle, WmNull, UIntPtr.Zero, IntPtr.Zero);
+
+                switch (command)
+                {
+                    case TrayMenuOpen:
+                        RestoreFromTray();
+                        break;
+                    case TrayMenuExit:
+                        ExitFromTray();
+                        break;
+                }
+            }
+            finally
+            {
+                DestroyMenu(menu);
+            }
+        });
+    }
+
+    private NotifyIconData CreateNotifyIconData(uint flags)
+    {
+        return new NotifyIconData
+        {
+            cbSize = (uint)Marshal.SizeOf<NotifyIconData>(),
+            hWnd = _windowHandle,
+            uID = TrayIconId,
+            uFlags = flags,
+            uCallbackMessage = WmTrayIcon,
+            hIcon = _trayIconHandle,
+            szTip = "SideDock",
+            szInfo = string.Empty,
+            szInfoTitle = string.Empty
+        };
+    }
+
+    private IntPtr LoadTrayIconHandle()
+    {
+        var processPath = Environment.ProcessPath;
+        if (!string.IsNullOrWhiteSpace(processPath) && File.Exists(processPath))
+        {
+            var smallIcons = new IntPtr[1];
+            var count = ExtractIconEx(processPath, 0, null, smallIcons, 1);
+            if (count > 0 && smallIcons[0] != IntPtr.Zero)
+            {
+                _ownsTrayIconHandle = true;
+                return smallIcons[0];
+            }
+        }
+
+        return LoadImage(IntPtr.Zero, new IntPtr(IdiApplication), ImageIcon, 0, 0, LrShared);
     }
 
     private async void StartHostButton_Click(object sender, RoutedEventArgs e)
@@ -1455,6 +1711,120 @@ public sealed partial class MainWindow : Window
         };
 
         await dialog.ShowAsync();
+    }
+
+    [DllImport("user32.dll")]
+    private static extern bool ShowWindow(IntPtr hWnd, int nCmdShow);
+
+    [DllImport("user32.dll")]
+    private static extern bool SetForegroundWindow(IntPtr hWnd);
+
+    [DllImport("shell32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+    private static extern bool Shell_NotifyIcon(uint dwMessage, ref NotifyIconData lpData);
+
+    [DllImport("shell32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+    private static extern uint ExtractIconEx(
+        string szFileName,
+        int nIconIndex,
+        IntPtr[]? phiconLarge,
+        IntPtr[]? phiconSmall,
+        uint nIcons);
+
+    [DllImport("user32.dll", SetLastError = true)]
+    private static extern IntPtr LoadImage(
+        IntPtr hInst,
+        IntPtr name,
+        uint type,
+        int cx,
+        int cy,
+        uint fuLoad);
+
+    [DllImport("user32.dll", SetLastError = true)]
+    private static extern bool DestroyIcon(IntPtr hIcon);
+
+    [DllImport("comctl32.dll", SetLastError = true)]
+    private static extern bool SetWindowSubclass(
+        IntPtr hWnd,
+        SubclassProc pfnSubclass,
+        UIntPtr uIdSubclass,
+        UIntPtr dwRefData);
+
+    [DllImport("comctl32.dll", SetLastError = true)]
+    private static extern bool RemoveWindowSubclass(
+        IntPtr hWnd,
+        SubclassProc pfnSubclass,
+        UIntPtr uIdSubclass);
+
+    [DllImport("comctl32.dll")]
+    private static extern IntPtr DefSubclassProc(IntPtr hWnd, uint uMsg, UIntPtr wParam, IntPtr lParam);
+
+    [DllImport("user32.dll", SetLastError = true)]
+    private static extern IntPtr CreatePopupMenu();
+
+    [DllImport("user32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+    private static extern bool AppendMenu(IntPtr hMenu, uint uFlags, UIntPtr uIDNewItem, string lpNewItem);
+
+    [DllImport("user32.dll", SetLastError = true)]
+    private static extern int TrackPopupMenu(
+        IntPtr hMenu,
+        uint uFlags,
+        int x,
+        int y,
+        int nReserved,
+        IntPtr hWnd,
+        IntPtr prcRect);
+
+    [DllImport("user32.dll", SetLastError = true)]
+    private static extern bool DestroyMenu(IntPtr hMenu);
+
+    [DllImport("user32.dll", SetLastError = true)]
+    private static extern bool GetCursorPos(out Point point);
+
+    [DllImport("user32.dll", SetLastError = true)]
+    private static extern bool PostMessage(IntPtr hWnd, uint msg, UIntPtr wParam, IntPtr lParam);
+
+    private delegate IntPtr SubclassProc(
+        IntPtr hWnd,
+        uint message,
+        UIntPtr wParam,
+        IntPtr lParam,
+        UIntPtr subclassId,
+        UIntPtr refData);
+
+    [StructLayout(LayoutKind.Sequential)]
+    private struct Point
+    {
+        public int X;
+        public int Y;
+    }
+
+    [StructLayout(LayoutKind.Sequential, CharSet = CharSet.Unicode)]
+    private struct NotifyIconData
+    {
+        public uint cbSize;
+        public IntPtr hWnd;
+        public uint uID;
+        public uint uFlags;
+        public uint uCallbackMessage;
+        public IntPtr hIcon;
+
+        [MarshalAs(UnmanagedType.ByValTStr, SizeConst = 128)]
+        public string szTip;
+
+        public uint dwState;
+        public uint dwStateMask;
+
+        [MarshalAs(UnmanagedType.ByValTStr, SizeConst = 256)]
+        public string szInfo;
+
+        public uint uTimeoutOrVersion;
+
+        [MarshalAs(UnmanagedType.ByValTStr, SizeConst = 64)]
+        public string szInfoTitle;
+
+        public uint dwInfoFlags;
+        public Guid guidItem;
+        public IntPtr hBalloonIcon;
     }
 
     private sealed class HostProcessLog(
