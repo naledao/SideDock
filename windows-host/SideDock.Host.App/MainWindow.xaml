@@ -90,6 +90,7 @@
                                 <Grid.RowDefinitions>
                                     <RowDefinition Height="Auto" />
                                     <RowDefinition Height="Auto" />
+                                    <RowDefinition Height="Auto" />
                                 </Grid.RowDefinitions>
 
                                 <StackPanel Spacing="6">
@@ -153,6 +154,29 @@
                                     <TextBox
                                         x:Name="AdbPathBox"
                                         PlaceholderText="可选 adb.exe 路径" />
+                                </StackPanel>
+
+                                <StackPanel Grid.Row="2" Grid.ColumnSpan="3" Spacing="6">
+                                    <TextBlock Text="Android 设备" />
+                                    <Grid ColumnSpacing="8">
+                                        <Grid.ColumnDefinitions>
+                                            <ColumnDefinition Width="*" />
+                                            <ColumnDefinition Width="Auto" />
+                                        </Grid.ColumnDefinitions>
+                                        <ComboBox
+                                            x:Name="AdbDeviceCombo"
+                                            HorizontalAlignment="Stretch" />
+                                        <Button
+                                            Grid.Column="1"
+                                            x:Name="RefreshAdbDevicesButton"
+                                            Click="RefreshAdbDevicesButton_Click"
+                                            Padding="10,6">
+                                            <StackPanel Orientation="Horizontal" Spacing="6">
+                                                <FontIcon Glyph="&#xE72C;" FontSize="14" />
+                                                <TextBlock Text="刷新" />
+                                            </StackPanel>
+                                        </Button>
+                                    </Grid>
                                 </StackPanel>
                             </Grid>
 

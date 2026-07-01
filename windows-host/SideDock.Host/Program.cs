@@ -76,14 +76,19 @@ internal static class Program
         }
 
         var adbPath = ResolveAdbPath();
+        var adbSerial = ResolveAdbSerial();
         Log("ADB", $"使用 adb: {adbPath}");
+        if (!string.IsNullOrWhiteSpace(adbSerial))
+        {
+            Log("ADB", $"目标设备: {adbSerial}");
+        }
 
         foreach (var port in options.ReversePorts)
         {
-            await ConfigureAdbReverseAsync(adbPath, port, appCts.Token);
+            await ConfigureAdbReverseAsync(adbPath, adbSerial, port, appCts.Token);
         }
 
-        _ = Task.Run(() => KeepAdbReverseAliveAsync(adbPath, options.ReversePorts, appCts.Token), appCts.Token);
+        _ = Task.Run(() => KeepAdbReverseAliveAsync(adbPath, adbSerial, options.ReversePorts, appCts.Token), appCts.Token);
 
         var controlPublisher = new ControlMessagePublisher();
         var controlServer = new ControlServer(IPAddress.Loopback, options, videoModeState, controlPublisher, displayLayoutProvider);
@@ -155,14 +160,19 @@ internal static class Program
         return value is VideoSourceKind.Idd or VideoSourceKind.IddGpu;
     }
 
-    private static async Task KeepAdbReverseAliveAsync(string adbPath, IReadOnlyList<int> ports, CancellationToken cancellationToken)
+    private static async Task KeepAdbReverseAliveAsync(
+        string adbPath,
+        string? adbSerial,
+        IReadOnlyList<int> ports,
+        CancellationToken cancellationToken)
     {
         using var timer = new PeriodicTimer(TimeSpan.FromSeconds(5));
         try
         {
             while (await timer.WaitForNextTickAsync(cancellationToken))
             {
-                var reverseList = await RunAdbAsync(adbPath, "reverse --list", cancellationToken);
+                var listArguments = BuildAdbDeviceArguments(adbSerial, "reverse --list");
+                var reverseList = await RunAdbAsync(adbPath, listArguments, cancellationToken);
                 if (reverseList.ExitCode != 0)
                 {
                     Log("ADB", $"读取 reverse 列表失败，退出码 {reverseList.ExitCode}: {reverseList.Stderr}");
@@ -177,7 +187,7 @@ internal static class Program
                     }
 
                     Log("ADB", $"未检测到 tcp:{port} reverse 映射，尝试重新配置。");
-                    await ConfigureAdbReverseAsync(adbPath, port, cancellationToken);
+                    await ConfigureAdbReverseAsync(adbPath, adbSerial, port, cancellationToken);
                 }
             }
         }
@@ -187,9 +197,14 @@ internal static class Program
         }
     }
 
-    private static async Task ConfigureAdbReverseAsync(string adbPath, int port, CancellationToken cancellationToken)
+    private static async Task ConfigureAdbReverseAsync(
+        string adbPath,
+        string? adbSerial,
+        int port,
+        CancellationToken cancellationToken)
     {
-        var arguments = $"reverse tcp:{port} tcp:{port}";
+        var reverseArguments = $"reverse tcp:{port} tcp:{port}";
+        var arguments = BuildAdbDeviceArguments(adbSerial, reverseArguments);
 
         try
         {
@@ -218,6 +233,20 @@ internal static class Program
             Log("ADB", $"自动配置失败: {ex.Message}");
             Log("ADB", $"可手动执行: adb {arguments}");
         }
+    }
+
+    private static string BuildAdbDeviceArguments(string? adbSerial, string command)
+    {
+        return string.IsNullOrWhiteSpace(adbSerial)
+            ? command
+            : $"-s {QuoteAdbArgument(adbSerial)} {command}";
+    }
+
+    private static string QuoteAdbArgument(string argument)
+    {
+        return argument.Contains(' ') || argument.Contains('"')
+            ? "\"" + argument.Replace("\"", "\\\"") + "\""
+            : argument;
     }
 
     private static async Task<ProcessResult> RunAdbAsync(string adbPath, string arguments, CancellationToken cancellationToken)
@@ -283,6 +312,12 @@ internal static class Program
         }
 
         return "adb";
+    }
+
+    private static string? ResolveAdbSerial()
+    {
+        var serial = Environment.GetEnvironmentVariable("ANDROID_SERIAL");
+        return string.IsNullOrWhiteSpace(serial) ? null : serial.Trim();
     }
 
     private static string ResolveExplicitAdbPath(string configuredPath)

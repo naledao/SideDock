@@ -92,12 +92,15 @@ public sealed partial class MainWindow : Window
             StopHost();
         };
 
+        InitializeAdbDeviceCombo();
         SetRunningState(false);
         RefreshVirtualDisplayState();
 
         _displayStatusTimer.Interval = TimeSpan.FromSeconds(2);
         _displayStatusTimer.Tick += (_, _) => RefreshVirtualDisplayState();
         _displayStatusTimer.Start();
+
+        _ = RefreshAdbDevicesAsync(showErrors: false);
     }
 
     private void InitializeTrayIcon()
@@ -317,6 +320,11 @@ public sealed partial class MainWindow : Window
         StopHost();
     }
 
+    private async void RefreshAdbDevicesButton_Click(object sender, RoutedEventArgs e)
+    {
+        await RefreshAdbDevicesAsync(showErrors: true);
+    }
+
     private void StartDisplayButton_Click(object sender, RoutedEventArgs e)
     {
         StartVirtualDisplay(failureAction: "启动虚拟显示器失败");
@@ -351,13 +359,18 @@ public sealed partial class MainWindow : Window
             _hostStopRequestedProcessId = null;
             StartHostButton.IsEnabled = false;
             StopHostButton.IsEnabled = false;
+            AdbDeviceCombo.IsEnabled = false;
+            RefreshAdbDevicesButton.IsEnabled = false;
             OverallStatusText.Text = "启动中";
             OverallStatusText.Foreground = _secondaryBrush;
             SetAdbStatus("正在检查 ADB reverse...", _secondaryBrush);
 
             adbPath = ResolveAdbPath(AdbPathBox.Text.Trim());
+            var explicitAdbSerial = SelectedAdbSerial();
+            await RefreshAdbDevicesAsync(showErrors: false, resolvedAdbPath: adbPath);
+            var selectedAdbSerial = explicitAdbSerial ?? SelectedAdbSerial();
             var reversePorts = GetConfiguredReversePorts();
-            var adbPreflight = await ConfigureAdbReverseBeforeHostStartAsync(adbPath, reversePorts);
+            var adbPreflight = await ConfigureAdbReverseBeforeHostStartAsync(adbPath, reversePorts, selectedAdbSerial);
             if (!adbPreflight.Success)
             {
                 SetRunningState(false);
@@ -474,6 +487,161 @@ public sealed partial class MainWindow : Window
         return controlPort == videoPort
             ? new[] { controlPort }
             : new[] { controlPort, videoPort };
+    }
+
+    private void InitializeAdbDeviceCombo()
+    {
+        AdbDeviceCombo.DisplayMemberPath = nameof(AdbDeviceChoice.DisplayName);
+        SetAdbDeviceChoices(Array.Empty<AdbDeviceRow>(), selectedSerial: null);
+    }
+
+    private async Task RefreshAdbDevicesAsync(bool showErrors, string? resolvedAdbPath = null)
+    {
+        var selectedSerial = SelectedAdbSerial();
+        RefreshAdbDevicesButton.IsEnabled = false;
+
+        try
+        {
+            var adbPath = resolvedAdbPath ?? ResolveAdbPath(AdbPathBox.Text.Trim());
+            var devices = await RunAdbAsync(adbPath, "devices -l", TimeSpan.FromSeconds(8));
+            if (devices.TimedOut)
+            {
+                SetAdbDeviceChoices(Array.Empty<AdbDeviceRow>(), selectedSerial);
+                SetAdbStatus("ADB devices 检查超时。", _dangerBrush);
+                if (showErrors)
+                {
+                    ShowError("无法刷新 Android 设备", "ADB devices 检查超时。");
+                }
+
+                return;
+            }
+
+            if (devices.ExitCode != 0)
+            {
+                SetAdbDeviceChoices(Array.Empty<AdbDeviceRow>(), selectedSerial);
+                var message = string.IsNullOrWhiteSpace(devices.Stderr)
+                    ? $"ADB devices 执行失败（退出码 {devices.ExitCode}）。"
+                    : devices.Stderr;
+                SetAdbStatus(message, _dangerBrush);
+                if (showErrors)
+                {
+                    ShowError("无法刷新 Android 设备", message);
+                }
+
+                return;
+            }
+
+            var rows = ParseAdbDevices(devices.Stdout).ToArray();
+            SetAdbDeviceChoices(rows, selectedSerial);
+            var authorizedCount = rows.Count(row => row.State.Equals("device", StringComparison.OrdinalIgnoreCase));
+            if (authorizedCount == 0)
+            {
+                SetAdbStatus("未检测到已授权 Android 设备。", _secondaryBrush);
+            }
+            else if (authorizedCount == 1)
+            {
+                var serial = rows.First(row => row.State.Equals("device", StringComparison.OrdinalIgnoreCase)).Serial;
+                SetAdbStatus($"已检测到 Android 设备：{serial}", _secondaryBrush);
+            }
+            else if (SelectedAdbSerial() is { Length: > 0 } serial)
+            {
+                SetAdbStatus($"已选择 Android 设备：{serial}", _secondaryBrush);
+            }
+            else
+            {
+                SetAdbStatus($"检测到 {authorizedCount} 台 Android 设备，请选择后启动。", _secondaryBrush);
+            }
+        }
+        catch (Exception ex)
+        {
+            SetAdbDeviceChoices(Array.Empty<AdbDeviceRow>(), selectedSerial);
+            SetAdbStatus($"刷新 Android 设备失败：{ex.Message}", _dangerBrush);
+            if (showErrors)
+            {
+                ShowError("无法刷新 Android 设备", ex.Message);
+            }
+        }
+        finally
+        {
+            RefreshAdbDevicesButton.IsEnabled = StartHostButton.IsEnabled && _hostProcess is not { HasExited: false };
+        }
+    }
+
+    private void SetAdbDeviceChoices(IReadOnlyList<AdbDeviceRow> rows, string? selectedSerial)
+    {
+        var choices = new List<AdbDeviceChoice>
+        {
+            new(null, "自动选择（仅一台设备时）", string.Empty, string.Empty)
+        };
+
+        choices.AddRange(rows.Select(row => new AdbDeviceChoice(
+            row.Serial,
+            FormatAdbDeviceDisplayName(row),
+            row.State,
+            row.RawLine)));
+
+        AdbDeviceCombo.ItemsSource = choices;
+
+        var selectedChoice = choices.FirstOrDefault(choice =>
+            !string.IsNullOrWhiteSpace(choice.Serial) &&
+            choice.Serial.Equals(selectedSerial, StringComparison.OrdinalIgnoreCase));
+        if (selectedChoice is null)
+        {
+            var authorizedChoices = choices
+                .Where(choice => choice.State.Equals("device", StringComparison.OrdinalIgnoreCase))
+                .ToArray();
+            selectedChoice = authorizedChoices.Length == 1 ? authorizedChoices[0] : choices[0];
+        }
+
+        AdbDeviceCombo.SelectedItem = selectedChoice;
+    }
+
+    private string? SelectedAdbSerial()
+    {
+        return AdbDeviceCombo.SelectedItem is AdbDeviceChoice { Serial.Length: > 0 } choice
+            ? choice.Serial
+            : null;
+    }
+
+    private static string FormatAdbDeviceDisplayName(AdbDeviceRow row)
+    {
+        var model = TryGetAdbDetail(row.RawLine, "model")?.Replace('_', ' ');
+        var product = TryGetAdbDetail(row.RawLine, "product")?.Replace('_', ' ');
+        var label = FirstNonEmpty(model, product, row.Serial);
+        var stateSuffix = row.State.Equals("device", StringComparison.OrdinalIgnoreCase)
+            ? string.Empty
+            : $" [{row.State}]";
+
+        return label.Equals(row.Serial, StringComparison.OrdinalIgnoreCase)
+            ? $"{row.Serial}{stateSuffix}"
+            : $"{label} - {row.Serial}{stateSuffix}";
+    }
+
+    private static string? TryGetAdbDetail(string rawLine, string key)
+    {
+        var prefix = key + ":";
+        foreach (var part in rawLine.Split(new[] { ' ', '\t' }, StringSplitOptions.RemoveEmptyEntries))
+        {
+            if (part.StartsWith(prefix, StringComparison.OrdinalIgnoreCase))
+            {
+                return part[prefix.Length..];
+            }
+        }
+
+        return null;
+    }
+
+    private static string FirstNonEmpty(params string?[] values)
+    {
+        foreach (var value in values)
+        {
+            if (!string.IsNullOrWhiteSpace(value))
+            {
+                return value;
+            }
+        }
+
+        return string.Empty;
     }
 
     private static string Selected(ComboBox comboBox)
@@ -593,12 +761,16 @@ public sealed partial class MainWindow : Window
         yield return Path.Combine(root, AdbExe);
     }
 
-    private async Task<AdbReversePreflight> ConfigureAdbReverseBeforeHostStartAsync(string adbPath, IReadOnlyList<int> ports)
+    private async Task<AdbReversePreflight> ConfigureAdbReverseBeforeHostStartAsync(
+        string adbPath,
+        IReadOnlyList<int> ports,
+        string? selectedSerial)
     {
         var report = new StringBuilder();
         report.AppendLine("SideDock ADB reverse 诊断报告");
         report.AppendLine($"时间: {DateTimeOffset.Now:yyyy-MM-dd HH:mm:ss zzz}");
         report.AppendLine($"ADB 路径: {adbPath}");
+        report.AppendLine($"选择设备: {FormatOptional(selectedSerial)}");
         report.AppendLine($"端口: {string.Join(", ", ports)}");
         report.AppendLine();
 
@@ -627,16 +799,38 @@ public sealed partial class MainWindow : Window
             return new AdbReversePreflight(false, summary, report.ToString(), null);
         }
 
-        if (authorizedDevices.Length > 1)
+        AdbDeviceRow selectedDevice;
+        if (!string.IsNullOrWhiteSpace(selectedSerial))
+        {
+            var selectedRows = deviceRows
+                .Where(row => row.Serial.Equals(selectedSerial, StringComparison.OrdinalIgnoreCase))
+                .ToArray();
+            if (selectedRows.Length == 0)
+            {
+                return new AdbReversePreflight(false, $"未检测到已选择的 ADB 设备 {selectedSerial}，请刷新设备列表后重试。", report.ToString(), selectedSerial);
+            }
+
+            if (!selectedRows[0].State.Equals("device", StringComparison.OrdinalIgnoreCase))
+            {
+                return new AdbReversePreflight(false, $"已选择的 ADB 设备 {selectedSerial} 当前状态为 {selectedRows[0].State}，无法配置 reverse。", report.ToString(), selectedSerial);
+            }
+
+            selectedDevice = selectedRows[0];
+        }
+        else if (authorizedDevices.Length > 1)
         {
             return new AdbReversePreflight(
                 false,
-                "检测到多个已授权 ADB 设备，无法确定要给哪台设备配置 reverse。",
+                "检测到多个已授权 ADB 设备，请在 Android 设备下拉框中选择一台后再启动主机。",
                 report.ToString(),
                 null);
         }
+        else
+        {
+            selectedDevice = authorizedDevices[0];
+        }
 
-        var serial = authorizedDevices[0].Serial;
+        var serial = selectedDevice.Serial;
         foreach (var port in ports.Distinct())
         {
             var arguments = $"-s {QuoteArgument(serial)} reverse tcp:{port} tcp:{port}";
@@ -1581,6 +1775,8 @@ public sealed partial class MainWindow : Window
     {
         StartHostButton.IsEnabled = !running;
         StopHostButton.IsEnabled = running;
+        AdbDeviceCombo.IsEnabled = !running;
+        RefreshAdbDevicesButton.IsEnabled = !running;
         OverallStatusText.Text = running ? "运行中" : "未启动";
         OverallStatusText.Foreground = running ? _successBrush : _dangerBrush;
     }
@@ -1886,6 +2082,8 @@ public sealed partial class MainWindow : Window
     private sealed record AdbReversePreflight(bool Success, string Summary, string Details, string? Serial);
 
     private sealed record AdbCommandResult(int ExitCode, string Stdout, string Stderr, bool TimedOut);
+
+    private sealed record AdbDeviceChoice(string? Serial, string DisplayName, string State, string RawLine);
 
     private sealed record AdbDeviceRow(string Serial, string State, string RawLine);
 
