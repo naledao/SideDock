@@ -96,6 +96,8 @@ public sealed partial class MainWindow : Window
     private string? _lastSpeakerErrorLine;
     private string? _lastMicrophoneErrorMessage;
     private string? _lastSpeakerErrorMessage;
+    private string? _lastMicrophoneSystemEndpointMessage;
+    private string? _lastSpeakerSystemEndpointMessage;
     private bool _loadingAudioEndpointChoices;
     private string? _boundMicrophoneRenderEndpointId;
     private string? _boundMicrophoneRenderEndpointName;
@@ -2206,6 +2208,8 @@ public sealed partial class MainWindow : Window
         report.AppendLine($"提示: {_lastAudioHint}");
         report.AppendLine($"最后麦克风错误: {FormatOptional(_lastMicrophoneErrorMessage)}");
         report.AppendLine($"最后音响错误: {FormatOptional(_lastSpeakerErrorMessage)}");
+        report.AppendLine($"最后麦克风系统端点消息: {FormatOptional(_lastMicrophoneSystemEndpointMessage)}");
+        report.AppendLine($"最后音响系统端点消息: {FormatOptional(_lastSpeakerSystemEndpointMessage)}");
         report.AppendLine($"最后麦克风状态日志: {FormatOptional(_lastMicrophoneStatusLine)}");
         report.AppendLine($"最后音响状态日志: {FormatOptional(_lastSpeakerStatusLine)}");
         report.AppendLine($"最后麦克风错误日志: {FormatOptional(_lastMicrophoneErrorLine)}");
@@ -2314,6 +2318,8 @@ public sealed partial class MainWindow : Window
         _lastSpeakerErrorLine = null;
         _lastMicrophoneErrorMessage = null;
         _lastSpeakerErrorMessage = null;
+        _lastMicrophoneSystemEndpointMessage = null;
+        _lastSpeakerSystemEndpointMessage = null;
 
         if (CopyAudioLogButtonText is not null)
         {
@@ -2343,7 +2349,7 @@ public sealed partial class MainWindow : Window
 
     private void HandleHostOutputLine(string line)
     {
-        if (!line.Contains("[AUDIO]", StringComparison.OrdinalIgnoreCase))
+        if (!line.Contains("[AUDIO", StringComparison.OrdinalIgnoreCase))
         {
             return;
         }
@@ -2384,10 +2390,16 @@ public sealed partial class MainWindow : Window
         }
 
         var errorMessage = ExtractLogTail(line, " message=");
+        var systemEndpointMessage = ExtractLogFieldBefore(line, " systemEndpointMessage=", " message=");
         if (isSpeaker)
         {
             _speakerRuntimeStatus = nextStatus.Value;
             _lastSpeakerStatusLine = line;
+            if (!string.IsNullOrWhiteSpace(systemEndpointMessage))
+            {
+                _lastSpeakerSystemEndpointMessage = systemEndpointMessage;
+            }
+
             if (nextStatus == AudioCapabilityStatus.Error)
             {
                 _lastSpeakerErrorLine = line;
@@ -2398,6 +2410,11 @@ public sealed partial class MainWindow : Window
         {
             _microphoneRuntimeStatus = nextStatus.Value;
             _lastMicrophoneStatusLine = line;
+            if (!string.IsNullOrWhiteSpace(systemEndpointMessage))
+            {
+                _lastMicrophoneSystemEndpointMessage = systemEndpointMessage;
+            }
+
             if (nextStatus == AudioCapabilityStatus.Error)
             {
                 _lastMicrophoneErrorLine = line;
@@ -2440,6 +2457,19 @@ public sealed partial class MainWindow : Window
 
         start += key.Length;
         return line[start..].Trim();
+    }
+
+    private static string ExtractLogFieldBefore(string line, string key, string nextKey)
+    {
+        var start = line.IndexOf(key, StringComparison.OrdinalIgnoreCase);
+        if (start < 0)
+        {
+            return string.Empty;
+        }
+
+        start += key.Length;
+        var end = line.IndexOf(nextKey, start, StringComparison.OrdinalIgnoreCase);
+        return (end < 0 ? line[start..] : line[start..end]).Trim();
     }
 
     private static string AudioStateHint(AudioDirection direction, AudioCapabilityStatus status)

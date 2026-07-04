@@ -1058,6 +1058,8 @@ internal static partial class Program
                 + $" stopped={ReadBool(payload, "stopped")}"
                 + $" permission={ReadBool(payload, "permissionGranted")}"
                 + $" port={ReadLong(payload, "port")}"
+                + $" sampleRate={ReadLong(payload, "sampleRate")}"
+                + $" channels={ReadLong(payload, "channels")}"
                 + (string.IsNullOrWhiteSpace(message) ? string.Empty : $" message={message}"));
         }
 
@@ -1081,6 +1083,8 @@ internal static partial class Program
                 + $" packets={ReadLong(payload, "packets")}"
                 + $" bytes={ReadLong(payload, "bytes")}"
                 + $" port={ReadLong(payload, "port")}"
+                + $" sampleRate={ReadLong(payload, "sampleRate")}"
+                + $" channels={ReadLong(payload, "channels")}"
                 + (string.IsNullOrWhiteSpace(message) ? string.Empty : $" message={message}"));
         }
 

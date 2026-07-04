@@ -146,7 +146,7 @@ public final class AudioCaptureClient {
             Socket nextSocket = null;
             Future<?> captureFuture = null;
             Future<?> playbackFuture = null;
-            AtomicReference<Exception> failure = new AtomicReference<>();
+            AtomicReference<WorkerFailure> failure = new AtomicReference<>();
 
             try {
                 emitCaptureState(canCapture ? "preparing" : "disabled", canCapture ? "正在准备麦克风采集。" : "麦克风未启用。");
@@ -165,6 +165,14 @@ public final class AudioCaptureClient {
                 }
 
                 final Socket activeSocket = nextSocket;
+                String socketMessage = "socket connected " + socketSummary(activeSocket) + "; " + generationDetails(runGeneration);
+                if (canCapture) {
+                    emitCaptureState("preparing", socketMessage);
+                }
+                if (speakerEnabled) {
+                    emitPlaybackState(speakerMuted ? "muted" : "preparing", socketMessage);
+                }
+
                 if (canCapture) {
                     recorder = createAudioRecord();
                     recorder.startRecording();
@@ -176,7 +184,9 @@ public final class AudioCaptureClient {
                                 emitCaptureState("capturing", "麦克风正在采集中。");
                                 writeCaptureStream(activeRecorder, activeSocket.getOutputStream(), runGeneration);
                             } catch (Exception ex) {
-                                failure.compareAndSet(null, ex);
+                                String message = "capture worker exception: " + exceptionSummary(ex) + "; " + generationDetails(runGeneration);
+                                emitCaptureState("unavailable", message);
+                                failure.compareAndSet(null, new WorkerFailure("capture", ex));
                                 closeQuietly(activeSocket);
                             }
                         }
@@ -190,7 +200,9 @@ public final class AudioCaptureClient {
                             try {
                                 readPlaybackStream(activeSocket.getInputStream(), runGeneration);
                             } catch (Exception ex) {
-                                failure.compareAndSet(null, ex);
+                                String message = "playback worker exception: " + exceptionSummary(ex) + "; " + generationDetails(runGeneration);
+                                emitPlaybackState("unavailable", message);
+                                failure.compareAndSet(null, new WorkerFailure("playback", ex));
                                 closeQuietly(activeSocket);
                             }
                         }
@@ -198,22 +210,28 @@ public final class AudioCaptureClient {
                 }
 
                 while (running && isCurrentGeneration(runGeneration)) {
-                    Exception ex = failure.get();
-                    if (ex != null) {
-                        throw ex;
+                    WorkerFailure workerFailure = failure.get();
+                    if (workerFailure != null) {
+                        throw new IllegalStateException(
+                            workerFailure.worker + " worker exception: " + exceptionSummary(workerFailure.exception)
+                                + "; " + generationDetails(runGeneration),
+                            workerFailure.exception);
                     }
 
-                    if ((captureFuture != null && captureFuture.isDone())
-                        || (playbackFuture != null && playbackFuture.isDone())) {
-                        throw new IllegalStateException("Audio worker stopped.");
+                    if (captureFuture != null && captureFuture.isDone()) {
+                        throw new IllegalStateException("capture worker stopped without exception; " + generationDetails(runGeneration));
+                    }
+                    if (playbackFuture != null && playbackFuture.isDone()) {
+                        throw new IllegalStateException("playback worker stopped without exception; " + generationDetails(runGeneration));
                     }
 
                     sleepQuietly(50L);
                 }
             } catch (Exception ex) {
                 if (running && isCurrentGeneration(runGeneration)) {
-                    emitCaptureState(canCapture ? "unavailable" : "disabled", messageFor(ex));
-                    emitPlaybackState(speakerEnabled ? "unavailable" : "disabled", messageFor(ex));
+                    String message = "audioLoop exception: " + exceptionSummary(ex) + "; " + generationDetails(runGeneration);
+                    emitCaptureState(canCapture ? "unavailable" : "disabled", message);
+                    emitPlaybackState(speakerEnabled ? "unavailable" : "disabled", message);
                     sleepQuietly(reconnectDelayMs);
                     reconnectDelayMs = Math.min(reconnectDelayMs * 2L, 3000L);
                 }
@@ -251,14 +269,26 @@ public final class AudioCaptureClient {
         while (running && isCurrentGeneration(runGeneration)) {
             int read = recorder.read(pcm, 0, targetChunkBytes);
             if (read <= 0) {
-                throw new IllegalStateException("AudioRecord read failed: " + read);
+                throw new IllegalStateException("AudioRecord read failed: " + read + "; " + generationDetails(runGeneration));
             }
 
             sequence += 1L;
             writeHeader(header, MIC_MAGIC, sequence, System.currentTimeMillis(), microphoneChannels, read);
-            output.write(header);
-            output.write(pcm, 0, read);
-            output.flush();
+            try {
+                output.write(header);
+            } catch (Exception ex) {
+                throw phaseException("write capture header", ex, runGeneration);
+            }
+            try {
+                output.write(pcm, 0, read);
+            } catch (Exception ex) {
+                throw phaseException("write capture payload", ex, runGeneration);
+            }
+            try {
+                output.flush();
+            } catch (Exception ex) {
+                throw phaseException("flush capture stream", ex, runGeneration);
+            }
 
             packetsSent += 1L;
             bytesSent += read;
@@ -274,7 +304,7 @@ public final class AudioCaptureClient {
         int channelConfig = speakerChannels == 1 ? AudioFormat.CHANNEL_OUT_MONO : AudioFormat.CHANNEL_OUT_STEREO;
         int minBufferBytes = AudioTrack.getMinBufferSize(sampleRate, channelConfig, AudioFormat.ENCODING_PCM_16BIT);
         if (minBufferBytes <= 0) {
-            throw new IllegalStateException("Unsupported speaker format.");
+            throw new IllegalStateException("Unsupported speaker format; " + generationDetails(runGeneration));
         }
 
         int playbackBufferBytes = Math.max(minBufferBytes * 2, (sampleRate / 5) * speakerChannels * (BITS_PER_SAMPLE / 8));
@@ -298,7 +328,7 @@ public final class AudioCaptureClient {
                 speakerMuted ? "本机音响已静音。" : "音响可用，等待电脑声音。");
 
             while (running && isCurrentGeneration(runGeneration)) {
-                readExactly(input, header, 0, HEADER_SIZE);
+                readExactly(input, header, 0, HEADER_SIZE, "read speaker header", runGeneration);
                 validateHeader(header, SPEAKER_MAGIC, "speaker");
                 int receivedSampleRate = readInt(header, 24);
                 int receivedChannels = readShort(header, 28);
@@ -306,16 +336,16 @@ public final class AudioCaptureClient {
                 int payloadLength = readInt(header, 32);
 
                 if (payloadLength <= 0 || payloadLength > pcm.length) {
-                    throw new IllegalStateException("Invalid speaker payload length: " + payloadLength);
+                    throw new IllegalStateException("Invalid speaker payload length: " + payloadLength + "; " + generationDetails(runGeneration));
                 }
                 if (receivedSampleRate != sampleRate
                     || receivedChannels != speakerChannels
                     || receivedBits != BITS_PER_SAMPLE) {
                     throw new IllegalStateException("Unsupported speaker format: "
-                        + receivedSampleRate + "/" + receivedChannels + "/" + receivedBits);
+                        + receivedSampleRate + "/" + receivedChannels + "/" + receivedBits + "; " + generationDetails(runGeneration));
                 }
 
-                readExactly(input, pcm, 0, payloadLength);
+                readExactly(input, pcm, 0, payloadLength, "read speaker payload", runGeneration);
                 packetsReceived += 1L;
                 bytesReceived += payloadLength;
 
@@ -324,7 +354,7 @@ public final class AudioCaptureClient {
                         track.play();
                         playbackStarted = true;
                     }
-                    writeTrack(track, pcm, payloadLength);
+                    writeTrack(track, pcm, payloadLength, runGeneration);
                 } else if (playbackStarted) {
                     track.pause();
                     track.flush();
@@ -400,23 +430,40 @@ public final class AudioCaptureClient {
         return ByteBuffer.wrap(buffer, offset, 2).order(ByteOrder.LITTLE_ENDIAN).getShort() & 0xFFFF;
     }
 
-    private static void readExactly(InputStream input, byte[] buffer, int offset, int length) throws Exception {
+    private void readExactly(
+        InputStream input,
+        byte[] buffer,
+        int offset,
+        int length,
+        String phase,
+        long runGeneration
+    ) throws Exception {
         int readTotal = 0;
         while (readTotal < length) {
-            int read = input.read(buffer, offset + readTotal, length - readTotal);
+            int read;
+            try {
+                read = input.read(buffer, offset + readTotal, length - readTotal);
+            } catch (Exception ex) {
+                throw phaseException(phase, ex, runGeneration);
+            }
             if (read < 0) {
-                throw new IllegalStateException("Audio stream closed.");
+                throw new IllegalStateException(phase + " EOF: Audio stream closed; " + generationDetails(runGeneration));
             }
             readTotal += read;
         }
     }
 
-    private static void writeTrack(AudioTrack track, byte[] pcm, int byteCount) {
+    private void writeTrack(AudioTrack track, byte[] pcm, int byteCount, long runGeneration) {
         int offset = 0;
         while (offset < byteCount) {
-            int written = track.write(pcm, offset, byteCount - offset);
+            int written;
+            try {
+                written = track.write(pcm, offset, byteCount - offset);
+            } catch (Exception ex) {
+                throw phaseException("write playback AudioTrack", ex, runGeneration);
+            }
             if (written <= 0) {
-                throw new IllegalStateException("AudioTrack write failed: " + written);
+                throw new IllegalStateException("AudioTrack write failed: " + written + "; " + generationDetails(runGeneration));
             }
             offset += written;
         }
@@ -466,11 +513,41 @@ public final class AudioCaptureClient {
         }
     }
 
-    private static String messageFor(Exception ex) {
+    private RuntimeException phaseException(String phase, Exception ex, long runGeneration) {
+        return new IllegalStateException(
+            phase + " failed: " + exceptionSummary(ex) + "; " + generationDetails(runGeneration),
+            ex);
+    }
+
+    private String generationDetails(long runGeneration) {
+        synchronized (lifecycleLock) {
+            return "generation=" + runGeneration
+                + " currentGeneration=" + generation
+                + " expired=" + (generation != runGeneration);
+        }
+    }
+
+    private static String exceptionSummary(Exception ex) {
         String message = ex.getMessage();
+        String type = ex.getClass().getSimpleName();
         return message == null || message.trim().isEmpty()
-            ? ex.getClass().getSimpleName()
-            : message;
+            ? type
+            : type + ": " + message;
+    }
+
+    private static String socketSummary(Socket socket) {
+        if (socket == null) {
+            return "socket=null";
+        }
+
+        try {
+            return "local=" + socket.getLocalSocketAddress()
+                + " remote=" + socket.getRemoteSocketAddress()
+                + " connected=" + socket.isConnected()
+                + " closed=" + socket.isClosed();
+        } catch (Exception ex) {
+            return "socketSummaryError=" + exceptionSummary(ex);
+        }
     }
 
     private static void sleepQuietly(long delayMs) {
@@ -495,6 +572,16 @@ public final class AudioCaptureClient {
 
     private void emitPlaybackStats(long packetsReceived, long bytesReceived) {
         listener.onAudioPlaybackStats(packetsReceived, bytesReceived);
+    }
+
+    private static final class WorkerFailure {
+        private final String worker;
+        private final Exception exception;
+
+        private WorkerFailure(String worker, Exception exception) {
+            this.worker = worker;
+            this.exception = exception;
+        }
     }
 
     private static final class NamedThreadFactory implements ThreadFactory {

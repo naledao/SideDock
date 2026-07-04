@@ -114,6 +114,7 @@ internal static partial class Program
                 Log(
                     "AUDIO",
                     $"mic-state={(micReady ? "available" : "unavailable")} backend={_audioBackend.Name} port={options.AudioPort} format=pcm_s16le/{AudioDefaults.SampleRate}/mono system-endpoint={(micReady ? "ready" : "missing")}"
+                    + $" systemEndpointMessage={LogValue(micMessage)}"
                     + (micReady ? string.Empty : $" message={micMessage}"));
                 await PublishMicStatusAsync(
                     micReady ? "available" : "unavailable",
@@ -132,6 +133,7 @@ internal static partial class Program
                 Log(
                     "AUDIO",
                     $"speaker-state={(speakerReady ? "available" : "unavailable")} backend={_audioBackend.Name} port={options.AudioPort} format=pcm_s16le/{AudioDefaults.SampleRate}/stereo system-endpoint={(speakerReady ? "ready" : "missing")}"
+                    + $" systemEndpointMessage={LogValue(speakerMessage)}"
                     + (speakerReady ? string.Empty : $" message={speakerMessage}"));
                 await PublishSpeakerStatusAsync(
                     speakerReady ? "available" : "unavailable",
@@ -151,58 +153,108 @@ internal static partial class Program
             CancellationTokenSource connectionCts,
             CancellationToken appToken)
         {
+            var directionTasks = new List<Task<AudioDirectionCompletion>>(2);
             using (client)
             using (connectionCts)
             {
-                var remote = client.Client.RemoteEndPoint?.ToString() ?? "unknown";
-                Log($"AUDIO {connectionId}", $"音频通道已连接: {remote}");
+                var remote = SafeEndpoint(client, remote: true);
+                var local = SafeEndpoint(client, remote: false);
+                Log(
+                    $"AUDIO {connectionId}",
+                    "音频通道已连接 "
+                    + $"remote={remote} local={local} "
+                    + $"microphone={(options.MicrophoneEnabled ? "enabled" : "disabled")} "
+                    + $"speaker={(options.SpeakerEnabled ? "enabled" : "disabled")} "
+                    + $"socket={DescribeSocket(client)}");
 
                 try
                 {
                     client.NoDelay = true;
-                    await using var stream = client.GetStream();
-                    var tasks = new List<Task>(2);
+                    var stream = client.GetStream();
                     if (options.MicrophoneEnabled)
                     {
-                        tasks.Add(ReceiveMicrophoneAsync(connectionId, stream, connectionCts.Token));
+                        directionTasks.Add(MonitorAudioDirectionAsync(
+                            "ReceiveMicrophoneAsync",
+                            token => ReceiveMicrophoneAsync(connectionId, stream, token),
+                            connectionCts.Token));
                     }
 
                     if (options.SpeakerEnabled)
                     {
-                        tasks.Add(SendSpeakerAsync(connectionId, stream, connectionCts.Token));
+                        directionTasks.Add(MonitorAudioDirectionAsync(
+                            "SendSpeakerAsync",
+                            token => SendSpeakerAsync(connectionId, stream, token),
+                            connectionCts.Token));
                     }
 
-                    if (tasks.Count == 0)
+                    if (directionTasks.Count == 0)
                     {
                         await Task.Delay(Timeout.InfiniteTimeSpan, connectionCts.Token);
                     }
                     else
                     {
-                        var completed = await Task.WhenAny(tasks);
-                        await completed;
+                        var firstTask = await Task.WhenAny(directionTasks);
+                        var firstCompletion = await firstTask;
+                        Log(
+                            $"AUDIO {connectionId}",
+                            "audio-task-ended first=true "
+                            + FormatAudioDirectionCompletion(firstCompletion));
+
+                        if (firstCompletion.Kind == AudioDirectionEndKind.EndOfStream)
+                        {
+                            Log(
+                                $"AUDIO {connectionId}",
+                                $"Android closed audio socket source={firstCompletion.TaskName} remote={remote}");
+                        }
+                        else if (firstCompletion.Kind is not AudioDirectionEndKind.OperationCanceled)
+                        {
+                            var message = $"音频连接已关闭：{firstCompletion.TaskName} {firstCompletion.Kind} {firstCompletion.Message}";
+                            await PublishMicStatusAsync("unavailable", message, CancellationToken.None);
+                            await PublishSpeakerStatusAsync("unavailable", message, CancellationToken.None);
+                        }
                     }
                 }
                 catch (OperationCanceledException) when (appToken.IsCancellationRequested || connectionCts.IsCancellationRequested)
                 {
-                    // Application shutdown or superseded connection.
+                    Log(
+                        $"AUDIO {connectionId}",
+                        $"audio-task-ended first=true task=HandleClientAsync endType=OperationCanceled socket={DescribeSocket(client)}");
                 }
-                catch (EndOfStreamException)
+                catch (EndOfStreamException ex)
                 {
-                    Log($"AUDIO {connectionId}", "音频通道已由 Android 关闭。");
+                    Log(
+                        $"AUDIO {connectionId}",
+                        $"Android closed audio socket task=HandleClientAsync endType=EOF message={ex.Message}");
                 }
                 catch (IOException ex)
                 {
-                    Log($"AUDIO {connectionId}", $"audio-state=unavailable reason=io message={ex.Message}");
+                    Log(
+                        $"AUDIO {connectionId}",
+                        $"audio-state=unavailable task=HandleClientAsync endType=IOException exception={ex.GetType().Name} message={ex.Message}");
+                }
+                catch (InvalidDataException ex)
+                {
+                    Log(
+                        $"AUDIO {connectionId}",
+                        $"audio-state=unavailable task=HandleClientAsync endType=InvalidDataException exception={ex.GetType().Name} message={ex.Message}");
                 }
                 catch (Exception ex)
                 {
-                    Log($"AUDIO {connectionId}", $"audio-state=unavailable reason=exception message={ex.Message}");
+                    Log(
+                        $"AUDIO {connectionId}",
+                        $"audio-state=unavailable task=HandleClientAsync endType=Exception exception={ex.GetType().Name} message={ex.Message}");
                     await PublishMicStatusAsync("unavailable", $"SideDock 麦克风暂不可用：{ex.Message}", CancellationToken.None);
                     await PublishSpeakerStatusAsync("unavailable", $"SideDock 音响暂不可用：{ex.Message}", CancellationToken.None);
                 }
                 finally
                 {
+                    Log($"AUDIO {connectionId}", $"准备关闭音频 socket beforeCancel={DescribeSocket(client)}");
                     await connectionCts.CancelAsync();
+                    Log($"AUDIO {connectionId}", $"关闭音频 socket 前状态 {DescribeSocket(client)}");
+                    CloseAudioSocket(client);
+                    Log($"AUDIO {connectionId}", $"关闭音频 socket 后状态 {DescribeSocket(client)}");
+                    await DrainAudioDirectionTasksAsync(connectionId, directionTasks);
+
                     lock (_connectionLock)
                     {
                         if (ReferenceEquals(_activeConnectionCts, connectionCts))
@@ -212,7 +264,7 @@ internal static partial class Program
                         }
                     }
 
-                    Log($"AUDIO {connectionId}", "音频通道已断开");
+                    Log($"AUDIO {connectionId}", $"音频通道已断开 remote={remote}");
                     await PublishInitialStatusAsync(CancellationToken.None);
                 }
             }
@@ -284,9 +336,19 @@ internal static partial class Program
             {
                 throw;
             }
-            catch (Exception ex) when (ex is IOException or InvalidDataException)
+            catch (EndOfStreamException ex)
             {
-                Log($"AUDIO {connectionId}", $"mic-state=unavailable reason={ex.GetType().Name} message={ex.Message}");
+                Log($"AUDIO {connectionId}", $"mic-state=unavailable task=ReceiveMicrophoneAsync endType=EOF exception={ex.GetType().Name} message={ex.Message}");
+                throw;
+            }
+            catch (InvalidDataException ex)
+            {
+                Log($"AUDIO {connectionId}", $"mic-state=unavailable task=ReceiveMicrophoneAsync endType=InvalidDataException exception={ex.GetType().Name} message={ex.Message}");
+                throw;
+            }
+            catch (IOException ex)
+            {
+                Log($"AUDIO {connectionId}", $"mic-state=unavailable task=ReceiveMicrophoneAsync endType=IOException exception={ex.GetType().Name} message={ex.Message}");
                 throw;
             }
             finally
@@ -364,9 +426,19 @@ internal static partial class Program
             {
                 throw;
             }
-            catch (Exception ex) when (ex is IOException or InvalidDataException)
+            catch (EndOfStreamException ex)
             {
-                Log($"AUDIO {connectionId}", $"speaker-state=unavailable reason={ex.GetType().Name} message={ex.Message}");
+                Log($"AUDIO {connectionId}", $"speaker-state=unavailable task=SendSpeakerAsync endType=EOF exception={ex.GetType().Name} message={ex.Message}");
+                throw;
+            }
+            catch (InvalidDataException ex)
+            {
+                Log($"AUDIO {connectionId}", $"speaker-state=unavailable task=SendSpeakerAsync endType=InvalidDataException exception={ex.GetType().Name} message={ex.Message}");
+                throw;
+            }
+            catch (IOException ex)
+            {
+                Log($"AUDIO {connectionId}", $"speaker-state=unavailable task=SendSpeakerAsync endType=IOException exception={ex.GetType().Name} message={ex.Message}");
                 throw;
             }
             finally
@@ -374,6 +446,157 @@ internal static partial class Program
                 ArrayPool<byte>.Shared.Return(header);
                 ArrayPool<byte>.Shared.Return(payload);
             }
+        }
+
+        private enum AudioDirectionEndKind
+        {
+            Normal,
+            EndOfStream,
+            IOException,
+            InvalidDataException,
+            OperationCanceled,
+            Exception
+        }
+
+        private sealed record AudioDirectionCompletion(
+            string TaskName,
+            AudioDirectionEndKind Kind,
+            string ExceptionType,
+            string Message);
+
+        private static async Task<AudioDirectionCompletion> MonitorAudioDirectionAsync(
+            string taskName,
+            Func<CancellationToken, Task> action,
+            CancellationToken cancellationToken)
+        {
+            try
+            {
+                await action(cancellationToken);
+                return new AudioDirectionCompletion(taskName, AudioDirectionEndKind.Normal, string.Empty, "正常结束");
+            }
+            catch (EndOfStreamException ex)
+            {
+                return new AudioDirectionCompletion(taskName, AudioDirectionEndKind.EndOfStream, ex.GetType().Name, ex.Message);
+            }
+            catch (InvalidDataException ex)
+            {
+                return new AudioDirectionCompletion(taskName, AudioDirectionEndKind.InvalidDataException, ex.GetType().Name, ex.Message);
+            }
+            catch (OperationCanceledException ex)
+            {
+                return new AudioDirectionCompletion(taskName, AudioDirectionEndKind.OperationCanceled, ex.GetType().Name, ex.Message);
+            }
+            catch (IOException ex)
+            {
+                return new AudioDirectionCompletion(taskName, AudioDirectionEndKind.IOException, ex.GetType().Name, ex.Message);
+            }
+            catch (Exception ex)
+            {
+                return new AudioDirectionCompletion(taskName, AudioDirectionEndKind.Exception, ex.GetType().Name, ex.Message);
+            }
+        }
+
+        private static async Task DrainAudioDirectionTasksAsync(
+            int connectionId,
+            IReadOnlyCollection<Task<AudioDirectionCompletion>> directionTasks)
+        {
+            if (directionTasks.Count == 0)
+            {
+                return;
+            }
+
+            try
+            {
+                var completions = await Task.WhenAll(directionTasks).WaitAsync(TimeSpan.FromSeconds(2));
+                foreach (var completion in completions)
+                {
+                    Log(
+                        $"AUDIO {connectionId}",
+                        "audio-task-ended first=false " + FormatAudioDirectionCompletion(completion));
+                }
+            }
+            catch (TimeoutException)
+            {
+                var pending = directionTasks.Count(task => !task.IsCompleted);
+                Log($"AUDIO {connectionId}", $"audio-task-drain timeout pending={pending}");
+            }
+            catch (Exception ex)
+            {
+                Log(
+                    $"AUDIO {connectionId}",
+                    $"audio-task-drain failed exception={ex.GetType().Name} message={LogValue(ex.Message)}");
+            }
+        }
+
+        private static string FormatAudioDirectionCompletion(AudioDirectionCompletion completion)
+        {
+            return $"task={completion.TaskName} endType={completion.Kind} exception={LogValue(completion.ExceptionType)} message={LogValue(completion.Message)}";
+        }
+
+        private static string SafeEndpoint(TcpClient client, bool remote)
+        {
+            try
+            {
+                var endpoint = remote ? client.Client.RemoteEndPoint : client.Client.LocalEndPoint;
+                return endpoint?.ToString() ?? "unknown";
+            }
+            catch (ObjectDisposedException)
+            {
+                return "disposed";
+            }
+            catch (SocketException ex)
+            {
+                return $"socket-error:{ex.SocketErrorCode}";
+            }
+        }
+
+        private static string DescribeSocket(TcpClient client)
+        {
+            try
+            {
+                var socket = client.Client;
+                return $"connected={socket.Connected} available={socket.Available} local={socket.LocalEndPoint?.ToString() ?? "unknown"} remote={socket.RemoteEndPoint?.ToString() ?? "unknown"}";
+            }
+            catch (ObjectDisposedException)
+            {
+                return "disposed=true";
+            }
+            catch (SocketException ex)
+            {
+                return $"socket-error={ex.SocketErrorCode}";
+            }
+            catch (InvalidOperationException ex)
+            {
+                return $"socket-invalid={LogValue(ex.Message)}";
+            }
+        }
+
+        private static void CloseAudioSocket(TcpClient client)
+        {
+            try
+            {
+                client.Client.Shutdown(SocketShutdown.Both);
+            }
+            catch (Exception ex) when (ex is ObjectDisposedException or SocketException or InvalidOperationException)
+            {
+                // The socket may already be closed by Android or by the opposite audio worker.
+            }
+
+            try
+            {
+                client.Close();
+            }
+            catch
+            {
+                // Best effort during connection cleanup.
+            }
+        }
+
+        private static string LogValue(string? value)
+        {
+            return string.IsNullOrWhiteSpace(value)
+                ? "(none)"
+                : value.Replace('\r', ' ').Replace('\n', ' ').Trim();
         }
 
         private async Task PublishMicStatusAsync(
@@ -639,6 +862,7 @@ internal static partial class Program
                         }
 
                         var device = GetEndpoint(_microphoneRenderEndpointId, DataFlow.Render, "Android 麦克风写入端点");
+                        var mixFormat = device.AudioClient.MixFormat;
                         var format = SelectMicrophoneRenderFormat(device);
                         var buffer = new BufferedWaveProvider(format)
                         {
@@ -665,7 +889,10 @@ internal static partial class Program
                         _microphoneRenderBuffer = buffer;
                         _microphoneRenderOutput = output;
                         _microphoneRenderFormat = format;
-                        _microphoneStatusMessage = $"Android 麦克风写入端点已就绪：{device.FriendlyName} ({FormatWaveFormat(format)})。";
+                        _microphoneStatusMessage = $"Android 麦克风写入端点已就绪：{device.FriendlyName}；direction={device.DataFlow}；selectedFormat={FormatWaveFormat(format)}；mixFormat={FormatWaveFormat(mixFormat)}。";
+                        Log(
+                            "AUDIO",
+                            $"wasapi-endpoint-opened role=microphone-render friendlyName={LogValue(device.FriendlyName)} direction={device.DataFlow} selectedFormat={LogValue(FormatWaveFormat(format))} mixFormat={LogValue(FormatWaveFormat(mixFormat))}");
                         message = _microphoneStatusMessage;
                         return true;
                     }
@@ -673,6 +900,9 @@ internal static partial class Program
                     {
                         ResetMicrophoneRenderCore();
                         _microphoneStatusMessage = $"Android 麦克风写入端点不可用：{ex.Message}";
+                        Log(
+                            "AUDIO",
+                            $"wasapi-endpoint-open-failed role=microphone-render exception={ex.GetType().Name} message={LogValue(ex.Message)}");
                         message = _microphoneStatusMessage;
                         return false;
                     }
@@ -777,6 +1007,7 @@ internal static partial class Program
                         }
 
                         var device = GetEndpoint(_speakerOutputLoopbackEndpointId, DataFlow.Render, "电脑声音 loopback 输出端点");
+                        var mixFormat = device.AudioClient.MixFormat;
                         var format = new WaveFormat(AudioDefaults.SampleRate, AudioDefaults.BitsPerSample, AudioDefaults.SpeakerChannels);
                         EnsureFormatSupported(device, format, "电脑声音 loopback 输出端点");
                         var capture = new WasapiLoopbackCapture(device)
@@ -790,7 +1021,10 @@ internal static partial class Program
                         _speakerCaptureDevice = device;
                         _speakerCapture = capture;
                         _speakerCaptureFormat = format;
-                        _speakerStatusMessage = $"电脑声音 loopback 输出端点已就绪：{device.FriendlyName} ({FormatWaveFormat(format)})。";
+                        _speakerStatusMessage = $"电脑声音 loopback 输出端点已就绪：{device.FriendlyName}；direction={device.DataFlow}；selectedFormat={FormatWaveFormat(format)}；mixFormat={FormatWaveFormat(mixFormat)}。";
+                        Log(
+                            "AUDIO",
+                            $"wasapi-endpoint-opened role=speaker-loopback friendlyName={LogValue(device.FriendlyName)} direction={device.DataFlow} selectedFormat={LogValue(FormatWaveFormat(format))} mixFormat={LogValue(FormatWaveFormat(mixFormat))}");
                         message = _speakerStatusMessage;
                         return true;
                     }
@@ -798,6 +1032,9 @@ internal static partial class Program
                     {
                         ResetSpeakerCaptureCore();
                         _speakerStatusMessage = $"电脑声音 loopback 输出端点不可用：{ex.Message}";
+                        Log(
+                            "AUDIO",
+                            $"wasapi-endpoint-open-failed role=speaker-loopback exception={ex.GetType().Name} message={LogValue(ex.Message)}");
                         message = _speakerStatusMessage;
                         return false;
                     }
@@ -1062,7 +1299,7 @@ internal static partial class Program
 
             private static string FormatWaveFormat(WaveFormat format)
             {
-                return $"{format.SampleRate} Hz / {format.BitsPerSample}-bit / {format.Channels}ch";
+                return $"{format.Encoding} {format.SampleRate} Hz / {format.BitsPerSample}-bit / {format.Channels}ch";
             }
 
             private static void DuplicateMono16ToStereo(byte[] source, int sourceByteCount, byte[] destination)

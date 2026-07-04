@@ -436,7 +436,7 @@
                                         Grid.Row="3"
                                         Grid.Column="1"
                                         Grid.ColumnSpan="2"
-                                        Text="选择虚拟线缆/Voicemeeter 的 Input/播放端；通话软件麦克风请选择同一链路对应的 Output/录制端。"
+                                        Text="推荐选择 Voicemeeter Input / CABLE Input 等虚拟线缆播放端；通话软件麦克风请选择对应 Output/录制端。不建议优先选择 AudioRelay Virtual Speakers，除非确认它有对应录制端可供通话软件选择。"
                                         TextWrapping="Wrap" />
 
                                     <Button
