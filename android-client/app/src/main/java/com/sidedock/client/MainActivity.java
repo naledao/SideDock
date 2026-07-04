@@ -180,6 +180,11 @@ public final class MainActivity extends Activity implements ControlClient.Listen
     private String microphoneRuntimeState = "waiting_device";
     private String speakerRuntimeState = "waiting_device";
     private String lastAudioHint = "等待电脑音频状态。";
+    private long microphonePacketsSent;
+    private long microphoneBytesSent;
+    private int microphonePeakSample;
+    private long microphoneSilentPackets;
+    private String microphoneAudioSource = "";
     private long speakerPacketsReceived;
     private long speakerBytesReceived;
 
@@ -405,10 +410,15 @@ public final class MainActivity extends Activity implements ControlClient.Listen
     }
 
     @Override
-    public void onAudioCaptureStats(long packetsSent, long bytesSent) {
+    public void onAudioCaptureStats(long packetsSent, long bytesSent, int peakSample, long silentPackets, String audioSourceName) {
         mainHandler.post(new Runnable() {
             @Override
             public void run() {
+                microphonePacketsSent = packetsSent;
+                microphoneBytesSent = bytesSent;
+                microphonePeakSample = peakSample;
+                microphoneSilentPackets = silentPackets;
+                microphoneAudioSource = audioSourceName == null ? "" : audioSourceName;
                 publishAudioMicrophoneStatus("capturing", "麦克风正在采集中。");
             }
         });
@@ -1446,7 +1456,12 @@ public final class MainActivity extends Activity implements ControlClient.Listen
             audioPort,
             audioSampleRate,
             audioChannels,
-            message
+            message,
+            microphonePacketsSent,
+            microphoneBytesSent,
+            microphonePeakSample,
+            microphoneSilentPackets,
+            microphoneAudioSource
         );
     }
 

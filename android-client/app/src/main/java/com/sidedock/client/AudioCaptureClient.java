@@ -25,7 +25,7 @@ import java.util.concurrent.atomic.AtomicReference;
 public final class AudioCaptureClient {
     public interface Listener {
         void onAudioCaptureState(String state, String message);
-        void onAudioCaptureStats(long packetsSent, long bytesSent);
+        void onAudioCaptureStats(long packetsSent, long bytesSent, int peakSample, long silentPackets, String audioSourceName);
         void onAudioPlaybackState(String state, String message);
         void onAudioPlaybackStats(long packetsReceived, long bytesReceived);
     }
@@ -34,6 +34,7 @@ public final class AudioCaptureClient {
     private static final int VERSION = 1;
     private static final int BITS_PER_SAMPLE = 16;
     private static final int MAX_SPEAKER_PAYLOAD_BYTES = 48000 * 2 * 2;
+    private static final int SILENCE_PEAK_THRESHOLD = 128;
     private static final byte[] MIC_MAGIC = new byte[] { 'S', 'D', 'A', 'M' };
     private static final byte[] SPEAKER_MAGIC = new byte[] { 'S', 'D', 'A', 'S' };
 
@@ -143,6 +144,7 @@ public final class AudioCaptureClient {
             }
 
             AudioRecord recorder = null;
+            AudioRecordSource recorderSource = null;
             Socket nextSocket = null;
             Future<?> captureFuture = null;
             Future<?> playbackFuture = null;
@@ -174,15 +176,17 @@ public final class AudioCaptureClient {
                 }
 
                 if (canCapture) {
-                    recorder = createAudioRecord();
+                    recorderSource = createAudioRecord();
+                    recorder = recorderSource.recorder;
                     recorder.startRecording();
                     final AudioRecord activeRecorder = recorder;
+                    final String activeAudioSourceName = recorderSource.audioSourceName;
                     captureFuture = executor.submit(new Runnable() {
                         @Override
                         public void run() {
                             try {
                                 emitCaptureState("capturing", "麦克风正在采集中。");
-                                writeCaptureStream(activeRecorder, activeSocket.getOutputStream(), runGeneration);
+                                writeCaptureStream(activeRecorder, activeSocket.getOutputStream(), runGeneration, activeAudioSourceName);
                             } catch (Exception ex) {
                                 String message = "capture worker exception: " + exceptionSummary(ex) + "; " + generationDetails(runGeneration);
                                 emitCaptureState("unavailable", message);
@@ -251,7 +255,7 @@ public final class AudioCaptureClient {
         }
     }
 
-    private void writeCaptureStream(AudioRecord recorder, OutputStream output, long runGeneration) throws Exception {
+    private void writeCaptureStream(AudioRecord recorder, OutputStream output, long runGeneration, String audioSourceName) throws Exception {
         int bytesPerSample = BITS_PER_SAMPLE / 8;
         int frameBytes = microphoneChannels * bytesPerSample;
         int targetChunkBytes = Math.max(frameBytes, (sampleRate / 50) * frameBytes);
@@ -264,12 +268,20 @@ public final class AudioCaptureClient {
         long sequence = 0L;
         long packetsSent = 0L;
         long bytesSent = 0L;
+        long silentPackets = 0L;
+        int peakSample = 0;
         long lastStatsAtMs = 0L;
 
         while (running && isCurrentGeneration(runGeneration)) {
             int read = recorder.read(pcm, 0, targetChunkBytes);
             if (read <= 0) {
                 throw new IllegalStateException("AudioRecord read failed: " + read + "; " + generationDetails(runGeneration));
+            }
+
+            int packetPeakSample = calculatePeakSample(pcm, read);
+            peakSample = Math.max(peakSample, packetPeakSample);
+            if (packetPeakSample <= SILENCE_PEAK_THRESHOLD) {
+                silentPackets += 1L;
             }
 
             sequence += 1L;
@@ -295,7 +307,7 @@ public final class AudioCaptureClient {
             long now = System.currentTimeMillis();
             if (now - lastStatsAtMs >= 1000L) {
                 lastStatsAtMs = now;
-                emitCaptureStats(packetsSent, bytesSent);
+                emitCaptureStats(packetsSent, bytesSent, peakSample, silentPackets, audioSourceName);
             }
         }
     }
@@ -378,7 +390,7 @@ public final class AudioCaptureClient {
         }
     }
 
-    private AudioRecord createAudioRecord() {
+    private AudioRecordSource createAudioRecord() {
         int channelConfig = microphoneChannels == 1 ? AudioFormat.CHANNEL_IN_MONO : AudioFormat.CHANNEL_IN_STEREO;
         int minBufferBytes = AudioRecord.getMinBufferSize(sampleRate, channelConfig, AudioFormat.ENCODING_PCM_16BIT);
         if (minBufferBytes <= 0) {
@@ -386,18 +398,67 @@ public final class AudioCaptureClient {
         }
 
         int bufferBytes = Math.max(minBufferBytes * 2, (sampleRate / 10) * microphoneChannels * (BITS_PER_SAMPLE / 8));
-        AudioRecord recorder = new AudioRecord(
-            MediaRecorder.AudioSource.VOICE_COMMUNICATION,
-            sampleRate,
-            channelConfig,
-            AudioFormat.ENCODING_PCM_16BIT,
-            bufferBytes);
-        if (recorder.getState() != AudioRecord.STATE_INITIALIZED) {
-            recorder.release();
-            throw new IllegalStateException("AudioRecord initialization failed.");
+        int[] audioSources = new int[] {
+            MediaRecorder.AudioSource.MIC,
+            MediaRecorder.AudioSource.UNPROCESSED,
+            MediaRecorder.AudioSource.VOICE_COMMUNICATION
+        };
+        RuntimeException lastFailure = null;
+        for (int audioSource : audioSources) {
+            AudioRecord recorder = null;
+            try {
+                recorder = new AudioRecord(
+                    audioSource,
+                    sampleRate,
+                    channelConfig,
+                    AudioFormat.ENCODING_PCM_16BIT,
+                    bufferBytes);
+                if (recorder.getState() == AudioRecord.STATE_INITIALIZED) {
+                    return new AudioRecordSource(recorder, audioSourceName(audioSource));
+                }
+
+                lastFailure = new IllegalStateException("AudioRecord source " + audioSourceName(audioSource) + " was not initialized.");
+            } catch (RuntimeException ex) {
+                lastFailure = ex;
+            }
+
+            if (recorder != null) {
+                recorder.release();
+            }
         }
 
-        return recorder;
+        throw new IllegalStateException(
+            "AudioRecord initialization failed for MIC, UNPROCESSED and VOICE_COMMUNICATION.",
+            lastFailure);
+    }
+
+    private static int calculatePeakSample(byte[] pcm, int byteCount) {
+        int peak = 0;
+        int end = byteCount - (byteCount % 2);
+        for (int offset = 0; offset < end; offset += 2) {
+            int low = pcm[offset] & 0xFF;
+            int high = pcm[offset + 1];
+            int sample = (short) ((high << 8) | low);
+            int abs = sample == Short.MIN_VALUE ? Short.MAX_VALUE : Math.abs(sample);
+            if (abs > peak) {
+                peak = abs;
+            }
+        }
+
+        return peak;
+    }
+
+    private static String audioSourceName(int audioSource) {
+        switch (audioSource) {
+            case MediaRecorder.AudioSource.MIC:
+                return "MIC";
+            case MediaRecorder.AudioSource.UNPROCESSED:
+                return "UNPROCESSED";
+            case MediaRecorder.AudioSource.VOICE_COMMUNICATION:
+                return "VOICE_COMMUNICATION";
+            default:
+                return "source-" + audioSource;
+        }
     }
 
     private void writeHeader(byte[] header, byte[] magic, long sequence, long timestampMs, int channels, int payloadLength) {
@@ -562,8 +623,8 @@ public final class AudioCaptureClient {
         listener.onAudioCaptureState(state, message);
     }
 
-    private void emitCaptureStats(long packetsSent, long bytesSent) {
-        listener.onAudioCaptureStats(packetsSent, bytesSent);
+    private void emitCaptureStats(long packetsSent, long bytesSent, int peakSample, long silentPackets, String audioSourceName) {
+        listener.onAudioCaptureStats(packetsSent, bytesSent, peakSample, silentPackets, audioSourceName);
     }
 
     private void emitPlaybackState(String state, String message) {
@@ -581,6 +642,16 @@ public final class AudioCaptureClient {
         private WorkerFailure(String worker, Exception exception) {
             this.worker = worker;
             this.exception = exception;
+        }
+    }
+
+    private static final class AudioRecordSource {
+        private final AudioRecord recorder;
+        private final String audioSourceName;
+
+        private AudioRecordSource(AudioRecord recorder, String audioSourceName) {
+            this.recorder = recorder;
+            this.audioSourceName = audioSourceName;
         }
     }
 

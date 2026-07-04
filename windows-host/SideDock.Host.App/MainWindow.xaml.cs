@@ -107,6 +107,7 @@ public sealed partial class MainWindow : Window
     private string? _boundMicrophoneRenderEndpointName;
     private string? _boundSpeakerCaptureEndpointId;
     private string? _boundSpeakerCaptureEndpointName;
+    private bool _audioEndpointChoicesReady;
     private AudioEndpointDiagnostics _microphoneRenderEndpointDiagnostics = AudioEndpointDiagnostics.Unknown(AudioEndpointRole.MicrophoneRender);
     private AudioEndpointDiagnostics _speakerCaptureEndpointDiagnostics = AudioEndpointDiagnostics.Unknown(AudioEndpointRole.SpeakerCapture);
 
@@ -438,7 +439,7 @@ public sealed partial class MainWindow : Window
 
     private void AudioEndpointCombo_SelectionChanged(object sender, SelectionChangedEventArgs e)
     {
-        if (_loadingAudioEndpointChoices)
+        if (_loadingAudioEndpointChoices || !_audioEndpointChoicesReady)
         {
             return;
         }
@@ -729,6 +730,9 @@ public sealed partial class MainWindow : Window
             RefreshAudioEndpointsButton.IsEnabled = false;
         }
 
+        _audioEndpointChoicesReady = false;
+        _loadingAudioEndpointChoices = true;
+
         try
         {
             if (!OperatingSystem.IsWindows())
@@ -748,32 +752,35 @@ public sealed partial class MainWindow : Window
             var microphoneRenderEndpoints = ToMicrophoneEndpointChoices(captureEndpoints, renderEndpoints);
 
             _loadingAudioEndpointChoices = true;
-            try
-            {
-                _speakerCaptureEndpointDiagnostics = ApplyAudioEndpointChoices(
-                    AudioEndpointRole.SpeakerCapture,
-                    SpeakerCaptureEndpointCombo,
-                    speakerCaptureEndpoints,
-                    _boundSpeakerCaptureEndpointId,
-                    _boundSpeakerCaptureEndpointName);
+            _speakerCaptureEndpointDiagnostics = ApplyAudioEndpointChoices(
+                AudioEndpointRole.SpeakerCapture,
+                SpeakerCaptureEndpointCombo,
+                speakerCaptureEndpoints,
+                _boundSpeakerCaptureEndpointId,
+                _boundSpeakerCaptureEndpointName);
 
-                _microphoneRenderEndpointDiagnostics = ApplyAudioEndpointChoices(
-                    AudioEndpointRole.MicrophoneRender,
-                    MicrophoneRenderEndpointCombo,
-                    microphoneRenderEndpoints,
-                    _boundMicrophoneRenderEndpointId,
-                    _boundMicrophoneRenderEndpointName);
-            }
-            finally
-            {
-                _loadingAudioEndpointChoices = false;
-            }
+            _microphoneRenderEndpointDiagnostics = ApplyAudioEndpointChoices(
+                AudioEndpointRole.MicrophoneRender,
+                MicrophoneRenderEndpointCombo,
+                microphoneRenderEndpoints,
+                _boundMicrophoneRenderEndpointId,
+                _boundMicrophoneRenderEndpointName);
 
             SetAudioEndpointStatusTexts();
+            if (!DispatcherQueue.TryEnqueue(() =>
+                {
+                    _loadingAudioEndpointChoices = false;
+                    _audioEndpointChoicesReady = true;
+                }))
+            {
+                _loadingAudioEndpointChoices = false;
+                _audioEndpointChoicesReady = true;
+            }
             UpdateAudioState(showHint ? "音频端点列表已刷新。" : null);
         }
         catch (Exception ex)
         {
+            _loadingAudioEndpointChoices = false;
             _speakerCaptureEndpointDiagnostics = AudioEndpointDiagnostics.EnumerationFailed(AudioEndpointRole.SpeakerCapture, ex.Message);
             _microphoneRenderEndpointDiagnostics = AudioEndpointDiagnostics.EnumerationFailed(AudioEndpointRole.MicrophoneRender, ex.Message);
             SetAudioEndpointStatusTexts();
@@ -2760,26 +2767,33 @@ public sealed partial class MainWindow : Window
         {
             var path = BuildAudioPreferencesPath();
             Directory.CreateDirectory(Path.GetDirectoryName(path)!);
+            var existingPreferences = !_audioEndpointChoicesReady
+                ? TryReadAudioPreferences(path)
+                : null;
+            var microphoneRenderEndpoint = BuildAudioEndpointBinding(
+                _boundMicrophoneRenderEndpointId,
+                _boundMicrophoneRenderEndpointName);
+            var speakerOutputLoopbackEndpoint = BuildAudioEndpointBinding(
+                _boundSpeakerCaptureEndpointId,
+                _boundSpeakerCaptureEndpointName);
+            if (!_audioEndpointChoicesReady)
+            {
+                microphoneRenderEndpoint = PreserveExistingBindingWhenEmpty(
+                    microphoneRenderEndpoint,
+                    existingPreferences?.MicrophoneRenderEndpoint);
+                speakerOutputLoopbackEndpoint = PreserveExistingBindingWhenEmpty(
+                    speakerOutputLoopbackEndpoint,
+                    existingPreferences?.SpeakerOutputLoopbackEndpoint ?? existingPreferences?.SpeakerCaptureEndpoint);
+            }
+
             var preferences = new AudioPreferences
             {
                 AudioDeviceEnabled = AudioDeviceSwitch.IsOn,
                 MicrophoneEnabled = MicrophoneSwitch.IsOn,
                 SpeakerEnabled = SpeakerSwitch.IsOn,
-                MicrophoneRenderEndpoint = new AudioEndpointBinding
-                {
-                    EndpointId = _boundMicrophoneRenderEndpointId,
-                    DisplayName = _boundMicrophoneRenderEndpointName
-                },
-                SpeakerOutputLoopbackEndpoint = new AudioEndpointBinding
-                {
-                    EndpointId = _boundSpeakerCaptureEndpointId,
-                    DisplayName = _boundSpeakerCaptureEndpointName
-                },
-                SpeakerCaptureEndpoint = new AudioEndpointBinding
-                {
-                    EndpointId = _boundSpeakerCaptureEndpointId,
-                    DisplayName = _boundSpeakerCaptureEndpointName
-                }
+                MicrophoneRenderEndpoint = microphoneRenderEndpoint,
+                SpeakerOutputLoopbackEndpoint = speakerOutputLoopbackEndpoint,
+                SpeakerCaptureEndpoint = speakerOutputLoopbackEndpoint
             };
             var json = JsonSerializer.Serialize(preferences, new JsonSerializerOptions { WriteIndented = true });
             File.WriteAllText(path, json, System.Text.Encoding.UTF8);
@@ -2797,6 +2811,38 @@ public sealed partial class MainWindow : Window
             "SideDock",
             "HostApp",
             AudioPreferencesFileName);
+    }
+
+    private static AudioPreferences? TryReadAudioPreferences(string path)
+    {
+        try
+        {
+            return File.Exists(path)
+                ? JsonSerializer.Deserialize<AudioPreferences>(File.ReadAllText(path, System.Text.Encoding.UTF8))
+                : null;
+        }
+        catch
+        {
+            return null;
+        }
+    }
+
+    private static AudioEndpointBinding BuildAudioEndpointBinding(string? endpointId, string? displayName)
+    {
+        return new AudioEndpointBinding
+        {
+            EndpointId = endpointId,
+            DisplayName = displayName
+        };
+    }
+
+    private static AudioEndpointBinding PreserveExistingBindingWhenEmpty(
+        AudioEndpointBinding current,
+        AudioEndpointBinding? existing)
+    {
+        return string.IsNullOrWhiteSpace(current.EndpointId) && !string.IsNullOrWhiteSpace(existing?.EndpointId)
+            ? existing
+            : current;
     }
 
     private string AudioToggleHint(object sender)

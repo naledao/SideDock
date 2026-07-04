@@ -579,7 +579,12 @@ public final class ControlClient {
         int port,
         int sampleRate,
         int channels,
-        String message
+        String message,
+        long packets,
+        long bytes,
+        int peakSample,
+        long silentPackets,
+        String audioSource
     ) {
         sendFromAnyThread("audio_mic_status", payload(
             "state", state == null ? "" : state,
@@ -589,7 +594,12 @@ public final class ControlClient {
             "port", port,
             "sampleRate", sampleRate,
             "channels", channels,
-            "message", message == null ? "" : message
+            "message", message == null ? "" : message,
+            "packets", packets,
+            "bytes", bytes,
+            "peakSample", peakSample,
+            "silentPackets", silentPackets,
+            "audioSource", audioSource == null ? "" : audioSource
         ));
     }
 
