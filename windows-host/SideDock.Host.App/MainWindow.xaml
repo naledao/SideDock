@@ -73,6 +73,8 @@
                         BorderBrush="{ThemeResource CardStrokeColorDefaultBrush}"
                         BorderThickness="1">
                         <ScrollViewer
+                            x:Name="ConnectionSessionScrollViewer"
+                            VerticalScrollMode="Enabled"
                             VerticalScrollBarVisibility="Auto"
                             HorizontalScrollBarVisibility="Disabled">
                             <StackPanel Spacing="18">
@@ -231,6 +233,8 @@
                             BorderBrush="{ThemeResource CardStrokeColorDefaultBrush}"
                             BorderThickness="1">
                             <ScrollViewer
+                                x:Name="DisplayCardScrollViewer"
+                                VerticalScrollMode="Enabled"
                                 VerticalScrollBarVisibility="Auto"
                                 HorizontalScrollBarVisibility="Disabled">
                                 <StackPanel Spacing="16">
@@ -341,6 +345,8 @@
                             BorderBrush="{ThemeResource CardStrokeColorDefaultBrush}"
                             BorderThickness="1">
                             <ScrollViewer
+                                x:Name="AudioCardScrollViewer"
+                                VerticalScrollMode="Enabled"
                                 VerticalScrollBarVisibility="Auto"
                                 HorizontalScrollBarVisibility="Disabled">
                                 <StackPanel Spacing="16">
@@ -463,6 +469,8 @@
                             BorderBrush="{ThemeResource CardStrokeColorDefaultBrush}"
                             BorderThickness="1">
                             <ScrollViewer
+                                x:Name="RuntimeCardScrollViewer"
+                                VerticalScrollMode="Enabled"
                                 VerticalScrollBarVisibility="Auto"
                                 HorizontalScrollBarVisibility="Disabled">
                                 <StackPanel Spacing="8">

@@ -9,6 +9,7 @@ using Microsoft.UI;
 using Microsoft.UI.Windowing;
 using Microsoft.UI.Xaml;
 using Microsoft.UI.Xaml.Controls;
+using Microsoft.UI.Xaml.Input;
 using Microsoft.UI.Xaml.Media;
 using Windows.ApplicationModel.DataTransfer;
 using WinRT.Interop;
@@ -98,6 +99,7 @@ public sealed partial class MainWindow : Window
             presenter.IsMaximizable = false;
         }
 
+        RegisterCardWheelScrolling();
         InitializeTrayIcon();
         AppWindow.Closing += OnAppWindowClosing;
         Closed += (_, _) =>
@@ -117,6 +119,49 @@ public sealed partial class MainWindow : Window
         _displayStatusTimer.Start();
 
         _ = RefreshAdbDevicesAsync(showErrors: false);
+    }
+
+    private void RegisterCardWheelScrolling()
+    {
+        RegisterCardWheelScrolling(ConnectionSessionScrollViewer);
+        RegisterCardWheelScrolling(DisplayCardScrollViewer);
+        RegisterCardWheelScrolling(AudioCardScrollViewer);
+        RegisterCardWheelScrolling(RuntimeCardScrollViewer);
+    }
+
+    private static void RegisterCardWheelScrolling(ScrollViewer scrollViewer)
+    {
+        scrollViewer.AddHandler(
+            UIElement.PointerWheelChangedEvent,
+            new PointerEventHandler(OnCardPointerWheelChanged),
+            handledEventsToo: true);
+    }
+
+    private static void OnCardPointerWheelChanged(object sender, PointerRoutedEventArgs args)
+    {
+        if (sender is not ScrollViewer scrollViewer)
+        {
+            return;
+        }
+
+        var delta = args.GetCurrentPoint(scrollViewer).Properties.MouseWheelDelta;
+        if (delta == 0 || scrollViewer.ScrollableHeight <= 0)
+        {
+            return;
+        }
+
+        var nextOffset = Math.Clamp(
+            scrollViewer.VerticalOffset - delta,
+            0,
+            scrollViewer.ScrollableHeight);
+
+        if (Math.Abs(nextOffset - scrollViewer.VerticalOffset) < 0.1)
+        {
+            return;
+        }
+
+        scrollViewer.ChangeView(null, nextOffset, null, disableAnimation: true);
+        args.Handled = true;
     }
 
     private void InitializeTrayIcon()
