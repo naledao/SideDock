@@ -1,8 +1,11 @@
 package com.sidedock.client;
 
+import android.Manifest;
 import android.app.Activity;
 import android.app.KeyguardManager;
 import android.content.Context;
+import android.content.SharedPreferences;
+import android.content.pm.PackageManager;
 import android.content.res.Configuration;
 import android.graphics.drawable.GradientDrawable;
 import android.media.MediaCodecInfo;
@@ -35,12 +38,16 @@ import java.util.ArrayDeque;
 import java.util.Date;
 import java.util.Locale;
 
-public final class MainActivity extends Activity implements ControlClient.Listener, VideoClient.Listener, SurfaceHolder.Callback, InputCollector.Listener {
+public final class MainActivity extends Activity implements ControlClient.Listener, VideoClient.Listener, AudioCaptureClient.Listener, SurfaceHolder.Callback, InputCollector.Listener {
     private static final String TAG = "SideDock";
     private static final int DEFAULT_VIDEO_PORT = 27184;
+    private static final int DEFAULT_AUDIO_PORT = 27185;
     private static final int DEFAULT_VIDEO_WIDTH = 1280;
     private static final int DEFAULT_VIDEO_HEIGHT = 720;
     private static final int DEFAULT_VIDEO_FPS = 120;
+    private static final int DEFAULT_AUDIO_SAMPLE_RATE = 48000;
+    private static final int DEFAULT_AUDIO_CHANNELS = 1;
+    private static final int REQUEST_RECORD_AUDIO = 5010;
     private static final String VIDEO_CODEC_AVC = "video/avc";
     private static final String ERROR_DECODER_UNSUPPORTED = "DECODER_UNSUPPORTED";
     private static final int OVERLAY_MODE_DETAILED = 0;
@@ -54,9 +61,14 @@ public final class MainActivity extends Activity implements ControlClient.Listen
         { 2560, 1440 }
     };
     private static final int[] REFRESH_PRESETS = new int[] { 30, 60, 120 };
+    private static final String AUDIO_PREFS_NAME = "audio_controls";
+    private static final String AUDIO_PREF_MIC_MUTED = "mic_muted";
+    private static final String AUDIO_PREF_SPEAKER_MUTED = "speaker_muted";
+    private static final String AUDIO_PREF_STOPPED = "stopped";
 
     private ControlClient controlClient;
     private VideoClient videoClient;
+    private AudioCaptureClient audioCaptureClient;
     private InputCollector inputCollector;
     private final Handler mainHandler = new Handler(Looper.getMainLooper());
     private final Runnable pointerAbsFlushRunnable = new Runnable() {
@@ -83,6 +95,14 @@ public final class MainActivity extends Activity implements ControlClient.Listen
     private TextView overlayText;
     private TextView modeToggleText;
     private LinearLayout modePanel;
+    private LinearLayout audioPanel;
+    private TextView audioMicStatusText;
+    private TextView audioSpeakerStatusText;
+    private TextView audioPermissionText;
+    private TextView audioHintText;
+    private TextView micMuteButton;
+    private TextView speakerMuteButton;
+    private TextView stopAudioButton;
     private FrameLayout connectionStatusLayer;
     private ProgressBar connectionStatusProgress;
     private TextView connectionStatusTitle;
@@ -146,6 +166,22 @@ public final class MainActivity extends Activity implements ControlClient.Listen
     private long overlayTapDownAtMs;
     private long lastCursorDebugAtMs;
     private boolean overlayTapCandidate;
+    private boolean audioStopped;
+    private boolean micMuted;
+    private boolean speakerMuted;
+    private boolean hostAudioEnabled = true;
+    private boolean hostMicrophoneEnabled = true;
+    private boolean hostSpeakerEnabled;
+    private boolean micPermissionRequestedInSession;
+    private int audioPort = DEFAULT_AUDIO_PORT;
+    private int audioSampleRate = DEFAULT_AUDIO_SAMPLE_RATE;
+    private int audioChannels = DEFAULT_AUDIO_CHANNELS;
+    private int audioSpeakerChannels = 2;
+    private String microphoneRuntimeState = "waiting_device";
+    private String speakerRuntimeState = "waiting_device";
+    private String lastAudioHint = "等待电脑音频状态。";
+    private long speakerPacketsReceived;
+    private long speakerBytesReceived;
 
     @Override
     protected void onCreate(Bundle savedInstanceState) {
@@ -155,7 +191,9 @@ public final class MainActivity extends Activity implements ControlClient.Listen
 
         controlClient = new ControlClient(this);
         videoClient = new VideoClient(this);
+        audioCaptureClient = new AudioCaptureClient(this, this);
         inputCollector = new InputCollector(this);
+        loadAudioPreferences();
         setContentView(buildContentView());
         enterImmersiveMode();
         useNativePointerIcon(getWindow().getDecorView());
@@ -215,10 +253,26 @@ public final class MainActivity extends Activity implements ControlClient.Listen
     }
 
     @Override
+    public void onRequestPermissionsResult(int requestCode, String[] permissions, int[] grantResults) {
+        super.onRequestPermissionsResult(requestCode, permissions, grantResults);
+        if (requestCode != REQUEST_RECORD_AUDIO) {
+            return;
+        }
+
+        boolean granted = grantResults.length > 0 && grantResults[0] == PackageManager.PERMISSION_GRANTED;
+        lastAudioHint = granted
+            ? "麦克风权限已允许，正在准备采集。"
+            : "需要允许麦克风权限后才能作为电脑麦克风。";
+        applyAudioCaptureIntent(lastAudioHint);
+        updateOverlay();
+    }
+
+    @Override
     protected void onDestroy() {
         mainHandler.removeCallbacks(pointerAbsFlushRunnable);
         stopDisplayFrameSampling();
         clearDisplayTimingHints();
+        audioCaptureClient.stop();
         videoClient.stop();
         controlClient.shutdown();
         super.onDestroy();
@@ -268,6 +322,13 @@ public final class MainActivity extends Activity implements ControlClient.Listen
         }
         if (state == ConnectionState.CONNECTED) {
             sendVideoReadyIfSurfaceReady();
+            applyAudioCaptureIntent("电脑音频已连接。");
+        } else {
+            audioCaptureClient.stop();
+            microphoneRuntimeState = state == ConnectionState.RECONNECTING ? "reconnecting" : "waiting_device";
+            speakerRuntimeState = state == ConnectionState.RECONNECTING ? "reconnecting" : "waiting_device";
+            publishAudioMicrophoneStatus(audioStatusWireState(currentMicrophoneAudioStatus()), audioStatusText(AudioEndpoint.MICROPHONE, currentMicrophoneAudioStatus()));
+            publishAudioSpeakerStatus(audioStatusWireState(AudioEndpoint.SPEAKER, currentSpeakerAudioStatus()), audioStatusText(AudioEndpoint.SPEAKER, currentSpeakerAudioStatus()));
         }
         updateOverlay();
     }
@@ -310,6 +371,75 @@ public final class MainActivity extends Activity implements ControlClient.Listen
         }
 
         maybeStartVideo();
+    }
+
+    @Override
+    public void onAudioConfig(ControlClient.AudioConfig config) {
+        hostAudioEnabled = config.audioEnabled;
+        hostMicrophoneEnabled = config.microphoneEnabled;
+        hostSpeakerEnabled = config.speakerEnabled;
+        audioPort = config.port > 0 ? config.port : DEFAULT_AUDIO_PORT;
+        audioSampleRate = config.sampleRate > 0 ? config.sampleRate : DEFAULT_AUDIO_SAMPLE_RATE;
+        audioChannels = config.microphoneChannels > 0 ? config.microphoneChannels : DEFAULT_AUDIO_CHANNELS;
+        audioSpeakerChannels = config.speakerChannels > 0 ? config.speakerChannels : 2;
+        lastAudioHint = hostAudioEnabled
+            ? "正在准备电脑音频。"
+            : "电脑未启用 SideDock 音频。";
+        applyAudioCaptureIntent(lastAudioHint);
+        updateOverlay();
+    }
+
+    @Override
+    public void onAudioCaptureState(String state, String message) {
+        mainHandler.post(new Runnable() {
+            @Override
+            public void run() {
+                microphoneRuntimeState = state == null ? "unavailable" : state;
+                if (message != null && !message.isEmpty()) {
+                    lastAudioHint = message;
+                }
+                publishAudioMicrophoneStatus(microphoneRuntimeState, lastAudioHint);
+                updateOverlay();
+            }
+        });
+    }
+
+    @Override
+    public void onAudioCaptureStats(long packetsSent, long bytesSent) {
+        mainHandler.post(new Runnable() {
+            @Override
+            public void run() {
+                publishAudioMicrophoneStatus("capturing", "麦克风正在采集中。");
+            }
+        });
+    }
+
+    @Override
+    public void onAudioPlaybackState(String state, String message) {
+        mainHandler.post(new Runnable() {
+            @Override
+            public void run() {
+                speakerRuntimeState = state == null ? "unavailable" : state;
+                if (message != null && !message.isEmpty()) {
+                    lastAudioHint = message;
+                }
+                publishAudioSpeakerStatus(speakerRuntimeState, lastAudioHint);
+                updateOverlay();
+            }
+        });
+    }
+
+    @Override
+    public void onAudioPlaybackStats(long packetsReceived, long bytesReceived) {
+        mainHandler.post(new Runnable() {
+            @Override
+            public void run() {
+                speakerPacketsReceived = packetsReceived;
+                speakerBytesReceived = bytesReceived;
+                publishAudioSpeakerStatus(speakerMuted ? "muted" : "playing",
+                    speakerMuted ? "本机音响已静音。" : "正在播放电脑声音。");
+            }
+        });
     }
 
     @Override
@@ -574,6 +704,10 @@ public final class MainActivity extends Activity implements ControlClient.Listen
 
     @Override
     public boolean dispatchTouchEvent(MotionEvent event) {
+        if (isPointInsideView(audioPanel, event)) {
+            return super.dispatchTouchEvent(event);
+        }
+
         if (!isMouseLikeEvent(event) && isModeControlTouch(event)) {
             return super.dispatchTouchEvent(event);
         }
@@ -769,6 +903,16 @@ public final class MainActivity extends Activity implements ControlClient.Listen
         rootView.addView(modePanel, modePanelParams);
         updateModeControls();
 
+        audioPanel = createAudioPanel(density);
+        FrameLayout.LayoutParams audioPanelParams = new FrameLayout.LayoutParams(
+            dp(316, density),
+            ViewGroup.LayoutParams.WRAP_CONTENT,
+            Gravity.START | Gravity.BOTTOM
+        );
+        audioPanelParams.setMargins(dp(12, density), dp(12, density), dp(12, density), dp(12, density));
+        rootView.addView(audioPanel, audioPanelParams);
+        updateAudioPanel();
+
         updateOverlay();
         rootView.post(new Runnable() {
             @Override
@@ -843,6 +987,154 @@ public final class MainActivity extends Activity implements ControlClient.Listen
         panelParams.setMargins(dp(28, density), 0, dp(28, density), 0);
         layer.addView(panel, panelParams);
         return layer;
+    }
+
+    private LinearLayout createAudioPanel(float density) {
+        LinearLayout panel = new LinearLayout(this);
+        panel.setOrientation(LinearLayout.VERTICAL);
+        panel.setPadding(dp(10, density), dp(10, density), dp(10, density), dp(10, density));
+        panel.setBackground(makeRoundedBackground(0xE6111820, 0xFF46657A, dp(8, density)));
+        useNativePointerIcon(panel);
+
+        TextView title = new TextView(this);
+        title.setText("电脑音频");
+        title.setTextColor(0xFFFFFFFF);
+        title.setTextSize(14f);
+        title.setGravity(Gravity.START);
+        title.setPadding(0, 0, 0, dp(8, density));
+        useNativePointerIcon(title);
+        panel.addView(title, new LinearLayout.LayoutParams(
+            ViewGroup.LayoutParams.MATCH_PARENT,
+            ViewGroup.LayoutParams.WRAP_CONTENT
+        ));
+
+        audioMicStatusText = createAudioValueText();
+        panel.addView(createAudioStatusRow("麦克风", audioMicStatusText, density), new LinearLayout.LayoutParams(
+            ViewGroup.LayoutParams.MATCH_PARENT,
+            ViewGroup.LayoutParams.WRAP_CONTENT
+        ));
+
+        audioSpeakerStatusText = createAudioValueText();
+        LinearLayout.LayoutParams speakerParams = new LinearLayout.LayoutParams(
+            ViewGroup.LayoutParams.MATCH_PARENT,
+            ViewGroup.LayoutParams.WRAP_CONTENT
+        );
+        speakerParams.topMargin = dp(4, density);
+        panel.addView(createAudioStatusRow("音响", audioSpeakerStatusText, density), speakerParams);
+
+        audioPermissionText = createAudioValueText();
+        audioPermissionText.setOnClickListener(new View.OnClickListener() {
+            @Override
+            public void onClick(View view) {
+                requestRecordAudioPermissionIfNeeded();
+            }
+        });
+        LinearLayout.LayoutParams permissionParams = new LinearLayout.LayoutParams(
+            ViewGroup.LayoutParams.MATCH_PARENT,
+            ViewGroup.LayoutParams.WRAP_CONTENT
+        );
+        permissionParams.topMargin = dp(4, density);
+        panel.addView(createAudioStatusRow("权限", audioPermissionText, density), permissionParams);
+
+        audioHintText = createAudioValueText();
+        audioHintText.setTextColor(0xFFB9C6CC);
+        LinearLayout.LayoutParams hintParams = new LinearLayout.LayoutParams(
+            ViewGroup.LayoutParams.MATCH_PARENT,
+            ViewGroup.LayoutParams.WRAP_CONTENT
+        );
+        hintParams.topMargin = dp(8, density);
+        panel.addView(audioHintText, hintParams);
+
+        LinearLayout controls = createSegmentRow();
+        LinearLayout.LayoutParams controlsParams = new LinearLayout.LayoutParams(
+            ViewGroup.LayoutParams.MATCH_PARENT,
+            dp(38, density)
+        );
+        controlsParams.topMargin = dp(10, density);
+        panel.addView(controls, controlsParams);
+
+        micMuteButton = createSegmentButton("麦克风静音", density);
+        controls.addView(micMuteButton, segmentParams(0, 2, density));
+        micMuteButton.setOnClickListener(new View.OnClickListener() {
+            @Override
+            public void onClick(View view) {
+                micMuted = !micMuted;
+                lastAudioHint = micMuted ? "本机麦克风已静音。" : "麦克风静音已取消。";
+                saveAudioPreferences();
+                applyAudioCaptureIntent(lastAudioHint);
+                updateOverlay();
+            }
+        });
+
+        speakerMuteButton = createSegmentButton("音响静音", density);
+        controls.addView(speakerMuteButton, segmentParams(1, 2, density));
+        speakerMuteButton.setOnClickListener(new View.OnClickListener() {
+            @Override
+            public void onClick(View view) {
+                speakerMuted = !speakerMuted;
+                lastAudioHint = speakerMuted ? "本机音响已静音。" : "音响静音已取消。";
+                saveAudioPreferences();
+                applyAudioCaptureIntent(lastAudioHint);
+                updateOverlay();
+            }
+        });
+
+        stopAudioButton = createActionButton("停止音频", density);
+        LinearLayout.LayoutParams stopParams = new LinearLayout.LayoutParams(
+            ViewGroup.LayoutParams.MATCH_PARENT,
+            dp(40, density)
+        );
+        stopParams.topMargin = dp(8, density);
+        panel.addView(stopAudioButton, stopParams);
+        stopAudioButton.setOnClickListener(new View.OnClickListener() {
+            @Override
+            public void onClick(View view) {
+                audioStopped = !audioStopped;
+                lastAudioHint = audioStopped
+                    ? "音频已停止，副屏仍在运行。"
+                    : "音频控制已恢复，正在准备音频状态。";
+                saveAudioPreferences();
+                applyAudioCaptureIntent(lastAudioHint);
+                updateOverlay();
+            }
+        });
+
+        return panel;
+    }
+
+    private LinearLayout createAudioStatusRow(String label, TextView value, float density) {
+        LinearLayout row = new LinearLayout(this);
+        row.setOrientation(LinearLayout.HORIZONTAL);
+        row.setGravity(Gravity.CENTER_VERTICAL);
+        useNativePointerIcon(row);
+
+        TextView labelView = new TextView(this);
+        labelView.setText(label);
+        labelView.setTextColor(0xFF9DAEB8);
+        labelView.setTextSize(12f);
+        labelView.setGravity(Gravity.START);
+        useNativePointerIcon(labelView);
+        row.addView(labelView, new LinearLayout.LayoutParams(
+            dp(52, density),
+            ViewGroup.LayoutParams.WRAP_CONTENT
+        ));
+
+        row.addView(value, new LinearLayout.LayoutParams(
+            0,
+            ViewGroup.LayoutParams.WRAP_CONTENT,
+            1f
+        ));
+        return row;
+    }
+
+    private TextView createAudioValueText() {
+        TextView view = new TextView(this);
+        view.setTextColor(0xFFE9F0F2);
+        view.setTextSize(12f);
+        view.setGravity(Gravity.START);
+        view.setLineSpacing(2f, 1.0f);
+        useNativePointerIcon(view);
+        return view;
     }
 
     private TextView createModeToggle(float density) {
@@ -1072,6 +1364,363 @@ public final class MainActivity extends Activity implements ControlClient.Listen
             selected ? 0xFF72AEEB : 0xFF314555,
             dp(6, density)
         ));
+    }
+
+    private void loadAudioPreferences() {
+        SharedPreferences preferences = getSharedPreferences(AUDIO_PREFS_NAME, MODE_PRIVATE);
+        micMuted = preferences.getBoolean(AUDIO_PREF_MIC_MUTED, false);
+        speakerMuted = preferences.getBoolean(AUDIO_PREF_SPEAKER_MUTED, false);
+        audioStopped = preferences.getBoolean(AUDIO_PREF_STOPPED, false);
+        if (audioStopped) {
+            lastAudioHint = "音频已停止，副屏仍在运行。";
+        } else if (micMuted) {
+            lastAudioHint = "本机麦克风已静音。";
+        } else if (speakerMuted) {
+            lastAudioHint = "本机音响已静音。";
+        }
+    }
+
+    private void saveAudioPreferences() {
+        getSharedPreferences(AUDIO_PREFS_NAME, MODE_PRIVATE)
+            .edit()
+            .putBoolean(AUDIO_PREF_MIC_MUTED, micMuted)
+            .putBoolean(AUDIO_PREF_SPEAKER_MUTED, speakerMuted)
+            .putBoolean(AUDIO_PREF_STOPPED, audioStopped)
+            .apply();
+    }
+
+    private void applyAudioCaptureIntent(String message) {
+        boolean connected = controlConnectionState == ConnectionState.CONNECTED;
+        boolean microphoneConfigured = hostAudioEnabled && hostMicrophoneEnabled && !audioStopped && connected;
+        boolean speakerConfigured = hostAudioEnabled && hostSpeakerEnabled && !audioStopped && connected;
+        boolean microphoneCanCapture = microphoneConfigured && !micMuted && hasRecordAudioPermission();
+
+        if (!microphoneConfigured) {
+            microphoneRuntimeState = audioStatusWireState(AudioEndpoint.MICROPHONE, currentMicrophoneAudioStatus());
+            publishAudioMicrophoneStatus(microphoneRuntimeState, message);
+        } else if (!hasRecordAudioPermission()) {
+            microphoneRuntimeState = "authorization_required";
+            publishAudioMicrophoneStatus("authorization_required", "需要允许麦克风权限。");
+            if (!micPermissionRequestedInSession) {
+                requestRecordAudioPermissionIfNeeded();
+            }
+        } else if (micMuted) {
+            microphoneRuntimeState = "muted";
+            publishAudioMicrophoneStatus("muted", "本机麦克风已静音。");
+        } else {
+            microphoneRuntimeState = audioCaptureClient.isRunning() ? "capturing" : "preparing";
+            publishAudioMicrophoneStatus(microphoneRuntimeState, message);
+        }
+
+        if (!speakerConfigured) {
+            speakerRuntimeState = audioStatusWireState(AudioEndpoint.SPEAKER, currentSpeakerAudioStatus());
+            publishAudioSpeakerStatus(speakerRuntimeState, message);
+        } else if (speakerMuted) {
+            speakerRuntimeState = "muted";
+            publishAudioSpeakerStatus("muted", "本机音响已静音。");
+        } else {
+            speakerRuntimeState = audioCaptureClient.isRunning() && !"muted".equals(speakerRuntimeState)
+                ? speakerRuntimeState
+                : "preparing";
+            publishAudioSpeakerStatus(speakerRuntimeState, message);
+        }
+
+        if (!microphoneCanCapture && !speakerConfigured) {
+            audioCaptureClient.stop();
+            return;
+        }
+
+        audioCaptureClient.start(
+            audioPort,
+            audioSampleRate,
+            audioChannels,
+            audioSpeakerChannels,
+            microphoneCanCapture,
+            speakerConfigured,
+            speakerMuted);
+    }
+
+    private void requestRecordAudioPermissionIfNeeded() {
+        if (hasRecordAudioPermission()) {
+            applyAudioCaptureIntent("麦克风权限已允许。");
+            return;
+        }
+
+        micPermissionRequestedInSession = true;
+        requestPermissions(new String[] { Manifest.permission.RECORD_AUDIO }, REQUEST_RECORD_AUDIO);
+    }
+
+    private void publishAudioMicrophoneStatus(String state, String message) {
+        if (controlClient == null) {
+            return;
+        }
+
+        controlClient.sendAudioMicrophoneStatus(
+            state,
+            micMuted,
+            audioStopped,
+            hasRecordAudioPermission(),
+            audioPort,
+            audioSampleRate,
+            audioChannels,
+            message
+        );
+    }
+
+    private void publishAudioSpeakerStatus(String state, String message) {
+        if (controlClient == null) {
+            return;
+        }
+
+        controlClient.sendAudioSpeakerStatus(
+            state,
+            speakerMuted,
+            audioStopped,
+            audioPort,
+            audioSampleRate,
+            audioSpeakerChannels,
+            speakerPacketsReceived,
+            speakerBytesReceived,
+            message
+        );
+    }
+
+    private String audioStatusWireState(AudioStatus status) {
+        return audioStatusWireState(AudioEndpoint.MICROPHONE, status);
+    }
+
+    private String audioStatusWireState(AudioEndpoint endpoint, AudioStatus status) {
+        switch (status) {
+            case DISABLED:
+                return "disabled";
+            case WAITING_DEVICE:
+                return "waiting_device";
+            case PREPARING:
+                return "preparing";
+            case AVAILABLE:
+                return "available";
+            case CAPTURING:
+                return endpoint == AudioEndpoint.SPEAKER ? "playing" : "capturing";
+            case MUTED:
+                return "muted";
+            case AUTHORIZATION_REQUIRED:
+                return "authorization_required";
+            case RECONNECTING:
+                return "reconnecting";
+            case ERROR:
+            case NOT_IMPLEMENTED:
+            default:
+                return "unavailable";
+        }
+    }
+
+    private void updateAudioPanel() {
+        if (audioPanel == null
+            || audioMicStatusText == null
+            || audioSpeakerStatusText == null
+            || audioPermissionText == null
+            || audioHintText == null
+            || micMuteButton == null
+            || speakerMuteButton == null
+            || stopAudioButton == null) {
+            return;
+        }
+
+        float density = getResources().getDisplayMetrics().density;
+        AudioStatus micStatus = currentMicrophoneAudioStatus();
+        AudioStatus speakerStatus = currentSpeakerAudioStatus();
+
+        audioMicStatusText.setText(audioStatusText(AudioEndpoint.MICROPHONE, micStatus));
+        audioMicStatusText.setTextColor(audioStatusColor(micStatus));
+        audioSpeakerStatusText.setText(audioStatusText(AudioEndpoint.SPEAKER, speakerStatus));
+        audioSpeakerStatusText.setTextColor(audioStatusColor(speakerStatus));
+        audioPermissionText.setText(hasRecordAudioPermission()
+            ? "麦克风权限已允许"
+            : "需要允许麦克风权限后才能作为电脑麦克风");
+        audioPermissionText.setTextColor(hasRecordAudioPermission() ? 0xFF77D59B : 0xFFFFB86B);
+        audioHintText.setText(audioStopped ? "音频已停止，副屏仍在运行。" : lastAudioHint);
+
+        micMuteButton.setText(micMuted ? "取消麦克风静音" : "麦克风静音");
+        speakerMuteButton.setText(speakerMuted ? "取消音响静音" : "音响静音");
+        stopAudioButton.setText(audioStopped ? "恢复音频" : "停止音频");
+
+        styleAudioToggleButton(micMuteButton, micMuted, canToggleMicrophoneMute(), density);
+        styleAudioToggleButton(speakerMuteButton, speakerMuted, canToggleSpeakerMute(), density);
+        styleAudioStopButton(stopAudioButton, audioStopped, density);
+    }
+
+    private AudioStatus currentMicrophoneAudioStatus() {
+        if (!hostAudioEnabled || !hostMicrophoneEnabled || audioStopped) {
+            return AudioStatus.DISABLED;
+        }
+        if (!hasRecordAudioPermission()) {
+            return AudioStatus.AUTHORIZATION_REQUIRED;
+        }
+        if (micMuted) {
+            return AudioStatus.MUTED;
+        }
+
+        AudioStatus baseStatus = currentAudioBaseStatus();
+        if (baseStatus != AudioStatus.AVAILABLE) {
+            return baseStatus;
+        }
+
+        if ("capturing".equals(microphoneRuntimeState)) {
+            return AudioStatus.CAPTURING;
+        }
+        if ("preparing".equals(microphoneRuntimeState)) {
+            return AudioStatus.PREPARING;
+        }
+        if ("unavailable".equals(microphoneRuntimeState)) {
+            return AudioStatus.ERROR;
+        }
+
+        return AudioStatus.AVAILABLE;
+    }
+
+    private AudioStatus currentSpeakerAudioStatus() {
+        if (!hostAudioEnabled || !hostSpeakerEnabled || audioStopped) {
+            return AudioStatus.DISABLED;
+        }
+        if (speakerMuted) {
+            return AudioStatus.MUTED;
+        }
+
+        AudioStatus baseStatus = currentAudioBaseStatus();
+        if (baseStatus != AudioStatus.AVAILABLE) {
+            return baseStatus;
+        }
+
+        if ("playing".equals(speakerRuntimeState)) {
+            return AudioStatus.CAPTURING;
+        }
+        if ("preparing".equals(speakerRuntimeState)) {
+            return AudioStatus.PREPARING;
+        }
+        if ("unavailable".equals(speakerRuntimeState)) {
+            return AudioStatus.ERROR;
+        }
+        if ("muted".equals(speakerRuntimeState)) {
+            return AudioStatus.MUTED;
+        }
+
+        return AudioStatus.AVAILABLE;
+    }
+
+    private AudioStatus currentAudioBaseStatus() {
+        switch (controlConnectionState) {
+            case CONNECTED:
+                return AudioStatus.AVAILABLE;
+            case CONNECTING:
+                return AudioStatus.PREPARING;
+            case RECONNECTING:
+                return AudioStatus.RECONNECTING;
+            case FAILED:
+                return AudioStatus.ERROR;
+            case DISCONNECTED:
+            default:
+                return AudioStatus.WAITING_DEVICE;
+        }
+    }
+
+    private String audioStatusText(AudioEndpoint endpoint, AudioStatus status) {
+        boolean microphone = endpoint == AudioEndpoint.MICROPHONE;
+        switch (status) {
+            case DISABLED:
+                return microphone ? "电脑未启用 SideDock 麦克风" : "电脑未启用 SideDock 音响";
+            case WAITING_DEVICE:
+                return "等待电脑连接";
+            case PREPARING:
+                return microphone ? "正在准备麦克风" : "正在准备音响";
+            case AVAILABLE:
+                return microphone ? "麦克风数据通道可用" : "电脑可以选择本机音响";
+            case CAPTURING:
+                return microphone ? "电脑正在使用本机麦克风" : "正在播放电脑声音";
+            case MUTED:
+                return microphone ? "本机麦克风已静音" : "本机音响已静音";
+            case AUTHORIZATION_REQUIRED:
+                return microphone ? "需要允许麦克风权限" : "等待音响准备";
+            case RECONNECTING:
+                return microphone ? "麦克风正在重连" : "音响正在重连";
+            case ERROR:
+                return microphone ? "麦克风暂不可用" : "音响暂不可用";
+            case NOT_IMPLEMENTED:
+                return microphone ? "麦克风暂不可用" : "音响暂不可用";
+            default:
+                return "等待电脑连接";
+        }
+    }
+
+    private int audioStatusColor(AudioStatus status) {
+        switch (status) {
+            case AVAILABLE:
+            case CAPTURING:
+                return 0xFF77D59B;
+            case MUTED:
+            case AUTHORIZATION_REQUIRED:
+                return 0xFFFFB86B;
+            case ERROR:
+                return 0xFFFF8A80;
+            default:
+                return 0xFFE9F0F2;
+        }
+    }
+
+    private boolean canToggleMicrophoneMute() {
+        return !audioStopped
+            && hostAudioEnabled
+            && hostMicrophoneEnabled
+            && hasRecordAudioPermission()
+            && controlConnectionState == ConnectionState.CONNECTED;
+    }
+
+    private boolean canToggleSpeakerMute() {
+        return !audioStopped
+            && hostAudioEnabled
+            && hostSpeakerEnabled
+            && controlConnectionState == ConnectionState.CONNECTED;
+    }
+
+    private boolean hasRecordAudioPermission() {
+        return checkSelfPermission(Manifest.permission.RECORD_AUDIO) == PackageManager.PERMISSION_GRANTED;
+    }
+
+    private void styleAudioToggleButton(TextView button, boolean active, boolean enabled, float density) {
+        button.setEnabled(enabled);
+        button.setAlpha(enabled ? 1.0f : 0.5f);
+        button.setTextColor(active ? 0xFFFFFFFF : 0xFFE9F0F2);
+        button.setBackground(makeRoundedBackground(
+            active ? 0xFF9D5D00 : 0x551B2630,
+            active ? 0xFFFFB86B : 0xFF314555,
+            dp(6, density)
+        ));
+    }
+
+    private void styleAudioStopButton(TextView button, boolean stopped, float density) {
+        button.setTextColor(0xFFFFFFFF);
+        button.setBackground(makeRoundedBackground(
+            stopped ? 0xFF2678C9 : 0xFF8C2D24,
+            stopped ? 0xFF72AEEB : 0xFFFF8A80,
+            dp(6, density)
+        ));
+    }
+
+    private enum AudioEndpoint {
+        MICROPHONE,
+        SPEAKER
+    }
+
+    private enum AudioStatus {
+        DISABLED,
+        WAITING_DEVICE,
+        PREPARING,
+        AVAILABLE,
+        CAPTURING,
+        MUTED,
+        AUTHORIZATION_REQUIRED,
+        RECONNECTING,
+        ERROR,
+        NOT_IMPLEMENTED
     }
 
     private String modeLabel(int width, int height) {
@@ -1526,6 +2175,7 @@ public final class MainActivity extends Activity implements ControlClient.Listen
     private void updateOverlay() {
         updateModeControlVisibility();
         updateConnectionStatusLayer();
+        updateAudioPanel();
 
         if (overlayText == null) {
             return;

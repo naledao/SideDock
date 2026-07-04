@@ -20,10 +20,11 @@ using Vortice.DXGI;
 
 namespace SideDock.Host;
 
-internal static class Program
+internal static partial class Program
 {
     private const int DefaultControlPort = 27183;
     private const int DefaultVideoPort = 27184;
+    private const int DefaultAudioPort = 27185;
     private const int DefaultVideoWidth = 1280;
     private const int DefaultVideoHeight = 720;
     private const int DefaultVideoFps = 120;
@@ -93,10 +94,12 @@ internal static class Program
         var controlPublisher = new ControlMessagePublisher();
         var controlServer = new ControlServer(IPAddress.Loopback, options, videoModeState, controlPublisher, displayLayoutProvider);
         var videoServer = new VideoServer(IPAddress.Loopback, options, videoModeState, controlPublisher);
+        var audioServer = new AudioServer(IPAddress.Loopback, options, controlPublisher);
 
         await Task.WhenAll(
             controlServer.RunAsync(appCts.Token),
-            videoServer.RunAsync(appCts.Token));
+            videoServer.RunAsync(appCts.Token),
+            audioServer.RunAsync(appCts.Token));
 
         return 0;
     }
@@ -106,6 +109,7 @@ internal static class Program
         Console.WriteLine("SideDock Windows 服务");
         Console.WriteLine($"控制通道: 127.0.0.1:{options.ControlPort}");
         Console.WriteLine($"视频通道: 127.0.0.1:{options.VideoPort}");
+        Console.WriteLine($"麦克风通道: 127.0.0.1:{options.AudioPort}");
         Console.WriteLine($"视频源: {FormatVideoSource(options.VideoSource)}");
         Console.WriteLine($"测试视频: {options.VideoFilePath}");
         Console.WriteLine($"实时编码器: {options.Encoder}");
@@ -125,6 +129,7 @@ internal static class Program
         Console.WriteLine($"编码规格: {options.VideoWidth}x{options.VideoHeight} bitrate={options.VideoBitrate} ({(options.AutoVideoBitrate ? "auto" : "manual")})");
         Console.WriteLine($"编码调优: {FormatEncoderTuningForLog(options)}");
         Console.WriteLine($"链路容量: nv12Pool={options.Nv12PoolSize} encodedPacketQueue={options.EncodedPacketQueue}");
+        Console.WriteLine($"音频能力: microphone={(options.AudioDeviceEnabled && options.MicrophoneEnabled ? "enabled" : "disabled")} speaker={(options.AudioDeviceEnabled && options.SpeakerEnabled ? "enabled" : "disabled")}");
 
         if (options.RequestedDisplayMode is not null)
         {
@@ -878,7 +883,16 @@ internal static class Program
                         ["videoFps"] = helloVideoMode.Fps,
                         ["videoSource"] = FormatVideoSource(_options.VideoSource),
                         ["encoder"] = _options.Encoder.ToString().ToLowerInvariant(),
-                        ["inputTarget"] = _options.InputTarget.ToString().ToLowerInvariant()
+                        ["inputTarget"] = _options.InputTarget.ToString().ToLowerInvariant(),
+                        ["audioPort"] = _options.AudioPort,
+                        ["audioEnabled"] = _options.AudioDeviceEnabled,
+                        ["microphoneEnabled"] = _options.MicrophoneEnabled,
+                        ["speakerEnabled"] = _options.SpeakerEnabled,
+                        ["audioSampleRate"] = AudioDefaults.SampleRate,
+                        ["audioChannels"] = AudioDefaults.MicChannels,
+                        ["microphoneChannels"] = AudioDefaults.MicChannels,
+                        ["speakerChannels"] = AudioDefaults.SpeakerChannels,
+                        ["audioBitsPerSample"] = AudioDefaults.BitsPerSample
                     }, cancellationToken);
                     await PublishDisplayMetricsIfChangedAsync(connection, force: true, cancellationToken);
                     break;
@@ -946,11 +960,21 @@ internal static class Program
 
                 case "status":
                 case "log":
+                case "audio_mic_status":
+                case "audio_speaker_status":
                 case "input_stats":
                 case "input_error":
                     if (message.Payload is not null)
                     {
                         Log(Scope, $"{message.Type} payload={message.Payload}");
+                        if (message.Type == "audio_mic_status")
+                        {
+                            LogAudioMicrophoneStatus(message.Payload);
+                        }
+                        else if (message.Type == "audio_speaker_status")
+                        {
+                            LogAudioSpeakerStatus(message.Payload);
+                        }
                     }
 
                     break;
@@ -995,6 +1019,51 @@ internal static class Program
                 + $"androidP95 queueOutput={ReadDouble(payload, "p95QueueToOutputMs"):F1}ms outputRender={ReadDouble(payload, "p95OutputToRenderMs"):F1}ms queueRender={ReadDouble(payload, "p95QueueToRenderMs"):F1}ms "
                 + $"androidP99 queueOutput={ReadDouble(payload, "p99QueueToOutputMs"):F1}ms outputRender={ReadDouble(payload, "p99OutputToRenderMs"):F1}ms queueRender={ReadDouble(payload, "p99QueueToRenderMs"):F1}ms "
                 + $"decodeErrors={ReadLong(payload, "decodeErrors")} reconnects={ReadLong(payload, "videoReconnects")}");
+        }
+
+        private void LogAudioMicrophoneStatus(JsonNode payloadNode)
+        {
+            if (payloadNode is not JsonObject payload)
+            {
+                return;
+            }
+
+            var state = ReadString(payload, "state");
+            var message = ReadString(payload, "message");
+            var logKey = state is "capturing" or "available" or "preparing"
+                ? "mic-client-state"
+                : "mic-state";
+            Log(
+                "AUDIO",
+                logKey + "=" + (string.IsNullOrWhiteSpace(state) ? "unknown" : state)
+                + $" muted={ReadBool(payload, "muted")}"
+                + $" stopped={ReadBool(payload, "stopped")}"
+                + $" permission={ReadBool(payload, "permissionGranted")}"
+                + $" port={ReadLong(payload, "port")}"
+                + (string.IsNullOrWhiteSpace(message) ? string.Empty : $" message={message}"));
+        }
+
+        private void LogAudioSpeakerStatus(JsonNode payloadNode)
+        {
+            if (payloadNode is not JsonObject payload)
+            {
+                return;
+            }
+
+            var state = ReadString(payload, "state");
+            var message = ReadString(payload, "message");
+            var logKey = state is "playing" or "available" or "preparing"
+                ? "speaker-client-state"
+                : "speaker-state";
+            Log(
+                "AUDIO",
+                logKey + "=" + (string.IsNullOrWhiteSpace(state) ? "unknown" : state)
+                + $" muted={ReadBool(payload, "muted")}"
+                + $" stopped={ReadBool(payload, "stopped")}"
+                + $" packets={ReadLong(payload, "packets")}"
+                + $" bytes={ReadLong(payload, "bytes")}"
+                + $" port={ReadLong(payload, "port")}"
+                + (string.IsNullOrWhiteSpace(message) ? string.Empty : $" message={message}"));
         }
 
         private ValueTask HandleVideoErrorAsync(
@@ -1055,6 +1124,23 @@ internal static class Program
             catch (FormatException)
             {
                 return 0;
+            }
+        }
+
+        private static bool ReadBool(JsonObject payload, string name)
+        {
+            if (!payload.TryGetPropertyValue(name, out var node) || node is null)
+            {
+                return false;
+            }
+
+            try
+            {
+                return node.GetValue<bool>();
+            }
+            catch (InvalidOperationException)
+            {
+                return false;
             }
         }
 
@@ -13204,6 +13290,7 @@ internal static class Program
     private sealed record HostOptions(
         int ControlPort,
         int VideoPort,
+        int AudioPort,
         string VideoFilePath,
         VideoSourceKind VideoSource,
         H264EncoderKind Encoder,
@@ -13227,9 +13314,18 @@ internal static class Program
         string? WindowTitle,
         string? ProcessName,
         DisplayModeRequest? RequestedDisplayMode,
-        string? DumpGpuFrameDirectory)
+        string? DumpGpuFrameDirectory,
+        bool AudioDeviceEnabled,
+        bool MicrophoneEnabled,
+        bool SpeakerEnabled)
     {
-        public IReadOnlyList<int> ReversePorts { get; } = new[] { ControlPort, VideoPort };
+        public IReadOnlyList<int> ReversePorts { get; } = AudioDeviceEnabled && (MicrophoneEnabled || SpeakerEnabled)
+            ? ControlPort == VideoPort
+                ? new[] { ControlPort, AudioPort }.Distinct().ToArray()
+                : new[] { ControlPort, VideoPort, AudioPort }.Distinct().ToArray()
+            : ControlPort == VideoPort
+                ? new[] { ControlPort }
+                : new[] { ControlPort, VideoPort };
 
         public H264EncoderTuning EncoderTuning => H264EncoderTuning.FromOptions(this);
 
@@ -13237,6 +13333,7 @@ internal static class Program
         {
             var controlPort = DefaultControlPort;
             var videoPort = DefaultVideoPort;
+            var audioPort = DefaultAudioPort;
             var videoFile = Path.GetFullPath(DefaultVideoFile);
             var videoWidth = DefaultVideoWidth;
             var videoHeight = DefaultVideoHeight;
@@ -13261,6 +13358,9 @@ internal static class Program
             string? processName = null;
             DisplayModeRequest? requestedDisplayMode = null;
             string? dumpGpuFrameDirectory = null;
+            var audioDeviceEnabled = true;
+            var microphoneEnabled = true;
+            var speakerEnabled = true;
 
             foreach (var arg in args)
             {
@@ -13271,6 +13371,18 @@ internal static class Program
                 else if (arg.Equals("--list-windows", StringComparison.OrdinalIgnoreCase))
                 {
                     listWindows = true;
+                }
+                else if (arg.Equals("--disable-audio", StringComparison.OrdinalIgnoreCase))
+                {
+                    audioDeviceEnabled = false;
+                }
+                else if (arg.Equals("--disable-microphone", StringComparison.OrdinalIgnoreCase))
+                {
+                    microphoneEnabled = false;
+                }
+                else if (arg.Equals("--disable-speaker", StringComparison.OrdinalIgnoreCase))
+                {
+                    speakerEnabled = false;
                 }
             }
 
@@ -13291,6 +13403,14 @@ internal static class Program
                         if (int.TryParse(args[index + 1], out var parsedVideoPort))
                         {
                             videoPort = parsedVideoPort;
+                        }
+
+                        break;
+
+                    case "--audio-port":
+                        if (int.TryParse(args[index + 1], out var parsedAudioPort))
+                        {
+                            audioPort = parsedAudioPort;
                         }
 
                         break;
@@ -13467,6 +13587,7 @@ internal static class Program
             return new HostOptions(
                 controlPort,
                 videoPort,
+                audioPort,
                 videoFile,
                 videoSource,
                 encoder,
@@ -13490,7 +13611,10 @@ internal static class Program
                 windowTitle,
                 processName,
                 requestedDisplayMode,
-                dumpGpuFrameDirectory);
+                dumpGpuFrameDirectory,
+                audioDeviceEnabled,
+                microphoneEnabled,
+                speakerEnabled);
         }
 
         private static DisplayModeRequest ParseDisplayMode(string value, int fallbackRefreshHz)

@@ -27,6 +27,7 @@ public final class ControlClient {
         void onLog(String message);
         void onStats(long sent, long received);
         void onVideoStart(int port, int width, int height, int fps);
+        void onAudioConfig(AudioConfig config);
         void onClockSync(ClockSync clockSync);
         void onCaptureStatus(CaptureStatus status);
         void onEncoderStatus(EncoderStatus status);
@@ -35,6 +36,40 @@ public final class ControlClient {
         void onDisplayModeChanged(DisplayModeChanged mode);
         void onCursorShape(String kind, boolean visible);
         void onCursorState(CursorState state);
+    }
+
+    public static final class AudioConfig {
+        public final boolean audioEnabled;
+        public final boolean microphoneEnabled;
+        public final boolean speakerEnabled;
+        public final int port;
+        public final int sampleRate;
+        public final int channels;
+        public final int microphoneChannels;
+        public final int speakerChannels;
+        public final int bitsPerSample;
+
+        public AudioConfig(
+            boolean audioEnabled,
+            boolean microphoneEnabled,
+            boolean speakerEnabled,
+            int port,
+            int sampleRate,
+            int channels,
+            int microphoneChannels,
+            int speakerChannels,
+            int bitsPerSample
+        ) {
+            this.audioEnabled = audioEnabled;
+            this.microphoneEnabled = microphoneEnabled;
+            this.speakerEnabled = speakerEnabled;
+            this.port = port;
+            this.sampleRate = sampleRate;
+            this.channels = channels;
+            this.microphoneChannels = microphoneChannels;
+            this.speakerChannels = speakerChannels;
+            this.bitsPerSample = bitsPerSample;
+        }
     }
 
     public static final class ClockSync {
@@ -536,6 +571,52 @@ public final class ControlClient {
         ));
     }
 
+    public void sendAudioMicrophoneStatus(
+        String state,
+        boolean muted,
+        boolean stopped,
+        boolean permissionGranted,
+        int port,
+        int sampleRate,
+        int channels,
+        String message
+    ) {
+        sendFromAnyThread("audio_mic_status", payload(
+            "state", state == null ? "" : state,
+            "muted", muted,
+            "stopped", stopped,
+            "permissionGranted", permissionGranted,
+            "port", port,
+            "sampleRate", sampleRate,
+            "channels", channels,
+            "message", message == null ? "" : message
+        ));
+    }
+
+    public void sendAudioSpeakerStatus(
+        String state,
+        boolean muted,
+        boolean stopped,
+        int port,
+        int sampleRate,
+        int channels,
+        long packets,
+        long bytes,
+        String message
+    ) {
+        sendFromAnyThread("audio_speaker_status", payload(
+            "state", state == null ? "" : state,
+            "muted", muted,
+            "stopped", stopped,
+            "port", port,
+            "sampleRate", sampleRate,
+            "channels", channels,
+            "packets", packets,
+            "bytes", bytes,
+            "message", message == null ? "" : message
+        ));
+    }
+
     public void sendKeyboardInput(
         String action,
         int androidKeyCode,
@@ -690,6 +771,12 @@ public final class ControlClient {
                         message.payload.optInt("videoFps", 30)
                     );
                 }
+                if (message.payload.has("audioPort")) {
+                    emitAudioConfig(audioConfigFromPayload(message.payload));
+                }
+                break;
+            case "audio_config":
+                emitAudioConfig(audioConfigFromPayload(message.payload));
                 break;
             case "ping":
                 send("pong", payload("replyTo", message.seq));
@@ -1048,6 +1135,30 @@ public final class ControlClient {
             @Override
             public void run() {
                 listener.onVideoStart(videoPort, width, height, fps);
+            }
+        });
+    }
+
+    private AudioConfig audioConfigFromPayload(JSONObject payload) {
+        int channels = payload.optInt("audioChannels", 1);
+        return new AudioConfig(
+            payload.optBoolean("audioEnabled", false),
+            payload.optBoolean("microphoneEnabled", false),
+            payload.optBoolean("speakerEnabled", false),
+            payload.optInt("audioPort", 27185),
+            payload.optInt("audioSampleRate", 48000),
+            channels,
+            payload.optInt("microphoneChannels", channels),
+            payload.optInt("speakerChannels", channels),
+            payload.optInt("audioBitsPerSample", 16)
+        );
+    }
+
+    private void emitAudioConfig(AudioConfig config) {
+        mainHandler.post(new Runnable() {
+            @Override
+            public void run() {
+                listener.onAudioConfig(config);
             }
         });
     }

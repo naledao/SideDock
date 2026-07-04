@@ -165,6 +165,7 @@
                                         </Grid.ColumnDefinitions>
                                         <ComboBox
                                             x:Name="AdbDeviceCombo"
+                                            SelectionChanged="AdbDeviceCombo_SelectionChanged"
                                             HorizontalAlignment="Stretch" />
                                         <Button
                                             Grid.Column="1"
@@ -310,6 +311,123 @@
                                         Foreground="{ThemeResource TextFillColorSecondaryBrush}"
                                         TextWrapping="Wrap" />
                                 </Grid>
+                            </StackPanel>
+                        </Border>
+
+                        <Border
+                            Padding="20"
+                            CornerRadius="8"
+                            Background="{ThemeResource CardBackgroundFillColorDefaultBrush}"
+                            BorderBrush="{ThemeResource CardStrokeColorDefaultBrush}"
+                            BorderThickness="1">
+                            <StackPanel Spacing="16">
+                                <StackPanel Spacing="4">
+                                    <TextBlock
+                                        Text="音频设备"
+                                        FontSize="20"
+                                        FontWeight="SemiBold" />
+                                    <TextBlock
+                                        Text="麦克风和音响状态独立于副屏显示。"
+                                        Foreground="{ThemeResource TextFillColorSecondaryBrush}"
+                                        TextWrapping="Wrap" />
+                                </StackPanel>
+
+                                <ToggleSwitch
+                                    x:Name="AudioDeviceSwitch"
+                                    Header="启用音频设备"
+                                    IsOn="True"
+                                    Toggled="AudioSwitch_Toggled" />
+
+                                <Grid ColumnSpacing="12">
+                                    <Grid.ColumnDefinitions>
+                                        <ColumnDefinition Width="*" />
+                                        <ColumnDefinition Width="*" />
+                                    </Grid.ColumnDefinitions>
+                                    <ToggleSwitch
+                                        x:Name="MicrophoneSwitch"
+                                        Header="麦克风"
+                                        IsOn="True"
+                                        Toggled="AudioSwitch_Toggled" />
+                                    <ToggleSwitch
+                                        Grid.Column="1"
+                                        x:Name="SpeakerSwitch"
+                                        Header="音响"
+                                        IsOn="True"
+                                        Toggled="AudioSwitch_Toggled" />
+                                </Grid>
+
+                                <Border
+                                    Padding="14"
+                                    CornerRadius="8"
+                                    Background="{ThemeResource LayerFillColorDefaultBrush}">
+                                    <Grid ColumnSpacing="12" RowSpacing="8">
+                                        <Grid.ColumnDefinitions>
+                                            <ColumnDefinition Width="Auto" />
+                                            <ColumnDefinition Width="*" />
+                                        </Grid.ColumnDefinitions>
+                                        <Grid.RowDefinitions>
+                                            <RowDefinition Height="Auto" />
+                                            <RowDefinition Height="Auto" />
+                                            <RowDefinition Height="Auto" />
+                                            <RowDefinition Height="Auto" />
+                                            <RowDefinition Height="Auto" />
+                                        </Grid.RowDefinitions>
+
+                                        <FontIcon Glyph="&#xE946;" FontSize="14" />
+                                        <TextBlock
+                                            x:Name="AudioOverallStatusText"
+                                            Grid.Column="1"
+                                            Text="等待 Android 设备连接"
+                                            FontWeight="SemiBold"
+                                            TextWrapping="Wrap" />
+
+                                        <TextBlock
+                                            Grid.Row="1"
+                                            Text="设备"
+                                            Foreground="{ThemeResource TextFillColorSecondaryBrush}" />
+                                        <TextBlock
+                                            x:Name="AudioCurrentDeviceText"
+                                            Grid.Row="1"
+                                            Grid.Column="1"
+                                            Text="等待 Android 设备"
+                                            Foreground="{ThemeResource TextFillColorSecondaryBrush}"
+                                            TextWrapping="Wrap" />
+
+                                        <TextBlock
+                                            Grid.Row="2"
+                                            Text="麦克风"
+                                            Foreground="{ThemeResource TextFillColorSecondaryBrush}" />
+                                        <TextBlock
+                                            x:Name="MicrophoneStatusText"
+                                            Grid.Row="2"
+                                            Grid.Column="1"
+                                            Text="等待 Android 设备"
+                                            TextWrapping="Wrap" />
+
+                                        <TextBlock
+                                            Grid.Row="3"
+                                            Text="音响"
+                                            Foreground="{ThemeResource TextFillColorSecondaryBrush}" />
+                                        <TextBlock
+                                            x:Name="SpeakerStatusText"
+                                            Grid.Row="3"
+                                            Grid.Column="1"
+                                            Text="等待 Android 设备"
+                                            TextWrapping="Wrap" />
+
+                                        <TextBlock
+                                            Grid.Row="4"
+                                            Text="提示"
+                                            Foreground="{ThemeResource TextFillColorSecondaryBrush}" />
+                                        <TextBlock
+                                            x:Name="AudioHintText"
+                                            Grid.Row="4"
+                                            Grid.Column="1"
+                                            Text="等待 Android 设备连接。"
+                                            Foreground="{ThemeResource TextFillColorSecondaryBrush}"
+                                            TextWrapping="Wrap" />
+                                    </Grid>
+                                </Border>
                             </StackPanel>
                         </Border>
 

@@ -4,6 +4,7 @@ using System.Globalization;
 using System.Reflection;
 using System.Runtime.InteropServices;
 using System.Text;
+using System.Text.Json;
 using Microsoft.UI;
 using Microsoft.UI.Windowing;
 using Microsoft.UI.Xaml;
@@ -19,6 +20,7 @@ public sealed partial class MainWindow : Window
     private const string HostExe = "SideDock.Host.exe";
     private const string DeviceToolExe = "SideDock.Idd.DeviceTool.exe";
     private const string DriverInstallerExe = "SideDock.Driver.Installer.exe";
+    private const int DefaultAudioPort = 27185;
     private const string AdbExe = "adb.exe";
     private const int SwHide = 0;
     private const int SwShow = 5;
@@ -51,12 +53,14 @@ public sealed partial class MainWindow : Window
     private const int IdiApplication = 32512;
     private const int TrayMenuOpen = 1001;
     private const int TrayMenuExit = 1002;
+    private const string AudioPreferencesFileName = "audio-preferences.json";
     private static readonly string DeviceToolProcessName = Path.GetFileNameWithoutExtension(DeviceToolExe);
     private static readonly UIntPtr WindowSubclassId = new(1);
 
     private readonly DispatcherTimer _displayStatusTimer = new();
     private readonly Brush _successBrush = new SolidColorBrush(ColorHelper.FromArgb(255, 18, 132, 86));
     private readonly Brush _dangerBrush = new SolidColorBrush(ColorHelper.FromArgb(255, 196, 43, 28));
+    private readonly Brush _warningBrush = new SolidColorBrush(ColorHelper.FromArgb(255, 157, 93, 0));
     private readonly Brush _secondaryBrush = new SolidColorBrush(ColorHelper.FromArgb(255, 96, 96, 96));
     private readonly IntPtr _windowHandle;
 
@@ -74,6 +78,11 @@ public sealed partial class MainWindow : Window
     private bool _trayIconAdded;
     private bool _windowSubclassed;
     private bool _ownsTrayIconHandle;
+    private bool _loadingAudioPreferences;
+    private AudioCapabilityStatus? _audioOverrideStatus;
+    private AudioCapabilityStatus? _microphoneRuntimeStatus;
+    private AudioCapabilityStatus? _speakerRuntimeStatus;
+    private string _lastAudioHint = "等待 Android 设备连接。";
 
     public MainWindow()
     {
@@ -93,8 +102,10 @@ public sealed partial class MainWindow : Window
         };
 
         InitializeAdbDeviceCombo();
+        LoadAudioPreferences();
         SetRunningState(false);
         RefreshVirtualDisplayState();
+        UpdateAudioState();
 
         _displayStatusTimer.Interval = TimeSpan.FromSeconds(2);
         _displayStatusTimer.Tick += (_, _) => RefreshVirtualDisplayState();
@@ -325,6 +336,24 @@ public sealed partial class MainWindow : Window
         await RefreshAdbDevicesAsync(showErrors: true);
     }
 
+    private void AdbDeviceCombo_SelectionChanged(object sender, SelectionChangedEventArgs e)
+    {
+        UpdateAudioState();
+    }
+
+    private void AudioSwitch_Toggled(object sender, RoutedEventArgs e)
+    {
+        if (_loadingAudioPreferences)
+        {
+            return;
+        }
+
+        _audioOverrideStatus = null;
+        var hint = AudioToggleHint(sender);
+        SaveAudioPreferences();
+        UpdateAudioState(hint);
+    }
+
     private void StartDisplayButton_Click(object sender, RoutedEventArgs e)
     {
         StartVirtualDisplay(failureAction: "启动虚拟显示器失败");
@@ -425,7 +454,14 @@ public sealed partial class MainWindow : Window
 
             hostLog = new HostProcessLog(hostPath, arguments, workingDirectory, adbPath, adbSerial);
             var process = new Process { StartInfo = startInfo, EnableRaisingEvents = true };
-            process.OutputDataReceived += (_, args) => hostLog.Append("stdout", args.Data);
+            process.OutputDataReceived += (_, args) =>
+            {
+                hostLog.Append("stdout", args.Data);
+                if (!string.IsNullOrWhiteSpace(args.Data))
+                {
+                    DispatcherQueue.TryEnqueue(() => HandleHostOutputLine(args.Data));
+                }
+            };
             process.ErrorDataReceived += (_, args) => hostLog.Append("stderr", args.Data);
             process.Exited += (_, _) => DispatcherQueue.TryEnqueue(() => HandleHostExited(process, hostLog));
 
@@ -458,6 +494,8 @@ public sealed partial class MainWindow : Window
                 $"启动 SideDock 主机时出错：{ex.Message}。下面是详细诊断信息，点“复制详情”可一键复制后发给开发者排查。",
                 details);
             SetRunningState(false);
+            _audioOverrideStatus = AudioCapabilityStatus.Error;
+            UpdateAudioState("音频设备暂不可用，主机未启动。");
         }
     }
 
@@ -469,12 +507,28 @@ public sealed partial class MainWindow : Window
             "--resolution", Selected(ResolutionCombo),
             "--refresh-rate", Selected(RefreshRateCombo),
             "--control-port", Port(ControlPortBox, "control"),
-            "--video-port", Port(VideoPortBox, "video")
+            "--video-port", Port(VideoPortBox, "video"),
+            "--audio-port", DefaultAudioPort.ToString(CultureInfo.InvariantCulture)
         };
 
         if (InputInjectionSwitch.IsOn)
         {
             args.Add("--enable-input-injection");
+        }
+
+        if (!AudioDeviceSwitch.IsOn)
+        {
+            args.Add("--disable-audio");
+        }
+
+        if (!MicrophoneSwitch.IsOn)
+        {
+            args.Add("--disable-microphone");
+        }
+
+        if (!SpeakerSwitch.IsOn)
+        {
+            args.Add("--disable-speaker");
         }
 
         return string.Join(" ", args.Select(QuoteArgument));
@@ -484,9 +538,13 @@ public sealed partial class MainWindow : Window
     {
         var controlPort = PortNumber(ControlPortBox, "control");
         var videoPort = PortNumber(VideoPortBox, "video");
-        return controlPort == videoPort
-            ? new[] { controlPort }
-            : new[] { controlPort, videoPort };
+        var ports = new List<int> { controlPort, videoPort };
+        if (AudioDeviceSwitch.IsOn && (MicrophoneSwitch.IsOn || SpeakerSwitch.IsOn))
+        {
+            ports.Add(DefaultAudioPort);
+        }
+
+        return ports.Distinct().ToArray();
     }
 
     private void InitializeAdbDeviceCombo()
@@ -594,6 +652,7 @@ public sealed partial class MainWindow : Window
         }
 
         AdbDeviceCombo.SelectedItem = selectedChoice;
+        UpdateAudioState();
     }
 
     private string? SelectedAdbSerial()
@@ -1487,6 +1546,9 @@ public sealed partial class MainWindow : Window
             return;
         }
 
+        _audioOverrideStatus = AudioCapabilityStatus.Error;
+        UpdateAudioState("音频设备暂不可用，主机进程已退出。");
+
         var exitCode = TryGetExitCode(process);
         var summary = exitCode.HasValue
             ? $"SideDock 主机进程已退出（退出码 {exitCode.Value}）。下面是详细诊断信息，点“复制详情”可一键复制后发给开发者排查。"
@@ -1779,12 +1841,413 @@ public sealed partial class MainWindow : Window
         RefreshAdbDevicesButton.IsEnabled = !running;
         OverallStatusText.Text = running ? "运行中" : "未启动";
         OverallStatusText.Foreground = running ? _successBrush : _dangerBrush;
+        if (running)
+        {
+            _audioOverrideStatus = null;
+            _microphoneRuntimeStatus = AudioCapabilityStatus.Preparing;
+            _speakerRuntimeStatus = AudioCapabilityStatus.Preparing;
+        }
+        else
+        {
+            _microphoneRuntimeStatus = null;
+            _speakerRuntimeStatus = null;
+        }
+
+        UpdateAudioState(running ? "正在准备音频设备。" : "等待 Android 设备连接。");
     }
 
     private void SetAdbStatus(string text, Brush brush)
     {
         AdbStatusText.Text = text;
         AdbStatusText.Foreground = brush;
+    }
+
+    private void HandleHostOutputLine(string line)
+    {
+        if (!line.Contains("[AUDIO]", StringComparison.OrdinalIgnoreCase)
+            || (!line.Contains("mic-state=", StringComparison.OrdinalIgnoreCase)
+                && !line.Contains("mic-client-state=", StringComparison.OrdinalIgnoreCase)
+                && !line.Contains("speaker-state=", StringComparison.OrdinalIgnoreCase)
+                && !line.Contains("speaker-client-state=", StringComparison.OrdinalIgnoreCase)))
+        {
+            return;
+        }
+
+        var isSpeaker = line.Contains("speaker-state=", StringComparison.OrdinalIgnoreCase)
+            || line.Contains("speaker-client-state=", StringComparison.OrdinalIgnoreCase);
+        var key = isSpeaker
+            ? (line.Contains("speaker-client-state=", StringComparison.OrdinalIgnoreCase) ? "speaker-client-state=" : "speaker-state=")
+            : (line.Contains("mic-client-state=", StringComparison.OrdinalIgnoreCase) ? "mic-client-state=" : "mic-state=");
+        var state = ExtractLogValue(line, key);
+        var nextStatus = state switch
+        {
+            "disabled" => AudioCapabilityStatus.Closed,
+            "authorization_required" => AudioCapabilityStatus.AuthorizationRequired,
+            "preparing" => AudioCapabilityStatus.Preparing,
+            "available" => AudioCapabilityStatus.Available,
+            "capturing" => AudioCapabilityStatus.Capturing,
+            "playing" => AudioCapabilityStatus.Playing,
+            "muted" => AudioCapabilityStatus.Muted,
+            "reconnecting" => AudioCapabilityStatus.Reconnecting,
+            "unavailable" => AudioCapabilityStatus.Error,
+            _ => (AudioCapabilityStatus?)null
+        };
+
+        if (nextStatus is null)
+        {
+            return;
+        }
+
+        if (isSpeaker)
+        {
+            _speakerRuntimeStatus = nextStatus.Value;
+        }
+        else
+        {
+            _microphoneRuntimeStatus = nextStatus.Value;
+        }
+
+        if (nextStatus != AudioCapabilityStatus.Error && _audioOverrideStatus == AudioCapabilityStatus.Error)
+        {
+            _audioOverrideStatus = null;
+        }
+
+        UpdateAudioState(AudioStateHint(isSpeaker ? AudioDirection.Speaker : AudioDirection.Microphone, nextStatus.Value));
+    }
+
+    private static string ExtractLogValue(string line, string key)
+    {
+        var start = line.IndexOf(key, StringComparison.OrdinalIgnoreCase);
+        if (start < 0)
+        {
+            return string.Empty;
+        }
+
+        start += key.Length;
+        var end = line.IndexOf(' ', start);
+        return (end < 0 ? line[start..] : line[start..end]).Trim();
+    }
+
+    private static string AudioStateHint(AudioDirection direction, AudioCapabilityStatus status)
+    {
+        var isMicrophone = direction == AudioDirection.Microphone;
+        return status switch
+        {
+            AudioCapabilityStatus.Closed => isMicrophone ? "SideDock 麦克风已关闭，副屏仍在运行。" : "SideDock 音响已关闭，副屏仍在运行。",
+            AudioCapabilityStatus.AuthorizationRequired => "需要在 Android 端允许麦克风权限。",
+            AudioCapabilityStatus.Preparing => isMicrophone ? "正在准备 SideDock 麦克风。" : "正在准备 SideDock 音响。",
+            AudioCapabilityStatus.Available => isMicrophone ? "SideDock 麦克风可在 Windows 或应用中选择。" : "SideDock 音响可在 Windows 或应用中选择。",
+            AudioCapabilityStatus.Capturing => "Android 麦克风正在采集中。",
+            AudioCapabilityStatus.Playing => "SideDock 音响正在播放。",
+            AudioCapabilityStatus.Muted => isMicrophone ? "SideDock 麦克风已静音。" : "SideDock 音响已静音。",
+            AudioCapabilityStatus.Reconnecting => "正在恢复音频连接。",
+            AudioCapabilityStatus.Error => isMicrophone ? "SideDock 麦克风暂不可用。" : "SideDock 音响暂不可用。",
+            _ => "等待 Android 设备连接。"
+        };
+    }
+
+    private void LoadAudioPreferences()
+    {
+        _loadingAudioPreferences = true;
+        try
+        {
+            var path = BuildAudioPreferencesPath();
+            if (!File.Exists(path))
+            {
+                return;
+            }
+
+            var json = File.ReadAllText(path, System.Text.Encoding.UTF8);
+            var preferences = JsonSerializer.Deserialize<AudioPreferences>(json);
+            if (preferences is null)
+            {
+                return;
+            }
+
+            AudioDeviceSwitch.IsOn = preferences.AudioDeviceEnabled;
+            MicrophoneSwitch.IsOn = preferences.MicrophoneEnabled;
+            SpeakerSwitch.IsOn = preferences.SpeakerEnabled;
+        }
+        catch
+        {
+            // Keep default-on intent if the local preferences file cannot be read.
+        }
+        finally
+        {
+            _loadingAudioPreferences = false;
+        }
+    }
+
+    private void SaveAudioPreferences()
+    {
+        if (_loadingAudioPreferences)
+        {
+            return;
+        }
+
+        try
+        {
+            var path = BuildAudioPreferencesPath();
+            Directory.CreateDirectory(Path.GetDirectoryName(path)!);
+            var preferences = new AudioPreferences
+            {
+                AudioDeviceEnabled = AudioDeviceSwitch.IsOn,
+                MicrophoneEnabled = MicrophoneSwitch.IsOn,
+                SpeakerEnabled = SpeakerSwitch.IsOn
+            };
+            var json = JsonSerializer.Serialize(preferences, new JsonSerializerOptions { WriteIndented = true });
+            File.WriteAllText(path, json, System.Text.Encoding.UTF8);
+        }
+        catch
+        {
+            // Preference persistence is best-effort and must not affect host startup.
+        }
+    }
+
+    private static string BuildAudioPreferencesPath()
+    {
+        return Path.Combine(
+            Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
+            "SideDock",
+            "HostApp",
+            AudioPreferencesFileName);
+    }
+
+    private string AudioToggleHint(object sender)
+    {
+        if (ReferenceEquals(sender, AudioDeviceSwitch))
+        {
+            return AudioDeviceSwitch.IsOn
+                ? "音频设备已启用，等待 Android 设备连接。"
+                : "音频设备已关闭，副屏仍在运行。";
+        }
+
+        if (ReferenceEquals(sender, MicrophoneSwitch))
+        {
+            return MicrophoneSwitch.IsOn
+                ? "SideDock 麦克风已启用。"
+                : "SideDock 麦克风已关闭。";
+        }
+
+        if (ReferenceEquals(sender, SpeakerSwitch))
+        {
+            return SpeakerSwitch.IsOn
+                ? "SideDock 音响已启用。"
+                : "SideDock 音响已关闭。";
+        }
+
+        return "音频状态已更新。";
+    }
+
+    private void UpdateAudioState(string? hint = null)
+    {
+        if (AudioDeviceSwitch is null
+            || MicrophoneSwitch is null
+            || SpeakerSwitch is null
+            || AudioOverallStatusText is null
+            || AudioCurrentDeviceText is null
+            || MicrophoneStatusText is null
+            || SpeakerStatusText is null
+            || AudioHintText is null)
+        {
+            return;
+        }
+
+        var audioEnabled = AudioDeviceSwitch.IsOn;
+        var microphoneIntent = MicrophoneSwitch.IsOn;
+        var speakerIntent = SpeakerSwitch.IsOn;
+        var baseStatus = _audioOverrideStatus ?? CurrentAudioBaseStatus();
+
+        MicrophoneSwitch.IsEnabled = audioEnabled;
+        SpeakerSwitch.IsEnabled = audioEnabled;
+        AudioCurrentDeviceText.Text = CurrentAudioDeviceLabel();
+
+        AudioCapabilityStatus overallStatus;
+        AudioCapabilityStatus microphoneStatus;
+        AudioCapabilityStatus speakerStatus;
+
+        if (!audioEnabled)
+        {
+            overallStatus = AudioCapabilityStatus.Closed;
+            microphoneStatus = AudioCapabilityStatus.Closed;
+            speakerStatus = AudioCapabilityStatus.Closed;
+        }
+        else
+        {
+            microphoneStatus = microphoneIntent
+                ? (_microphoneRuntimeStatus ?? baseStatus)
+                : AudioCapabilityStatus.Closed;
+            speakerStatus = speakerIntent
+                ? (_speakerRuntimeStatus ?? baseStatus)
+                : AudioCapabilityStatus.Closed;
+
+            if (!microphoneIntent && !speakerIntent)
+            {
+                overallStatus = AudioCapabilityStatus.Closed;
+            }
+            else if (_audioOverrideStatus.HasValue)
+            {
+                overallStatus = _audioOverrideStatus.Value;
+            }
+            else if (_speakerRuntimeStatus == AudioCapabilityStatus.Playing)
+            {
+                overallStatus = AudioCapabilityStatus.Playing;
+            }
+            else if (_microphoneRuntimeStatus == AudioCapabilityStatus.Capturing)
+            {
+                overallStatus = AudioCapabilityStatus.Capturing;
+            }
+            else if ((microphoneIntent && microphoneStatus == AudioCapabilityStatus.Available)
+                || (speakerIntent && speakerStatus == AudioCapabilityStatus.Available))
+            {
+                overallStatus = microphoneIntent && speakerIntent
+                    && (microphoneStatus != AudioCapabilityStatus.Available || speakerStatus != AudioCapabilityStatus.Available)
+                        ? AudioCapabilityStatus.PartialAvailable
+                        : AudioCapabilityStatus.Available;
+            }
+            else if (microphoneIntent && microphoneStatus != AudioCapabilityStatus.Closed)
+            {
+                overallStatus = microphoneStatus;
+            }
+            else if (speakerIntent && speakerStatus != AudioCapabilityStatus.Closed)
+            {
+                overallStatus = speakerStatus;
+            }
+            else
+            {
+                overallStatus = baseStatus;
+            }
+        }
+
+        SetAudioStatusText(AudioOverallStatusText, AudioOverallText(overallStatus), overallStatus);
+        SetAudioStatusText(MicrophoneStatusText, AudioDirectionText(AudioDirection.Microphone, microphoneStatus), microphoneStatus);
+        SetAudioStatusText(SpeakerStatusText, AudioDirectionText(AudioDirection.Speaker, speakerStatus), speakerStatus);
+
+        _lastAudioHint = BuildAudioHint(audioEnabled, microphoneIntent, speakerIntent, overallStatus, hint);
+        AudioHintText.Text = _lastAudioHint;
+    }
+
+    private AudioCapabilityStatus CurrentAudioBaseStatus()
+    {
+        return _hostProcess is { HasExited: false }
+            ? AudioCapabilityStatus.Preparing
+            : AudioCapabilityStatus.WaitingDevice;
+    }
+
+    private string CurrentAudioDeviceLabel()
+    {
+        if (AdbDeviceCombo.SelectedItem is AdbDeviceChoice { Serial.Length: > 0 } choice)
+        {
+            return choice.DisplayName;
+        }
+
+        return _hostProcess is { HasExited: false }
+            ? "自动选择 Android 设备"
+            : "等待 Android 设备";
+    }
+
+    private string BuildAudioHint(
+        bool audioEnabled,
+        bool microphoneIntent,
+        bool speakerIntent,
+        AudioCapabilityStatus overallStatus,
+        string? requestedHint)
+    {
+        if (!audioEnabled)
+        {
+            return "音频设备已关闭，副屏仍在运行。";
+        }
+
+        if (!microphoneIntent && !speakerIntent)
+        {
+            return "音频设备已关闭，副屏仍在运行。";
+        }
+
+        if (!string.IsNullOrWhiteSpace(requestedHint))
+        {
+            return requestedHint;
+        }
+
+        if (!microphoneIntent)
+        {
+            return "当前只启用了音响，麦克风已关闭。";
+        }
+
+        if (!speakerIntent)
+        {
+            return "当前只启用了麦克风，音响已关闭。";
+        }
+
+        return overallStatus switch
+        {
+            AudioCapabilityStatus.Preparing => "正在准备音频设备。",
+            AudioCapabilityStatus.Available => "音频设备可用，请在 Windows 或应用中选择 SideDock 麦克风/音响。",
+            AudioCapabilityStatus.Capturing => "Android 麦克风正在采集中。",
+            AudioCapabilityStatus.Playing => "SideDock 音响正在播放。",
+            AudioCapabilityStatus.PartialAvailable => "部分音频能力可用。",
+            AudioCapabilityStatus.AuthorizationRequired => "需要在 Android 端允许麦克风权限。",
+            AudioCapabilityStatus.Reconnecting => "正在恢复音频连接。",
+            AudioCapabilityStatus.Error => "音频设备暂不可用。",
+            AudioCapabilityStatus.Muted => "SideDock 麦克风已静音。",
+            _ => "等待 Android 设备连接。"
+        };
+    }
+
+    private void SetAudioStatusText(TextBlock textBlock, string text, AudioCapabilityStatus status)
+    {
+        textBlock.Text = text;
+        textBlock.Foreground = AudioBrush(status);
+    }
+
+    private Brush AudioBrush(AudioCapabilityStatus status)
+    {
+        return status switch
+        {
+            AudioCapabilityStatus.Available or AudioCapabilityStatus.PartialAvailable or AudioCapabilityStatus.Capturing or AudioCapabilityStatus.Playing => _successBrush,
+            AudioCapabilityStatus.Muted => _warningBrush,
+            AudioCapabilityStatus.AuthorizationRequired or AudioCapabilityStatus.Error => _dangerBrush,
+            _ => _secondaryBrush
+        };
+    }
+
+    private static string AudioOverallText(AudioCapabilityStatus status)
+    {
+        return status switch
+        {
+            AudioCapabilityStatus.Closed => "音频设备已关闭",
+            AudioCapabilityStatus.WaitingDevice => "等待 Android 设备连接",
+            AudioCapabilityStatus.Preparing => "正在准备音频设备",
+            AudioCapabilityStatus.Available => "音频设备可用",
+            AudioCapabilityStatus.Capturing => "SideDock 麦克风正在使用",
+            AudioCapabilityStatus.Playing => "SideDock 音响正在播放",
+            AudioCapabilityStatus.PartialAvailable => "部分音频能力可用",
+            AudioCapabilityStatus.Muted => "音频设备已静音",
+            AudioCapabilityStatus.AuthorizationRequired => "等待 Android 端麦克风授权",
+            AudioCapabilityStatus.Reconnecting => "音频连接中断，正在重连",
+            AudioCapabilityStatus.Error => "音频设备暂不可用",
+            _ => "等待 Android 设备连接"
+        };
+    }
+
+    private static string AudioDirectionText(AudioDirection direction, AudioCapabilityStatus status)
+    {
+        var isMicrophone = direction == AudioDirection.Microphone;
+        return status switch
+        {
+            AudioCapabilityStatus.Closed => isMicrophone ? "麦克风已关闭" : "音响已关闭",
+            AudioCapabilityStatus.WaitingDevice => "等待 Android 设备",
+            AudioCapabilityStatus.Preparing => isMicrophone ? "正在准备麦克风" : "正在准备音响",
+            AudioCapabilityStatus.Available => isMicrophone ? "SideDock 麦克风可选择" : "SideDock 音响可选择",
+            AudioCapabilityStatus.Capturing => isMicrophone ? "SideDock 麦克风正在使用" : "SideDock 音响正在播放",
+            AudioCapabilityStatus.Playing => isMicrophone ? "SideDock 麦克风正在使用" : "SideDock 音响正在播放",
+            AudioCapabilityStatus.PartialAvailable => isMicrophone ? "SideDock 麦克风可选择" : "SideDock 音响可选择",
+            AudioCapabilityStatus.Muted => isMicrophone ? "SideDock 麦克风已静音" : "SideDock 音响已静音",
+            AudioCapabilityStatus.AuthorizationRequired => isMicrophone ? "需要在 Android 端允许麦克风权限" : "音响等待 Android 设备",
+            AudioCapabilityStatus.Reconnecting => isMicrophone ? "麦克风正在重连" : "音响正在重连",
+            AudioCapabilityStatus.Error => isMicrophone ? "SideDock 麦克风暂不可用" : "SideDock 音响暂不可用",
+            AudioCapabilityStatus.NotImplemented => isMicrophone ? "SideDock 麦克风暂不可用" : "SideDock 音响暂不可用",
+            _ => "等待 Android 设备"
+        };
     }
 
     private async void ShowError(string title, string message)
@@ -1986,6 +2449,37 @@ public sealed partial class MainWindow : Window
         IntPtr lParam,
         UIntPtr subclassId,
         UIntPtr refData);
+
+    private enum AudioDirection
+    {
+        Microphone,
+        Speaker
+    }
+
+    private enum AudioCapabilityStatus
+    {
+        Closed,
+        WaitingDevice,
+        Preparing,
+        Available,
+        Capturing,
+        Playing,
+        PartialAvailable,
+        Muted,
+        AuthorizationRequired,
+        Reconnecting,
+        Error,
+        NotImplemented
+    }
+
+    private sealed class AudioPreferences
+    {
+        public bool AudioDeviceEnabled { get; set; } = true;
+
+        public bool MicrophoneEnabled { get; set; } = true;
+
+        public bool SpeakerEnabled { get; set; } = true;
+    }
 
     [StructLayout(LayoutKind.Sequential)]
     private struct Point
