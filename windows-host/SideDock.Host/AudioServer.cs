@@ -8,6 +8,7 @@ using System.Runtime.InteropServices;
 using System.Text.Json.Nodes;
 using NAudio.CoreAudioApi;
 using NAudio.Wave;
+using NAudio.Wave.SampleProviders;
 
 namespace SideDock.Host;
 
@@ -774,9 +775,11 @@ internal static partial class Program
 
             private MMDeviceEnumerator? _deviceEnumerator;
             private MMDevice? _microphoneRenderDevice;
-            private BufferedWaveProvider? _microphoneRenderBuffer;
+            private BufferedWaveProvider? _microphoneSourceBuffer;
             private WasapiOut? _microphoneRenderOutput;
             private WaveFormat? _microphoneRenderFormat;
+            private DateTimeOffset _lastMicrophoneOpenFailureLoggedAt = DateTimeOffset.MinValue;
+            private string? _lastMicrophoneOpenFailureLogMessage;
             private string _microphoneStatusMessage = "Android 麦克风写入端点未初始化。";
 
             private MMDevice? _speakerCaptureDevice;
@@ -802,7 +805,7 @@ internal static partial class Program
                 {
                     lock (_microphoneLock)
                     {
-                        return _microphoneRenderOutput is not null && _microphoneRenderBuffer is not null;
+                        return _microphoneRenderOutput is not null && _microphoneSourceBuffer is not null;
                     }
                 }
             }
@@ -845,7 +848,7 @@ internal static partial class Program
                 lock (_microphoneLock)
                 {
                     ThrowIfDisposed();
-                    if (_microphoneRenderOutput is not null && _microphoneRenderBuffer is not null)
+                    if (_microphoneRenderOutput is not null && _microphoneSourceBuffer is not null)
                     {
                         message = _microphoneStatusMessage;
                         return true;
@@ -870,13 +873,15 @@ internal static partial class Program
 
                         var device = GetEndpoint(_microphoneRenderEndpointId, DataFlow.Render, "Android 麦克风写入端点");
                         var mixFormat = device.AudioClient.MixFormat;
-                        var format = SelectMicrophoneRenderFormat(device);
-                        var buffer = new BufferedWaveProvider(format)
+                        var renderFormat = SelectMicrophoneRenderFormat(device);
+                        var sourceFormat = new WaveFormat(AudioDefaults.SampleRate, AudioDefaults.BitsPerSample, AudioDefaults.MicChannels);
+                        var sourceBuffer = new BufferedWaveProvider(sourceFormat)
                         {
                             BufferDuration = TimeSpan.FromMilliseconds(500),
                             DiscardOnBufferOverflow = true,
                             ReadFully = true
                         };
+                        var renderProvider = CreateMicrophoneRenderProvider(sourceBuffer, renderFormat);
                         var output = new WasapiOut(device, AudioClientShareMode.Shared, true, WasapiLatencyMilliseconds);
                         output.PlaybackStopped += (_, args) =>
                         {
@@ -889,17 +894,18 @@ internal static partial class Program
                                 }
                             }
                         };
-                        output.Init(buffer);
+                        output.Init(renderProvider);
                         output.Play();
 
                         _microphoneRenderDevice = device;
-                        _microphoneRenderBuffer = buffer;
+                        _microphoneSourceBuffer = sourceBuffer;
                         _microphoneRenderOutput = output;
-                        _microphoneRenderFormat = format;
-                        _microphoneStatusMessage = $"Android 麦克风写入端点已就绪：{device.FriendlyName}；direction={device.DataFlow}；selectedFormat={FormatWaveFormat(format)}；mixFormat={FormatWaveFormat(mixFormat)}。";
+                        _microphoneRenderFormat = renderFormat;
+                        _lastMicrophoneOpenFailureLogMessage = null;
+                        _microphoneStatusMessage = $"Android 麦克风写入端点已就绪：{device.FriendlyName}；direction={device.DataFlow}；sourceFormat={FormatWaveFormat(sourceFormat)}；selectedFormat={FormatWaveFormat(renderFormat)}；mixFormat={FormatWaveFormat(mixFormat)}。";
                         Log(
                             "AUDIO",
-                            $"wasapi-endpoint-opened role=microphone-render friendlyName={LogValue(device.FriendlyName)} direction={device.DataFlow} selectedFormat={LogValue(FormatWaveFormat(format))} mixFormat={LogValue(FormatWaveFormat(mixFormat))}");
+                            $"wasapi-endpoint-opened role=microphone-render friendlyName={LogValue(device.FriendlyName)} direction={device.DataFlow} sourceFormat={LogValue(FormatWaveFormat(sourceFormat))} selectedFormat={LogValue(FormatWaveFormat(renderFormat))} mixFormat={LogValue(FormatWaveFormat(mixFormat))}");
                         message = _microphoneStatusMessage;
                         return true;
                     }
@@ -907,9 +913,7 @@ internal static partial class Program
                     {
                         ResetMicrophoneRenderCore();
                         _microphoneStatusMessage = $"Android 麦克风写入端点不可用：{ex.Message}";
-                        Log(
-                            "AUDIO",
-                            $"wasapi-endpoint-open-failed role=microphone-render exception={ex.GetType().Name} message={LogValue(ex.Message)}");
+                        LogMicrophoneOpenFailure(ex);
                         message = _microphoneStatusMessage;
                         return false;
                     }
@@ -926,13 +930,13 @@ internal static partial class Program
 
                 lock (_microphoneLock)
                 {
-                    if ((_microphoneRenderOutput is null || _microphoneRenderBuffer is null || _microphoneRenderFormat is null)
+                    if ((_microphoneRenderOutput is null || _microphoneSourceBuffer is null || _microphoneRenderFormat is null)
                         && !EnsureMicrophoneReady(out message))
                     {
                         return false;
                     }
 
-                    if (_microphoneRenderBuffer is null || _microphoneRenderFormat is null)
+                    if (_microphoneSourceBuffer is null || _microphoneRenderFormat is null)
                     {
                         message = _microphoneStatusMessage;
                         return false;
@@ -947,30 +951,7 @@ internal static partial class Program
                             return true;
                         }
 
-                        if (_microphoneRenderFormat.Channels == AudioDefaults.MicChannels)
-                        {
-                            _microphoneRenderBuffer.AddSamples(buffer, 0, boundedByteCount);
-                        }
-                        else if (_microphoneRenderFormat.Channels == 2)
-                        {
-                            var convertedByteCount = boundedByteCount * 2;
-                            var converted = ArrayPool<byte>.Shared.Rent(convertedByteCount);
-                            try
-                            {
-                                DuplicateMono16ToStereo(buffer, boundedByteCount, converted);
-                                _microphoneRenderBuffer.AddSamples(converted, 0, convertedByteCount);
-                            }
-                            finally
-                            {
-                                ArrayPool<byte>.Shared.Return(converted);
-                            }
-                        }
-                        else
-                        {
-                            throw new InvalidOperationException(
-                                $"不支持的 Android 麦克风写入声道数：{_microphoneRenderFormat.Channels}。");
-                        }
-
+                        _microphoneSourceBuffer.AddSamples(buffer, 0, boundedByteCount);
                         _microphoneStatusMessage = "Android 麦克风正在写入 Windows 虚拟线缆。";
                         message = _microphoneStatusMessage;
                         return true;
@@ -1131,20 +1112,95 @@ internal static partial class Program
 
             private static WaveFormat SelectMicrophoneRenderFormat(MMDevice device)
             {
-                var mono = new WaveFormat(AudioDefaults.SampleRate, AudioDefaults.BitsPerSample, AudioDefaults.MicChannels);
-                if (IsFormatSupported(device, mono))
+                foreach (var candidate in EnumerateMicrophoneRenderFormatCandidates(device.AudioClient.MixFormat))
                 {
-                    return mono;
-                }
-
-                var stereo = new WaveFormat(AudioDefaults.SampleRate, AudioDefaults.BitsPerSample, AudioDefaults.SpeakerChannels);
-                if (IsFormatSupported(device, stereo))
-                {
-                    return stereo;
+                    if (IsFormatSupported(device, candidate))
+                    {
+                        return candidate;
+                    }
                 }
 
                 throw new InvalidOperationException(
-                    $"Android 麦克风写入端点不支持 48000 Hz / 16-bit / mono 或 stereo；当前混音格式为 {FormatWaveFormat(device.AudioClient.MixFormat)}。请在 Windows 声音设置里把虚拟线缆默认格式改为 48 kHz / 16-bit。");
+                    $"Android 麦克风写入端点不支持 SideDock 可转换的共享模式格式；当前混音格式为 {FormatWaveFormat(device.AudioClient.MixFormat)}。请尝试在 Windows 声音设置里把虚拟线缆默认格式改为 48 kHz 或 44.1 kHz / 16-bit / stereo。");
+            }
+
+            private static IEnumerable<WaveFormat> EnumerateMicrophoneRenderFormatCandidates(WaveFormat mixFormat)
+            {
+                var emitted = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+
+                foreach (var candidate in EnumerateMicrophoneRenderFormatCandidatesCore(mixFormat))
+                {
+                    var key = $"{candidate.Encoding}:{candidate.SampleRate}:{candidate.BitsPerSample}:{candidate.Channels}";
+                    if (emitted.Add(key))
+                    {
+                        yield return candidate;
+                    }
+                }
+            }
+
+            private static IEnumerable<WaveFormat> EnumerateMicrophoneRenderFormatCandidatesCore(WaveFormat mixFormat)
+            {
+                yield return new WaveFormat(AudioDefaults.SampleRate, AudioDefaults.BitsPerSample, AudioDefaults.MicChannels);
+                yield return new WaveFormat(AudioDefaults.SampleRate, AudioDefaults.BitsPerSample, AudioDefaults.SpeakerChannels);
+
+                var mixChannels = NormalizeMicrophoneRenderChannels(mixFormat.Channels);
+                yield return new WaveFormat(mixFormat.SampleRate, AudioDefaults.BitsPerSample, mixChannels);
+                yield return new WaveFormat(mixFormat.SampleRate, AudioDefaults.BitsPerSample, AudioDefaults.SpeakerChannels);
+                yield return WaveFormat.CreateIeeeFloatWaveFormat(mixFormat.SampleRate, mixChannels);
+                yield return WaveFormat.CreateIeeeFloatWaveFormat(mixFormat.SampleRate, AudioDefaults.SpeakerChannels);
+
+                yield return new WaveFormat(44100, AudioDefaults.BitsPerSample, AudioDefaults.SpeakerChannels);
+                yield return WaveFormat.CreateIeeeFloatWaveFormat(44100, AudioDefaults.SpeakerChannels);
+            }
+
+            private static int NormalizeMicrophoneRenderChannels(int channels)
+            {
+                return channels == AudioDefaults.MicChannels
+                    ? AudioDefaults.MicChannels
+                    : AudioDefaults.SpeakerChannels;
+            }
+
+            private static IWaveProvider CreateMicrophoneRenderProvider(BufferedWaveProvider sourceBuffer, WaveFormat renderFormat)
+            {
+                ISampleProvider sampleProvider = new Pcm16BitToSampleProvider(sourceBuffer);
+
+                if (renderFormat.Channels == AudioDefaults.SpeakerChannels)
+                {
+                    sampleProvider = new MonoToStereoSampleProvider(sampleProvider);
+                }
+                else if (renderFormat.Channels != AudioDefaults.MicChannels)
+                {
+                    throw new InvalidOperationException($"不支持的 Android 麦克风写入声道数：{renderFormat.Channels}。");
+                }
+
+                if (renderFormat.SampleRate != AudioDefaults.SampleRate)
+                {
+                    sampleProvider = new WdlResamplingSampleProvider(sampleProvider, renderFormat.SampleRate);
+                }
+
+                if (IsPcm16WaveFormat(renderFormat))
+                {
+                    return new SampleToWaveProvider16(sampleProvider);
+                }
+
+                if (IsIeeeFloat32WaveFormat(renderFormat))
+                {
+                    return new SampleToWaveProvider(sampleProvider);
+                }
+
+                throw new InvalidOperationException($"不支持的 Android 麦克风写入格式：{FormatWaveFormat(renderFormat)}。");
+            }
+
+            private static bool IsPcm16WaveFormat(WaveFormat format)
+            {
+                return format.Encoding == WaveFormatEncoding.Pcm
+                    && format.BitsPerSample == AudioDefaults.BitsPerSample;
+            }
+
+            private static bool IsIeeeFloat32WaveFormat(WaveFormat format)
+            {
+                return format.Encoding == WaveFormatEncoding.IeeeFloat
+                    && format.BitsPerSample == 32;
             }
 
             private static void EnsureFormatSupported(MMDevice device, WaveFormat format, string role)
@@ -1255,9 +1311,24 @@ internal static partial class Program
                 _microphoneRenderOutput?.Dispose();
                 _microphoneRenderDevice?.Dispose();
                 _microphoneRenderOutput = null;
-                _microphoneRenderBuffer = null;
+                _microphoneSourceBuffer = null;
                 _microphoneRenderDevice = null;
                 _microphoneRenderFormat = null;
+            }
+
+            private void LogMicrophoneOpenFailure(Exception ex)
+            {
+                var logMessage = $"wasapi-endpoint-open-failed role=microphone-render exception={ex.GetType().Name} message={LogValue(ex.Message)}";
+                var now = DateTimeOffset.UtcNow;
+                if (string.Equals(logMessage, _lastMicrophoneOpenFailureLogMessage, StringComparison.Ordinal)
+                    && now - _lastMicrophoneOpenFailureLoggedAt < TimeSpan.FromSeconds(5))
+                {
+                    return;
+                }
+
+                _lastMicrophoneOpenFailureLogMessage = logMessage;
+                _lastMicrophoneOpenFailureLoggedAt = now;
+                Log("AUDIO", logMessage);
             }
 
             private void ResetSpeakerCaptureCore()
@@ -1332,19 +1403,6 @@ internal static partial class Program
                 return $"{format.Encoding} {format.SampleRate} Hz / {format.BitsPerSample}-bit / {format.Channels}ch";
             }
 
-            private static void DuplicateMono16ToStereo(byte[] source, int sourceByteCount, byte[] destination)
-            {
-                var sourceSamples = sourceByteCount / 2;
-                for (var sampleIndex = 0; sampleIndex < sourceSamples; sampleIndex++)
-                {
-                    var sourceOffset = sampleIndex * 2;
-                    var destinationOffset = sampleIndex * 4;
-                    destination[destinationOffset] = source[sourceOffset];
-                    destination[destinationOffset + 1] = source[sourceOffset + 1];
-                    destination[destinationOffset + 2] = source[sourceOffset];
-                    destination[destinationOffset + 3] = source[sourceOffset + 1];
-                }
-            }
         }
 
         private sealed class AudioMicSharedRing : IDisposable

@@ -436,7 +436,7 @@
                                         Grid.Row="3"
                                         Grid.Column="1"
                                         Grid.ColumnSpan="2"
-                                        Text="选择通话软件里要使用的麦克风/录制端，例如 Voicemeeter Out B3；Host 会自动匹配对应的可写入虚拟音频端。"
+                                        Text="选择通话软件里要使用的麦克风/录制端，例如 Voicemeeter Out B3/B2/B1；Host 会自动匹配对应的可写入虚拟音频端。"
                                         TextWrapping="Wrap" />
 
                                     <Button

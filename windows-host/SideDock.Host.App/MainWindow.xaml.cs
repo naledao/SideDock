@@ -3252,13 +3252,7 @@ public sealed partial class MainWindow : Window
                 return false;
             }
 
-            if (TryReadVoicemeeterOutNumber(captureName, "A", out var busNumber))
-            {
-                renderEndpoint = FindVoicemeeterRenderEndpoint(renderEndpoints, $"Voicemeeter In {busNumber}");
-                return renderEndpoint is not null;
-            }
-
-            if (TryReadVoicemeeterOutNumber(captureName, "B", out busNumber))
+            if (TryReadVoicemeeterOutNumber(captureName, "B", out var busNumber))
             {
                 renderEndpoint = busNumber switch
                 {
