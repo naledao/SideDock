@@ -130,6 +130,9 @@ internal static partial class Program
         Console.WriteLine($"编码调优: {FormatEncoderTuningForLog(options)}");
         Console.WriteLine($"链路容量: nv12Pool={options.Nv12PoolSize} encodedPacketQueue={options.EncodedPacketQueue}");
         Console.WriteLine($"音频能力: microphone={(options.AudioDeviceEnabled && options.MicrophoneEnabled ? "enabled" : "disabled")} speaker={(options.AudioDeviceEnabled && options.SpeakerEnabled ? "enabled" : "disabled")}");
+        Console.WriteLine($"音频后端: {FormatAudioBackend(options.AudioBackend)}");
+        Console.WriteLine($"电脑声音捕获端点: {FormatOptionalForLog(options.AudioSpeakerCaptureEndpointId)}");
+        Console.WriteLine($"Android 麦克风写入端点: {FormatOptionalForLog(options.AudioMicrophoneRenderEndpointId)}");
 
         if (options.RequestedDisplayMode is not null)
         {
@@ -158,6 +161,21 @@ internal static partial class Program
             VideoSourceKind.IddGpu => "idd-gpu",
             _ => value.ToString().ToLowerInvariant()
         };
+    }
+
+    private static string FormatAudioBackend(AudioBackendKind value)
+    {
+        return value switch
+        {
+            AudioBackendKind.LegacySharedMemory => "legacy-shared-memory",
+            AudioBackendKind.WasapiVirtualCable => "wasapi-virtual-cable",
+            _ => value.ToString()
+        };
+    }
+
+    private static string FormatOptionalForLog(string? value)
+    {
+        return string.IsNullOrWhiteSpace(value) ? "(not set)" : value;
     }
 
     private static bool IsIddVideoSource(VideoSourceKind value)
@@ -13317,7 +13335,10 @@ internal static partial class Program
         string? DumpGpuFrameDirectory,
         bool AudioDeviceEnabled,
         bool MicrophoneEnabled,
-        bool SpeakerEnabled)
+        bool SpeakerEnabled,
+        AudioBackendKind AudioBackend,
+        string? AudioSpeakerCaptureEndpointId,
+        string? AudioMicrophoneRenderEndpointId)
     {
         public IReadOnlyList<int> ReversePorts { get; } = AudioDeviceEnabled && (MicrophoneEnabled || SpeakerEnabled)
             ? ControlPort == VideoPort
@@ -13361,6 +13382,9 @@ internal static partial class Program
             var audioDeviceEnabled = true;
             var microphoneEnabled = true;
             var speakerEnabled = true;
+            var audioBackend = AudioBackendKind.LegacySharedMemory;
+            string? audioSpeakerCaptureEndpointId = null;
+            string? audioMicrophoneRenderEndpointId = null;
 
             foreach (var arg in args)
             {
@@ -13413,6 +13437,18 @@ internal static partial class Program
                             audioPort = parsedAudioPort;
                         }
 
+                        break;
+
+                    case "--audio-backend":
+                        audioBackend = ParseAudioBackend(args[index + 1]);
+                        break;
+
+                    case "--audio-speaker-capture-endpoint-id":
+                        audioSpeakerCaptureEndpointId = args[index + 1];
+                        break;
+
+                    case "--audio-microphone-render-endpoint-id":
+                        audioMicrophoneRenderEndpointId = args[index + 1];
                         break;
 
                     case "--video-file":
@@ -13614,7 +13650,15 @@ internal static partial class Program
                 dumpGpuFrameDirectory,
                 audioDeviceEnabled,
                 microphoneEnabled,
-                speakerEnabled);
+                speakerEnabled,
+                audioBackend,
+                NormalizeOptionalAudioEndpointId(audioSpeakerCaptureEndpointId),
+                NormalizeOptionalAudioEndpointId(audioMicrophoneRenderEndpointId));
+        }
+
+        private static string? NormalizeOptionalAudioEndpointId(string? value)
+        {
+            return string.IsNullOrWhiteSpace(value) ? null : value.Trim();
         }
 
         private static DisplayModeRequest ParseDisplayMode(string value, int fallbackRefreshHz)
@@ -13695,6 +13739,17 @@ internal static partial class Program
                 "idd" => VideoSourceKind.Idd,
                 "idd-gpu" => VideoSourceKind.IddGpu,
                 _ => throw new ArgumentException($"Unsupported --video-source value: {value}")
+            };
+        }
+
+        private static AudioBackendKind ParseAudioBackend(string value)
+        {
+            return value.Trim().ToLowerInvariant() switch
+            {
+                "legacy" or "legacy-shared-memory" or "shared-memory" => AudioBackendKind.LegacySharedMemory,
+                "wasapi" or "wasapi-virtual-cable" or "virtual-cable" => AudioBackendKind.WasapiVirtualCable,
+                _ => throw new ArgumentException(
+                    $"Unsupported --audio-backend value: {value}. Use legacy-shared-memory or wasapi-virtual-cable.")
             };
         }
 
@@ -13856,6 +13911,12 @@ internal static partial class Program
     {
         System,
         Idd
+    }
+
+    private enum AudioBackendKind
+    {
+        LegacySharedMemory,
+        WasapiVirtualCable
     }
 
     private enum H264EncoderKind

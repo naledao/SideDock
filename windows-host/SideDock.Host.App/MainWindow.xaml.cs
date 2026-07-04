@@ -12,6 +12,8 @@ using Microsoft.UI.Xaml.Controls;
 using Microsoft.UI.Xaml.Input;
 using Microsoft.UI.Xaml.Media;
 using Windows.ApplicationModel.DataTransfer;
+using Windows.Devices.Enumeration;
+using Windows.Media.Devices;
 using WinRT.Interop;
 
 namespace SideDock.Host.App;
@@ -54,11 +56,14 @@ public sealed partial class MainWindow : Window
     private const int IdiApplication = 32512;
     private const int TrayMenuOpen = 1001;
     private const int TrayMenuExit = 1002;
+    private const int MaxRecentAudioLogLines = 80;
     private const string AudioPreferencesFileName = "audio-preferences.json";
     private static readonly string DeviceToolProcessName = Path.GetFileNameWithoutExtension(DeviceToolExe);
     private static readonly UIntPtr WindowSubclassId = new(1);
 
     private readonly DispatcherTimer _displayStatusTimer = new();
+    private readonly object _audioLogGate = new();
+    private readonly Queue<string> _recentAudioLogLines = new();
     private readonly Brush _successBrush = new SolidColorBrush(ColorHelper.FromArgb(255, 18, 132, 86));
     private readonly Brush _dangerBrush = new SolidColorBrush(ColorHelper.FromArgb(255, 196, 43, 28));
     private readonly Brush _warningBrush = new SolidColorBrush(ColorHelper.FromArgb(255, 157, 93, 0));
@@ -73,6 +78,7 @@ public sealed partial class MainWindow : Window
     private string? _hostPath;
     private string? _deviceToolPath;
     private string? _driverInstallerPath;
+    private HostProcessLog? _currentHostLog;
     private bool _hostOwnsVirtualDisplay;
     private int? _hostStopRequestedProcessId;
     private bool _exitRequested;
@@ -84,6 +90,19 @@ public sealed partial class MainWindow : Window
     private AudioCapabilityStatus? _microphoneRuntimeStatus;
     private AudioCapabilityStatus? _speakerRuntimeStatus;
     private string _lastAudioHint = "等待 Android 设备连接。";
+    private string? _lastMicrophoneStatusLine;
+    private string? _lastSpeakerStatusLine;
+    private string? _lastMicrophoneErrorLine;
+    private string? _lastSpeakerErrorLine;
+    private string? _lastMicrophoneErrorMessage;
+    private string? _lastSpeakerErrorMessage;
+    private bool _loadingAudioEndpointChoices;
+    private string? _boundMicrophoneRenderEndpointId;
+    private string? _boundMicrophoneRenderEndpointName;
+    private string? _boundSpeakerCaptureEndpointId;
+    private string? _boundSpeakerCaptureEndpointName;
+    private AudioEndpointDiagnostics _microphoneRenderEndpointDiagnostics = AudioEndpointDiagnostics.Unknown(AudioEndpointRole.MicrophoneRender);
+    private AudioEndpointDiagnostics _speakerCaptureEndpointDiagnostics = AudioEndpointDiagnostics.Unknown(AudioEndpointRole.SpeakerCapture);
 
     public MainWindow()
     {
@@ -109,6 +128,7 @@ public sealed partial class MainWindow : Window
         };
 
         InitializeAdbDeviceCombo();
+        InitializeAudioEndpointCombos();
         LoadAudioPreferences();
         SetRunningState(false);
         RefreshVirtualDisplayState();
@@ -119,6 +139,7 @@ public sealed partial class MainWindow : Window
         _displayStatusTimer.Start();
 
         _ = RefreshAdbDevicesAsync(showErrors: false);
+        _ = RefreshAudioEndpointsAsync(showHint: false);
     }
 
     private void RegisterCardWheelScrolling()
@@ -404,6 +425,45 @@ public sealed partial class MainWindow : Window
         UpdateAudioState(hint);
     }
 
+    private async void RefreshAudioEndpointsButton_Click(object sender, RoutedEventArgs e)
+    {
+        await RefreshAudioEndpointsAsync(showHint: true);
+    }
+
+    private void AudioEndpointCombo_SelectionChanged(object sender, SelectionChangedEventArgs e)
+    {
+        if (_loadingAudioEndpointChoices)
+        {
+            return;
+        }
+
+        if (ReferenceEquals(sender, SpeakerCaptureEndpointCombo))
+        {
+            SaveAudioEndpointBinding(AudioEndpointRole.SpeakerCapture, SpeakerCaptureEndpointCombo.SelectedItem as AudioEndpointChoice);
+        }
+        else if (ReferenceEquals(sender, MicrophoneRenderEndpointCombo))
+        {
+            SaveAudioEndpointBinding(AudioEndpointRole.MicrophoneRender, MicrophoneRenderEndpointCombo.SelectedItem as AudioEndpointChoice);
+        }
+    }
+
+    private void CopyAudioLogButton_Click(object sender, RoutedEventArgs e)
+    {
+        try
+        {
+            var details = BuildAudioDiagnosticsReport();
+            var package = new DataPackage { RequestedOperation = DataPackageOperation.Copy };
+            package.SetText(details);
+            Clipboard.SetContent(package);
+            Clipboard.Flush();
+            CopyAudioLogButtonText.Text = "已复制";
+        }
+        catch
+        {
+            CopyAudioLogButtonText.Text = "复制失败";
+        }
+    }
+
     private void StartDisplayButton_Click(object sender, RoutedEventArgs e)
     {
         StartVirtualDisplay(failureAction: "启动虚拟显示器失败");
@@ -435,6 +495,8 @@ public sealed partial class MainWindow : Window
 
         try
         {
+            ClearAudioDiagnostics();
+            _currentHostLog = null;
             _hostStopRequestedProcessId = null;
             StartHostButton.IsEnabled = false;
             StopHostButton.IsEnabled = false;
@@ -503,6 +565,7 @@ public sealed partial class MainWindow : Window
             }
 
             hostLog = new HostProcessLog(hostPath, arguments, workingDirectory, adbPath, adbSerial);
+            _currentHostLog = hostLog;
             var process = new Process { StartInfo = startInfo, EnableRaisingEvents = true };
             process.OutputDataReceived += (_, args) =>
             {
@@ -558,7 +621,8 @@ public sealed partial class MainWindow : Window
             "--refresh-rate", Selected(RefreshRateCombo),
             "--control-port", Port(ControlPortBox, "control"),
             "--video-port", Port(VideoPortBox, "video"),
-            "--audio-port", DefaultAudioPort.ToString(CultureInfo.InvariantCulture)
+            "--audio-port", DefaultAudioPort.ToString(CultureInfo.InvariantCulture),
+            "--audio-backend", "wasapi-virtual-cable"
         };
 
         if (InputInjectionSwitch.IsOn)
@@ -581,6 +645,18 @@ public sealed partial class MainWindow : Window
             args.Add("--disable-speaker");
         }
 
+        if (!string.IsNullOrWhiteSpace(_boundSpeakerCaptureEndpointId))
+        {
+            args.Add("--audio-speaker-capture-endpoint-id");
+            args.Add(_boundSpeakerCaptureEndpointId);
+        }
+
+        if (!string.IsNullOrWhiteSpace(_boundMicrophoneRenderEndpointId))
+        {
+            args.Add("--audio-microphone-render-endpoint-id");
+            args.Add(_boundMicrophoneRenderEndpointId);
+        }
+
         return string.Join(" ", args.Select(QuoteArgument));
     }
 
@@ -601,6 +677,205 @@ public sealed partial class MainWindow : Window
     {
         AdbDeviceCombo.DisplayMemberPath = nameof(AdbDeviceChoice.DisplayName);
         SetAdbDeviceChoices(Array.Empty<AdbDeviceRow>(), selectedSerial: null);
+    }
+
+    private void InitializeAudioEndpointCombos()
+    {
+        SpeakerCaptureEndpointCombo.DisplayMemberPath = nameof(AudioEndpointChoice.DisplayLabel);
+        MicrophoneRenderEndpointCombo.DisplayMemberPath = nameof(AudioEndpointChoice.DisplayLabel);
+        _loadingAudioEndpointChoices = true;
+        try
+        {
+            SpeakerCaptureEndpointCombo.ItemsSource = new[]
+            {
+                AudioEndpointChoice.Unbound(AudioEndpointRole.SpeakerCapture)
+            };
+            MicrophoneRenderEndpointCombo.ItemsSource = new[]
+            {
+                AudioEndpointChoice.Unbound(AudioEndpointRole.MicrophoneRender)
+            };
+            SpeakerCaptureEndpointCombo.SelectedIndex = 0;
+            MicrophoneRenderEndpointCombo.SelectedIndex = 0;
+        }
+        finally
+        {
+            _loadingAudioEndpointChoices = false;
+        }
+    }
+
+    private async Task RefreshAudioEndpointsAsync(bool showHint)
+    {
+        if (SpeakerCaptureEndpointCombo is null
+            || MicrophoneRenderEndpointCombo is null
+            || SpeakerCaptureEndpointStatusText is null
+            || MicrophoneRenderEndpointStatusText is null)
+        {
+            return;
+        }
+
+        if (RefreshAudioEndpointsButton is not null)
+        {
+            RefreshAudioEndpointsButton.IsEnabled = false;
+        }
+
+        try
+        {
+            if (!OperatingSystem.IsWindows())
+            {
+                _speakerCaptureEndpointDiagnostics = AudioEndpointDiagnostics.Unsupported(AudioEndpointRole.SpeakerCapture);
+                _microphoneRenderEndpointDiagnostics = AudioEndpointDiagnostics.Unsupported(AudioEndpointRole.MicrophoneRender);
+                SetAudioEndpointStatusTexts();
+                UpdateAudioState(showHint ? "当前系统不支持 Windows 音频端点枚举。" : null);
+                return;
+            }
+
+            var captureOperation = DeviceInformation.FindAllAsync(MediaDevice.GetAudioCaptureSelector());
+            var renderOperation = DeviceInformation.FindAllAsync(MediaDevice.GetAudioRenderSelector());
+            var speakerCaptureEndpoints = ToAudioEndpointChoices(AudioEndpointRole.SpeakerCapture, await captureOperation);
+            var microphoneRenderEndpoints = ToAudioEndpointChoices(AudioEndpointRole.MicrophoneRender, await renderOperation);
+
+            _loadingAudioEndpointChoices = true;
+            try
+            {
+                _speakerCaptureEndpointDiagnostics = ApplyAudioEndpointChoices(
+                    AudioEndpointRole.SpeakerCapture,
+                    SpeakerCaptureEndpointCombo,
+                    speakerCaptureEndpoints,
+                    _boundSpeakerCaptureEndpointId,
+                    _boundSpeakerCaptureEndpointName);
+
+                _microphoneRenderEndpointDiagnostics = ApplyAudioEndpointChoices(
+                    AudioEndpointRole.MicrophoneRender,
+                    MicrophoneRenderEndpointCombo,
+                    microphoneRenderEndpoints,
+                    _boundMicrophoneRenderEndpointId,
+                    _boundMicrophoneRenderEndpointName);
+            }
+            finally
+            {
+                _loadingAudioEndpointChoices = false;
+            }
+
+            SetAudioEndpointStatusTexts();
+            UpdateAudioState(showHint ? "音频端点列表已刷新。" : null);
+        }
+        catch (Exception ex)
+        {
+            _speakerCaptureEndpointDiagnostics = AudioEndpointDiagnostics.EnumerationFailed(AudioEndpointRole.SpeakerCapture, ex.Message);
+            _microphoneRenderEndpointDiagnostics = AudioEndpointDiagnostics.EnumerationFailed(AudioEndpointRole.MicrophoneRender, ex.Message);
+            SetAudioEndpointStatusTexts();
+            UpdateAudioState(showHint ? $"无法枚举 Windows 音频端点：{ex.Message}" : null);
+        }
+        finally
+        {
+            if (RefreshAudioEndpointsButton is not null)
+            {
+                RefreshAudioEndpointsButton.IsEnabled = true;
+            }
+        }
+    }
+
+    private static IReadOnlyList<AudioEndpointChoice> ToAudioEndpointChoices(
+        AudioEndpointRole role,
+        IEnumerable<DeviceInformation> devices)
+    {
+        return devices
+            .Select(device => AudioEndpointChoice.FromDevice(role, device))
+            .Where(choice => !string.IsNullOrWhiteSpace(choice.EndpointId))
+            .OrderByDescending(choice => choice.IsEnabled)
+            .ThenBy(choice => choice.DisplayName, StringComparer.CurrentCultureIgnoreCase)
+            .ThenBy(choice => choice.EndpointId, StringComparer.OrdinalIgnoreCase)
+            .ToArray();
+    }
+
+    private AudioEndpointDiagnostics ApplyAudioEndpointChoices(
+        AudioEndpointRole role,
+        ComboBox comboBox,
+        IReadOnlyList<AudioEndpointChoice> endpoints,
+        string? boundEndpointId,
+        string? boundDisplayName)
+    {
+        var choices = new List<AudioEndpointChoice>(endpoints.Count + 2)
+        {
+            AudioEndpointChoice.Unbound(role)
+        };
+        choices.AddRange(endpoints);
+
+        AudioEndpointChoice? selectedChoice = null;
+        if (!string.IsNullOrWhiteSpace(boundEndpointId))
+        {
+            selectedChoice = choices.FirstOrDefault(choice =>
+                string.Equals(choice.EndpointId, boundEndpointId, StringComparison.OrdinalIgnoreCase));
+
+            if (selectedChoice is null)
+            {
+                selectedChoice = AudioEndpointChoice.Missing(role, boundEndpointId, boundDisplayName);
+                choices.Insert(1, selectedChoice);
+            }
+        }
+
+        comboBox.ItemsSource = choices;
+        comboBox.SelectedItem = selectedChoice ?? choices[0];
+
+        return AudioEndpointDiagnostics.FromSelection(role, selectedChoice, endpoints.Count);
+    }
+
+    private void SaveAudioEndpointBinding(AudioEndpointRole role, AudioEndpointChoice? choice)
+    {
+        if (choice is null || !choice.IsBound)
+        {
+            SetBoundAudioEndpoint(role, endpointId: null, displayName: null);
+        }
+        else if (choice.IsPresent)
+        {
+            SetBoundAudioEndpoint(role, choice.EndpointId, choice.DisplayName);
+        }
+        else
+        {
+            return;
+        }
+
+        SaveAudioPreferences();
+        _ = RefreshAudioEndpointsAsync(showHint: false);
+        UpdateAudioState(role == AudioEndpointRole.MicrophoneRender
+            ? "Android 麦克风写入端点绑定已更新。"
+            : "电脑声音捕获端点绑定已更新。");
+    }
+
+    private void SetBoundAudioEndpoint(AudioEndpointRole role, string? endpointId, string? displayName)
+    {
+        if (role == AudioEndpointRole.MicrophoneRender)
+        {
+            _boundMicrophoneRenderEndpointId = endpointId;
+            _boundMicrophoneRenderEndpointName = displayName;
+        }
+        else
+        {
+            _boundSpeakerCaptureEndpointId = endpointId;
+            _boundSpeakerCaptureEndpointName = displayName;
+        }
+    }
+
+    private void SetAudioEndpointStatusTexts()
+    {
+        SetAudioEndpointStatusText(SpeakerCaptureEndpointStatusText, _speakerCaptureEndpointDiagnostics);
+        SetAudioEndpointStatusText(MicrophoneRenderEndpointStatusText, _microphoneRenderEndpointDiagnostics);
+    }
+
+    private void SetAudioEndpointStatusText(TextBlock? textBlock, AudioEndpointDiagnostics diagnostics)
+    {
+        if (textBlock is null)
+        {
+            return;
+        }
+
+        textBlock.Text = diagnostics.Summary;
+        textBlock.Foreground = diagnostics.Health switch
+        {
+            AudioEndpointBindingHealth.Ready => _successBrush,
+            AudioEndpointBindingHealth.Unknown => _secondaryBrush,
+            _ => _warningBrush
+        };
     }
 
     private async Task RefreshAdbDevicesAsync(bool showErrors, string? resolvedAdbPath = null)
@@ -1912,13 +2187,161 @@ public sealed partial class MainWindow : Window
         AdbStatusText.Foreground = brush;
     }
 
+    private string BuildAudioDiagnosticsReport()
+    {
+        var hostLog = _currentHostLog;
+        var recentAudioLines = SnapshotRecentAudioLogLines();
+        var report = new StringBuilder();
+        report.AppendLine("SideDock 音频设备诊断报告");
+        report.AppendLine($"时间: {DateTimeOffset.Now:yyyy-MM-dd HH:mm:ss zzz}");
+        report.AppendLine();
+
+        report.AppendLine("---- 当前状态 ----");
+        report.AppendLine($"主机状态: {OverallStatusText.Text}");
+        report.AppendLine($"主机进程: {FormatHostProcessState()}");
+        report.AppendLine($"音频总状态: {AudioOverallStatusText.Text}");
+        report.AppendLine($"Android 设备: {AudioCurrentDeviceText.Text}");
+        report.AppendLine($"麦克风状态: {MicrophoneStatusText.Text}");
+        report.AppendLine($"音响状态: {SpeakerStatusText.Text}");
+        report.AppendLine($"提示: {_lastAudioHint}");
+        report.AppendLine($"最后麦克风错误: {FormatOptional(_lastMicrophoneErrorMessage)}");
+        report.AppendLine($"最后音响错误: {FormatOptional(_lastSpeakerErrorMessage)}");
+        report.AppendLine($"最后麦克风状态日志: {FormatOptional(_lastMicrophoneStatusLine)}");
+        report.AppendLine($"最后音响状态日志: {FormatOptional(_lastSpeakerStatusLine)}");
+        report.AppendLine($"最后麦克风错误日志: {FormatOptional(_lastMicrophoneErrorLine)}");
+        report.AppendLine($"最后音响错误日志: {FormatOptional(_lastSpeakerErrorLine)}");
+        report.AppendLine();
+
+        report.AppendLine("---- 配置 ----");
+        report.AppendLine($"启用音频设备: {AudioDeviceSwitch.IsOn}");
+        report.AppendLine($"启用麦克风: {MicrophoneSwitch.IsOn}");
+        report.AppendLine($"启用音响: {SpeakerSwitch.IsOn}");
+        report.AppendLine("音频后端: wasapi-virtual-cable");
+        report.AppendLine($"电脑声音捕获端点状态: {_speakerCaptureEndpointDiagnostics.Summary}");
+        report.AppendLine($"电脑声音捕获 endpoint id: {FormatOptional(_boundSpeakerCaptureEndpointId)}");
+        report.AppendLine($"电脑声音捕获端点名称: {FormatOptional(_boundSpeakerCaptureEndpointName)}");
+        report.AppendLine($"Android 麦克风写入端点状态: {_microphoneRenderEndpointDiagnostics.Summary}");
+        report.AppendLine($"Android 麦克风写入 endpoint id: {FormatOptional(_boundMicrophoneRenderEndpointId)}");
+        report.AppendLine($"Android 麦克风写入端点名称: {FormatOptional(_boundMicrophoneRenderEndpointName)}");
+        report.AppendLine($"音频端口: {DefaultAudioPort}");
+        report.AppendLine($"控制端口: {FormatNumberBox(ControlPortBox)}");
+        report.AppendLine($"视频端口: {FormatNumberBox(VideoPortBox)}");
+        report.AppendLine($"视频源: {Selected(VideoSourceCombo)}");
+        report.AppendLine($"分辨率: {Selected(ResolutionCombo)}");
+        report.AppendLine($"刷新率: {Selected(RefreshRateCombo)}");
+        report.AppendLine($"ADB 路径输入: {FormatOptional(AdbPathBox.Text.Trim())}");
+        report.AppendLine($"ADB 选择设备: {FormatOptional(SelectedAdbSerial())}");
+        report.AppendLine();
+
+        report.AppendLine("---- Host 进程 ----");
+        report.AppendLine($"Host 路径: {FormatOptional(hostLog?.HostPath ?? _hostPath)}");
+        report.AppendLine($"工作目录: {FormatOptional(hostLog?.WorkingDirectory)}");
+        report.AppendLine($"启动参数: {FormatOptional(hostLog?.Arguments)}");
+        report.AppendLine($"ADB 路径: {FormatOptional(hostLog?.AdbPath)}");
+        report.AppendLine($"ADB 设备: {FormatOptional(hostLog?.AdbSerial)}");
+        report.AppendLine();
+
+        report.AppendLine("---- 最近音频日志 ----");
+        if (recentAudioLines.Length == 0)
+        {
+            report.AppendLine("(还没有捕获到 [AUDIO] 日志)");
+        }
+        else
+        {
+            foreach (var line in recentAudioLines)
+            {
+                report.AppendLine(line);
+            }
+        }
+
+        report.AppendLine();
+        report.AppendLine("---- 主机 stdout/stderr ----");
+        if (hostLog is null)
+        {
+            report.AppendLine("(当前没有主机日志缓存)");
+        }
+        else
+        {
+            report.Append(hostLog.Snapshot());
+        }
+
+        return report.ToString();
+    }
+
+    private void AppendRecentAudioLogLine(string line)
+    {
+        var entry = $"[{DateTimeOffset.Now:HH:mm:ss.fff}] {line}";
+        lock (_audioLogGate)
+        {
+            _recentAudioLogLines.Enqueue(entry);
+            while (_recentAudioLogLines.Count > MaxRecentAudioLogLines)
+            {
+                _recentAudioLogLines.Dequeue();
+            }
+        }
+    }
+
+    private string[] SnapshotRecentAudioLogLines()
+    {
+        lock (_audioLogGate)
+        {
+            return _recentAudioLogLines.ToArray();
+        }
+    }
+
+    private void ClearAudioDiagnostics()
+    {
+        lock (_audioLogGate)
+        {
+            _recentAudioLogLines.Clear();
+        }
+
+        _lastMicrophoneStatusLine = null;
+        _lastSpeakerStatusLine = null;
+        _lastMicrophoneErrorLine = null;
+        _lastSpeakerErrorLine = null;
+        _lastMicrophoneErrorMessage = null;
+        _lastSpeakerErrorMessage = null;
+
+        if (CopyAudioLogButtonText is not null)
+        {
+            CopyAudioLogButtonText.Text = "复制错误日志";
+        }
+    }
+
+    private string FormatHostProcessState()
+    {
+        var process = _hostProcess;
+        if (process is null)
+        {
+            return "未运行";
+        }
+
+        try
+        {
+            return process.HasExited
+                ? $"已退出，退出码 {process.ExitCode}"
+                : $"运行中，PID {process.Id}";
+        }
+        catch
+        {
+            return "状态不可读取";
+        }
+    }
+
     private void HandleHostOutputLine(string line)
     {
-        if (!line.Contains("[AUDIO]", StringComparison.OrdinalIgnoreCase)
-            || (!line.Contains("mic-state=", StringComparison.OrdinalIgnoreCase)
-                && !line.Contains("mic-client-state=", StringComparison.OrdinalIgnoreCase)
-                && !line.Contains("speaker-state=", StringComparison.OrdinalIgnoreCase)
-                && !line.Contains("speaker-client-state=", StringComparison.OrdinalIgnoreCase)))
+        if (!line.Contains("[AUDIO]", StringComparison.OrdinalIgnoreCase))
+        {
+            return;
+        }
+
+        AppendRecentAudioLogLine(line);
+
+        if (!line.Contains("mic-state=", StringComparison.OrdinalIgnoreCase)
+            && !line.Contains("mic-client-state=", StringComparison.OrdinalIgnoreCase)
+            && !line.Contains("speaker-state=", StringComparison.OrdinalIgnoreCase)
+            && !line.Contains("speaker-client-state=", StringComparison.OrdinalIgnoreCase))
         {
             return;
         }
@@ -1948,13 +2371,26 @@ public sealed partial class MainWindow : Window
             return;
         }
 
+        var errorMessage = ExtractLogTail(line, " message=");
         if (isSpeaker)
         {
             _speakerRuntimeStatus = nextStatus.Value;
+            _lastSpeakerStatusLine = line;
+            if (nextStatus == AudioCapabilityStatus.Error)
+            {
+                _lastSpeakerErrorLine = line;
+                _lastSpeakerErrorMessage = string.IsNullOrWhiteSpace(errorMessage) ? null : errorMessage;
+            }
         }
         else
         {
             _microphoneRuntimeStatus = nextStatus.Value;
+            _lastMicrophoneStatusLine = line;
+            if (nextStatus == AudioCapabilityStatus.Error)
+            {
+                _lastMicrophoneErrorLine = line;
+                _lastMicrophoneErrorMessage = string.IsNullOrWhiteSpace(errorMessage) ? null : errorMessage;
+            }
         }
 
         if (nextStatus != AudioCapabilityStatus.Error && _audioOverrideStatus == AudioCapabilityStatus.Error)
@@ -1962,7 +2398,11 @@ public sealed partial class MainWindow : Window
             _audioOverrideStatus = null;
         }
 
-        UpdateAudioState(AudioStateHint(isSpeaker ? AudioDirection.Speaker : AudioDirection.Microphone, nextStatus.Value));
+        var direction = isSpeaker ? AudioDirection.Speaker : AudioDirection.Microphone;
+        var hint = nextStatus == AudioCapabilityStatus.Error && !string.IsNullOrWhiteSpace(errorMessage)
+            ? AudioUnavailableHint(direction, errorMessage)
+            : AudioStateHint(direction, nextStatus.Value);
+        UpdateAudioState(hint);
     }
 
     private static string ExtractLogValue(string line, string key)
@@ -1976,6 +2416,18 @@ public sealed partial class MainWindow : Window
         start += key.Length;
         var end = line.IndexOf(' ', start);
         return (end < 0 ? line[start..] : line[start..end]).Trim();
+    }
+
+    private static string ExtractLogTail(string line, string key)
+    {
+        var start = line.IndexOf(key, StringComparison.OrdinalIgnoreCase);
+        if (start < 0)
+        {
+            return string.Empty;
+        }
+
+        start += key.Length;
+        return line[start..].Trim();
     }
 
     private static string AudioStateHint(AudioDirection direction, AudioCapabilityStatus status)
@@ -1994,6 +2446,13 @@ public sealed partial class MainWindow : Window
             AudioCapabilityStatus.Error => isMicrophone ? "SideDock 麦克风暂不可用。" : "SideDock 音响暂不可用。",
             _ => "等待 Android 设备连接。"
         };
+    }
+
+    private static string AudioUnavailableHint(AudioDirection direction, string message)
+    {
+        return direction == AudioDirection.Microphone
+            ? $"SideDock 麦克风暂不可用：{message}"
+            : $"SideDock 音响暂不可用：{message}";
     }
 
     private void LoadAudioPreferences()
@@ -2017,6 +2476,10 @@ public sealed partial class MainWindow : Window
             AudioDeviceSwitch.IsOn = preferences.AudioDeviceEnabled;
             MicrophoneSwitch.IsOn = preferences.MicrophoneEnabled;
             SpeakerSwitch.IsOn = preferences.SpeakerEnabled;
+            _boundMicrophoneRenderEndpointId = preferences.MicrophoneRenderEndpoint?.EndpointId;
+            _boundMicrophoneRenderEndpointName = preferences.MicrophoneRenderEndpoint?.DisplayName;
+            _boundSpeakerCaptureEndpointId = preferences.SpeakerCaptureEndpoint?.EndpointId;
+            _boundSpeakerCaptureEndpointName = preferences.SpeakerCaptureEndpoint?.DisplayName;
         }
         catch
         {
@@ -2043,7 +2506,17 @@ public sealed partial class MainWindow : Window
             {
                 AudioDeviceEnabled = AudioDeviceSwitch.IsOn,
                 MicrophoneEnabled = MicrophoneSwitch.IsOn,
-                SpeakerEnabled = SpeakerSwitch.IsOn
+                SpeakerEnabled = SpeakerSwitch.IsOn,
+                MicrophoneRenderEndpoint = new AudioEndpointBinding
+                {
+                    EndpointId = _boundMicrophoneRenderEndpointId,
+                    DisplayName = _boundMicrophoneRenderEndpointName
+                },
+                SpeakerCaptureEndpoint = new AudioEndpointBinding
+                {
+                    EndpointId = _boundSpeakerCaptureEndpointId,
+                    DisplayName = _boundSpeakerCaptureEndpointName
+                }
             };
             var json = JsonSerializer.Serialize(preferences, new JsonSerializerOptions { WriteIndented = true });
             File.WriteAllText(path, json, System.Text.Encoding.UTF8);
@@ -2107,6 +2580,8 @@ public sealed partial class MainWindow : Window
         var microphoneIntent = MicrophoneSwitch.IsOn;
         var speakerIntent = SpeakerSwitch.IsOn;
         var baseStatus = _audioOverrideStatus ?? CurrentAudioBaseStatus();
+        var microphoneEndpointBlocked = microphoneIntent && _microphoneRenderEndpointDiagnostics.BlocksAudio;
+        var speakerEndpointBlocked = speakerIntent && _speakerCaptureEndpointDiagnostics.BlocksAudio;
 
         MicrophoneSwitch.IsEnabled = audioEnabled;
         SpeakerSwitch.IsEnabled = audioEnabled;
@@ -2131,9 +2606,23 @@ public sealed partial class MainWindow : Window
                 ? (_speakerRuntimeStatus ?? baseStatus)
                 : AudioCapabilityStatus.Closed;
 
+            if (microphoneEndpointBlocked)
+            {
+                microphoneStatus = AudioCapabilityStatus.Error;
+            }
+
+            if (speakerEndpointBlocked)
+            {
+                speakerStatus = AudioCapabilityStatus.Error;
+            }
+
             if (!microphoneIntent && !speakerIntent)
             {
                 overallStatus = AudioCapabilityStatus.Closed;
+            }
+            else if (microphoneEndpointBlocked && speakerEndpointBlocked)
+            {
+                overallStatus = AudioCapabilityStatus.Error;
             }
             else if (_audioOverrideStatus.HasValue)
             {
@@ -2213,6 +2702,12 @@ public sealed partial class MainWindow : Window
             return "音频设备已关闭，副屏仍在运行。";
         }
 
+        var endpointIssue = BuildAudioEndpointIssueHint(microphoneIntent, speakerIntent);
+        if (!string.IsNullOrWhiteSpace(endpointIssue))
+        {
+            return endpointIssue;
+        }
+
         if (!string.IsNullOrWhiteSpace(requestedHint))
         {
             return requestedHint;
@@ -2231,7 +2726,7 @@ public sealed partial class MainWindow : Window
         return overallStatus switch
         {
             AudioCapabilityStatus.Preparing => "正在准备音频设备。",
-            AudioCapabilityStatus.Available => "音频设备可用，请在 Windows 或应用中选择 SideDock 麦克风/音响。",
+            AudioCapabilityStatus.Available => "音频设备可用。Windows/应用输出选择电脑声音线缆的 Input；会议软件麦克风选择麦克风线缆的 Output。",
             AudioCapabilityStatus.Capturing => "Android 麦克风正在采集中。",
             AudioCapabilityStatus.Playing => "SideDock 音响正在播放。",
             AudioCapabilityStatus.PartialAvailable => "部分音频能力可用。",
@@ -2241,6 +2736,23 @@ public sealed partial class MainWindow : Window
             AudioCapabilityStatus.Muted => "SideDock 麦克风已静音。",
             _ => "等待 Android 设备连接。"
         };
+    }
+
+    private string? BuildAudioEndpointIssueHint(bool microphoneIntent, bool speakerIntent)
+    {
+        var microphoneIssue = microphoneIntent && _microphoneRenderEndpointDiagnostics.BlocksAudio
+            ? _microphoneRenderEndpointDiagnostics.Summary
+            : null;
+        var speakerIssue = speakerIntent && _speakerCaptureEndpointDiagnostics.BlocksAudio
+            ? _speakerCaptureEndpointDiagnostics.Summary
+            : null;
+
+        if (!string.IsNullOrWhiteSpace(microphoneIssue) && !string.IsNullOrWhiteSpace(speakerIssue))
+        {
+            return $"{microphoneIssue}；{speakerIssue}";
+        }
+
+        return microphoneIssue ?? speakerIssue;
     }
 
     private void SetAudioStatusText(TextBlock textBlock, string text, AudioCapabilityStatus status)
@@ -2506,6 +3018,12 @@ public sealed partial class MainWindow : Window
         Speaker
     }
 
+    private enum AudioEndpointRole
+    {
+        SpeakerCapture,
+        MicrophoneRender
+    }
+
     private enum AudioCapabilityStatus
     {
         Closed,
@@ -2522,6 +3040,17 @@ public sealed partial class MainWindow : Window
         NotImplemented
     }
 
+    private enum AudioEndpointBindingHealth
+    {
+        Unknown,
+        Unconfigured,
+        Ready,
+        Disabled,
+        Missing,
+        Unsupported,
+        EnumerationFailed
+    }
+
     private sealed class AudioPreferences
     {
         public bool AudioDeviceEnabled { get; set; } = true;
@@ -2529,6 +3058,167 @@ public sealed partial class MainWindow : Window
         public bool MicrophoneEnabled { get; set; } = true;
 
         public bool SpeakerEnabled { get; set; } = true;
+
+        public AudioEndpointBinding? MicrophoneRenderEndpoint { get; set; }
+
+        public AudioEndpointBinding? SpeakerCaptureEndpoint { get; set; }
+    }
+
+    private sealed class AudioEndpointBinding
+    {
+        public string? EndpointId { get; set; }
+
+        public string? DisplayName { get; set; }
+    }
+
+    private sealed record AudioEndpointChoice(
+        AudioEndpointRole Role,
+        string EndpointId,
+        string DisplayName,
+        bool IsEnabled,
+        bool IsPresent)
+    {
+        public bool IsBound => !string.IsNullOrWhiteSpace(EndpointId);
+
+        public string DisplayLabel
+        {
+            get
+            {
+                if (!IsBound)
+                {
+                    return Role == AudioEndpointRole.SpeakerCapture
+                        ? "未绑定电脑声音捕获端点"
+                        : "未绑定 Android 麦克风写入端点";
+                }
+
+                if (!IsPresent)
+                {
+                    return $"{DisplayName}（当前不可用）";
+                }
+
+                return IsEnabled ? DisplayName : $"{DisplayName}（已禁用）";
+            }
+        }
+
+        public static AudioEndpointChoice Unbound(AudioEndpointRole role)
+        {
+            return new AudioEndpointChoice(role, string.Empty, string.Empty, IsEnabled: true, IsPresent: true);
+        }
+
+        public static AudioEndpointChoice Missing(AudioEndpointRole role, string endpointId, string? displayName)
+        {
+            return new AudioEndpointChoice(
+                role,
+                endpointId,
+                string.IsNullOrWhiteSpace(displayName) ? "已绑定端点" : displayName,
+                IsEnabled: false,
+                IsPresent: false);
+        }
+
+        public static AudioEndpointChoice FromDevice(AudioEndpointRole role, DeviceInformation device)
+        {
+            return new AudioEndpointChoice(
+                role,
+                device.Id,
+                string.IsNullOrWhiteSpace(device.Name) ? "(未命名音频端点)" : device.Name,
+                device.IsEnabled,
+                IsPresent: true);
+        }
+    }
+
+    private sealed record AudioEndpointDiagnostics(
+        AudioEndpointBindingHealth Health,
+        string Summary,
+        string? EndpointId,
+        string? DisplayName,
+        int AvailableEndpointCount)
+    {
+        public bool BlocksAudio => Health is
+            AudioEndpointBindingHealth.Unconfigured
+            or AudioEndpointBindingHealth.Disabled
+            or AudioEndpointBindingHealth.Missing
+            or AudioEndpointBindingHealth.Unsupported
+            or AudioEndpointBindingHealth.EnumerationFailed;
+
+        public static AudioEndpointDiagnostics Unknown(AudioEndpointRole role)
+        {
+            return new AudioEndpointDiagnostics(
+                AudioEndpointBindingHealth.Unknown,
+                role == AudioEndpointRole.SpeakerCapture
+                    ? "正在枚举电脑声音捕获端点..."
+                    : "正在枚举 Android 麦克风写入端点...",
+                null,
+                null,
+                0);
+        }
+
+        public static AudioEndpointDiagnostics Unsupported(AudioEndpointRole role)
+        {
+            return new AudioEndpointDiagnostics(
+                AudioEndpointBindingHealth.Unsupported,
+                role == AudioEndpointRole.SpeakerCapture
+                    ? "当前系统不支持枚举 Windows 录制端点。"
+                    : "当前系统不支持枚举 Windows 播放端点。",
+                null,
+                null,
+                0);
+        }
+
+        public static AudioEndpointDiagnostics EnumerationFailed(AudioEndpointRole role, string message)
+        {
+            return new AudioEndpointDiagnostics(
+                AudioEndpointBindingHealth.EnumerationFailed,
+                role == AudioEndpointRole.SpeakerCapture
+                    ? $"电脑声音捕获端点枚举失败：{message}"
+                    : $"Android 麦克风写入端点枚举失败：{message}",
+                null,
+                null,
+                0);
+        }
+
+        public static AudioEndpointDiagnostics FromSelection(
+            AudioEndpointRole role,
+            AudioEndpointChoice? selectedChoice,
+            int availableEndpointCount)
+        {
+            var roleName = role == AudioEndpointRole.SpeakerCapture ? "电脑声音捕获" : "Android 麦克风写入";
+            if (selectedChoice is null || !selectedChoice.IsBound)
+            {
+                return new AudioEndpointDiagnostics(
+                    AudioEndpointBindingHealth.Unconfigured,
+                    $"{roleName}端点未绑定，请选择已安装虚拟线缆对应端点。",
+                    null,
+                    null,
+                    availableEndpointCount);
+            }
+
+            if (!selectedChoice.IsPresent)
+            {
+                return new AudioEndpointDiagnostics(
+                    AudioEndpointBindingHealth.Missing,
+                    $"{roleName}端点丢失，请重新安装虚拟线缆或重新绑定。",
+                    selectedChoice.EndpointId,
+                    selectedChoice.DisplayName,
+                    availableEndpointCount);
+            }
+
+            if (!selectedChoice.IsEnabled)
+            {
+                return new AudioEndpointDiagnostics(
+                    AudioEndpointBindingHealth.Disabled,
+                    $"{roleName}端点已禁用，请在 Windows 声音设置中启用后刷新。",
+                    selectedChoice.EndpointId,
+                    selectedChoice.DisplayName,
+                    availableEndpointCount);
+            }
+
+            return new AudioEndpointDiagnostics(
+                AudioEndpointBindingHealth.Ready,
+                $"{roleName}端点已绑定：{selectedChoice.DisplayName}",
+                selectedChoice.EndpointId,
+                selectedChoice.DisplayName,
+                availableEndpointCount);
+        }
     }
 
     [StructLayout(LayoutKind.Sequential)]

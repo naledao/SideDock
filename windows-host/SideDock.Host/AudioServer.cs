@@ -1,9 +1,13 @@
 using System.Buffers;
 using System.Buffers.Binary;
+using System.Collections.Concurrent;
 using System.IO.MemoryMappedFiles;
 using System.Net;
 using System.Net.Sockets;
+using System.Runtime.InteropServices;
 using System.Text.Json.Nodes;
+using NAudio.CoreAudioApi;
+using NAudio.Wave;
 
 namespace SideDock.Host;
 
@@ -29,8 +33,7 @@ internal static partial class Program
 
         private readonly TcpListener _listener = new(address, options.AudioPort);
         private readonly object _connectionLock = new();
-        private readonly AudioMicSharedRing _micRing = new();
-        private readonly AudioSpeakerSharedRing _speakerRing = new();
+        private readonly IAudioBridgeBackend _audioBackend = CreateAudioBackend(options);
         private CancellationTokenSource? _activeConnectionCts;
         private Task? _activeConnectionTask;
         private int _connectionSerial;
@@ -99,8 +102,7 @@ internal static partial class Program
             finally
             {
                 _listener.Stop();
-                _micRing.Dispose();
-                _speakerRing.Dispose();
+                _audioBackend.Dispose();
             }
         }
 
@@ -108,8 +110,11 @@ internal static partial class Program
         {
             if (options.MicrophoneEnabled)
             {
-                var micReady = _micRing.EnsureReady(out var micMessage);
-                Log("AUDIO", $"mic-state={(micReady ? "available" : "unavailable")} port={options.AudioPort} format=pcm_s16le/{AudioDefaults.SampleRate}/mono system-endpoint={(micReady ? "ready" : "missing")}");
+                var micReady = _audioBackend.EnsureMicrophoneReady(out var micMessage);
+                Log(
+                    "AUDIO",
+                    $"mic-state={(micReady ? "available" : "unavailable")} backend={_audioBackend.Name} port={options.AudioPort} format=pcm_s16le/{AudioDefaults.SampleRate}/mono system-endpoint={(micReady ? "ready" : "missing")}"
+                    + (micReady ? string.Empty : $" message={micMessage}"));
                 await PublishMicStatusAsync(
                     micReady ? "available" : "unavailable",
                     micReady ? "SideDock 麦克风可在 Windows 或应用中选择。" : micMessage,
@@ -123,8 +128,11 @@ internal static partial class Program
 
             if (options.SpeakerEnabled)
             {
-                var speakerReady = _speakerRing.EnsureReady(out var speakerMessage);
-                Log("AUDIO", $"speaker-state={(speakerReady ? "available" : "unavailable")} port={options.AudioPort} format=pcm_s16le/{AudioDefaults.SampleRate}/stereo system-endpoint={(speakerReady ? "ready" : "missing")}");
+                var speakerReady = _audioBackend.EnsureSpeakerReady(out var speakerMessage);
+                Log(
+                    "AUDIO",
+                    $"speaker-state={(speakerReady ? "available" : "unavailable")} backend={_audioBackend.Name} port={options.AudioPort} format=pcm_s16le/{AudioDefaults.SampleRate}/stereo system-endpoint={(speakerReady ? "ready" : "missing")}"
+                    + (speakerReady ? string.Empty : $" message={speakerMessage}"));
                 await PublishSpeakerStatusAsync(
                     speakerReady ? "available" : "unavailable",
                     speakerReady ? "SideDock 音响可在 Windows 或应用中选择。" : speakerMessage,
@@ -212,7 +220,7 @@ internal static partial class Program
 
         private async Task ReceiveMicrophoneAsync(int connectionId, Stream stream, CancellationToken cancellationToken)
         {
-            var endpointReady = _micRing.EnsureReady(out var endpointMessage);
+            var endpointReady = _audioBackend.EnsureMicrophoneReady(out var endpointMessage);
             await PublishMicStatusAsync(
                 endpointReady ? "available" : "unavailable",
                 endpointReady ? "等待 Android 麦克风采集。" : endpointMessage,
@@ -250,7 +258,7 @@ internal static partial class Program
                     }
 
                     await stream.ReadExactlyAsync(payload.AsMemory(0, payloadLength), cancellationToken);
-                    endpointReady = _micRing.Write(payload, payloadLength, timestampMs, out endpointMessage);
+                    endpointReady = _audioBackend.WriteMicrophone(payload, payloadLength, timestampMs, out endpointMessage);
                     packetCount += 1;
                     byteCount += payloadLength;
 
@@ -260,7 +268,8 @@ internal static partial class Program
                         var sourceAgeMs = Math.Max(0, now.ToUnixTimeMilliseconds() - timestampMs);
                         Log(
                             "AUDIO",
-                            $"mic-state={(endpointReady ? "capturing" : "unavailable")} packets={packetCount} bytes={byteCount} lastSeq={sequence} sourceAgeMs={sourceAgeMs} system-endpoint={(endpointReady ? "ready" : "missing")}");
+                            $"mic-state={(endpointReady ? "capturing" : "unavailable")} packets={packetCount} bytes={byteCount} lastSeq={sequence} sourceAgeMs={sourceAgeMs} system-endpoint={(endpointReady ? "ready" : "missing")}"
+                            + (endpointReady ? string.Empty : $" message={endpointMessage}"));
                         await PublishMicStatusAsync(
                             endpointReady ? "capturing" : "unavailable",
                             endpointReady ? "Android 麦克风正在采集中。" : endpointMessage,
@@ -293,7 +302,6 @@ internal static partial class Program
             var payload = ArrayPool<byte>.Shared.Rent(SpeakerChunkBytes);
             long packetCount = 0;
             long byteCount = 0;
-            long readPosition = 0;
             var lastStatsAt = DateTimeOffset.MinValue;
             var lastUnavailableAt = DateTimeOffset.MinValue;
 
@@ -301,26 +309,28 @@ internal static partial class Program
             {
                 while (!cancellationToken.IsCancellationRequested)
                 {
-                    if (!_speakerRing.TryRead(payload, SpeakerChunkBytes, ref readPosition, out var bytesRead, out var message))
+                    var readResult = _audioBackend.ReadSpeaker(payload, SpeakerChunkBytes);
+                    if (!readResult.EndpointReady)
                     {
                         var unavailableNow = DateTimeOffset.UtcNow;
                         if (unavailableNow - lastUnavailableAt >= TimeSpan.FromSeconds(1))
                         {
                             lastUnavailableAt = unavailableNow;
-                            Log("AUDIO", $"speaker-state=unavailable system-endpoint=missing message={message}");
-                            await PublishSpeakerStatusAsync("unavailable", message, cancellationToken, packetCount, byteCount);
+                            Log("AUDIO", $"speaker-state=unavailable backend={_audioBackend.Name} system-endpoint=missing message={readResult.Message}");
+                            await PublishSpeakerStatusAsync("unavailable", readResult.Message, cancellationToken, packetCount, byteCount);
                         }
 
                         await Task.Delay(250, cancellationToken);
                         continue;
                     }
 
+                    var bytesRead = readResult.BytesRead;
                     if (bytesRead <= 0)
                     {
                         if (packetCount == 0 && lastStatsAt == DateTimeOffset.MinValue)
                         {
                             lastStatsAt = DateTimeOffset.UtcNow;
-                            Log("AUDIO", "speaker-state=available system-endpoint=ready");
+                            Log("AUDIO", $"speaker-state=available backend={_audioBackend.Name} system-endpoint=ready");
                             await PublishSpeakerStatusAsync("available", "等待 Windows 播放到 SideDock 音响。", cancellationToken);
                         }
 
@@ -339,7 +349,7 @@ internal static partial class Program
                     var now = DateTimeOffset.UtcNow;
                     if (packetCount == 1 || now - lastStatsAt >= TimeSpan.FromSeconds(1))
                     {
-                        Log("AUDIO", $"speaker-state=playing packets={packetCount} bytes={byteCount} system-endpoint=ready");
+                        Log("AUDIO", $"speaker-state=playing backend={_audioBackend.Name} packets={packetCount} bytes={byteCount} system-endpoint=ready");
                         await PublishSpeakerStatusAsync(
                             "playing",
                             "SideDock 音响正在播放。",
@@ -382,8 +392,9 @@ internal static partial class Program
                 ["sampleRate"] = AudioDefaults.SampleRate,
                 ["channels"] = AudioDefaults.MicChannels,
                 ["bitsPerSample"] = AudioDefaults.BitsPerSample,
-                ["systemEndpoint"] = _micRing.IsReady,
-                ["systemEndpointMessage"] = _micRing.StatusMessage
+                ["backend"] = _audioBackend.Name,
+                ["systemEndpoint"] = _audioBackend.IsMicrophoneReady,
+                ["systemEndpointMessage"] = _audioBackend.MicrophoneStatusMessage
             }, cancellationToken);
         }
 
@@ -403,8 +414,9 @@ internal static partial class Program
                 ["sampleRate"] = AudioDefaults.SampleRate,
                 ["channels"] = AudioDefaults.SpeakerChannels,
                 ["bitsPerSample"] = AudioDefaults.BitsPerSample,
-                ["systemEndpoint"] = _speakerRing.IsReady,
-                ["systemEndpointMessage"] = _speakerRing.StatusMessage
+                ["backend"] = _audioBackend.Name,
+                ["systemEndpoint"] = _audioBackend.IsSpeakerReady,
+                ["systemEndpointMessage"] = _audioBackend.SpeakerStatusMessage
             }, cancellationToken);
         }
 
@@ -432,6 +444,625 @@ internal static partial class Program
             BinaryPrimitives.WriteInt16LittleEndian(header.AsSpan(28, 2), (short)channels);
             BinaryPrimitives.WriteInt16LittleEndian(header.AsSpan(30, 2), AudioDefaults.BitsPerSample);
             BinaryPrimitives.WriteInt32LittleEndian(header.AsSpan(32, 4), payloadLength);
+        }
+
+        private static IAudioBridgeBackend CreateAudioBackend(HostOptions hostOptions)
+        {
+            return hostOptions.AudioBackend switch
+            {
+                AudioBackendKind.WasapiVirtualCable => new WasapiVirtualCableAudioBackend(
+                    hostOptions.AudioSpeakerCaptureEndpointId,
+                    hostOptions.AudioMicrophoneRenderEndpointId),
+                _ => new LegacySharedMemoryAudioBackend()
+            };
+        }
+
+        private interface IAudioBridgeBackend : IDisposable
+        {
+            string Name { get; }
+
+            bool IsMicrophoneReady { get; }
+
+            string MicrophoneStatusMessage { get; }
+
+            bool IsSpeakerReady { get; }
+
+            string SpeakerStatusMessage { get; }
+
+            bool EnsureMicrophoneReady(out string message);
+
+            bool WriteMicrophone(byte[] buffer, int byteCount, long timestampMs, out string message);
+
+            bool EnsureSpeakerReady(out string message);
+
+            AudioReadResult ReadSpeaker(byte[] destination, int maxByteCount);
+        }
+
+        private sealed record AudioReadResult(bool EndpointReady, int BytesRead, string Message);
+
+        private sealed class LegacySharedMemoryAudioBackend : IAudioBridgeBackend
+        {
+            private readonly AudioMicSharedRing _micRing = new();
+            private readonly AudioSpeakerSharedRing _speakerRing = new();
+            private long _speakerReadPosition;
+
+            public string Name => "legacy-shared-memory";
+
+            public bool IsMicrophoneReady => _micRing.IsReady;
+
+            public string MicrophoneStatusMessage => _micRing.StatusMessage;
+
+            public bool IsSpeakerReady => _speakerRing.IsReady;
+
+            public string SpeakerStatusMessage => _speakerRing.StatusMessage;
+
+            public bool EnsureMicrophoneReady(out string message)
+            {
+                return _micRing.EnsureReady(out message);
+            }
+
+            public bool WriteMicrophone(byte[] buffer, int byteCount, long timestampMs, out string message)
+            {
+                return _micRing.Write(buffer, byteCount, timestampMs, out message);
+            }
+
+            public bool EnsureSpeakerReady(out string message)
+            {
+                return _speakerRing.EnsureReady(out message);
+            }
+
+            public AudioReadResult ReadSpeaker(byte[] destination, int maxByteCount)
+            {
+                var endpointReady = _speakerRing.TryRead(
+                    destination,
+                    maxByteCount,
+                    ref _speakerReadPosition,
+                    out var bytesRead,
+                    out var message);
+
+                return new AudioReadResult(endpointReady, bytesRead, message);
+            }
+
+            public void Dispose()
+            {
+                _micRing.Dispose();
+                _speakerRing.Dispose();
+            }
+        }
+
+        private sealed class WasapiVirtualCableAudioBackend : IAudioBridgeBackend
+        {
+            private const int WasapiLatencyMilliseconds = 50;
+            private const int MaxSpeakerQueueBytes = AudioDefaults.SampleRate * AudioDefaults.SpeakerFrameBytes;
+
+            private readonly string? _speakerCaptureEndpointId;
+            private readonly string? _microphoneRenderEndpointId;
+            private readonly object _microphoneLock = new();
+            private readonly object _speakerLock = new();
+            private readonly ConcurrentQueue<byte[]> _speakerPackets = new();
+            private readonly object _speakerPacketLock = new();
+
+            private MMDeviceEnumerator? _deviceEnumerator;
+            private MMDevice? _microphoneRenderDevice;
+            private BufferedWaveProvider? _microphoneRenderBuffer;
+            private WasapiOut? _microphoneRenderOutput;
+            private WaveFormat? _microphoneRenderFormat;
+            private string _microphoneStatusMessage = "Android 麦克风写入端点未初始化。";
+
+            private MMDevice? _speakerCaptureDevice;
+            private WasapiCapture? _speakerCapture;
+            private WaveFormat? _speakerCaptureFormat;
+            private string _speakerStatusMessage = "电脑声音捕获端点未初始化。";
+            private int _queuedSpeakerBytes;
+            private byte[]? _speakerPendingPacket;
+            private int _speakerPendingOffset;
+            private bool _disposed;
+
+            public WasapiVirtualCableAudioBackend(string? speakerCaptureEndpointId, string? microphoneRenderEndpointId)
+            {
+                _speakerCaptureEndpointId = NormalizeEndpointId(speakerCaptureEndpointId);
+                _microphoneRenderEndpointId = NormalizeEndpointId(microphoneRenderEndpointId);
+            }
+
+            public string Name => "wasapi-virtual-cable";
+
+            public bool IsMicrophoneReady
+            {
+                get
+                {
+                    lock (_microphoneLock)
+                    {
+                        return _microphoneRenderOutput is not null && _microphoneRenderBuffer is not null;
+                    }
+                }
+            }
+
+            public string MicrophoneStatusMessage
+            {
+                get
+                {
+                    lock (_microphoneLock)
+                    {
+                        return _microphoneStatusMessage;
+                    }
+                }
+            }
+
+            public bool IsSpeakerReady
+            {
+                get
+                {
+                    lock (_speakerLock)
+                    {
+                        return _speakerCapture is not null;
+                    }
+                }
+            }
+
+            public string SpeakerStatusMessage
+            {
+                get
+                {
+                    lock (_speakerLock)
+                    {
+                        return _speakerStatusMessage;
+                    }
+                }
+            }
+
+            public bool EnsureMicrophoneReady(out string message)
+            {
+                lock (_microphoneLock)
+                {
+                    ThrowIfDisposed();
+                    if (_microphoneRenderOutput is not null && _microphoneRenderBuffer is not null)
+                    {
+                        message = _microphoneStatusMessage;
+                        return true;
+                    }
+
+                    ResetMicrophoneRenderCore();
+                    try
+                    {
+                        if (!OperatingSystem.IsWindows())
+                        {
+                            _microphoneStatusMessage = "WASAPI 麦克风写入端点仅支持 Windows Host。";
+                            message = _microphoneStatusMessage;
+                            return false;
+                        }
+
+                        if (string.IsNullOrWhiteSpace(_microphoneRenderEndpointId))
+                        {
+                            _microphoneStatusMessage = "未配置 Android 麦克风写入端点，请选择虚拟线缆的 Input/播放端。";
+                            message = _microphoneStatusMessage;
+                            return false;
+                        }
+
+                        var device = GetEndpoint(_microphoneRenderEndpointId, DataFlow.Render, "Android 麦克风写入端点");
+                        var format = SelectMicrophoneRenderFormat(device);
+                        var buffer = new BufferedWaveProvider(format)
+                        {
+                            BufferDuration = TimeSpan.FromMilliseconds(500),
+                            DiscardOnBufferOverflow = true,
+                            ReadFully = true
+                        };
+                        var output = new WasapiOut(device, AudioClientShareMode.Shared, true, WasapiLatencyMilliseconds);
+                        output.PlaybackStopped += (_, args) =>
+                        {
+                            if (args.Exception is not null)
+                            {
+                                lock (_microphoneLock)
+                                {
+                                    _microphoneStatusMessage = $"Android 麦克风写入端点已停止：{args.Exception.Message}";
+                                    ResetMicrophoneRenderCore();
+                                }
+                            }
+                        };
+                        output.Init(buffer);
+                        output.Play();
+
+                        _microphoneRenderDevice = device;
+                        _microphoneRenderBuffer = buffer;
+                        _microphoneRenderOutput = output;
+                        _microphoneRenderFormat = format;
+                        _microphoneStatusMessage = $"Android 麦克风写入端点已就绪：{device.FriendlyName} ({FormatWaveFormat(format)})。";
+                        message = _microphoneStatusMessage;
+                        return true;
+                    }
+                    catch (Exception ex) when (ex is InvalidOperationException or COMException or UnauthorizedAccessException)
+                    {
+                        ResetMicrophoneRenderCore();
+                        _microphoneStatusMessage = $"Android 麦克风写入端点不可用：{ex.Message}";
+                        message = _microphoneStatusMessage;
+                        return false;
+                    }
+                }
+            }
+
+            public bool WriteMicrophone(byte[] buffer, int byteCount, long timestampMs, out string message)
+            {
+                if (buffer is null || byteCount <= 0)
+                {
+                    message = MicrophoneStatusMessage;
+                    return IsMicrophoneReady;
+                }
+
+                lock (_microphoneLock)
+                {
+                    if ((_microphoneRenderOutput is null || _microphoneRenderBuffer is null || _microphoneRenderFormat is null)
+                        && !EnsureMicrophoneReady(out message))
+                    {
+                        return false;
+                    }
+
+                    if (_microphoneRenderBuffer is null || _microphoneRenderFormat is null)
+                    {
+                        message = _microphoneStatusMessage;
+                        return false;
+                    }
+
+                    try
+                    {
+                        var boundedByteCount = byteCount - (byteCount % AudioDefaults.MicFrameBytes);
+                        if (boundedByteCount <= 0)
+                        {
+                            message = _microphoneStatusMessage;
+                            return true;
+                        }
+
+                        if (_microphoneRenderFormat.Channels == AudioDefaults.MicChannels)
+                        {
+                            _microphoneRenderBuffer.AddSamples(buffer, 0, boundedByteCount);
+                        }
+                        else if (_microphoneRenderFormat.Channels == 2)
+                        {
+                            var convertedByteCount = boundedByteCount * 2;
+                            var converted = ArrayPool<byte>.Shared.Rent(convertedByteCount);
+                            try
+                            {
+                                DuplicateMono16ToStereo(buffer, boundedByteCount, converted);
+                                _microphoneRenderBuffer.AddSamples(converted, 0, convertedByteCount);
+                            }
+                            finally
+                            {
+                                ArrayPool<byte>.Shared.Return(converted);
+                            }
+                        }
+                        else
+                        {
+                            throw new InvalidOperationException(
+                                $"不支持的 Android 麦克风写入声道数：{_microphoneRenderFormat.Channels}。");
+                        }
+
+                        _microphoneStatusMessage = "Android 麦克风正在写入 Windows 虚拟线缆。";
+                        message = _microphoneStatusMessage;
+                        return true;
+                    }
+                    catch (Exception ex) when (ex is InvalidOperationException or COMException)
+                    {
+                        ResetMicrophoneRenderCore();
+                        _microphoneStatusMessage = $"Android 麦克风写入端点不可用：{ex.Message}";
+                        message = _microphoneStatusMessage;
+                        return false;
+                    }
+                }
+            }
+
+            public bool EnsureSpeakerReady(out string message)
+            {
+                lock (_speakerLock)
+                {
+                    ThrowIfDisposed();
+                    if (_speakerCapture is not null)
+                    {
+                        message = _speakerStatusMessage;
+                        return true;
+                    }
+
+                    ResetSpeakerCaptureCore();
+                    try
+                    {
+                        if (!OperatingSystem.IsWindows())
+                        {
+                            _speakerStatusMessage = "WASAPI 电脑声音捕获端点仅支持 Windows Host。";
+                            message = _speakerStatusMessage;
+                            return false;
+                        }
+
+                        if (string.IsNullOrWhiteSpace(_speakerCaptureEndpointId))
+                        {
+                            _speakerStatusMessage = "未配置电脑声音捕获端点，请选择虚拟线缆的 Output/录制端。";
+                            message = _speakerStatusMessage;
+                            return false;
+                        }
+
+                        var device = GetEndpoint(_speakerCaptureEndpointId, DataFlow.Capture, "电脑声音捕获端点");
+                        var format = new WaveFormat(AudioDefaults.SampleRate, AudioDefaults.BitsPerSample, AudioDefaults.SpeakerChannels);
+                        EnsureFormatSupported(device, format, "电脑声音捕获端点");
+                        var capture = new WasapiCapture(device, true, WasapiLatencyMilliseconds)
+                        {
+                            WaveFormat = format
+                        };
+                        capture.DataAvailable += OnSpeakerDataAvailable;
+                        capture.RecordingStopped += OnSpeakerRecordingStopped;
+                        capture.StartRecording();
+
+                        _speakerCaptureDevice = device;
+                        _speakerCapture = capture;
+                        _speakerCaptureFormat = format;
+                        _speakerStatusMessage = $"电脑声音捕获端点已就绪：{device.FriendlyName} ({FormatWaveFormat(format)})。";
+                        message = _speakerStatusMessage;
+                        return true;
+                    }
+                    catch (Exception ex) when (ex is InvalidOperationException or COMException or UnauthorizedAccessException)
+                    {
+                        ResetSpeakerCaptureCore();
+                        _speakerStatusMessage = $"电脑声音捕获端点不可用：{ex.Message}";
+                        message = _speakerStatusMessage;
+                        return false;
+                    }
+                }
+            }
+
+            public AudioReadResult ReadSpeaker(byte[] destination, int maxByteCount)
+            {
+                if (destination is null || maxByteCount <= 0)
+                {
+                    var message = SpeakerStatusMessage;
+                    return new AudioReadResult(IsSpeakerReady, 0, message);
+                }
+
+                if (!EnsureSpeakerReady(out var readyMessage))
+                {
+                    return new AudioReadResult(false, 0, readyMessage);
+                }
+
+                var bytesRead = DequeueSpeakerBytes(destination, maxByteCount);
+                if (bytesRead > 0)
+                {
+                    lock (_speakerLock)
+                    {
+                        _speakerStatusMessage = "正在捕获电脑声音并发送到 Android。";
+                        readyMessage = _speakerStatusMessage;
+                    }
+                }
+
+                return new AudioReadResult(true, bytesRead, readyMessage);
+            }
+
+            public void Dispose()
+            {
+                lock (_microphoneLock)
+                lock (_speakerLock)
+                {
+                    if (_disposed)
+                    {
+                        return;
+                    }
+
+                    _disposed = true;
+                    ResetMicrophoneRenderCore();
+                    ResetSpeakerCaptureCore();
+                    _deviceEnumerator?.Dispose();
+                    _deviceEnumerator = null;
+                }
+            }
+
+            private MMDevice GetEndpoint(string endpointId, DataFlow expectedDataFlow, string role)
+            {
+                _deviceEnumerator ??= new MMDeviceEnumerator();
+                var device = _deviceEnumerator.GetDevice(endpointId);
+                if (device.DataFlow != expectedDataFlow)
+                {
+                    device.Dispose();
+                    throw new InvalidOperationException(
+                        $"{role}方向不匹配：期望 {expectedDataFlow}，实际 {device.DataFlow}。");
+                }
+
+                if (device.State != DeviceState.Active)
+                {
+                    var state = device.State;
+                    var name = device.FriendlyName;
+                    device.Dispose();
+                    throw new InvalidOperationException($"{role}未启用：{name} ({state})。");
+                }
+
+                return device;
+            }
+
+            private static WaveFormat SelectMicrophoneRenderFormat(MMDevice device)
+            {
+                var mono = new WaveFormat(AudioDefaults.SampleRate, AudioDefaults.BitsPerSample, AudioDefaults.MicChannels);
+                if (IsFormatSupported(device, mono))
+                {
+                    return mono;
+                }
+
+                var stereo = new WaveFormat(AudioDefaults.SampleRate, AudioDefaults.BitsPerSample, AudioDefaults.SpeakerChannels);
+                if (IsFormatSupported(device, stereo))
+                {
+                    return stereo;
+                }
+
+                throw new InvalidOperationException(
+                    $"Android 麦克风写入端点不支持 48000 Hz / 16-bit / mono 或 stereo；当前混音格式为 {FormatWaveFormat(device.AudioClient.MixFormat)}。请在 Windows 声音设置里把虚拟线缆默认格式改为 48 kHz / 16-bit。");
+            }
+
+            private static void EnsureFormatSupported(MMDevice device, WaveFormat format, string role)
+            {
+                if (!IsFormatSupported(device, format))
+                {
+                    throw new InvalidOperationException(
+                        $"{role}不支持 {FormatWaveFormat(format)}；当前混音格式为 {FormatWaveFormat(device.AudioClient.MixFormat)}。请在 Windows 声音设置里把虚拟线缆默认格式改为 48 kHz / 16-bit / stereo。");
+                }
+            }
+
+            private static bool IsFormatSupported(MMDevice device, WaveFormat format)
+            {
+                try
+                {
+                    return device.AudioClient.IsFormatSupported(AudioClientShareMode.Shared, format);
+                }
+                catch (COMException)
+                {
+                    return false;
+                }
+            }
+
+            private void OnSpeakerDataAvailable(object? sender, WaveInEventArgs args)
+            {
+                var byteCount = args.BytesRecorded - (args.BytesRecorded % AudioDefaults.SpeakerFrameBytes);
+                if (byteCount <= 0)
+                {
+                    return;
+                }
+
+                var copy = new byte[byteCount];
+                Buffer.BlockCopy(args.Buffer, 0, copy, 0, byteCount);
+
+                lock (_speakerPacketLock)
+                {
+                    while (_queuedSpeakerBytes + copy.Length > MaxSpeakerQueueBytes && _speakerPackets.TryDequeue(out var dropped))
+                    {
+                        _queuedSpeakerBytes -= dropped.Length;
+                    }
+
+                    _speakerPackets.Enqueue(copy);
+                    _queuedSpeakerBytes += copy.Length;
+                }
+            }
+
+            private void OnSpeakerRecordingStopped(object? sender, StoppedEventArgs args)
+            {
+                if (args.Exception is null)
+                {
+                    return;
+                }
+
+                lock (_speakerLock)
+                {
+                    _speakerStatusMessage = $"电脑声音捕获端点已停止：{args.Exception.Message}";
+                    ResetSpeakerCaptureCore();
+                }
+            }
+
+            private int DequeueSpeakerBytes(byte[] destination, int maxByteCount)
+            {
+                lock (_speakerPacketLock)
+                {
+                    if (_speakerPendingPacket is null || _speakerPendingOffset >= _speakerPendingPacket.Length)
+                    {
+                        if (!_speakerPackets.TryDequeue(out _speakerPendingPacket))
+                        {
+                            _speakerPendingOffset = 0;
+                            return 0;
+                        }
+
+                        _queuedSpeakerBytes -= _speakerPendingPacket.Length;
+                        _speakerPendingOffset = 0;
+                    }
+
+                    var available = Math.Min(maxByteCount, destination.Length);
+                    available = Math.Min(available, _speakerPendingPacket.Length - _speakerPendingOffset);
+                    available -= available % AudioDefaults.SpeakerFrameBytes;
+                    if (available <= 0)
+                    {
+                        return 0;
+                    }
+
+                    Buffer.BlockCopy(_speakerPendingPacket, _speakerPendingOffset, destination, 0, available);
+                    _speakerPendingOffset += available;
+                    if (_speakerPendingOffset >= _speakerPendingPacket.Length)
+                    {
+                        _speakerPendingPacket = null;
+                        _speakerPendingOffset = 0;
+                    }
+
+                    return available;
+                }
+            }
+
+            private void ResetMicrophoneRenderCore()
+            {
+                try
+                {
+                    _microphoneRenderOutput?.Stop();
+                }
+                catch
+                {
+                    // Best effort during endpoint reset.
+                }
+
+                _microphoneRenderOutput?.Dispose();
+                _microphoneRenderDevice?.Dispose();
+                _microphoneRenderOutput = null;
+                _microphoneRenderBuffer = null;
+                _microphoneRenderDevice = null;
+                _microphoneRenderFormat = null;
+            }
+
+            private void ResetSpeakerCaptureCore()
+            {
+                if (_speakerCapture is not null)
+                {
+                    _speakerCapture.DataAvailable -= OnSpeakerDataAvailable;
+                    _speakerCapture.RecordingStopped -= OnSpeakerRecordingStopped;
+                    try
+                    {
+                        _speakerCapture.StopRecording();
+                    }
+                    catch
+                    {
+                        // Best effort during endpoint reset.
+                    }
+
+                    _speakerCapture.Dispose();
+                }
+
+                _speakerCaptureDevice?.Dispose();
+                _speakerCapture = null;
+                _speakerCaptureDevice = null;
+                _speakerCaptureFormat = null;
+                lock (_speakerPacketLock)
+                {
+                    while (_speakerPackets.TryDequeue(out _))
+                    {
+                    }
+
+                    _queuedSpeakerBytes = 0;
+                    _speakerPendingPacket = null;
+                    _speakerPendingOffset = 0;
+                }
+            }
+
+            private void ThrowIfDisposed()
+            {
+                ObjectDisposedException.ThrowIf(_disposed, this);
+            }
+
+            private static string? NormalizeEndpointId(string? value)
+            {
+                return string.IsNullOrWhiteSpace(value) ? null : value.Trim();
+            }
+
+            private static string FormatWaveFormat(WaveFormat format)
+            {
+                return $"{format.SampleRate} Hz / {format.BitsPerSample}-bit / {format.Channels}ch";
+            }
+
+            private static void DuplicateMono16ToStereo(byte[] source, int sourceByteCount, byte[] destination)
+            {
+                var sourceSamples = sourceByteCount / 2;
+                for (var sampleIndex = 0; sampleIndex < sourceSamples; sampleIndex++)
+                {
+                    var sourceOffset = sampleIndex * 2;
+                    var destinationOffset = sampleIndex * 4;
+                    destination[destinationOffset] = source[sourceOffset];
+                    destination[destinationOffset + 1] = source[sourceOffset + 1];
+                    destination[destinationOffset + 2] = source[sourceOffset];
+                    destination[destinationOffset + 3] = source[sourceOffset + 1];
+                }
+            }
         }
 
         private sealed class AudioMicSharedRing : IDisposable
