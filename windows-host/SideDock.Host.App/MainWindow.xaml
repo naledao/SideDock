@@ -453,6 +453,30 @@
                                     </Button>
                                 </Grid>
 
+                                <Grid ColumnSpacing="8" RowSpacing="8">
+                                    <Grid.ColumnDefinitions>
+                                        <ColumnDefinition Width="*" />
+                                        <ColumnDefinition Width="Auto" />
+                                    </Grid.ColumnDefinitions>
+                                    <TextBlock
+                                        x:Name="VirtualAudioCableInstallStatusText"
+                                        Text="没有 CABLE Output 时，可先安装虚拟音频线；安装完成后刷新端点并选择 CABLE Output。"
+                                        Foreground="{ThemeResource TextFillColorSecondaryBrush}"
+                                        TextWrapping="Wrap"
+                                        VerticalAlignment="Center" />
+                                    <Button
+                                        x:Name="InstallVirtualAudioCableButton"
+                                        Grid.Column="1"
+                                        Click="InstallVirtualAudioCableButton_Click"
+                                        HorizontalAlignment="Right"
+                                        Padding="8,6">
+                                        <StackPanel Orientation="Horizontal" Spacing="6">
+                                            <FontIcon Glyph="&#xE896;" FontSize="14" />
+                                            <TextBlock Text="安装/修复虚拟音频线" />
+                                        </StackPanel>
+                                    </Button>
+                                </Grid>
+
                                 <Border
                                     Padding="14"
                                     CornerRadius="8"

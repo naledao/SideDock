@@ -135,6 +135,14 @@ jobs:
           Copy-Item -Recurse -Force "${env:RUNNER_TEMP}\sidedock-driver-installer" (Join-Path $driverInstallerPayload "SideDock.Driver.Installer")
           Compress-Archive -Path (Join-Path $driverInstallerPayload "*") -DestinationPath .\windows-host\SideDock.Host.App\DriverInstallerPayload.zip -Force
 
+          $virtualAudioCablePayload = ".\third_party\vb-cable\VBCABLE_Driver_Pack45.zip"
+          if (Test-Path -LiteralPath $virtualAudioCablePayload) {
+            Copy-Item -Force $virtualAudioCablePayload .\windows-host\SideDock.Host.App\VirtualAudioCablePayload.zip
+            Write-Host "Embedded VB-CABLE payload."
+          } else {
+            Write-Host "VB-CABLE payload not found; host app will rely on a local installer."
+          }
+
           $appOut = Join-Path $env:RUNNER_TEMP "sidedock-host-app-ui"
           dotnet publish .\windows-host\SideDock.Host.App\SideDock.Host.App.csproj `
             --configuration $env:BUILD_CONFIGURATION `

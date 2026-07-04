@@ -24,6 +24,7 @@
   <ItemGroup>
     <EmbeddedResource Include="HostPayload.zip" Condition="Exists('HostPayload.zip')" />
     <EmbeddedResource Include="DriverInstallerPayload.zip" Condition="Exists('DriverInstallerPayload.zip')" />
+    <EmbeddedResource Include="VirtualAudioCablePayload.zip" Condition="Exists('VirtualAudioCablePayload.zip')" />
   </ItemGroup>
 
   <ItemGroup>

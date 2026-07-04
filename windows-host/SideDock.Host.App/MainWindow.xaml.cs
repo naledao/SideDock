@@ -23,6 +23,9 @@ public sealed partial class MainWindow : Window
     private const string HostExe = "SideDock.Host.exe";
     private const string DeviceToolExe = "SideDock.Idd.DeviceTool.exe";
     private const string DriverInstallerExe = "SideDock.Driver.Installer.exe";
+    private const string VirtualAudioCableSetupX64Exe = "VBCABLE_Setup_x64.exe";
+    private const string VirtualAudioCableSetupX86Exe = "VBCABLE_Setup.exe";
+    private const string VirtualAudioCablePayloadZip = "VirtualAudioCablePayload.zip";
     private const int DefaultAudioPort = 27185;
     private const string AdbExe = "adb.exe";
     private const int SwHide = 0;
@@ -78,6 +81,7 @@ public sealed partial class MainWindow : Window
     private string? _hostPath;
     private string? _deviceToolPath;
     private string? _driverInstallerPath;
+    private string? _virtualAudioCableSetupPath;
     private HostProcessLog? _currentHostLog;
     private bool _hostOwnsVirtualDisplay;
     private int? _hostStopRequestedProcessId;
@@ -474,6 +478,11 @@ public sealed partial class MainWindow : Window
     private async void InstallDriverButton_Click(object sender, RoutedEventArgs e)
     {
         await InstallDriverAsync();
+    }
+
+    private async void InstallVirtualAudioCableButton_Click(object sender, RoutedEventArgs e)
+    {
+        await InstallVirtualAudioCableAsync();
     }
 
     private void StopDisplayButton_Click(object sender, RoutedEventArgs e)
@@ -1685,6 +1694,58 @@ public sealed partial class MainWindow : Window
         }
     }
 
+    private async Task InstallVirtualAudioCableAsync()
+    {
+        InstallVirtualAudioCableButton.IsEnabled = false;
+        VirtualAudioCableInstallStatusText.Text = "正在启动 VB-CABLE 安装器，请在管理员权限弹窗中选择“是”。";
+
+        try
+        {
+            _virtualAudioCableSetupPath ??= ResolveVirtualAudioCableSetupPath();
+            var startInfo = new ProcessStartInfo
+            {
+                FileName = _virtualAudioCableSetupPath,
+                WorkingDirectory = Path.GetDirectoryName(_virtualAudioCableSetupPath) ?? Environment.CurrentDirectory,
+                UseShellExecute = true,
+                Verb = "runas"
+            };
+
+            var process = Process.Start(startInfo)
+                ?? throw new InvalidOperationException($"无法启动 {Path.GetFileName(_virtualAudioCableSetupPath)}。");
+
+            await process.WaitForExitAsync();
+            _virtualAudioCableSetupPath = null;
+
+            await RefreshAudioEndpointsAsync(showHint: false);
+
+            if (process.ExitCode == 0)
+            {
+                VirtualAudioCableInstallStatusText.Text = "VB-CABLE 安装器已关闭。若系统提示重启，请重启后再刷新端点并选择 CABLE Output。";
+            }
+            else
+            {
+                VirtualAudioCableInstallStatusText.Text = $"VB-CABLE 安装器已退出（退出码 {process.ExitCode}）。如果端点未出现，请重新运行安装或重启电脑。";
+            }
+        }
+        catch (System.ComponentModel.Win32Exception ex) when (ex.NativeErrorCode == 1223)
+        {
+            VirtualAudioCableInstallStatusText.Text = "VB-CABLE 安装已取消（未授予管理员权限）。";
+            ShowError("VB-CABLE 安装已取消", "你在管理员权限弹窗中选择了“否”，安装未开始。请重新点击“安装/修复虚拟音频线”，并在弹窗中选择“是”。");
+        }
+        catch (Exception ex)
+        {
+            VirtualAudioCableInstallStatusText.Text = "VB-CABLE 安装未完成。";
+            ShowErrorWithDetails(
+                "无法安装 VB-CABLE",
+                $"启动或执行 VB-CABLE 安装器时出错：{ex.Message}",
+                ex.ToString());
+        }
+        finally
+        {
+            InstallVirtualAudioCableButton.IsEnabled = true;
+        }
+    }
+
     private string ResolveDriverInstallerPath()
     {
         foreach (var candidate in EnumerateDriverInstallerCandidates())
@@ -1703,6 +1764,26 @@ public sealed partial class MainWindow : Window
 
         throw new FileNotFoundException(
             $"未找到 {DriverInstallerExe}。请使用包含驱动安装器的 SideDock 桌面端发布包。");
+    }
+
+    private string ResolveVirtualAudioCableSetupPath()
+    {
+        foreach (var candidate in EnumerateVirtualAudioCableSetupCandidates())
+        {
+            if (File.Exists(candidate))
+            {
+                return Path.GetFullPath(candidate);
+            }
+        }
+
+        var extracted = TryExtractVirtualAudioCablePayload();
+        if (!string.IsNullOrWhiteSpace(extracted))
+        {
+            return extracted;
+        }
+
+        throw new FileNotFoundException(
+            $"未找到 {VirtualAudioCableSetupExe()}。请使用包含 VB-CABLE payload 的 SideDock 桌面端发布包。");
     }
 
     private string TryExtractDriverInstallerPayload()
@@ -1744,6 +1825,45 @@ public sealed partial class MainWindow : Window
         return FindExtractedExecutable(root, DriverInstallerExe);
     }
 
+    private string TryExtractVirtualAudioCablePayload()
+    {
+        var resourceName = Assembly.GetExecutingAssembly().GetManifestResourceNames()
+            .FirstOrDefault(name => name.EndsWith($".{VirtualAudioCablePayloadZip}", StringComparison.OrdinalIgnoreCase))
+            ?? string.Empty;
+
+        if (string.IsNullOrWhiteSpace(resourceName))
+        {
+            return string.Empty;
+        }
+
+        var root = Path.Combine(
+            Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
+            "SideDock",
+            "VirtualAudioCable",
+            GetBuildKey());
+
+        var setupPath = FindVirtualAudioCableSetupExecutable(root);
+        if (!string.IsNullOrWhiteSpace(setupPath))
+        {
+            return setupPath;
+        }
+
+        Directory.CreateDirectory(root);
+        var zipPath = Path.Combine(root, VirtualAudioCablePayloadZip);
+
+        using (var resource = Assembly.GetExecutingAssembly().GetManifestResourceStream(resourceName)
+            ?? throw new InvalidOperationException("未找到内置 VB-CABLE 资源流。"))
+        using (var output = File.Create(zipPath))
+        {
+            resource.CopyTo(output);
+        }
+
+        ZipFile.ExtractToDirectory(zipPath, root, overwriteFiles: true);
+        File.Delete(zipPath);
+
+        return FindVirtualAudioCableSetupExecutable(root);
+    }
+
     private static string FindExtractedExecutable(string root, string executableName)
     {
         if (!Directory.Exists(root))
@@ -1759,6 +1879,33 @@ public sealed partial class MainWindow : Window
 
         return Directory.GetFiles(root, executableName, SearchOption.AllDirectories).FirstOrDefault()
             ?? string.Empty;
+    }
+
+    private static string FindVirtualAudioCableSetupExecutable(string root)
+    {
+        if (!Directory.Exists(root))
+        {
+            return string.Empty;
+        }
+
+        var executableName = VirtualAudioCableSetupExe();
+        var directPath = Path.Combine(root, executableName);
+        if (File.Exists(directPath))
+        {
+            return directPath;
+        }
+
+        return Directory.GetFiles(root, executableName, SearchOption.AllDirectories)
+            .OrderBy(path => path.Length)
+            .FirstOrDefault()
+            ?? string.Empty;
+    }
+
+    private static string VirtualAudioCableSetupExe()
+    {
+        return Environment.Is64BitOperatingSystem
+            ? VirtualAudioCableSetupX64Exe
+            : VirtualAudioCableSetupX86Exe;
     }
 
     private static string GetBuildKey()
@@ -1800,6 +1947,53 @@ public sealed partial class MainWindow : Window
             "win-x64",
             "publish",
             DriverInstallerExe));
+    }
+
+    private IEnumerable<string> EnumerateVirtualAudioCableSetupCandidates()
+    {
+        var setupExe = VirtualAudioCableSetupExe();
+        var baseDirectory = AppContext.BaseDirectory;
+        yield return Path.Combine(baseDirectory, setupExe);
+        yield return Path.Combine(baseDirectory, "VBCABLE_Driver_Pack45", setupExe);
+        yield return Path.Combine(baseDirectory, "VB-CABLE", setupExe);
+        yield return Path.Combine(baseDirectory, "VirtualAudioCable", setupExe);
+
+        if (_payloadRoot is not null)
+        {
+            yield return Path.Combine(_payloadRoot, setupExe);
+            yield return Path.Combine(_payloadRoot, "VBCABLE_Driver_Pack45", setupExe);
+            yield return Path.Combine(_payloadRoot, "VB-CABLE", setupExe);
+            yield return Path.Combine(_payloadRoot, "VirtualAudioCable", setupExe);
+        }
+
+        yield return Path.GetFullPath(Path.Combine(
+            baseDirectory,
+            "..",
+            "..",
+            "..",
+            "..",
+            "..",
+            "third_party",
+            "vb-cable",
+            "VBCABLE_Driver_Pack45",
+            setupExe));
+        yield return Path.GetFullPath(Path.Combine(
+            baseDirectory,
+            "..",
+            "..",
+            "..",
+            "..",
+            "..",
+            "..",
+            "third_party",
+            "vb-cable",
+            "VBCABLE_Driver_Pack45",
+            setupExe));
+        yield return Path.Combine(
+            Environment.GetFolderPath(Environment.SpecialFolder.UserProfile),
+            "Downloads",
+            "VBCABLE_Driver_Pack45",
+            setupExe);
     }
 
     private IEnumerable<string> EnumerateDeviceToolCandidates()
@@ -3307,6 +3501,14 @@ public sealed partial class MainWindow : Window
             string captureName,
             IReadOnlyList<AudioEndpointCandidate> renderEndpoints)
         {
+            if (captureName.Contains("CABLE Output", StringComparison.OrdinalIgnoreCase)
+                && captureName.Contains("VB-Audio Virtual Cable", StringComparison.OrdinalIgnoreCase))
+            {
+                return renderEndpoints.FirstOrDefault(endpoint =>
+                    endpoint.DisplayName.Contains("CABLE Input", StringComparison.OrdinalIgnoreCase)
+                    && endpoint.DisplayName.Contains("VB-Audio Virtual Cable", StringComparison.OrdinalIgnoreCase));
+            }
+
             if (captureName.Contains("ToDesk Virtual Audio", StringComparison.OrdinalIgnoreCase))
             {
                 return renderEndpoints.FirstOrDefault(endpoint =>
