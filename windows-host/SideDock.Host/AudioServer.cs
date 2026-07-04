@@ -52,6 +52,7 @@ internal static partial class Program
             try
             {
                 _listener.Start();
+                Log("AUDIO", $"listening address={address} port={options.AudioPort}");
                 await PublishInitialStatusAsync(cancellationToken);
 
                 while (!cancellationToken.IsCancellationRequested)
@@ -73,7 +74,7 @@ internal static partial class Program
                     if (previousConnectionCts is not null)
                     {
                         Log("AUDIO", "检测到新的音频连接，关闭旧连接。");
-                        await previousConnectionCts.CancelAsync();
+                        await CancelPreviousConnectionAsync(previousConnectionCts);
                         await WaitForPreviousConnectionAsync(previousConnectionTask, cancellationToken);
                     }
 
@@ -98,6 +99,12 @@ internal static partial class Program
                 Log("AUDIO", $"mic-state=unavailable speaker-state=unavailable reason=listen_failed message={ex.Message}");
                 await PublishMicStatusAsync("unavailable", $"SideDock 麦克风监听失败：{ex.Message}", CancellationToken.None);
                 await PublishSpeakerStatusAsync("unavailable", $"SideDock 音响监听失败：{ex.Message}", CancellationToken.None);
+            }
+            catch (Exception ex)
+            {
+                Log("AUDIO", $"mic-state=unavailable speaker-state=unavailable reason=run_failed exception={ex.GetType().Name} message={LogValue(ex.Message)}");
+                await PublishMicStatusAsync("unavailable", $"SideDock 麦克风服务失败：{ex.Message}", CancellationToken.None);
+                await PublishSpeakerStatusAsync("unavailable", $"SideDock 音响服务失败：{ex.Message}", CancellationToken.None);
             }
             finally
             {
@@ -896,7 +903,7 @@ internal static partial class Program
                         message = _microphoneStatusMessage;
                         return true;
                     }
-                    catch (Exception ex) when (ex is InvalidOperationException or COMException or UnauthorizedAccessException)
+                    catch (Exception ex) when (ex is InvalidOperationException or ArgumentException or COMException or UnauthorizedAccessException)
                     {
                         ResetMicrophoneRenderCore();
                         _microphoneStatusMessage = $"Android 麦克风写入端点不可用：{ex.Message}";
@@ -1028,7 +1035,7 @@ internal static partial class Program
                         message = _speakerStatusMessage;
                         return true;
                     }
-                    catch (Exception ex) when (ex is InvalidOperationException or COMException or UnauthorizedAccessException)
+                    catch (Exception ex) when (ex is InvalidOperationException or ArgumentException or COMException or UnauthorizedAccessException)
                     {
                         ResetSpeakerCaptureCore();
                         _speakerStatusMessage = $"电脑声音 loopback 输出端点不可用：{ex.Message}";
@@ -1294,7 +1301,30 @@ internal static partial class Program
 
             private static string? NormalizeEndpointId(string? value)
             {
-                return string.IsNullOrWhiteSpace(value) ? null : value.Trim();
+                if (string.IsNullOrWhiteSpace(value))
+                {
+                    return null;
+                }
+
+                var endpointId = value.Trim();
+                const string deviceInterfaceMarker = "MMDEVAPI#";
+                var markerIndex = endpointId.IndexOf(deviceInterfaceMarker, StringComparison.OrdinalIgnoreCase);
+                if (markerIndex < 0)
+                {
+                    return endpointId;
+                }
+
+                var compactStart = markerIndex + deviceInterfaceMarker.Length;
+                if (compactStart >= endpointId.Length)
+                {
+                    return endpointId;
+                }
+
+                var compactEnd = endpointId.IndexOf('#', compactStart);
+                var compactEndpointId = compactEnd < 0
+                    ? endpointId[compactStart..]
+                    : endpointId[compactStart..compactEnd];
+                return string.IsNullOrWhiteSpace(compactEndpointId) ? endpointId : compactEndpointId;
             }
 
             private static string FormatWaveFormat(WaveFormat format)
@@ -1711,6 +1741,22 @@ internal static partial class Program
             catch (Exception ex) when (ex is OperationCanceledException or TimeoutException)
             {
                 Log("AUDIO", "旧音频连接尚未完全退出，新连接继续接管。");
+            }
+            catch (Exception ex)
+            {
+                Log("AUDIO", $"旧音频连接退出异常，新连接继续接管。 exception={ex.GetType().Name} message={LogValue(ex.Message)}");
+            }
+        }
+
+        private static async Task CancelPreviousConnectionAsync(CancellationTokenSource previousConnectionCts)
+        {
+            try
+            {
+                await previousConnectionCts.CancelAsync();
+            }
+            catch (ObjectDisposedException)
+            {
+                Log("AUDIO", "旧音频连接已释放，新连接继续接管。");
             }
         }
 
