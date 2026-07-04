@@ -131,7 +131,7 @@ internal static partial class Program
         Console.WriteLine($"链路容量: nv12Pool={options.Nv12PoolSize} encodedPacketQueue={options.EncodedPacketQueue}");
         Console.WriteLine($"音频能力: microphone={(options.AudioDeviceEnabled && options.MicrophoneEnabled ? "enabled" : "disabled")} speaker={(options.AudioDeviceEnabled && options.SpeakerEnabled ? "enabled" : "disabled")}");
         Console.WriteLine($"音频后端: {FormatAudioBackend(options.AudioBackend)}");
-        Console.WriteLine($"电脑声音捕获端点: {FormatOptionalForLog(options.AudioSpeakerCaptureEndpointId)}");
+        Console.WriteLine($"电脑声音 loopback 输出端点: {FormatOptionalForLog(options.AudioOutputLoopbackEndpointId)}");
         Console.WriteLine($"Android 麦克风写入端点: {FormatOptionalForLog(options.AudioMicrophoneRenderEndpointId)}");
 
         if (options.RequestedDisplayMode is not null)
@@ -13337,7 +13337,7 @@ internal static partial class Program
         bool MicrophoneEnabled,
         bool SpeakerEnabled,
         AudioBackendKind AudioBackend,
-        string? AudioSpeakerCaptureEndpointId,
+        string? AudioOutputLoopbackEndpointId,
         string? AudioMicrophoneRenderEndpointId)
     {
         public IReadOnlyList<int> ReversePorts { get; } = AudioDeviceEnabled && (MicrophoneEnabled || SpeakerEnabled)
@@ -13383,7 +13383,7 @@ internal static partial class Program
             var microphoneEnabled = true;
             var speakerEnabled = true;
             var audioBackend = AudioBackendKind.LegacySharedMemory;
-            string? audioSpeakerCaptureEndpointId = null;
+            string? audioOutputLoopbackEndpointId = null;
             string? audioMicrophoneRenderEndpointId = null;
 
             foreach (var arg in args)
@@ -13443,8 +13443,10 @@ internal static partial class Program
                         audioBackend = ParseAudioBackend(args[index + 1]);
                         break;
 
+                    case "--audio-output-loopback-endpoint-id":
+                    case "--audio-speaker-render-endpoint-id":
                     case "--audio-speaker-capture-endpoint-id":
-                        audioSpeakerCaptureEndpointId = args[index + 1];
+                        audioOutputLoopbackEndpointId = args[index + 1];
                         break;
 
                     case "--audio-microphone-render-endpoint-id":
@@ -13652,7 +13654,7 @@ internal static partial class Program
                 microphoneEnabled,
                 speakerEnabled,
                 audioBackend,
-                NormalizeOptionalAudioEndpointId(audioSpeakerCaptureEndpointId),
+                NormalizeOptionalAudioEndpointId(audioOutputLoopbackEndpointId),
                 NormalizeOptionalAudioEndpointId(audioMicrophoneRenderEndpointId));
         }
 

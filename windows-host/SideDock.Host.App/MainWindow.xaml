@@ -356,7 +356,7 @@
                                         FontSize="20"
                                         FontWeight="SemiBold" />
                                     <TextBlock
-                                        Text="个人版使用两条虚拟音频线缆完成电脑声音与 Android 麦克风闭环。"
+                                        Text="个人版使用 Windows 输出设备 loopback 捕获电脑声音，并通过虚拟音频线缆写入 Android 麦克风。"
                                         Foreground="{ThemeResource TextFillColorSecondaryBrush}"
                                         TextWrapping="Wrap" />
                                 </StackPanel>
@@ -401,7 +401,7 @@
 
                                     <TextBlock
                                         VerticalAlignment="Center"
-                                        Text="Host 捕获电脑声音"
+                                        Text="Host 捕获电脑输出"
                                         Foreground="{ThemeResource TextFillColorSecondaryBrush}" />
                                     <ComboBox
                                         x:Name="SpeakerCaptureEndpointCombo"
@@ -415,7 +415,7 @@
                                         Grid.Row="1"
                                         Grid.Column="1"
                                         Grid.ColumnSpan="2"
-                                        Text="选择 CABLE-A Output / VAC 录制端；Windows 或应用输出请选择同一条线的 Input。"
+                                        Text="选择要发送到 Android 播放的 Windows 输出设备；Host 将使用 loopback 捕获它。"
                                         TextWrapping="Wrap" />
 
                                     <TextBlock
@@ -436,7 +436,7 @@
                                         Grid.Row="3"
                                         Grid.Column="1"
                                         Grid.ColumnSpan="2"
-                                        Text="选择 CABLE-B Input / VAC 播放端；会议软件麦克风请选择同一条线的 Output。"
+                                        Text="选择虚拟线缆/Voicemeeter 的 Input/播放端；通话软件麦克风请选择同一链路对应的 Output/录制端。"
                                         TextWrapping="Wrap" />
 
                                     <Button

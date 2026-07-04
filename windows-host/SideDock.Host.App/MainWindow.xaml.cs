@@ -647,7 +647,7 @@ public sealed partial class MainWindow : Window
 
         if (!string.IsNullOrWhiteSpace(_boundSpeakerCaptureEndpointId))
         {
-            args.Add("--audio-speaker-capture-endpoint-id");
+            args.Add("--audio-output-loopback-endpoint-id");
             args.Add(_boundSpeakerCaptureEndpointId);
         }
 
@@ -729,10 +729,10 @@ public sealed partial class MainWindow : Window
                 return;
             }
 
-            var captureOperation = DeviceInformation.FindAllAsync(MediaDevice.GetAudioCaptureSelector());
             var renderOperation = DeviceInformation.FindAllAsync(MediaDevice.GetAudioRenderSelector());
-            var speakerCaptureEndpoints = ToAudioEndpointChoices(AudioEndpointRole.SpeakerCapture, await captureOperation);
-            var microphoneRenderEndpoints = ToAudioEndpointChoices(AudioEndpointRole.MicrophoneRender, await renderOperation);
+            var renderEndpoints = await renderOperation;
+            var speakerCaptureEndpoints = ToAudioEndpointChoices(AudioEndpointRole.SpeakerCapture, renderEndpoints);
+            var microphoneRenderEndpoints = ToAudioEndpointChoices(AudioEndpointRole.MicrophoneRender, renderEndpoints);
 
             _loadingAudioEndpointChoices = true;
             try
@@ -839,7 +839,7 @@ public sealed partial class MainWindow : Window
         _ = RefreshAudioEndpointsAsync(showHint: false);
         UpdateAudioState(role == AudioEndpointRole.MicrophoneRender
             ? "Android 麦克风写入端点绑定已更新。"
-            : "电脑声音捕获端点绑定已更新。");
+            : "电脑声音 loopback 输出端点绑定已更新。");
     }
 
     private void SetBoundAudioEndpoint(AudioEndpointRole role, string? endpointId, string? displayName)
@@ -2217,9 +2217,9 @@ public sealed partial class MainWindow : Window
         report.AppendLine($"启用麦克风: {MicrophoneSwitch.IsOn}");
         report.AppendLine($"启用音响: {SpeakerSwitch.IsOn}");
         report.AppendLine("音频后端: wasapi-virtual-cable");
-        report.AppendLine($"电脑声音捕获端点状态: {_speakerCaptureEndpointDiagnostics.Summary}");
-        report.AppendLine($"电脑声音捕获 endpoint id: {FormatOptional(_boundSpeakerCaptureEndpointId)}");
-        report.AppendLine($"电脑声音捕获端点名称: {FormatOptional(_boundSpeakerCaptureEndpointName)}");
+        report.AppendLine($"电脑声音 loopback 输出端点状态: {_speakerCaptureEndpointDiagnostics.Summary}");
+        report.AppendLine($"电脑声音 loopback 输出 endpoint id: {FormatOptional(_boundSpeakerCaptureEndpointId)}");
+        report.AppendLine($"电脑声音 loopback 输出端点名称: {FormatOptional(_boundSpeakerCaptureEndpointName)}");
         report.AppendLine($"Android 麦克风写入端点状态: {_microphoneRenderEndpointDiagnostics.Summary}");
         report.AppendLine($"Android 麦克风写入 endpoint id: {FormatOptional(_boundMicrophoneRenderEndpointId)}");
         report.AppendLine($"Android 麦克风写入端点名称: {FormatOptional(_boundMicrophoneRenderEndpointName)}");
@@ -2236,7 +2236,7 @@ public sealed partial class MainWindow : Window
         report.AppendLine("---- Host 进程 ----");
         report.AppendLine($"Host 路径: {FormatOptional(hostLog?.HostPath ?? _hostPath)}");
         report.AppendLine($"工作目录: {FormatOptional(hostLog?.WorkingDirectory)}");
-        report.AppendLine($"启动参数: {FormatOptional(hostLog?.Arguments)}");
+        report.AppendLine($"启动参数: {FormatOptional(hostLog?.Arguments ?? TryBuildArgumentsForDiagnostics())}");
         report.AppendLine($"ADB 路径: {FormatOptional(hostLog?.AdbPath)}");
         report.AppendLine($"ADB 设备: {FormatOptional(hostLog?.AdbSerial)}");
         report.AppendLine();
@@ -2266,6 +2266,18 @@ public sealed partial class MainWindow : Window
         }
 
         return report.ToString();
+    }
+
+    private string? TryBuildArgumentsForDiagnostics()
+    {
+        try
+        {
+            return BuildArguments();
+        }
+        catch (Exception ex)
+        {
+            return $"(无法生成启动参数：{ex.Message})";
+        }
     }
 
     private void AppendRecentAudioLogLine(string line)
@@ -2478,8 +2490,9 @@ public sealed partial class MainWindow : Window
             SpeakerSwitch.IsOn = preferences.SpeakerEnabled;
             _boundMicrophoneRenderEndpointId = preferences.MicrophoneRenderEndpoint?.EndpointId;
             _boundMicrophoneRenderEndpointName = preferences.MicrophoneRenderEndpoint?.DisplayName;
-            _boundSpeakerCaptureEndpointId = preferences.SpeakerCaptureEndpoint?.EndpointId;
-            _boundSpeakerCaptureEndpointName = preferences.SpeakerCaptureEndpoint?.DisplayName;
+            var speakerLoopbackEndpoint = preferences.SpeakerOutputLoopbackEndpoint ?? preferences.SpeakerCaptureEndpoint;
+            _boundSpeakerCaptureEndpointId = speakerLoopbackEndpoint?.EndpointId;
+            _boundSpeakerCaptureEndpointName = speakerLoopbackEndpoint?.DisplayName;
         }
         catch
         {
@@ -2511,6 +2524,11 @@ public sealed partial class MainWindow : Window
                 {
                     EndpointId = _boundMicrophoneRenderEndpointId,
                     DisplayName = _boundMicrophoneRenderEndpointName
+                },
+                SpeakerOutputLoopbackEndpoint = new AudioEndpointBinding
+                {
+                    EndpointId = _boundSpeakerCaptureEndpointId,
+                    DisplayName = _boundSpeakerCaptureEndpointName
                 },
                 SpeakerCaptureEndpoint = new AudioEndpointBinding
                 {
@@ -2726,7 +2744,7 @@ public sealed partial class MainWindow : Window
         return overallStatus switch
         {
             AudioCapabilityStatus.Preparing => "正在准备音频设备。",
-            AudioCapabilityStatus.Available => "音频设备可用。Windows/应用输出选择电脑声音线缆的 Input；会议软件麦克风选择麦克风线缆的 Output。",
+            AudioCapabilityStatus.Available => "音频设备可用。电脑声音会从所选 Windows 输出设备 loopback 捕获；通话软件麦克风请选择同一虚拟链路对应的 Output/录制端。",
             AudioCapabilityStatus.Capturing => "Android 麦克风正在采集中。",
             AudioCapabilityStatus.Playing => "SideDock 音响正在播放。",
             AudioCapabilityStatus.PartialAvailable => "部分音频能力可用。",
@@ -3061,6 +3079,8 @@ public sealed partial class MainWindow : Window
 
         public AudioEndpointBinding? MicrophoneRenderEndpoint { get; set; }
 
+        public AudioEndpointBinding? SpeakerOutputLoopbackEndpoint { get; set; }
+
         public AudioEndpointBinding? SpeakerCaptureEndpoint { get; set; }
     }
 
@@ -3087,7 +3107,7 @@ public sealed partial class MainWindow : Window
                 if (!IsBound)
                 {
                     return Role == AudioEndpointRole.SpeakerCapture
-                        ? "未绑定电脑声音捕获端点"
+                        ? "未绑定电脑声音 loopback 输出端点"
                         : "未绑定 Android 麦克风写入端点";
                 }
 
@@ -3145,7 +3165,7 @@ public sealed partial class MainWindow : Window
             return new AudioEndpointDiagnostics(
                 AudioEndpointBindingHealth.Unknown,
                 role == AudioEndpointRole.SpeakerCapture
-                    ? "正在枚举电脑声音捕获端点..."
+                    ? "正在枚举电脑声音 loopback 输出端点..."
                     : "正在枚举 Android 麦克风写入端点...",
                 null,
                 null,
@@ -3157,7 +3177,7 @@ public sealed partial class MainWindow : Window
             return new AudioEndpointDiagnostics(
                 AudioEndpointBindingHealth.Unsupported,
                 role == AudioEndpointRole.SpeakerCapture
-                    ? "当前系统不支持枚举 Windows 录制端点。"
+                    ? "当前系统不支持枚举 Windows 输出端点。"
                     : "当前系统不支持枚举 Windows 播放端点。",
                 null,
                 null,
@@ -3169,7 +3189,7 @@ public sealed partial class MainWindow : Window
             return new AudioEndpointDiagnostics(
                 AudioEndpointBindingHealth.EnumerationFailed,
                 role == AudioEndpointRole.SpeakerCapture
-                    ? $"电脑声音捕获端点枚举失败：{message}"
+                    ? $"电脑声音 loopback 输出端点枚举失败：{message}"
                     : $"Android 麦克风写入端点枚举失败：{message}",
                 null,
                 null,
@@ -3181,7 +3201,7 @@ public sealed partial class MainWindow : Window
             AudioEndpointChoice? selectedChoice,
             int availableEndpointCount)
         {
-            var roleName = role == AudioEndpointRole.SpeakerCapture ? "电脑声音捕获" : "Android 麦克风写入";
+            var roleName = role == AudioEndpointRole.SpeakerCapture ? "电脑声音 loopback 输出" : "Android 麦克风写入";
             if (selectedChoice is null || !selectedChoice.IsBound)
             {
                 return new AudioEndpointDiagnostics(

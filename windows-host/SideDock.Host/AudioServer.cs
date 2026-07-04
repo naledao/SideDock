@@ -135,7 +135,7 @@ internal static partial class Program
                     + (speakerReady ? string.Empty : $" message={speakerMessage}"));
                 await PublishSpeakerStatusAsync(
                     speakerReady ? "available" : "unavailable",
-                    speakerReady ? "SideDock 音响可在 Windows 或应用中选择。" : speakerMessage,
+                    speakerReady ? "电脑声音 loopback 捕获已准备，等待 Android 播放。" : speakerMessage,
                     cancellationToken);
             }
             else
@@ -331,7 +331,7 @@ internal static partial class Program
                         {
                             lastStatsAt = DateTimeOffset.UtcNow;
                             Log("AUDIO", $"speaker-state=available backend={_audioBackend.Name} system-endpoint=ready");
-                            await PublishSpeakerStatusAsync("available", "等待 Windows 播放到 SideDock 音响。", cancellationToken);
+                            await PublishSpeakerStatusAsync("available", "等待所选 Windows 输出设备产生声音。", cancellationToken);
                         }
 
                         await Task.Delay(10, cancellationToken);
@@ -352,7 +352,7 @@ internal static partial class Program
                         Log("AUDIO", $"speaker-state=playing backend={_audioBackend.Name} packets={packetCount} bytes={byteCount} system-endpoint=ready");
                         await PublishSpeakerStatusAsync(
                             "playing",
-                            "SideDock 音响正在播放。",
+                            "电脑输出正在发送到 Android 播放。",
                             cancellationToken,
                             packetCount,
                             byteCount);
@@ -451,7 +451,7 @@ internal static partial class Program
             return hostOptions.AudioBackend switch
             {
                 AudioBackendKind.WasapiVirtualCable => new WasapiVirtualCableAudioBackend(
-                    hostOptions.AudioSpeakerCaptureEndpointId,
+                    hostOptions.AudioOutputLoopbackEndpointId,
                     hostOptions.AudioMicrophoneRenderEndpointId),
                 _ => new LegacySharedMemoryAudioBackend()
             };
@@ -535,7 +535,7 @@ internal static partial class Program
             private const int WasapiLatencyMilliseconds = 50;
             private const int MaxSpeakerQueueBytes = AudioDefaults.SampleRate * AudioDefaults.SpeakerFrameBytes;
 
-            private readonly string? _speakerCaptureEndpointId;
+            private readonly string? _speakerOutputLoopbackEndpointId;
             private readonly string? _microphoneRenderEndpointId;
             private readonly object _microphoneLock = new();
             private readonly object _speakerLock = new();
@@ -552,15 +552,15 @@ internal static partial class Program
             private MMDevice? _speakerCaptureDevice;
             private WasapiCapture? _speakerCapture;
             private WaveFormat? _speakerCaptureFormat;
-            private string _speakerStatusMessage = "电脑声音捕获端点未初始化。";
+            private string _speakerStatusMessage = "电脑声音 loopback 输出端点未初始化。";
             private int _queuedSpeakerBytes;
             private byte[]? _speakerPendingPacket;
             private int _speakerPendingOffset;
             private bool _disposed;
 
-            public WasapiVirtualCableAudioBackend(string? speakerCaptureEndpointId, string? microphoneRenderEndpointId)
+            public WasapiVirtualCableAudioBackend(string? speakerOutputLoopbackEndpointId, string? microphoneRenderEndpointId)
             {
-                _speakerCaptureEndpointId = NormalizeEndpointId(speakerCaptureEndpointId);
+                _speakerOutputLoopbackEndpointId = NormalizeEndpointId(speakerOutputLoopbackEndpointId);
                 _microphoneRenderEndpointId = NormalizeEndpointId(microphoneRenderEndpointId);
             }
 
@@ -764,22 +764,22 @@ internal static partial class Program
                     {
                         if (!OperatingSystem.IsWindows())
                         {
-                            _speakerStatusMessage = "WASAPI 电脑声音捕获端点仅支持 Windows Host。";
+                            _speakerStatusMessage = "WASAPI 电脑声音 loopback 输出端点仅支持 Windows Host。";
                             message = _speakerStatusMessage;
                             return false;
                         }
 
-                        if (string.IsNullOrWhiteSpace(_speakerCaptureEndpointId))
+                        if (string.IsNullOrWhiteSpace(_speakerOutputLoopbackEndpointId))
                         {
-                            _speakerStatusMessage = "未配置电脑声音捕获端点，请选择虚拟线缆的 Output/录制端。";
+                            _speakerStatusMessage = "未配置电脑声音 loopback 输出端点，请选择扬声器、Voicemeeter Input、CABLE Input 等 Windows 输出/播放设备。";
                             message = _speakerStatusMessage;
                             return false;
                         }
 
-                        var device = GetEndpoint(_speakerCaptureEndpointId, DataFlow.Capture, "电脑声音捕获端点");
+                        var device = GetEndpoint(_speakerOutputLoopbackEndpointId, DataFlow.Render, "电脑声音 loopback 输出端点");
                         var format = new WaveFormat(AudioDefaults.SampleRate, AudioDefaults.BitsPerSample, AudioDefaults.SpeakerChannels);
-                        EnsureFormatSupported(device, format, "电脑声音捕获端点");
-                        var capture = new WasapiCapture(device, true, WasapiLatencyMilliseconds)
+                        EnsureFormatSupported(device, format, "电脑声音 loopback 输出端点");
+                        var capture = new WasapiLoopbackCapture(device)
                         {
                             WaveFormat = format
                         };
@@ -790,14 +790,14 @@ internal static partial class Program
                         _speakerCaptureDevice = device;
                         _speakerCapture = capture;
                         _speakerCaptureFormat = format;
-                        _speakerStatusMessage = $"电脑声音捕获端点已就绪：{device.FriendlyName} ({FormatWaveFormat(format)})。";
+                        _speakerStatusMessage = $"电脑声音 loopback 输出端点已就绪：{device.FriendlyName} ({FormatWaveFormat(format)})。";
                         message = _speakerStatusMessage;
                         return true;
                     }
                     catch (Exception ex) when (ex is InvalidOperationException or COMException or UnauthorizedAccessException)
                     {
                         ResetSpeakerCaptureCore();
-                        _speakerStatusMessage = $"电脑声音捕获端点不可用：{ex.Message}";
+                        _speakerStatusMessage = $"电脑声音 loopback 输出端点不可用：{ex.Message}";
                         message = _speakerStatusMessage;
                         return false;
                     }
@@ -822,7 +822,7 @@ internal static partial class Program
                 {
                     lock (_speakerLock)
                     {
-                        _speakerStatusMessage = "正在捕获电脑声音并发送到 Android。";
+                        _speakerStatusMessage = "正在 loopback 捕获电脑输出并发送到 Android。";
                         readyMessage = _speakerStatusMessage;
                     }
                 }
@@ -855,8 +855,7 @@ internal static partial class Program
                 if (device.DataFlow != expectedDataFlow)
                 {
                     device.Dispose();
-                    throw new InvalidOperationException(
-                        $"{role}方向不匹配：期望 {expectedDataFlow}，实际 {device.DataFlow}。");
+                    throw new InvalidOperationException(BuildDirectionMismatchMessage(role, expectedDataFlow, device.DataFlow));
                 }
 
                 if (device.State != DeviceState.Active)
@@ -868,6 +867,22 @@ internal static partial class Program
                 }
 
                 return device;
+            }
+
+            private static string BuildDirectionMismatchMessage(string role, DataFlow expectedDataFlow, DataFlow actualDataFlow)
+            {
+                if (role.Contains("loopback", StringComparison.OrdinalIgnoreCase)
+                    || role.Contains("输出端点", StringComparison.Ordinal))
+                {
+                    return $"{role}方向不匹配：请选择 Windows 输出/播放设备，例如扬声器、Voicemeeter Input 或 CABLE Input；不要选择 Voicemeeter Out 或 CABLE Output 这类录制端。实际端点方向为 {actualDataFlow}，期望 {expectedDataFlow}。";
+                }
+
+                if (role.Contains("麦克风写入", StringComparison.Ordinal))
+                {
+                    return $"{role}方向不匹配：请选择虚拟线缆/Voicemeeter 的 Input/播放端；通话软件麦克风再选择同一链路对应的 Output/录制端。实际端点方向为 {actualDataFlow}，期望 {expectedDataFlow}。";
+                }
+
+                return $"{role}方向不匹配：期望 {expectedDataFlow}，实际 {actualDataFlow}。";
             }
 
             private static WaveFormat SelectMicrophoneRenderFormat(MMDevice device)
@@ -893,7 +908,7 @@ internal static partial class Program
                 if (!IsFormatSupported(device, format))
                 {
                     throw new InvalidOperationException(
-                        $"{role}不支持 {FormatWaveFormat(format)}；当前混音格式为 {FormatWaveFormat(device.AudioClient.MixFormat)}。请在 Windows 声音设置里把虚拟线缆默认格式改为 48 kHz / 16-bit / stereo。");
+                        $"{role}不支持 {FormatWaveFormat(format)}；当前混音格式为 {FormatWaveFormat(device.AudioClient.MixFormat)}。请在 Windows 声音设置里把对应端点默认格式改为 48 kHz / 16-bit / stereo。");
                 }
             }
 
@@ -941,7 +956,7 @@ internal static partial class Program
 
                 lock (_speakerLock)
                 {
-                    _speakerStatusMessage = $"电脑声音捕获端点已停止：{args.Exception.Message}";
+                    _speakerStatusMessage = $"电脑声音 loopback 输出端点已停止：{args.Exception.Message}";
                     ResetSpeakerCaptureCore();
                 }
             }
