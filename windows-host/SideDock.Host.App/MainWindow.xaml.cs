@@ -732,9 +732,11 @@ public sealed partial class MainWindow : Window
             }
 
             var renderOperation = DeviceInformation.FindAllAsync(MediaDevice.GetAudioRenderSelector());
+            var captureOperation = DeviceInformation.FindAllAsync(MediaDevice.GetAudioCaptureSelector());
             var renderEndpoints = await renderOperation;
+            var captureEndpoints = await captureOperation;
             var speakerCaptureEndpoints = ToAudioEndpointChoices(AudioEndpointRole.SpeakerCapture, renderEndpoints);
-            var microphoneRenderEndpoints = ToAudioEndpointChoices(AudioEndpointRole.MicrophoneRender, renderEndpoints);
+            var microphoneRenderEndpoints = ToMicrophoneEndpointChoices(captureEndpoints, renderEndpoints);
 
             _loadingAudioEndpointChoices = true;
             try
@@ -784,6 +786,25 @@ public sealed partial class MainWindow : Window
         return devices
             .Select(device => AudioEndpointChoice.FromDevice(role, device))
             .Where(choice => !string.IsNullOrWhiteSpace(choice.EndpointId))
+            .OrderByDescending(choice => choice.IsEnabled)
+            .ThenBy(choice => choice.DisplayName, StringComparer.CurrentCultureIgnoreCase)
+            .ThenBy(choice => choice.EndpointId, StringComparer.OrdinalIgnoreCase)
+            .ToArray();
+    }
+
+    private static IReadOnlyList<AudioEndpointChoice> ToMicrophoneEndpointChoices(
+        IEnumerable<DeviceInformation> captureDevices,
+        IEnumerable<DeviceInformation> renderDevices)
+    {
+        var renderEndpoints = renderDevices
+            .Select(AudioEndpointCandidate.FromDevice)
+            .Where(endpoint => !string.IsNullOrWhiteSpace(endpoint.EndpointId))
+            .ToArray();
+
+        return captureDevices
+            .Select(device => AudioEndpointChoice.FromMicrophoneDevice(device, renderEndpoints))
+            .Where(choice => choice is not null)
+            .Select(choice => choice!)
             .OrderByDescending(choice => choice.IsEnabled)
             .ThenBy(choice => choice.DisplayName, StringComparer.CurrentCultureIgnoreCase)
             .ThenBy(choice => choice.EndpointId, StringComparer.OrdinalIgnoreCase)
@@ -3121,6 +3142,20 @@ public sealed partial class MainWindow : Window
         public string? DisplayName { get; set; }
     }
 
+    private sealed record AudioEndpointCandidate(
+        string EndpointId,
+        string DisplayName,
+        bool IsEnabled)
+    {
+        public static AudioEndpointCandidate FromDevice(DeviceInformation device)
+        {
+            return new AudioEndpointCandidate(
+                device.Id,
+                string.IsNullOrWhiteSpace(device.Name) ? "(未命名音频端点)" : device.Name,
+                device.IsEnabled);
+        }
+    }
+
     private sealed record AudioEndpointChoice(
         AudioEndpointRole Role,
         string EndpointId,
@@ -3173,6 +3208,133 @@ public sealed partial class MainWindow : Window
                 string.IsNullOrWhiteSpace(device.Name) ? "(未命名音频端点)" : device.Name,
                 device.IsEnabled,
                 IsPresent: true);
+        }
+
+        public static AudioEndpointChoice? FromMicrophoneDevice(
+            DeviceInformation device,
+            IReadOnlyList<AudioEndpointCandidate> renderEndpoints)
+        {
+            var displayName = string.IsNullOrWhiteSpace(device.Name) ? "(未命名麦克风端点)" : device.Name;
+            var renderEndpoint = FindMicrophoneRenderEndpoint(displayName, renderEndpoints);
+            if (renderEndpoint is null)
+            {
+                return null;
+            }
+
+            return new AudioEndpointChoice(
+                AudioEndpointRole.MicrophoneRender,
+                renderEndpoint.EndpointId,
+                displayName,
+                device.IsEnabled && renderEndpoint.IsEnabled,
+                IsPresent: true);
+        }
+
+        private static AudioEndpointCandidate? FindMicrophoneRenderEndpoint(
+            string captureName,
+            IReadOnlyList<AudioEndpointCandidate> renderEndpoints)
+        {
+            if (TryFindVoicemeeterRenderEndpoint(captureName, renderEndpoints, out var voicemeeterEndpoint))
+            {
+                return voicemeeterEndpoint;
+            }
+
+            return TryFindKnownVirtualRenderEndpoint(captureName, renderEndpoints);
+        }
+
+        private static bool TryFindVoicemeeterRenderEndpoint(
+            string captureName,
+            IReadOnlyList<AudioEndpointCandidate> renderEndpoints,
+            out AudioEndpointCandidate? renderEndpoint)
+        {
+            renderEndpoint = null;
+            if (!captureName.Contains("Voicemeeter", StringComparison.OrdinalIgnoreCase))
+            {
+                return false;
+            }
+
+            if (TryReadVoicemeeterOutNumber(captureName, "A", out var busNumber))
+            {
+                renderEndpoint = FindVoicemeeterRenderEndpoint(renderEndpoints, $"Voicemeeter In {busNumber}");
+                return renderEndpoint is not null;
+            }
+
+            if (TryReadVoicemeeterOutNumber(captureName, "B", out busNumber))
+            {
+                renderEndpoint = busNumber switch
+                {
+                    1 => FindVoicemeeterRenderEndpoint(renderEndpoints, "Voicemeeter Input", "AUX", "VAIO3", "In "),
+                    2 => FindVoicemeeterRenderEndpoint(renderEndpoints, "Voicemeeter AUX Input"),
+                    3 => FindVoicemeeterRenderEndpoint(renderEndpoints, "Voicemeeter VAIO3 Input"),
+                    _ => null
+                };
+                return renderEndpoint is not null;
+            }
+
+            return false;
+        }
+
+        private static bool TryReadVoicemeeterOutNumber(string captureName, string busPrefix, out int number)
+        {
+            number = 0;
+            var marker = $"Voicemeeter Out {busPrefix}";
+            var markerIndex = captureName.IndexOf(marker, StringComparison.OrdinalIgnoreCase);
+            if (markerIndex < 0)
+            {
+                return false;
+            }
+
+            var numberStart = markerIndex + marker.Length;
+            if (numberStart >= captureName.Length || !char.IsDigit(captureName[numberStart]))
+            {
+                return false;
+            }
+
+            var numberEnd = numberStart;
+            while (numberEnd < captureName.Length && char.IsDigit(captureName[numberEnd]))
+            {
+                numberEnd++;
+            }
+
+            return int.TryParse(captureName[numberStart..numberEnd], NumberStyles.None, CultureInfo.InvariantCulture, out number);
+        }
+
+        private static AudioEndpointCandidate? FindVoicemeeterRenderEndpoint(
+            IReadOnlyList<AudioEndpointCandidate> renderEndpoints,
+            string requiredPrefix,
+            params string[] excludedParts)
+        {
+            return renderEndpoints.FirstOrDefault(endpoint =>
+                endpoint.DisplayName.StartsWith(requiredPrefix, StringComparison.OrdinalIgnoreCase)
+                && endpoint.DisplayName.Contains("Voicemeeter", StringComparison.OrdinalIgnoreCase)
+                && !excludedParts.Any(part => endpoint.DisplayName.Contains(part, StringComparison.OrdinalIgnoreCase)));
+        }
+
+        private static AudioEndpointCandidate? TryFindKnownVirtualRenderEndpoint(
+            string captureName,
+            IReadOnlyList<AudioEndpointCandidate> renderEndpoints)
+        {
+            if (captureName.Contains("ToDesk Virtual Audio", StringComparison.OrdinalIgnoreCase))
+            {
+                return renderEndpoints.FirstOrDefault(endpoint =>
+                    endpoint.DisplayName.Contains("ToDesk Virtual Audio", StringComparison.OrdinalIgnoreCase)
+                    && endpoint.DisplayName.Contains("扬声器", StringComparison.OrdinalIgnoreCase));
+            }
+
+            if (captureName.Contains("Steam Streaming Speakers", StringComparison.OrdinalIgnoreCase))
+            {
+                return renderEndpoints.FirstOrDefault(endpoint =>
+                    endpoint.DisplayName.Contains("Steam Streaming Speakers", StringComparison.OrdinalIgnoreCase)
+                    && endpoint.DisplayName.Contains("扬声器", StringComparison.OrdinalIgnoreCase));
+            }
+
+            if (captureName.Contains("AudioRelay", StringComparison.OrdinalIgnoreCase))
+            {
+                return renderEndpoints.FirstOrDefault(endpoint =>
+                    endpoint.DisplayName.Contains("AudioRelay", StringComparison.OrdinalIgnoreCase)
+                    && endpoint.DisplayName.Contains("Virtual Speakers", StringComparison.OrdinalIgnoreCase));
+            }
+
+            return null;
         }
     }
 
