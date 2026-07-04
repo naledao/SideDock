@@ -231,7 +231,7 @@ jobs:
             throw "WDK MSBuild targets were not found after installation."
           }
 
-      - name: Build driver solution
+      - name: Build display driver solution
         shell: pwsh
         run: |
           msbuild .\windows-driver\SideDock.Driver.sln `
@@ -244,7 +244,19 @@ jobs:
             /p:SkipPackageVerification=true `
             /p:SignMode=Off
 
-      - name: Self-sign driver package
+      - name: Build audio driver solution
+        shell: pwsh
+        run: |
+          msbuild .\windows-driver\SideDock.Audio\SimpleAudioSample.sln `
+            /m `
+            /p:Configuration=$env:BUILD_CONFIGURATION `
+            /p:Platform=$env:DRIVER_PLATFORM `
+            /p:RunCodeAnalysis=false `
+            /p:EnablePREfast=false `
+            /p:SkipPackageVerification=true `
+            /p:SignMode=Off
+
+      - name: Self-sign driver packages
         shell: pwsh
         run: |
           $ErrorActionPreference = "Stop"
@@ -275,7 +287,29 @@ jobs:
             /sha1 $cert.Thumbprint `
             $catPath
 
-          Write-Host "Self-signed driver package for SideDock-controlled installations."
+          $audioPackage = Resolve-Path ".\windows-driver\SideDock.Audio\x64\Release\package"
+          $audioInfPath = Join-Path $audioPackage "SimpleAudioSample.inf"
+          $audioCertPath = Join-Path $audioPackage "SimpleAudioSample.cer"
+          $audioCatPath = Join-Path $audioPackage "simpleaudiosample.cat"
+          $audioInfContent = Get-Content -Raw $audioInfPath
+          if ($audioInfContent -notmatch 'ROOT\\SideDockAudio') {
+            throw "Audio driver INF does not expose ROOT\SideDockAudio: $audioInfPath"
+          }
+          if ($audioInfContent -notmatch 'KSCATEGORY_RENDER') {
+            throw "Audio driver INF does not expose a render endpoint: $audioInfPath"
+          }
+          if ($audioInfContent -notmatch 'KSCATEGORY_CAPTURE') {
+            throw "Audio driver INF does not expose a capture endpoint: $audioInfPath"
+          }
+          Export-Certificate -Cert $cert -FilePath $audioCertPath | Out-Null
+          & $signtool sign `
+            /v `
+            /fd SHA256 `
+            /s My `
+            /sha1 $cert.Thumbprint `
+            $audioCatPath
+
+          Write-Host "Self-signed driver packages for SideDock-controlled installations."
 
       - name: Build driver installer
         shell: pwsh
@@ -284,13 +318,27 @@ jobs:
           $payloadRoot = Join-Path $env:RUNNER_TEMP "driver-payload"
           $driverDest = Join-Path $payloadRoot "SideDock.Idd"
           $toolDest = Join-Path $payloadRoot "SideDock.Idd.DeviceTool"
-          New-Item -ItemType Directory -Force $driverDest, $toolDest | Out-Null
+          $audioDest = Join-Path $payloadRoot "SideDock.Audio"
+          New-Item -ItemType Directory -Force $driverDest, $toolDest, $audioDest | Out-Null
           Copy-Item -Recurse -Force .\windows-driver\SideDock.Idd\x64 $driverDest
           Copy-Item -Recurse -Force .\windows-driver\SideDock.Idd.DeviceTool\x64 $toolDest
+          Copy-Item -Recurse -Force .\windows-driver\SideDock.Audio\x64 $audioDest
           $payloadInf = Join-Path $driverDest "x64\Release\SideDock.Idd\SideDock.Idd.inf"
           $payloadInfContent = Get-Content -Raw $payloadInf
           if ($payloadInfContent -notmatch 'NTamd64\.10\.0\.\.\.18362') {
             throw "Driver payload INF was not stamped for Windows 10 1903+ (18362): $payloadInf"
+          }
+          $audioPayloadInf = Join-Path $audioDest "x64\Release\package\SimpleAudioSample.inf"
+          $audioPayloadCat = Join-Path $audioDest "x64\Release\package\simpleaudiosample.cat"
+          $audioPayloadCert = Join-Path $audioDest "x64\Release\package\SimpleAudioSample.cer"
+          foreach ($requiredAudioFile in @($audioPayloadInf, $audioPayloadCat, $audioPayloadCert)) {
+            if (-not (Test-Path -LiteralPath $requiredAudioFile)) {
+              throw "Audio driver payload file is missing: $requiredAudioFile"
+            }
+          }
+          $audioPayloadInfContent = Get-Content -Raw $audioPayloadInf
+          if ($audioPayloadInfContent -notmatch 'KSCATEGORY_RENDER' -or $audioPayloadInfContent -notmatch 'KSCATEGORY_CAPTURE') {
+            throw "Audio driver payload INF does not include both render and capture endpoints: $audioPayloadInf"
           }
           Compress-Archive -Path (Join-Path $payloadRoot "*") -DestinationPath .\windows-driver\SideDock.Driver.Installer\DriverPayload.zip -Force
           dotnet publish .\windows-driver\SideDock.Driver.Installer\SideDock.Driver.Installer.csproj `
