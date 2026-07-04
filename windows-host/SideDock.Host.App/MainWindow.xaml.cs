@@ -92,6 +92,11 @@ public sealed partial class MainWindow : Window
         ExtendsContentIntoTitleBar = true;
         SetTitleBar(null);
         AppWindow.Resize(new Windows.Graphics.SizeInt32(1080, 760));
+        if (AppWindow.Presenter is OverlappedPresenter presenter)
+        {
+            presenter.IsResizable = false;
+            presenter.IsMaximizable = false;
+        }
 
         InitializeTrayIcon();
         AppWindow.Closing += OnAppWindowClosing;

@@ -765,7 +765,7 @@ public final class MainActivity extends Activity implements ControlClient.Listen
                 && !movedBeyondTapSlop(event);
             overlayTapCandidate = false;
             if (isTap) {
-                cycleOverlayMode();
+                toggleOverlayControls();
             }
             return true;
         }
@@ -785,17 +785,17 @@ public final class MainActivity extends Activity implements ControlClient.Listen
         return dx * dx + dy * dy > slop * slop;
     }
 
+    private void toggleOverlayControls() {
+        overlayMode = overlayMode == OVERLAY_MODE_HIDDEN ? OVERLAY_MODE_DETAILED : OVERLAY_MODE_HIDDEN;
+        updateOverlay();
+    }
+
     private boolean isMouseLikeEvent(MotionEvent event) {
         if (event.isFromSource(InputDevice.SOURCE_MOUSE)) {
             return true;
         }
 
         return event.getPointerCount() > 0 && event.getToolType(0) == MotionEvent.TOOL_TYPE_MOUSE;
-    }
-
-    private void cycleOverlayMode() {
-        overlayMode = (overlayMode + 1) % 3;
-        updateOverlay();
     }
 
     private boolean isPointInsideView(View view, MotionEvent event) {
@@ -866,23 +866,6 @@ public final class MainActivity extends Activity implements ControlClient.Listen
             ViewGroup.LayoutParams.MATCH_PARENT,
             ViewGroup.LayoutParams.MATCH_PARENT
         ));
-
-        overlayText = new TextView(this);
-        overlayText.setTextColor(0xFFE9F0F2);
-        overlayText.setTextSize(12f);
-        overlayText.setGravity(Gravity.START);
-        overlayText.setBackgroundColor(0x99000000);
-        overlayText.setPadding(dp(10, density), dp(8, density), dp(10, density), dp(8, density));
-        overlayText.setText("SideDock");
-        useNativePointerIcon(overlayText);
-
-        FrameLayout.LayoutParams overlayParams = new FrameLayout.LayoutParams(
-            dp(360, density),
-            ViewGroup.LayoutParams.WRAP_CONTENT,
-            Gravity.START | Gravity.TOP
-        );
-        overlayParams.setMargins(dp(12, density), dp(12, density), dp(12, density), dp(12, density));
-        rootView.addView(overlayText, overlayParams);
 
         modeToggleText = createModeToggle(density);
         FrameLayout.LayoutParams modeToggleParams = new FrameLayout.LayoutParams(
@@ -1301,7 +1284,7 @@ public final class MainActivity extends Activity implements ControlClient.Listen
     }
 
     private void toggleModePanel() {
-        if (modePanel == null || overlayMode == OVERLAY_MODE_HIDDEN) {
+        if (modePanel == null) {
             return;
         }
 
@@ -1525,6 +1508,8 @@ public final class MainActivity extends Activity implements ControlClient.Listen
             || stopAudioButton == null) {
             return;
         }
+
+        audioPanel.setVisibility(overlayMode == OVERLAY_MODE_HIDDEN ? View.GONE : View.VISIBLE);
 
         float density = getResources().getDisplayMetrics().density;
         AudioStatus micStatus = currentMicrophoneAudioStatus();

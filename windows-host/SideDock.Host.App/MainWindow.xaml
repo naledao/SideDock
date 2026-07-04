@@ -8,15 +8,14 @@
     Title="SideDock Host">
 
     <Grid Background="{ThemeResource ApplicationPageBackgroundThemeBrush}">
-        <ScrollViewer VerticalScrollBarVisibility="Auto">
-            <Grid
-                MaxWidth="1080"
-                Padding="28"
-                HorizontalAlignment="Stretch"
-                RowSpacing="20">
+        <Grid
+            MaxWidth="1080"
+            Padding="28"
+            HorizontalAlignment="Stretch"
+            RowSpacing="20">
                 <Grid.RowDefinitions>
                     <RowDefinition Height="Auto" />
-                    <RowDefinition Height="Auto" />
+                    <RowDefinition Height="*" />
                 </Grid.RowDefinitions>
 
                 <Grid Grid.Row="0" ColumnSpacing="18">
@@ -58,7 +57,10 @@
                     </Border>
                 </Grid>
 
-                <Grid Grid.Row="1" ColumnSpacing="20">
+                <Grid
+                    Grid.Row="1"
+                    ColumnSpacing="20"
+                    MinHeight="0">
                     <Grid.ColumnDefinitions>
                         <ColumnDefinition Width="1.35*" />
                         <ColumnDefinition Width="1*" />
@@ -70,7 +72,10 @@
                         Background="{ThemeResource CardBackgroundFillColorDefaultBrush}"
                         BorderBrush="{ThemeResource CardStrokeColorDefaultBrush}"
                         BorderThickness="1">
-                        <StackPanel Spacing="18">
+                        <ScrollViewer
+                            VerticalScrollBarVisibility="Auto"
+                            HorizontalScrollBarVisibility="Disabled">
+                            <StackPanel Spacing="18">
                             <StackPanel Spacing="4">
                                 <TextBlock
                                     Text="连接会话"
@@ -205,17 +210,30 @@
                                     </StackPanel>
                                 </Button>
                             </StackPanel>
-                        </StackPanel>
+                            </StackPanel>
+                        </ScrollViewer>
                     </Border>
 
-                    <StackPanel Grid.Column="1" Spacing="20">
+                    <Grid
+                        Grid.Column="1"
+                        RowSpacing="12"
+                        MinHeight="0">
+                        <Grid.RowDefinitions>
+                            <RowDefinition Height="1.1*" />
+                            <RowDefinition Height="1*" />
+                            <RowDefinition Height="0.85*" />
+                        </Grid.RowDefinitions>
                         <Border
+                            Grid.Row="0"
                             Padding="20"
                             CornerRadius="8"
                             Background="{ThemeResource CardBackgroundFillColorDefaultBrush}"
                             BorderBrush="{ThemeResource CardStrokeColorDefaultBrush}"
                             BorderThickness="1">
-                            <StackPanel Spacing="16">
+                            <ScrollViewer
+                                VerticalScrollBarVisibility="Auto"
+                                HorizontalScrollBarVisibility="Disabled">
+                                <StackPanel Spacing="16">
                                 <StackPanel Spacing="4">
                                     <TextBlock
                                     Text="虚拟显示器"
@@ -311,16 +329,21 @@
                                         Foreground="{ThemeResource TextFillColorSecondaryBrush}"
                                         TextWrapping="Wrap" />
                                 </Grid>
-                            </StackPanel>
+                                </StackPanel>
+                            </ScrollViewer>
                         </Border>
 
                         <Border
+                            Grid.Row="1"
                             Padding="20"
                             CornerRadius="8"
                             Background="{ThemeResource CardBackgroundFillColorDefaultBrush}"
                             BorderBrush="{ThemeResource CardStrokeColorDefaultBrush}"
                             BorderThickness="1">
-                            <StackPanel Spacing="16">
+                            <ScrollViewer
+                                VerticalScrollBarVisibility="Auto"
+                                HorizontalScrollBarVisibility="Disabled">
+                                <StackPanel Spacing="16">
                                 <StackPanel Spacing="4">
                                     <TextBlock
                                         Text="音频设备"
@@ -428,16 +451,21 @@
                                             TextWrapping="Wrap" />
                                     </Grid>
                                 </Border>
-                            </StackPanel>
+                                </StackPanel>
+                            </ScrollViewer>
                         </Border>
 
                         <Border
+                            Grid.Row="2"
                             Padding="20"
                             CornerRadius="8"
                             Background="{ThemeResource CardBackgroundFillColorDefaultBrush}"
                             BorderBrush="{ThemeResource CardStrokeColorDefaultBrush}"
                             BorderThickness="1">
-                            <StackPanel Spacing="8">
+                            <ScrollViewer
+                                VerticalScrollBarVisibility="Auto"
+                                HorizontalScrollBarVisibility="Disabled">
+                                <StackPanel Spacing="8">
                                 <TextBlock
                                     Text="运行状态"
                                     FontSize="20"
@@ -486,11 +514,11 @@
                                         Foreground="{ThemeResource TextFillColorSecondaryBrush}"
                                         TextWrapping="Wrap" />
                                 </Grid>
-                            </StackPanel>
+                                </StackPanel>
+                            </ScrollViewer>
                         </Border>
-                    </StackPanel>
+                    </Grid>
                 </Grid>
             </Grid>
-        </ScrollViewer>
     </Grid>
 </Window>
