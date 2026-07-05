@@ -697,8 +697,8 @@ public final class MainActivity extends Activity implements ControlClient.Listen
 
     @Override
     public boolean dispatchKeyEvent(KeyEvent event) {
-        if (isLocalVolumeKey(event.getKeyCode())) {
-            return super.dispatchKeyEvent(event);
+        if (handleLocalVolumeKey(event)) {
+            return true;
         }
 
         if (inputCollector != null && inputCollector.handleKeyEvent(event)) {
@@ -706,6 +706,45 @@ public final class MainActivity extends Activity implements ControlClient.Listen
         }
 
         return super.dispatchKeyEvent(event);
+    }
+
+    private boolean handleLocalVolumeKey(KeyEvent event) {
+        int keyCode = event.getKeyCode();
+        if (!isLocalVolumeKey(keyCode)) {
+            return false;
+        }
+
+        int action = event.getAction();
+        if (action == KeyEvent.ACTION_DOWN) {
+            adjustLocalMediaVolume(keyCode, event.getRepeatCount());
+        }
+        return true;
+    }
+
+    private void adjustLocalMediaVolume(int keyCode, int repeatCount) {
+        AudioManager audioManager = (AudioManager) getSystemService(Context.AUDIO_SERVICE);
+        if (audioManager == null) {
+            return;
+        }
+
+        int direction;
+        if (keyCode == KeyEvent.KEYCODE_VOLUME_UP) {
+            direction = AudioManager.ADJUST_RAISE;
+        } else if (keyCode == KeyEvent.KEYCODE_VOLUME_DOWN) {
+            direction = AudioManager.ADJUST_LOWER;
+        } else {
+            direction = AudioManager.ADJUST_TOGGLE_MUTE;
+        }
+
+        audioManager.adjustStreamVolume(
+            AudioManager.STREAM_MUSIC,
+            direction,
+            AudioManager.FLAG_SHOW_UI | AudioManager.FLAG_PLAY_SOUND
+        );
+        Log.d(TAG, "local media volume key keyCode=" + keyCode
+            + " repeat=" + repeatCount
+            + " volume=" + audioManager.getStreamVolume(AudioManager.STREAM_MUSIC)
+            + "/" + audioManager.getStreamMaxVolume(AudioManager.STREAM_MUSIC));
     }
 
     private boolean isLocalVolumeKey(int keyCode) {
