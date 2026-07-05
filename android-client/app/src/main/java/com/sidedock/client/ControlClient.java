@@ -28,6 +28,7 @@ public final class ControlClient {
         void onStats(long sent, long received);
         void onVideoStart(int port, int width, int height, int fps);
         void onAudioConfig(AudioConfig config);
+        void onCameraConfig(CameraConfig config);
         void onClockSync(ClockSync clockSync);
         void onCaptureStatus(CaptureStatus status);
         void onEncoderStatus(EncoderStatus status);
@@ -69,6 +70,31 @@ public final class ControlClient {
             this.microphoneChannels = microphoneChannels;
             this.speakerChannels = speakerChannels;
             this.bitsPerSample = bitsPerSample;
+        }
+    }
+
+    public static final class CameraConfig {
+        public final boolean enabled;
+        public final int port;
+        public final int width;
+        public final int height;
+        public final int fps;
+        public final String codec;
+
+        public CameraConfig(
+            boolean enabled,
+            int port,
+            int width,
+            int height,
+            int fps,
+            String codec
+        ) {
+            this.enabled = enabled;
+            this.port = port;
+            this.width = width;
+            this.height = height;
+            this.fps = fps;
+            this.codec = codec;
         }
     }
 
@@ -627,6 +653,36 @@ public final class ControlClient {
         ));
     }
 
+    public void sendCameraStatus(
+        String state,
+        String message,
+        boolean permissionGranted,
+        int port,
+        int width,
+        int height,
+        int fps,
+        String codec,
+        long packets,
+        long bytes,
+        long keyFrames,
+        long codecConfigPackets
+    ) {
+        sendFromAnyThread("camera_status", payload(
+            "state", state == null ? "" : state,
+            "message", message == null ? "" : message,
+            "permissionGranted", permissionGranted,
+            "port", port,
+            "width", width,
+            "height", height,
+            "fps", fps,
+            "codec", codec == null ? "" : codec,
+            "packets", packets,
+            "bytes", bytes,
+            "keyFrames", keyFrames,
+            "codecConfigPackets", codecConfigPackets
+        ));
+    }
+
     public void sendKeyboardInput(
         String action,
         int androidKeyCode,
@@ -784,9 +840,15 @@ public final class ControlClient {
                 if (message.payload.has("audioPort")) {
                     emitAudioConfig(audioConfigFromPayload(message.payload));
                 }
+                if (message.payload.has("cameraPort") || message.payload.has("cameraEnabled")) {
+                    emitCameraConfig(cameraConfigFromHelloPayload(message.payload));
+                }
                 break;
             case "audio_config":
                 emitAudioConfig(audioConfigFromPayload(message.payload));
+                break;
+            case "camera_config":
+                emitCameraConfig(cameraConfigFromPayload(message.payload));
                 break;
             case "ping":
                 send("pong", payload("replyTo", message.seq));
@@ -1164,11 +1226,42 @@ public final class ControlClient {
         );
     }
 
+    private CameraConfig cameraConfigFromHelloPayload(JSONObject payload) {
+        return new CameraConfig(
+            payload.optBoolean("cameraEnabled", false),
+            payload.optInt("cameraPort", 27186),
+            payload.optInt("cameraWidth", 1280),
+            payload.optInt("cameraHeight", 720),
+            payload.optInt("cameraFps", 30),
+            payload.optString("cameraCodec", "video/avc")
+        );
+    }
+
+    private CameraConfig cameraConfigFromPayload(JSONObject payload) {
+        return new CameraConfig(
+            payload.optBoolean("enabled", false),
+            payload.optInt("port", 27186),
+            payload.optInt("width", 1280),
+            payload.optInt("height", 720),
+            payload.optInt("fps", 30),
+            payload.optString("codec", "video/avc")
+        );
+    }
+
     private void emitAudioConfig(AudioConfig config) {
         mainHandler.post(new Runnable() {
             @Override
             public void run() {
                 listener.onAudioConfig(config);
+            }
+        });
+    }
+
+    private void emitCameraConfig(CameraConfig config) {
+        mainHandler.post(new Runnable() {
+            @Override
+            public void run() {
+                listener.onCameraConfig(config);
             }
         });
     }

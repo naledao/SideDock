@@ -39,16 +39,21 @@ import java.util.ArrayDeque;
 import java.util.Date;
 import java.util.Locale;
 
-public final class MainActivity extends Activity implements ControlClient.Listener, VideoClient.Listener, AudioCaptureClient.Listener, SurfaceHolder.Callback, InputCollector.Listener {
+public final class MainActivity extends Activity implements ControlClient.Listener, VideoClient.Listener, AudioCaptureClient.Listener, CameraCaptureClient.Listener, SurfaceHolder.Callback, InputCollector.Listener {
     private static final String TAG = "SideDock";
     private static final int DEFAULT_VIDEO_PORT = 27184;
     private static final int DEFAULT_AUDIO_PORT = 27185;
+    private static final int DEFAULT_CAMERA_PORT = 27186;
     private static final int DEFAULT_VIDEO_WIDTH = 1280;
     private static final int DEFAULT_VIDEO_HEIGHT = 720;
     private static final int DEFAULT_VIDEO_FPS = 120;
+    private static final int DEFAULT_CAMERA_WIDTH = 1280;
+    private static final int DEFAULT_CAMERA_HEIGHT = 720;
+    private static final int DEFAULT_CAMERA_FPS = 30;
     private static final int DEFAULT_AUDIO_SAMPLE_RATE = 48000;
     private static final int DEFAULT_AUDIO_CHANNELS = 1;
     private static final int REQUEST_RECORD_AUDIO = 5010;
+    private static final int REQUEST_CAMERA = 5011;
     private static final String VIDEO_CODEC_AVC = "video/avc";
     private static final String ERROR_DECODER_UNSUPPORTED = "DECODER_UNSUPPORTED";
     private static final int OVERLAY_MODE_DETAILED = 0;
@@ -70,6 +75,7 @@ public final class MainActivity extends Activity implements ControlClient.Listen
     private ControlClient controlClient;
     private VideoClient videoClient;
     private AudioCaptureClient audioCaptureClient;
+    private CameraCaptureClient cameraCaptureClient;
     private InputCollector inputCollector;
     private final Handler mainHandler = new Handler(Looper.getMainLooper());
     private final Runnable pointerAbsFlushRunnable = new Runnable() {
@@ -173,8 +179,15 @@ public final class MainActivity extends Activity implements ControlClient.Listen
     private boolean hostAudioEnabled = true;
     private boolean hostMicrophoneEnabled = true;
     private boolean hostSpeakerEnabled;
+    private boolean hostCameraEnabled = true;
     private boolean micPermissionRequestedInSession;
+    private boolean cameraPermissionRequestedInSession;
     private int audioPort = DEFAULT_AUDIO_PORT;
+    private int cameraPort = DEFAULT_CAMERA_PORT;
+    private int cameraWidth = DEFAULT_CAMERA_WIDTH;
+    private int cameraHeight = DEFAULT_CAMERA_HEIGHT;
+    private int cameraFps = DEFAULT_CAMERA_FPS;
+    private String cameraCodec = VIDEO_CODEC_AVC;
     private int audioSampleRate = DEFAULT_AUDIO_SAMPLE_RATE;
     private int audioChannels = DEFAULT_AUDIO_CHANNELS;
     private int audioSpeakerChannels = 2;
@@ -188,6 +201,12 @@ public final class MainActivity extends Activity implements ControlClient.Listen
     private String microphoneAudioSource = "";
     private long speakerPacketsReceived;
     private long speakerBytesReceived;
+    private String cameraRuntimeState = "disconnected";
+    private String lastCameraHint = "Waiting for camera configuration.";
+    private long cameraPacketsSent;
+    private long cameraBytesSent;
+    private long cameraKeyFramesSent;
+    private long cameraCodecConfigPacketsSent;
 
     @Override
     protected void onCreate(Bundle savedInstanceState) {
@@ -199,6 +218,7 @@ public final class MainActivity extends Activity implements ControlClient.Listen
         controlClient = new ControlClient(this);
         videoClient = new VideoClient(this);
         audioCaptureClient = new AudioCaptureClient(this, this);
+        cameraCaptureClient = new CameraCaptureClient(this, this);
         inputCollector = new InputCollector(this);
         loadAudioPreferences();
         setContentView(buildContentView());
@@ -262,6 +282,16 @@ public final class MainActivity extends Activity implements ControlClient.Listen
     @Override
     public void onRequestPermissionsResult(int requestCode, String[] permissions, int[] grantResults) {
         super.onRequestPermissionsResult(requestCode, permissions, grantResults);
+        if (requestCode == REQUEST_CAMERA) {
+            boolean granted = grantResults.length > 0 && grantResults[0] == PackageManager.PERMISSION_GRANTED;
+            lastCameraHint = granted
+                ? "Camera permission granted; preparing capture."
+                : "Camera permission is required before camera uplink can start.";
+            applyCameraCaptureIntent(lastCameraHint);
+            updateOverlay();
+            return;
+        }
+
         if (requestCode != REQUEST_RECORD_AUDIO) {
             return;
         }
@@ -279,6 +309,7 @@ public final class MainActivity extends Activity implements ControlClient.Listen
         mainHandler.removeCallbacks(pointerAbsFlushRunnable);
         stopDisplayFrameSampling();
         clearDisplayTimingHints();
+        cameraCaptureClient.stop();
         audioCaptureClient.stop();
         videoClient.stop();
         controlClient.shutdown();
@@ -330,7 +361,12 @@ public final class MainActivity extends Activity implements ControlClient.Listen
         if (state == ConnectionState.CONNECTED) {
             sendVideoReadyIfSurfaceReady();
             applyAudioCaptureIntent("电脑音频已连接。");
+            applyCameraCaptureIntent("Control channel connected.");
         } else {
+            cameraCaptureClient.stop();
+            cameraRuntimeState = "disconnected";
+            lastCameraHint = state == ConnectionState.RECONNECTING ? "Control channel reconnecting." : "Control channel disconnected.";
+            publishCameraStatus(cameraRuntimeState, lastCameraHint);
             audioCaptureClient.stop();
             microphoneRuntimeState = state == ConnectionState.RECONNECTING ? "reconnecting" : "waiting_device";
             speakerRuntimeState = state == ConnectionState.RECONNECTING ? "reconnecting" : "waiting_device";
@@ -397,6 +433,26 @@ public final class MainActivity extends Activity implements ControlClient.Listen
     }
 
     @Override
+    public void onCameraConfig(ControlClient.CameraConfig config) {
+        hostCameraEnabled = config.enabled;
+        cameraPort = config.port > 0 ? config.port : DEFAULT_CAMERA_PORT;
+        cameraWidth = config.width > 0 ? config.width : DEFAULT_CAMERA_WIDTH;
+        cameraHeight = config.height > 0 ? config.height : DEFAULT_CAMERA_HEIGHT;
+        cameraFps = config.fps > 0 ? config.fps : DEFAULT_CAMERA_FPS;
+        cameraCodec = config.codec == null || config.codec.length() == 0 ? VIDEO_CODEC_AVC : config.codec;
+        cameraPacketsSent = 0L;
+        cameraBytesSent = 0L;
+        cameraKeyFramesSent = 0L;
+        cameraCodecConfigPacketsSent = 0L;
+        lastCameraHint = hostCameraEnabled
+            ? "Camera uplink configured."
+            : "Host camera uplink is disabled.";
+        addLog("camera_config " + cameraWidth + "x" + cameraHeight + "@" + cameraFps + " port=" + cameraPort);
+        applyCameraCaptureIntent(lastCameraHint);
+        updateOverlay();
+    }
+
+    @Override
     public void onAudioCaptureState(String state, String message) {
         mainHandler.post(new Runnable() {
             @Override
@@ -450,6 +506,36 @@ public final class MainActivity extends Activity implements ControlClient.Listen
                 speakerBytesReceived = bytesReceived;
                 publishAudioSpeakerStatus(speakerMuted ? "muted" : "playing",
                     speakerMuted ? "本机音响已静音。" : "正在播放电脑声音。");
+            }
+        });
+    }
+
+    @Override
+    public void onCameraCaptureState(String state, String message) {
+        mainHandler.post(new Runnable() {
+            @Override
+            public void run() {
+                cameraRuntimeState = state == null ? "unavailable" : state;
+                if (message != null && !message.isEmpty()) {
+                    lastCameraHint = message;
+                }
+                publishCameraStatus(cameraRuntimeState, lastCameraHint);
+                updateOverlay();
+            }
+        });
+    }
+
+    @Override
+    public void onCameraCaptureStats(long packetsSent, long bytesSent, long keyFrames, long codecConfigPackets) {
+        mainHandler.post(new Runnable() {
+            @Override
+            public void run() {
+                cameraPacketsSent = packetsSent;
+                cameraBytesSent = bytesSent;
+                cameraKeyFramesSent = keyFrames;
+                cameraCodecConfigPacketsSent = codecConfigPackets;
+                publishCameraStatus("capturing", "Camera capture is running.");
+                updateOverlay();
             }
         });
     }
@@ -1534,6 +1620,67 @@ public final class MainActivity extends Activity implements ControlClient.Listen
         );
     }
 
+    private void applyCameraCaptureIntent(String message) {
+        boolean connected = controlConnectionState == ConnectionState.CONNECTED;
+        boolean configured = hostCameraEnabled && connected;
+
+        if (!configured) {
+            cameraCaptureClient.stop();
+            cameraRuntimeState = hostCameraEnabled ? "disconnected" : "disabled";
+            publishCameraStatus(cameraRuntimeState, message);
+            return;
+        }
+
+        if (!hasCameraPermission()) {
+            cameraCaptureClient.stop();
+            cameraRuntimeState = "waiting_permission";
+            publishCameraStatus("waiting_permission", "Camera permission is required.");
+            if (!cameraPermissionRequestedInSession) {
+                requestCameraPermissionIfNeeded();
+            }
+            return;
+        }
+
+        cameraRuntimeState = cameraCaptureClient.isRunning() ? "capturing" : "preparing";
+        publishCameraStatus(cameraRuntimeState, message);
+        cameraCaptureClient.start(cameraPort, cameraWidth, cameraHeight, cameraFps, cameraCodec);
+    }
+
+    private void requestCameraPermissionIfNeeded() {
+        if (hasCameraPermission()) {
+            applyCameraCaptureIntent("Camera permission already granted.");
+            return;
+        }
+
+        cameraPermissionRequestedInSession = true;
+        requestPermissions(new String[] { Manifest.permission.CAMERA }, REQUEST_CAMERA);
+    }
+
+    private boolean hasCameraPermission() {
+        return checkSelfPermission(Manifest.permission.CAMERA) == PackageManager.PERMISSION_GRANTED;
+    }
+
+    private void publishCameraStatus(String state, String message) {
+        if (controlClient == null) {
+            return;
+        }
+
+        controlClient.sendCameraStatus(
+            state,
+            message,
+            hasCameraPermission(),
+            cameraPort,
+            cameraWidth,
+            cameraHeight,
+            cameraFps,
+            cameraCodec,
+            cameraPacketsSent,
+            cameraBytesSent,
+            cameraKeyFramesSent,
+            cameraCodecConfigPacketsSent
+        );
+    }
+
     private String audioStatusWireState(AudioStatus status) {
         return audioStatusWireState(AudioEndpoint.MICROPHONE, status);
     }
@@ -2254,6 +2401,15 @@ public final class MainActivity extends Activity implements ControlClient.Listen
             .append("视频: ").append(videoState)
             .append("  ").append(videoWidth).append('x').append(videoHeight).append('@').append(videoFps)
             .append("  port ").append(videoPort).append('\n');
+        builder
+            .append("Camera: ").append(cameraRuntimeState)
+            .append("  ").append(cameraWidth).append('x').append(cameraHeight).append('@').append(cameraFps)
+            .append("  port ").append(cameraPort)
+            .append("  packets ").append(cameraPacketsSent)
+            .append("  bytes ").append(cameraBytesSent)
+            .append("  key ").append(cameraKeyFramesSent)
+            .append("  cfg ").append(cameraCodecConfigPacketsSent)
+            .append('\n');
         builder.append("吞吐FPS: ");
         appendFpsFields(builder);
         builder.append('\n');
@@ -2437,7 +2593,7 @@ public final class MainActivity extends Activity implements ControlClient.Listen
             hint = "Surface 创建完成后会自动请求视频流。";
         } else if (controlConnectionState == ConnectionState.DISCONNECTED) {
             title = "等待 Windows 主机";
-            hint = "请确认 Host 正在运行，并已配置 adb reverse tcp:27183/tcp:27184。";
+            hint = "请确认 Host 正在运行，并已配置 adb reverse tcp:27183/tcp:27184/tcp:27185/tcp:27186。";
         } else if (controlConnectionState == ConnectionState.CONNECTING) {
             title = "正在连接 Windows 主机";
             hint = "控制通道连接中。";

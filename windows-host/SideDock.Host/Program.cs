@@ -25,9 +25,13 @@ internal static partial class Program
     private const int DefaultControlPort = 27183;
     private const int DefaultVideoPort = 27184;
     private const int DefaultAudioPort = 27185;
+    private const int DefaultCameraPort = 27186;
     private const int DefaultVideoWidth = 1280;
     private const int DefaultVideoHeight = 720;
     private const int DefaultVideoFps = 120;
+    private const int DefaultCameraWidth = 1280;
+    private const int DefaultCameraHeight = 720;
+    private const int DefaultCameraFps = 30;
     private const int DefaultVideoBitrate = 4_000_000;
     private const int DefaultVideoGop = 30;
     private const int DefaultMaxVideoQueue = 2;
@@ -95,11 +99,19 @@ internal static partial class Program
         var controlServer = new ControlServer(IPAddress.Loopback, options, videoModeState, controlPublisher, displayLayoutProvider);
         var videoServer = new VideoServer(IPAddress.Loopback, options, videoModeState, controlPublisher);
         var audioServer = new AudioServer(IPAddress.Loopback, options, controlPublisher);
+        var cameraServer = new CameraServer(IPAddress.Loopback, options, controlPublisher);
+        if (!string.IsNullOrWhiteSpace(options.CameraReplayFilePath))
+        {
+            _ = Task.Run(
+                () => CameraDebugReplayClient.RunAsync(IPAddress.Loopback, options, appCts.Token),
+                appCts.Token);
+        }
 
         await Task.WhenAll(
             controlServer.RunAsync(appCts.Token),
             videoServer.RunAsync(appCts.Token),
-            audioServer.RunAsync(appCts.Token));
+            audioServer.RunAsync(appCts.Token),
+            cameraServer.RunAsync(appCts.Token));
 
         return 0;
     }
@@ -110,6 +122,7 @@ internal static partial class Program
         Console.WriteLine($"控制通道: 127.0.0.1:{options.ControlPort}");
         Console.WriteLine($"视频通道: 127.0.0.1:{options.VideoPort}");
         Console.WriteLine($"麦克风通道: 127.0.0.1:{options.AudioPort}");
+        Console.WriteLine($"摄像头通道: 127.0.0.1:{options.CameraPort}");
         Console.WriteLine($"视频源: {FormatVideoSource(options.VideoSource)}");
         Console.WriteLine($"测试视频: {options.VideoFilePath}");
         Console.WriteLine($"实时编码器: {options.Encoder}");
@@ -130,6 +143,12 @@ internal static partial class Program
         Console.WriteLine($"编码调优: {FormatEncoderTuningForLog(options)}");
         Console.WriteLine($"链路容量: nv12Pool={options.Nv12PoolSize} encodedPacketQueue={options.EncodedPacketQueue}");
         Console.WriteLine($"音频能力: microphone={(options.AudioDeviceEnabled && options.MicrophoneEnabled ? "enabled" : "disabled")} speaker={(options.AudioDeviceEnabled && options.SpeakerEnabled ? "enabled" : "disabled")}");
+        Console.WriteLine($"摄像头能力: {(options.CameraEnabled ? "enabled" : "disabled")} {options.CameraWidth}x{options.CameraHeight}@{options.CameraFps} {options.CameraCodec}");
+        if (!string.IsNullOrWhiteSpace(options.CameraReplayFilePath))
+        {
+            Console.WriteLine($"摄像头回放输入: {options.CameraReplayFilePath}");
+        }
+
         Console.WriteLine($"音频后端: {FormatAudioBackend(options.AudioBackend)}");
         Console.WriteLine($"电脑声音 loopback 输出端点: {FormatOptionalForLog(options.AudioOutputLoopbackEndpointId)}");
         Console.WriteLine($"Android 麦克风写入端点: {FormatOptionalForLog(options.AudioMicrophoneRenderEndpointId)}");
@@ -910,8 +929,15 @@ internal static partial class Program
                         ["audioChannels"] = AudioDefaults.MicChannels,
                         ["microphoneChannels"] = AudioDefaults.MicChannels,
                         ["speakerChannels"] = AudioDefaults.SpeakerChannels,
-                        ["audioBitsPerSample"] = AudioDefaults.BitsPerSample
+                        ["audioBitsPerSample"] = AudioDefaults.BitsPerSample,
+                        ["cameraEnabled"] = _options.CameraEnabled,
+                        ["cameraPort"] = _options.CameraPort,
+                        ["cameraWidth"] = _options.CameraWidth,
+                        ["cameraHeight"] = _options.CameraHeight,
+                        ["cameraFps"] = _options.CameraFps,
+                        ["cameraCodec"] = _options.CameraCodec
                     }, cancellationToken);
+                    await connection.SendAsync("camera_config", CameraConfigPayload(_options), cancellationToken);
                     await PublishDisplayMetricsIfChangedAsync(connection, force: true, cancellationToken);
                     break;
 
@@ -980,6 +1006,7 @@ internal static partial class Program
                 case "log":
                 case "audio_mic_status":
                 case "audio_speaker_status":
+                case "camera_status":
                 case "input_stats":
                 case "input_error":
                     if (message.Payload is not null)
@@ -992,6 +1019,10 @@ internal static partial class Program
                         else if (message.Type == "audio_speaker_status")
                         {
                             LogAudioSpeakerStatus(message.Payload);
+                        }
+                        else if (message.Type == "camera_status")
+                        {
+                            LogCameraStatus(message.Payload);
                         }
                     }
 
@@ -1090,6 +1121,46 @@ internal static partial class Program
                 + $" port={ReadLong(payload, "port")}"
                 + $" sampleRate={ReadLong(payload, "sampleRate")}"
                 + $" channels={ReadLong(payload, "channels")}"
+                + (string.IsNullOrWhiteSpace(message) ? string.Empty : $" message={message}"));
+        }
+
+        private static JsonObject CameraConfigPayload(HostOptions options)
+        {
+            return new JsonObject
+            {
+                ["enabled"] = options.CameraEnabled,
+                ["port"] = options.CameraPort,
+                ["width"] = options.CameraWidth,
+                ["height"] = options.CameraHeight,
+                ["fps"] = options.CameraFps,
+                ["codec"] = options.CameraCodec
+            };
+        }
+
+        private void LogCameraStatus(JsonNode payloadNode)
+        {
+            if (payloadNode is not JsonObject payload)
+            {
+                return;
+            }
+
+            var state = ReadString(payload, "state");
+            var message = ReadString(payload, "message");
+            var logKey = state is "capturing" or "preparing"
+                ? "camera-client-state"
+                : "camera-state";
+            Log(
+                "CAMERA",
+                logKey + "=" + (string.IsNullOrWhiteSpace(state) ? "unknown" : state)
+                + $" permission={ReadBool(payload, "permissionGranted")}"
+                + $" port={ReadLong(payload, "port")}"
+                + $" size={ReadLong(payload, "width")}x{ReadLong(payload, "height")}"
+                + $" fps={ReadLong(payload, "fps")}"
+                + $" codec={ReadString(payload, "codec")}"
+                + $" packets={ReadLong(payload, "packets")}"
+                + $" bytes={ReadLong(payload, "bytes")}"
+                + $" keyFrames={ReadLong(payload, "keyFrames")}"
+                + $" codecConfigPackets={ReadLong(payload, "codecConfigPackets")}"
                 + (string.IsNullOrWhiteSpace(message) ? string.Empty : $" message={message}"));
         }
 
@@ -13318,6 +13389,7 @@ internal static partial class Program
         int ControlPort,
         int VideoPort,
         int AudioPort,
+        int CameraPort,
         string VideoFilePath,
         VideoSourceKind VideoSource,
         H264EncoderKind Encoder,
@@ -13345,17 +13417,26 @@ internal static partial class Program
         bool AudioDeviceEnabled,
         bool MicrophoneEnabled,
         bool SpeakerEnabled,
+        bool CameraEnabled,
+        int CameraWidth,
+        int CameraHeight,
+        int CameraFps,
+        string CameraCodec,
         AudioBackendKind AudioBackend,
         string? AudioOutputLoopbackEndpointId,
-        string? AudioMicrophoneRenderEndpointId)
+        string? AudioMicrophoneRenderEndpointId,
+        string? CameraReplayFilePath)
     {
-        public IReadOnlyList<int> ReversePorts { get; } = AudioDeviceEnabled && (MicrophoneEnabled || SpeakerEnabled)
-            ? ControlPort == VideoPort
-                ? new[] { ControlPort, AudioPort }.Distinct().ToArray()
-                : new[] { ControlPort, VideoPort, AudioPort }.Distinct().ToArray()
-            : ControlPort == VideoPort
-                ? new[] { ControlPort }
-                : new[] { ControlPort, VideoPort };
+        public IReadOnlyList<int> ReversePorts { get; } = new[]
+            {
+                ControlPort,
+                VideoPort,
+                AudioDeviceEnabled && (MicrophoneEnabled || SpeakerEnabled) ? AudioPort : 0,
+                CameraEnabled ? CameraPort : 0
+            }
+            .Where(port => port > 0)
+            .Distinct()
+            .ToArray();
 
         public H264EncoderTuning EncoderTuning => H264EncoderTuning.FromOptions(this);
 
@@ -13364,10 +13445,15 @@ internal static partial class Program
             var controlPort = DefaultControlPort;
             var videoPort = DefaultVideoPort;
             var audioPort = DefaultAudioPort;
+            var cameraPort = DefaultCameraPort;
             var videoFile = Path.GetFullPath(DefaultVideoFile);
             var videoWidth = DefaultVideoWidth;
             var videoHeight = DefaultVideoHeight;
             var videoFps = DefaultVideoFps;
+            var cameraWidth = DefaultCameraWidth;
+            var cameraHeight = DefaultCameraHeight;
+            var cameraFps = DefaultCameraFps;
+            var cameraCodec = "video/avc";
             var resolutionPreset = DefaultResolutionPreset;
             var videoSource = DefaultVideoSource;
             var encoder = H264EncoderKind.MediaFoundation;
@@ -13391,9 +13477,11 @@ internal static partial class Program
             var audioDeviceEnabled = true;
             var microphoneEnabled = true;
             var speakerEnabled = true;
+            var cameraEnabled = true;
             var audioBackend = AudioBackendKind.LegacySharedMemory;
             string? audioOutputLoopbackEndpointId = null;
             string? audioMicrophoneRenderEndpointId = null;
+            string? cameraReplayFilePath = null;
 
             foreach (var arg in args)
             {
@@ -13416,6 +13504,10 @@ internal static partial class Program
                 else if (arg.Equals("--disable-speaker", StringComparison.OrdinalIgnoreCase))
                 {
                     speakerEnabled = false;
+                }
+                else if (arg.Equals("--disable-camera", StringComparison.OrdinalIgnoreCase))
+                {
+                    cameraEnabled = false;
                 }
             }
 
@@ -13446,6 +13538,51 @@ internal static partial class Program
                             audioPort = parsedAudioPort;
                         }
 
+                        break;
+
+                    case "--camera-port":
+                        if (int.TryParse(args[index + 1], out var parsedCameraPort))
+                        {
+                            cameraPort = parsedCameraPort;
+                        }
+
+                        break;
+
+                    case "--camera-width":
+                        if (int.TryParse(args[index + 1], out var parsedCameraWidth) && parsedCameraWidth > 0)
+                        {
+                            cameraWidth = parsedCameraWidth;
+                        }
+
+                        break;
+
+                    case "--camera-height":
+                        if (int.TryParse(args[index + 1], out var parsedCameraHeight) && parsedCameraHeight > 0)
+                        {
+                            cameraHeight = parsedCameraHeight;
+                        }
+
+                        break;
+
+                    case "--camera-fps":
+                        if (int.TryParse(args[index + 1], out var parsedCameraFps) && parsedCameraFps > 0)
+                        {
+                            cameraFps = parsedCameraFps;
+                        }
+
+                        break;
+
+                    case "--camera-codec":
+                        if (!string.IsNullOrWhiteSpace(args[index + 1]))
+                        {
+                            cameraCodec = args[index + 1].Trim();
+                        }
+
+                        break;
+
+                    case "--camera-replay":
+                    case "--camera-replay-file":
+                        cameraReplayFilePath = Path.GetFullPath(args[index + 1]);
                         break;
 
                     case "--audio-backend":
@@ -13635,6 +13772,7 @@ internal static partial class Program
                 controlPort,
                 videoPort,
                 audioPort,
+                cameraPort,
                 videoFile,
                 videoSource,
                 encoder,
@@ -13662,14 +13800,25 @@ internal static partial class Program
                 audioDeviceEnabled,
                 microphoneEnabled,
                 speakerEnabled,
+                cameraEnabled,
+                cameraWidth,
+                cameraHeight,
+                cameraFps,
+                cameraCodec,
                 audioBackend,
                 NormalizeOptionalAudioEndpointId(audioOutputLoopbackEndpointId),
-                NormalizeOptionalAudioEndpointId(audioMicrophoneRenderEndpointId));
+                NormalizeOptionalAudioEndpointId(audioMicrophoneRenderEndpointId),
+                NormalizeOptionalPath(cameraReplayFilePath));
         }
 
         private static string? NormalizeOptionalAudioEndpointId(string? value)
         {
             return string.IsNullOrWhiteSpace(value) ? null : value.Trim();
+        }
+
+        private static string? NormalizeOptionalPath(string? value)
+        {
+            return string.IsNullOrWhiteSpace(value) ? null : Path.GetFullPath(value.Trim());
         }
 
         private static DisplayModeRequest ParseDisplayMode(string value, int fallbackRefreshHz)

@@ -1,8 +1,10 @@
 using System.Diagnostics;
 using System.IO.Compression;
+using System.IO.MemoryMappedFiles;
 using System.Globalization;
 using System.Reflection;
 using System.Runtime.InteropServices;
+using System.Runtime.InteropServices.WindowsRuntime;
 using System.Text;
 using System.Text.Json;
 using Microsoft.UI;
@@ -11,10 +13,12 @@ using Microsoft.UI.Xaml;
 using Microsoft.UI.Xaml.Controls;
 using Microsoft.UI.Xaml.Input;
 using Microsoft.UI.Xaml.Media;
+using Microsoft.UI.Xaml.Media.Imaging;
 using Windows.ApplicationModel.DataTransfer;
 using Windows.Devices.Enumeration;
 using Windows.Media.Devices;
 using WinRT.Interop;
+using Microsoft.Win32;
 
 namespace SideDock.Host.App;
 
@@ -22,11 +26,15 @@ public sealed partial class MainWindow : Window
 {
     private const string HostExe = "SideDock.Host.exe";
     private const string DeviceToolExe = "SideDock.Idd.DeviceTool.exe";
+    private const string VirtualCameraToolExe = "SideDock.VirtualCamera.Tool.exe";
+    private const string VirtualCameraMediaSourceDll = "SideDock.VirtualCamera.MediaSource.dll";
+    private const string VirtualCameraMediaSourceClsid = "{951EE24C-E200-4E62-8035-F76214F695D2}";
     private const string DriverInstallerExe = "SideDock.Driver.Installer.exe";
     private const string VirtualAudioCableSetupX64Exe = "VBCABLE_Setup_x64.exe";
     private const string VirtualAudioCableSetupX86Exe = "VBCABLE_Setup.exe";
     private const string VirtualAudioCablePayloadZip = "VirtualAudioCablePayload.zip";
     private const int DefaultAudioPort = 27185;
+    private const int DefaultCameraPort = 27186;
     private const string AdbExe = "adb.exe";
     private const int SwHide = 0;
     private const int SwShow = 5;
@@ -60,13 +68,20 @@ public sealed partial class MainWindow : Window
     private const int TrayMenuOpen = 1001;
     private const int TrayMenuExit = 1002;
     private const int MaxRecentAudioLogLines = 80;
+    private const int MaxRecentCameraLogLines = 80;
     private const string AudioPreferencesFileName = "audio-preferences.json";
     private static readonly string DeviceToolProcessName = Path.GetFileNameWithoutExtension(DeviceToolExe);
     private static readonly UIntPtr WindowSubclassId = new(1);
 
     private readonly DispatcherTimer _displayStatusTimer = new();
+    private readonly DispatcherTimer _cameraPreviewTimer = new();
+    private readonly DispatcherTimer _virtualCameraStatusTimer = new();
     private readonly object _audioLogGate = new();
+    private readonly object _cameraLogGate = new();
     private readonly Queue<string> _recentAudioLogLines = new();
+    private readonly Queue<string> _recentCameraLogLines = new();
+    private readonly CameraDiagnosticsState _cameraDiagnostics = new();
+    private readonly VirtualCameraDiagnosticsState _virtualCameraDiagnostics = new();
     private readonly Brush _successBrush = new SolidColorBrush(ColorHelper.FromArgb(255, 18, 132, 86));
     private readonly Brush _dangerBrush = new SolidColorBrush(ColorHelper.FromArgb(255, 196, 43, 28));
     private readonly Brush _warningBrush = new SolidColorBrush(ColorHelper.FromArgb(255, 157, 93, 0));
@@ -80,6 +95,8 @@ public sealed partial class MainWindow : Window
     private string? _payloadRoot;
     private string? _hostPath;
     private string? _deviceToolPath;
+    private string? _virtualCameraToolPath;
+    private string? _virtualCameraMediaSourcePath;
     private string? _driverInstallerPath;
     private string? _virtualAudioCableSetupPath;
     private HostProcessLog? _currentHostLog;
@@ -102,6 +119,9 @@ public sealed partial class MainWindow : Window
     private string? _lastSpeakerErrorMessage;
     private string? _lastMicrophoneSystemEndpointMessage;
     private string? _lastSpeakerSystemEndpointMessage;
+    private string? _lastCameraStatusLine;
+    private string? _lastCameraErrorLine;
+    private string? _lastCameraErrorMessage;
     private bool _loadingAudioEndpointChoices;
     private string? _boundMicrophoneRenderEndpointId;
     private string? _boundMicrophoneRenderEndpointName;
@@ -110,6 +130,10 @@ public sealed partial class MainWindow : Window
     private bool _audioEndpointChoicesReady;
     private AudioEndpointDiagnostics _microphoneRenderEndpointDiagnostics = AudioEndpointDiagnostics.Unknown(AudioEndpointRole.MicrophoneRender);
     private AudioEndpointDiagnostics _speakerCaptureEndpointDiagnostics = AudioEndpointDiagnostics.Unknown(AudioEndpointRole.SpeakerCapture);
+    private CameraPreviewFrameReader? _cameraPreviewReader;
+    private WriteableBitmap? _cameraPreviewBitmap;
+    private long _lastCameraPreviewSequence;
+    private DateTimeOffset? _lastCameraPreviewAt;
 
     public MainWindow()
     {
@@ -130,6 +154,9 @@ public sealed partial class MainWindow : Window
         AppWindow.Closing += OnAppWindowClosing;
         Closed += (_, _) =>
         {
+            _cameraPreviewTimer.Stop();
+            _virtualCameraStatusTimer.Stop();
+            _cameraPreviewReader?.Dispose();
             DisposeTrayIcon();
             StopHost();
         };
@@ -140,13 +167,24 @@ public sealed partial class MainWindow : Window
         SetRunningState(false);
         RefreshVirtualDisplayState();
         UpdateAudioState();
+        UpdateCameraStatusView();
+        RefreshVirtualCameraStatusFromFiles();
 
         _displayStatusTimer.Interval = TimeSpan.FromSeconds(2);
         _displayStatusTimer.Tick += (_, _) => RefreshVirtualDisplayState();
         _displayStatusTimer.Start();
 
+        _cameraPreviewTimer.Interval = TimeSpan.FromMilliseconds(200);
+        _cameraPreviewTimer.Tick += (_, _) => UpdateCameraPreview();
+        _cameraPreviewTimer.Start();
+
+        _virtualCameraStatusTimer.Interval = TimeSpan.FromSeconds(2);
+        _virtualCameraStatusTimer.Tick += (_, _) => RefreshVirtualCameraStatusFromFiles();
+        _virtualCameraStatusTimer.Start();
+
         _ = RefreshAdbDevicesAsync(showErrors: false);
         _ = RefreshAudioEndpointsAsync(showHint: false);
+        _ = RefreshVirtualCameraStatusAsync();
     }
 
     private void RegisterCardWheelScrolling()
@@ -471,6 +509,38 @@ public sealed partial class MainWindow : Window
         }
     }
 
+    private void CopyCameraDiagnosticsButton_Click(object sender, RoutedEventArgs e)
+    {
+        try
+        {
+            var details = BuildCameraDiagnosticsReport();
+            var package = new DataPackage { RequestedOperation = DataPackageOperation.Copy };
+            package.SetText(details);
+            Clipboard.SetContent(package);
+            Clipboard.Flush();
+            CopyCameraDiagnosticsButtonText.Text = "已复制";
+        }
+        catch
+        {
+            CopyCameraDiagnosticsButtonText.Text = "复制失败";
+        }
+    }
+
+    private async void StartVirtualCameraButton_Click(object sender, RoutedEventArgs e)
+    {
+        await RunVirtualCameraCommandAsync("ensure-start");
+    }
+
+    private async void StopVirtualCameraButton_Click(object sender, RoutedEventArgs e)
+    {
+        await RunVirtualCameraCommandAsync("stop");
+    }
+
+    private async void RefreshVirtualCameraButton_Click(object sender, RoutedEventArgs e)
+    {
+        await RefreshVirtualCameraStatusAsync();
+    }
+
     private void StartDisplayButton_Click(object sender, RoutedEventArgs e)
     {
         StartVirtualDisplay(failureAction: "启动虚拟显示器失败");
@@ -634,6 +704,7 @@ public sealed partial class MainWindow : Window
             "--control-port", Port(ControlPortBox, "control"),
             "--video-port", Port(VideoPortBox, "video"),
             "--audio-port", DefaultAudioPort.ToString(CultureInfo.InvariantCulture),
+            "--camera-port", DefaultCameraPort.ToString(CultureInfo.InvariantCulture),
             "--audio-backend", "wasapi-virtual-cable"
         };
 
@@ -682,6 +753,7 @@ public sealed partial class MainWindow : Window
             ports.Add(DefaultAudioPort);
         }
 
+        ports.Add(DefaultCameraPort);
         return ports.Distinct().ToArray();
     }
 
@@ -1439,6 +1511,30 @@ public sealed partial class MainWindow : Window
         yield return Path.Combine(baseDirectory, "SideDock.Host", HostExe);
         yield return Path.Combine(baseDirectory, "SideDock.Host", "x64", "Release", HostExe);
         yield return Path.Combine(baseDirectory, "SideDock.Host", "x64", "Debug", HostExe);
+        yield return Path.GetFullPath(Path.Combine(
+            baseDirectory,
+            "..",
+            "..",
+            "..",
+            "..",
+            "..",
+            "SideDock.Host",
+            "bin",
+            "Debug",
+            "net8.0",
+            HostExe));
+        yield return Path.GetFullPath(Path.Combine(
+            baseDirectory,
+            "..",
+            "..",
+            "..",
+            "..",
+            "..",
+            "SideDock.Host",
+            "bin",
+            "Release",
+            "net8.0",
+            HostExe));
 
         if (_payloadRoot is not null)
         {
@@ -2411,10 +2507,687 @@ public sealed partial class MainWindow : Window
         AdbStatusText.Foreground = brush;
     }
 
+    private void UpdateCameraPreview()
+    {
+        try
+        {
+            _cameraPreviewReader ??= CameraPreviewFrameReader.TryOpen();
+            if (_cameraPreviewReader is null)
+            {
+                CameraPreviewPlaceholderText.Visibility = Visibility.Visible;
+                CameraPreviewPlaceholderText.Text = "等待摄像头解码帧";
+                return;
+            }
+
+            var frame = _cameraPreviewReader.TryReadLatest();
+            if (frame is null)
+            {
+                UpdateCameraPreviewStaleness();
+                return;
+            }
+
+            if (frame.Sequence <= _lastCameraPreviewSequence)
+            {
+                UpdateCameraPreviewStaleness();
+                return;
+            }
+
+            if (_cameraPreviewBitmap is null
+                || _cameraPreviewBitmap.PixelWidth != frame.Width
+                || _cameraPreviewBitmap.PixelHeight != frame.Height)
+            {
+                _cameraPreviewBitmap = new WriteableBitmap(frame.Width, frame.Height);
+                CameraPreviewImage.Source = _cameraPreviewBitmap;
+            }
+
+            using (var stream = _cameraPreviewBitmap.PixelBuffer.AsStream())
+            {
+                stream.Seek(0, SeekOrigin.Begin);
+                stream.Write(frame.Bgra, 0, frame.Bgra.Length);
+            }
+
+            _cameraPreviewBitmap.Invalidate();
+            _lastCameraPreviewSequence = frame.Sequence;
+            _lastCameraPreviewAt = DateTimeOffset.FromUnixTimeMilliseconds(frame.WrittenAtUnixMs);
+            _cameraDiagnostics.PreviewFrameSequence = Math.Max(_cameraDiagnostics.PreviewFrameSequence, frame.Sequence);
+            CameraPreviewPlaceholderText.Visibility = Visibility.Collapsed;
+            UpdateCameraStatusView();
+        }
+        catch (FileNotFoundException)
+        {
+            _cameraPreviewReader?.Dispose();
+            _cameraPreviewReader = null;
+            CameraPreviewPlaceholderText.Visibility = Visibility.Visible;
+            CameraPreviewPlaceholderText.Text = "等待摄像头解码帧";
+        }
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException or ObjectDisposedException or ArgumentException)
+        {
+            _cameraPreviewReader?.Dispose();
+            _cameraPreviewReader = null;
+            _cameraDiagnostics.LastError = ex.Message;
+            CameraPreviewPlaceholderText.Visibility = Visibility.Visible;
+            CameraPreviewPlaceholderText.Text = "预览缓存暂不可读";
+            UpdateCameraStatusView();
+        }
+    }
+
+    private void UpdateCameraPreviewStaleness()
+    {
+        if (_lastCameraPreviewAt is null)
+        {
+            CameraPreviewPlaceholderText.Visibility = CameraPreviewImage.Source is null ? Visibility.Visible : Visibility.Collapsed;
+            return;
+        }
+
+        UpdateCameraStatusView();
+    }
+
+    private void UpdateCameraStatusView()
+    {
+        if (CameraStatusText is null)
+        {
+            return;
+        }
+
+        var camera = _cameraDiagnostics;
+        CameraStatusText.Text = $"Server: {camera.ServerState}  Android: {camera.ClientState}  权限: {camera.PermissionText}";
+        CameraConfigText.Text = $"port {camera.Port} · {camera.Width}x{camera.Height}@{camera.Fps} · {camera.Codec}";
+        CameraMetricsText.Text =
+            $"{camera.ApproxFps:F1} fps · {camera.ApproxKbps:F0} kbps · packets {camera.Packets} · frames {camera.Frames} · decoded {camera.DecodedFrames} · last {FormatCameraAge(camera.LastFrameAt)}";
+        var errorText = string.IsNullOrWhiteSpace(camera.LastError) ? "无" : camera.LastError;
+        CameraErrorText.Text = errorText;
+        CameraErrorText.Foreground = string.IsNullOrWhiteSpace(camera.LastError) ? _secondaryBrush : _warningBrush;
+
+        var virtualCamera = _virtualCameraDiagnostics;
+        VirtualCameraStatusText.Text =
+            $"注册: {virtualCamera.RegistrationText} · 运行: {virtualCamera.RunningText} · "
+            + $"供帧: {FormatVirtualCameraServedAt(virtualCamera.LastServedAt)} · 源帧 {virtualCamera.SourceFrameSequence}";
+        if (!string.IsNullOrWhiteSpace(virtualCamera.LastError) && string.IsNullOrWhiteSpace(camera.LastError))
+        {
+            CameraErrorText.Text = virtualCamera.LastError;
+            CameraErrorText.Foreground = _warningBrush;
+        }
+    }
+
+    private async Task RunVirtualCameraCommandAsync(string command)
+    {
+        SetVirtualCameraButtonsEnabled(false);
+        _virtualCameraDiagnostics.LastError = "";
+        _virtualCameraDiagnostics.LastToolState = command;
+        UpdateCameraStatusView();
+
+        try
+        {
+            var actualCommand = command;
+            if (command.Equals("ensure-start", StringComparison.OrdinalIgnoreCase))
+            {
+                await EnsureVirtualCameraMachineRegistrationAsync();
+                actualCommand = "start";
+            }
+
+            var result = await RunVirtualCameraToolAsync(actualCommand, scope: "machine");
+            if (result.ExitCode != 0)
+            {
+                var message = string.IsNullOrWhiteSpace(result.Stderr)
+                    ? $"虚拟摄像头工具退出码 {result.ExitCode}"
+                    : result.Stderr.Trim();
+                _virtualCameraDiagnostics.LastError = message;
+                UpdateCameraStatusView();
+                return;
+            }
+
+            ApplyVirtualCameraStatusJson(result.Stdout);
+            RefreshVirtualCameraStatusFromFiles();
+        }
+        catch (Exception ex)
+        {
+            _virtualCameraDiagnostics.LastError = ex.Message;
+            UpdateCameraStatusView();
+        }
+        finally
+        {
+            SetVirtualCameraButtonsEnabled(true);
+        }
+    }
+
+    private async Task RefreshVirtualCameraStatusAsync()
+    {
+        try
+        {
+            var result = await RunVirtualCameraToolAsync("status", scope: "machine");
+            if (result.ExitCode == 0)
+            {
+                ApplyVirtualCameraStatusJson(result.Stdout);
+            }
+            else if (!string.IsNullOrWhiteSpace(result.Stderr))
+            {
+                _virtualCameraDiagnostics.LastError = result.Stderr.Trim();
+            }
+        }
+        catch (Exception ex)
+        {
+            _virtualCameraDiagnostics.LastError = ex.Message;
+        }
+
+        RefreshVirtualCameraStatusFromFiles();
+        UpdateCameraStatusView();
+    }
+
+    private async Task EnsureVirtualCameraMachineRegistrationAsync()
+    {
+        _virtualCameraToolPath ??= ResolveVirtualCameraToolPath();
+        _virtualCameraMediaSourcePath ??= ResolveVirtualCameraMediaSourcePath();
+
+        if (IsMachineVirtualCameraRegistered(_virtualCameraMediaSourcePath))
+        {
+            return;
+        }
+
+        var startInfo = new ProcessStartInfo
+        {
+            FileName = _virtualCameraToolPath,
+            Arguments = string.Join(" ", new[]
+            {
+                "install",
+                "--scope",
+                "machine",
+                "--dll",
+                _virtualCameraMediaSourcePath
+            }.Select(QuoteArgument)),
+            WorkingDirectory = Path.GetDirectoryName(_virtualCameraToolPath) ?? Environment.CurrentDirectory,
+            UseShellExecute = true,
+            Verb = "runas",
+            WindowStyle = ProcessWindowStyle.Hidden
+        };
+
+        using var process = Process.Start(startInfo)
+            ?? throw new InvalidOperationException($"无法启动 {VirtualCameraToolExe}。");
+        if (!await WaitForExitAsync(process, TimeSpan.FromSeconds(60)))
+        {
+            throw new TimeoutException("虚拟摄像头机器级注册超时。");
+        }
+
+        if (process.ExitCode != 0)
+        {
+            throw new InvalidOperationException($"虚拟摄像头机器级注册失败，退出码 {process.ExitCode}。");
+        }
+    }
+
+    private static async Task<bool> WaitForExitAsync(Process process, TimeSpan timeout)
+    {
+        using var cancellation = new CancellationTokenSource(timeout);
+        try
+        {
+            await process.WaitForExitAsync(cancellation.Token);
+            return true;
+        }
+        catch (OperationCanceledException)
+        {
+            try
+            {
+                process.Kill(entireProcessTree: true);
+            }
+            catch
+            {
+                // Process may have exited between timeout and kill.
+            }
+
+            return false;
+        }
+    }
+
+    private static bool IsMachineVirtualCameraRegistered(string expectedDllPath)
+    {
+        try
+        {
+            using var root = RegistryKey.OpenBaseKey(RegistryHive.LocalMachine, RegistryView.Registry64);
+            using var key = root.OpenSubKey($@"Software\Classes\CLSID\{VirtualCameraMediaSourceClsid}\InProcServer32");
+            var registeredPath = key?.GetValue(null) as string;
+            return !string.IsNullOrWhiteSpace(registeredPath)
+                && File.Exists(registeredPath)
+                && string.Equals(
+                    Path.GetFullPath(registeredPath),
+                    Path.GetFullPath(expectedDllPath),
+                    StringComparison.OrdinalIgnoreCase);
+        }
+        catch
+        {
+            return false;
+        }
+    }
+
+    private async Task<VirtualCameraToolResult> RunVirtualCameraToolAsync(string command, string scope)
+    {
+        _virtualCameraToolPath ??= ResolveVirtualCameraToolPath();
+        var args = new List<string>
+        {
+            command,
+            "--scope",
+            scope,
+            "--lifetime",
+            "system",
+            "--access",
+            "currentUser"
+        };
+
+        if (command.Equals("install", StringComparison.OrdinalIgnoreCase)
+            || command.Equals("register", StringComparison.OrdinalIgnoreCase)
+            || command.Equals("ensure-start", StringComparison.OrdinalIgnoreCase))
+        {
+            _virtualCameraMediaSourcePath ??= ResolveVirtualCameraMediaSourcePath();
+            args.Add("--dll");
+            args.Add(_virtualCameraMediaSourcePath);
+        }
+
+        var workingDirectory = Path.GetDirectoryName(_virtualCameraToolPath) ?? Environment.CurrentDirectory;
+        var startInfo = new ProcessStartInfo
+        {
+            FileName = _virtualCameraToolPath,
+            Arguments = string.Join(" ", args.Select(QuoteArgument)),
+            WorkingDirectory = workingDirectory,
+            UseShellExecute = false,
+            CreateNoWindow = true,
+            RedirectStandardOutput = true,
+            RedirectStandardError = true,
+            StandardOutputEncoding = Encoding.UTF8,
+            StandardErrorEncoding = Encoding.UTF8
+        };
+
+        using var process = Process.Start(startInfo)
+            ?? throw new InvalidOperationException($"无法启动 {VirtualCameraToolExe}。");
+        using var timeout = new CancellationTokenSource(TimeSpan.FromSeconds(30));
+
+        try
+        {
+            var stdoutTask = process.StandardOutput.ReadToEndAsync(timeout.Token);
+            var stderrTask = process.StandardError.ReadToEndAsync(timeout.Token);
+            await process.WaitForExitAsync(timeout.Token);
+            return new VirtualCameraToolResult(process.ExitCode, await stdoutTask, await stderrTask);
+        }
+        catch (OperationCanceledException)
+        {
+            try
+            {
+                process.Kill(entireProcessTree: true);
+            }
+            catch
+            {
+                // Process may have exited between timeout and kill.
+            }
+
+            return new VirtualCameraToolResult(-1, "", "虚拟摄像头工具超时。");
+        }
+    }
+
+    private void RefreshVirtualCameraStatusFromFiles()
+    {
+        TryApplyVirtualCameraServedStatusFile();
+        TryApplyVirtualCameraToolStatusFile();
+        UpdateCameraStatusView();
+    }
+
+    private void TryApplyVirtualCameraServedStatusFile()
+    {
+        try
+        {
+            var path = VirtualCameraServedStatusPath;
+            if (!File.Exists(path))
+            {
+                return;
+            }
+
+            using var document = JsonDocument.Parse(File.ReadAllText(path));
+            ApplyServedFrameElement(document.RootElement);
+        }
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException or JsonException)
+        {
+            _virtualCameraDiagnostics.LastError = ex.Message;
+        }
+    }
+
+    private void TryApplyVirtualCameraToolStatusFile()
+    {
+        try
+        {
+            var path = VirtualCameraToolStatusPath;
+            if (!File.Exists(path))
+            {
+                return;
+            }
+
+            using var document = JsonDocument.Parse(File.ReadAllText(path));
+            if (TryGetString(document.RootElement, "state", out var state))
+            {
+                _virtualCameraDiagnostics.LastToolState = state;
+                if (state.Equals("started", StringComparison.OrdinalIgnoreCase))
+                {
+                    _virtualCameraDiagnostics.Running = true;
+                }
+                else if (state.Equals("stopped", StringComparison.OrdinalIgnoreCase)
+                    || state.Equals("removed", StringComparison.OrdinalIgnoreCase))
+                {
+                    _virtualCameraDiagnostics.Running = false;
+                }
+            }
+
+            if (TryGetString(document.RootElement, "error", out var error) && !string.IsNullOrWhiteSpace(error))
+            {
+                _virtualCameraDiagnostics.LastError = error;
+            }
+        }
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException or JsonException)
+        {
+            _virtualCameraDiagnostics.LastError = ex.Message;
+        }
+    }
+
+    private void ApplyVirtualCameraStatusJson(string json)
+    {
+        if (string.IsNullOrWhiteSpace(json))
+        {
+            return;
+        }
+
+        using var document = JsonDocument.Parse(json);
+        var root = document.RootElement;
+        if (TryGetBoolean(root, "registered", out var registered))
+        {
+            _virtualCameraDiagnostics.Registered = registered;
+        }
+
+        if (TryGetBoolean(root, "running", out var running))
+        {
+            _virtualCameraDiagnostics.Running = running;
+        }
+
+        if (root.TryGetProperty("registeredScopes", out var scopes))
+        {
+            _virtualCameraDiagnostics.RegisteredScopeSummary = FormatVirtualCameraRegistrationScopes(scopes);
+        }
+
+        if (root.TryGetProperty("devices", out var devices) && devices.ValueKind == JsonValueKind.Array)
+        {
+            _virtualCameraDiagnostics.DeviceCount = devices.GetArrayLength();
+        }
+
+        if (root.TryGetProperty("servedFrame", out var servedFrame) && servedFrame.ValueKind == JsonValueKind.Object)
+        {
+            ApplyServedFrameElement(servedFrame);
+        }
+
+        if (root.TryGetProperty("lastToolState", out var toolState) && toolState.ValueKind == JsonValueKind.Object)
+        {
+            if (TryGetString(toolState, "state", out var state))
+            {
+                _virtualCameraDiagnostics.LastToolState = state;
+            }
+
+            if (TryGetString(toolState, "error", out var error) && !string.IsNullOrWhiteSpace(error))
+            {
+                _virtualCameraDiagnostics.LastError = error;
+            }
+        }
+    }
+
+    private void ApplyServedFrameElement(JsonElement element)
+    {
+        if (TryGetInt64(element, "servedAtUnixMs", out var servedAtUnixMs) && servedAtUnixMs > 0)
+        {
+            _virtualCameraDiagnostics.LastServedAt = DateTimeOffset.FromUnixTimeMilliseconds(servedAtUnixMs);
+        }
+
+        if (TryGetInt64(element, "sourceFrameSequence", out var sourceSequence))
+        {
+            _virtualCameraDiagnostics.SourceFrameSequence = sourceSequence;
+        }
+
+        if (TryGetString(element, "frameKind", out var frameKind))
+        {
+            _virtualCameraDiagnostics.FrameKind = frameKind;
+        }
+
+        if (TryGetString(element, "lastError", out var error) && !string.IsNullOrWhiteSpace(error))
+        {
+            _virtualCameraDiagnostics.LastError = error;
+        }
+    }
+
+    private static string FormatVirtualCameraRegistrationScopes(JsonElement scopes)
+    {
+        var parts = new List<string>();
+        if (scopes.TryGetProperty("user", out var user)
+            && TryGetBoolean(user, "registered", out var userRegistered)
+            && userRegistered)
+        {
+            parts.Add("user");
+        }
+
+        if (scopes.TryGetProperty("machine", out var machine)
+            && TryGetBoolean(machine, "registered", out var machineRegistered)
+            && machineRegistered)
+        {
+            parts.Add("machine");
+        }
+
+        return parts.Count == 0 ? "" : string.Join(",", parts);
+    }
+
+    private static string FormatVirtualCameraServedAt(DateTimeOffset? value)
+    {
+        if (value is null)
+        {
+            return "--";
+        }
+
+        var age = DateTimeOffset.UtcNow - value.Value.ToUniversalTime();
+        if (age.TotalSeconds < 1)
+        {
+            return "刚刚";
+        }
+
+        if (age.TotalSeconds < 60)
+        {
+            return $"{age.TotalSeconds:F0}s";
+        }
+
+        return value.Value.ToLocalTime().ToString("HH:mm:ss", CultureInfo.InvariantCulture);
+    }
+
+    private void SetVirtualCameraButtonsEnabled(bool enabled)
+    {
+        StartVirtualCameraButton.IsEnabled = enabled;
+        StopVirtualCameraButton.IsEnabled = enabled;
+        RefreshVirtualCameraButton.IsEnabled = enabled;
+    }
+
+    private string ResolveVirtualCameraToolPath()
+    {
+        foreach (var candidate in EnumerateVirtualCameraToolCandidates())
+        {
+            if (File.Exists(candidate))
+            {
+                return Path.GetFullPath(candidate);
+            }
+        }
+
+        throw new FileNotFoundException(
+            $"未找到 {VirtualCameraToolExe}。请先构建 SideDock.VirtualCamera.Tool。");
+    }
+
+    private string ResolveVirtualCameraMediaSourcePath()
+    {
+        foreach (var candidate in EnumerateVirtualCameraMediaSourceCandidates())
+        {
+            if (File.Exists(candidate))
+            {
+                return Path.GetFullPath(candidate);
+            }
+        }
+
+        throw new FileNotFoundException(
+            $"未找到 {VirtualCameraMediaSourceDll}。请先构建 SideDock.VirtualCamera.MediaSource。");
+    }
+
+    private IEnumerable<string> EnumerateVirtualCameraToolCandidates()
+    {
+        var baseDirectory = AppContext.BaseDirectory;
+        yield return Path.Combine(baseDirectory, VirtualCameraToolExe);
+        yield return Path.Combine(baseDirectory, "SideDock.VirtualCamera.Tool", VirtualCameraToolExe);
+
+        if (_payloadRoot is not null)
+        {
+            yield return Path.Combine(_payloadRoot, VirtualCameraToolExe);
+            yield return Path.Combine(_payloadRoot, "SideDock.VirtualCamera.Tool", VirtualCameraToolExe);
+        }
+
+        foreach (var configuration in new[] { "Release", "Debug" })
+        {
+            yield return Path.GetFullPath(Path.Combine(
+                baseDirectory,
+                "..",
+                "..",
+                "..",
+                "..",
+                "..",
+                "SideDock.VirtualCamera.Tool",
+                "bin",
+                configuration,
+                "net8.0-windows10.0.22000.0",
+                "win-x64",
+                VirtualCameraToolExe));
+            yield return Path.GetFullPath(Path.Combine(
+                baseDirectory,
+                "..",
+                "..",
+                "..",
+                "..",
+                "..",
+                "..",
+                "windows-host",
+                "SideDock.VirtualCamera.Tool",
+                "bin",
+                configuration,
+                "net8.0-windows10.0.22000.0",
+                "win-x64",
+                VirtualCameraToolExe));
+        }
+    }
+
+    private IEnumerable<string> EnumerateVirtualCameraMediaSourceCandidates()
+    {
+        var baseDirectory = AppContext.BaseDirectory;
+        yield return Path.Combine(baseDirectory, VirtualCameraMediaSourceDll);
+        if (!string.IsNullOrWhiteSpace(_virtualCameraToolPath))
+        {
+            yield return Path.Combine(Path.GetDirectoryName(_virtualCameraToolPath) ?? baseDirectory, VirtualCameraMediaSourceDll);
+        }
+
+        if (_payloadRoot is not null)
+        {
+            yield return Path.Combine(_payloadRoot, VirtualCameraMediaSourceDll);
+            yield return Path.Combine(_payloadRoot, "SideDock.VirtualCamera.MediaSource", VirtualCameraMediaSourceDll);
+        }
+
+        foreach (var configuration in new[] { "Release", "Debug" })
+        {
+            yield return Path.GetFullPath(Path.Combine(
+                baseDirectory,
+                "..",
+                "..",
+                "..",
+                "..",
+                "..",
+                "SideDock.VirtualCamera.MediaSource",
+                "x64",
+                configuration,
+                VirtualCameraMediaSourceDll));
+            yield return Path.GetFullPath(Path.Combine(
+                baseDirectory,
+                "..",
+                "..",
+                "..",
+                "..",
+                "..",
+                "..",
+                "windows-host",
+                "SideDock.VirtualCamera.MediaSource",
+                "x64",
+                configuration,
+                VirtualCameraMediaSourceDll));
+        }
+    }
+
+    private static bool TryGetBoolean(JsonElement element, string name, out bool value)
+    {
+        value = false;
+        if (!element.TryGetProperty(name, out var property))
+        {
+            return false;
+        }
+
+        if (property.ValueKind is JsonValueKind.True or JsonValueKind.False)
+        {
+            value = property.GetBoolean();
+            return true;
+        }
+
+        return false;
+    }
+
+    private static bool TryGetInt64(JsonElement element, string name, out long value)
+    {
+        value = 0;
+        return element.TryGetProperty(name, out var property) && property.TryGetInt64(out value);
+    }
+
+    private static bool TryGetString(JsonElement element, string name, out string value)
+    {
+        value = "";
+        if (!element.TryGetProperty(name, out var property) || property.ValueKind != JsonValueKind.String)
+        {
+            return false;
+        }
+
+        value = property.GetString() ?? "";
+        return true;
+    }
+
+    private static string VirtualCameraStatusDirectory =>
+        Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.CommonApplicationData), "SideDock");
+
+    private static string VirtualCameraServedStatusPath =>
+        Path.Combine(VirtualCameraStatusDirectory, "virtual-camera-status.json");
+
+    private static string VirtualCameraToolStatusPath =>
+        Path.Combine(VirtualCameraStatusDirectory, "virtual-camera-tool-status.json");
+
+    private static string FormatCameraAge(string isoTimestamp)
+    {
+        if (string.IsNullOrWhiteSpace(isoTimestamp)
+            || !DateTimeOffset.TryParse(isoTimestamp, CultureInfo.InvariantCulture, DateTimeStyles.AssumeUniversal, out var timestamp))
+        {
+            return "--";
+        }
+
+        var age = DateTimeOffset.UtcNow - timestamp.ToUniversalTime();
+        if (age.TotalSeconds < 1)
+        {
+            return "刚刚";
+        }
+
+        if (age.TotalSeconds < 60)
+        {
+            return $"{age.TotalSeconds:F0}s";
+        }
+
+        return timestamp.ToLocalTime().ToString("HH:mm:ss", CultureInfo.InvariantCulture);
+    }
+
     private string BuildAudioDiagnosticsReport()
     {
         var hostLog = _currentHostLog;
         var recentAudioLines = SnapshotRecentAudioLogLines();
+        var recentCameraLines = SnapshotRecentCameraLogLines();
         var report = new StringBuilder();
         report.AppendLine("SideDock 音频设备诊断报告");
         report.AppendLine($"时间: {DateTimeOffset.Now:yyyy-MM-dd HH:mm:ss zzz}");
@@ -2436,6 +3209,10 @@ public sealed partial class MainWindow : Window
         report.AppendLine($"最后音响状态日志: {FormatOptional(_lastSpeakerStatusLine)}");
         report.AppendLine($"最后麦克风错误日志: {FormatOptional(_lastMicrophoneErrorLine)}");
         report.AppendLine($"最后音响错误日志: {FormatOptional(_lastSpeakerErrorLine)}");
+        report.AppendLine($"最后摄像头状态日志: {FormatOptional(_lastCameraStatusLine)}");
+        report.AppendLine($"最后摄像头错误日志: {FormatOptional(_lastCameraErrorLine)}");
+        report.AppendLine($"最后摄像头错误: {FormatOptional(_lastCameraErrorMessage)}");
+        AppendCameraDiagnosticsSummary(report);
         report.AppendLine();
 
         report.AppendLine("---- 配置 ----");
@@ -2450,6 +3227,8 @@ public sealed partial class MainWindow : Window
         report.AppendLine($"Android 麦克风写入 endpoint id: {FormatOptional(_boundMicrophoneRenderEndpointId)}");
         report.AppendLine($"Android 麦克风写入端点名称: {FormatOptional(_boundMicrophoneRenderEndpointName)}");
         report.AppendLine($"音频端口: {DefaultAudioPort}");
+        report.AppendLine($"摄像头端口: {DefaultCameraPort}");
+        report.AppendLine($"摄像头 reverse: tcp:{DefaultCameraPort} -> tcp:{DefaultCameraPort}");
         report.AppendLine($"控制端口: {FormatNumberBox(ControlPortBox)}");
         report.AppendLine($"视频端口: {FormatNumberBox(VideoPortBox)}");
         report.AppendLine($"视频源: {Selected(VideoSourceCombo)}");
@@ -2465,6 +3244,21 @@ public sealed partial class MainWindow : Window
         report.AppendLine($"启动参数: {FormatOptional(hostLog?.Arguments ?? TryBuildArgumentsForDiagnostics())}");
         report.AppendLine($"ADB 路径: {FormatOptional(hostLog?.AdbPath)}");
         report.AppendLine($"ADB 设备: {FormatOptional(hostLog?.AdbSerial)}");
+        report.AppendLine();
+
+        report.AppendLine("---- 最近摄像头日志 ----");
+        if (recentCameraLines.Length == 0)
+        {
+            report.AppendLine("(还没有捕获到 [CAMERA] 日志)");
+        }
+        else
+        {
+            foreach (var line in recentCameraLines)
+            {
+                report.AppendLine(line);
+            }
+        }
+
         report.AppendLine();
 
         report.AppendLine("---- 最近音频日志 ----");
@@ -2492,6 +3286,91 @@ public sealed partial class MainWindow : Window
         }
 
         return report.ToString();
+    }
+
+    private string BuildCameraDiagnosticsReport()
+    {
+        var hostLog = _currentHostLog;
+        var recentCameraLines = SnapshotRecentCameraLogLines();
+        var report = new StringBuilder();
+        report.AppendLine("SideDock 摄像头诊断报告");
+        report.AppendLine($"时间: {DateTimeOffset.Now:yyyy-MM-dd HH:mm:ss zzz}");
+        report.AppendLine();
+
+        report.AppendLine("---- 当前状态 ----");
+        report.AppendLine($"主机状态: {OverallStatusText.Text}");
+        report.AppendLine($"主机进程: {FormatHostProcessState()}");
+        report.AppendLine($"ADB reverse 状态: {AdbStatusText.Text}");
+        report.AppendLine($"摄像头 reverse: tcp:{DefaultCameraPort} -> tcp:{DefaultCameraPort}");
+        AppendCameraDiagnosticsSummary(report);
+        report.AppendLine($"最后摄像头状态日志: {FormatOptional(_lastCameraStatusLine)}");
+        report.AppendLine($"最后摄像头错误日志: {FormatOptional(_lastCameraErrorLine)}");
+        report.AppendLine($"最后摄像头错误: {FormatOptional(_lastCameraErrorMessage)}");
+        report.AppendLine();
+
+        report.AppendLine("---- Host 进程 ----");
+        report.AppendLine($"Host 路径: {FormatOptional(hostLog?.HostPath ?? _hostPath)}");
+        report.AppendLine($"工作目录: {FormatOptional(hostLog?.WorkingDirectory)}");
+        report.AppendLine($"启动参数: {FormatOptional(hostLog?.Arguments ?? TryBuildArgumentsForDiagnostics())}");
+        report.AppendLine($"ADB 路径: {FormatOptional(hostLog?.AdbPath)}");
+        report.AppendLine($"ADB 设备: {FormatOptional(hostLog?.AdbSerial)}");
+        report.AppendLine();
+
+        report.AppendLine("---- 最近摄像头日志 ----");
+        if (recentCameraLines.Length == 0)
+        {
+            report.AppendLine("(还没有捕获到 [CAMERA] 日志)");
+        }
+        else
+        {
+            foreach (var line in recentCameraLines)
+            {
+                report.AppendLine(line);
+            }
+        }
+
+        report.AppendLine();
+        report.AppendLine("---- 主机 stdout/stderr ----");
+        if (hostLog is null)
+        {
+            report.AppendLine("(当前没有主机日志缓存)");
+        }
+        else
+        {
+            report.Append(hostLog.Snapshot());
+        }
+
+        return report.ToString();
+    }
+
+    private void AppendCameraDiagnosticsSummary(StringBuilder report)
+    {
+        var camera = _cameraDiagnostics;
+        report.AppendLine($"Camera server 状态: {FormatOptional(camera.ServerState)}");
+        report.AppendLine($"Camera client 状态: {FormatOptional(camera.ClientState)}");
+        report.AppendLine($"Android 权限: {FormatOptional(camera.PermissionText)}");
+        report.AppendLine($"端口: {camera.Port}");
+        report.AppendLine($"配置: {camera.Width}x{camera.Height}@{camera.Fps} {camera.Codec}");
+        report.AppendLine($"接收包/帧/字节: {camera.Packets}/{camera.Frames}/{camera.Bytes}");
+        report.AppendLine($"Keyframe/config 包: {camera.KeyFrames}/{camera.CodecConfigPackets}");
+        report.AppendLine($"实际接收 fps: {camera.ApproxFps:F1}");
+        report.AppendLine($"码率 kbps: {camera.ApproxKbps:F0}");
+        report.AppendLine($"解码帧/错误: {camera.DecodedFrames}/{camera.DecodeErrors}");
+        report.AppendLine($"共享预览帧序号: {_lastCameraPreviewSequence}");
+        report.AppendLine($"共享预览最近时间: {FormatOptional(_lastCameraPreviewAt?.ToString("O"))}");
+        report.AppendLine($"最近接收帧时间: {FormatOptional(camera.LastFrameAt)}");
+        report.AppendLine($"最近解码帧时间: {FormatOptional(camera.LastDecodedFrameAt)}");
+        report.AppendLine($"最近错误: {FormatOptional(camera.LastError)}");
+        report.AppendLine($"虚拟摄像头注册: {_virtualCameraDiagnostics.RegistrationText}");
+        report.AppendLine($"虚拟摄像头注册范围: {FormatOptional(_virtualCameraDiagnostics.RegisteredScopeSummary)}");
+        report.AppendLine($"虚拟摄像头运行: {_virtualCameraDiagnostics.RunningText}");
+        report.AppendLine($"虚拟摄像头设备数: {_virtualCameraDiagnostics.DeviceCount}");
+        report.AppendLine($"虚拟摄像头最近供帧: {FormatOptional(_virtualCameraDiagnostics.LastServedAt?.ToString("O"))}");
+        report.AppendLine($"虚拟摄像头供帧类型: {FormatOptional(_virtualCameraDiagnostics.FrameKind)}");
+        report.AppendLine($"虚拟摄像头源帧序号: {_virtualCameraDiagnostics.SourceFrameSequence}");
+        report.AppendLine($"虚拟摄像头最后工具状态: {FormatOptional(_virtualCameraDiagnostics.LastToolState)}");
+        report.AppendLine($"虚拟摄像头最近错误: {FormatOptional(_virtualCameraDiagnostics.LastError)}");
+        report.AppendLine($"虚拟摄像头状态文件: {VirtualCameraServedStatusPath}");
     }
 
     private string? TryBuildArgumentsForDiagnostics()
@@ -2527,11 +3406,36 @@ public sealed partial class MainWindow : Window
         }
     }
 
+    private void AppendRecentCameraLogLine(string line)
+    {
+        var entry = $"[{DateTimeOffset.Now:HH:mm:ss.fff}] {line}";
+        lock (_cameraLogGate)
+        {
+            _recentCameraLogLines.Enqueue(entry);
+            while (_recentCameraLogLines.Count > MaxRecentCameraLogLines)
+            {
+                _recentCameraLogLines.Dequeue();
+            }
+        }
+    }
+
+    private string[] SnapshotRecentCameraLogLines()
+    {
+        lock (_cameraLogGate)
+        {
+            return _recentCameraLogLines.ToArray();
+        }
+    }
+
     private void ClearAudioDiagnostics()
     {
         lock (_audioLogGate)
         {
             _recentAudioLogLines.Clear();
+        }
+        lock (_cameraLogGate)
+        {
+            _recentCameraLogLines.Clear();
         }
 
         _lastMicrophoneStatusLine = null;
@@ -2542,11 +3446,22 @@ public sealed partial class MainWindow : Window
         _lastSpeakerErrorMessage = null;
         _lastMicrophoneSystemEndpointMessage = null;
         _lastSpeakerSystemEndpointMessage = null;
+        _lastCameraStatusLine = null;
+        _lastCameraErrorLine = null;
+        _lastCameraErrorMessage = null;
+        _cameraDiagnostics.Reset();
 
         if (CopyAudioLogButtonText is not null)
         {
             CopyAudioLogButtonText.Text = "复制错误日志";
         }
+
+        if (CopyCameraDiagnosticsButtonText is not null)
+        {
+            CopyCameraDiagnosticsButtonText.Text = "复制诊断";
+        }
+
+        UpdateCameraStatusView();
     }
 
     private string FormatHostProcessState()
@@ -2571,6 +3486,11 @@ public sealed partial class MainWindow : Window
 
     private void HandleHostOutputLine(string line)
     {
+        if (line.Contains("[CAMERA", StringComparison.OrdinalIgnoreCase))
+        {
+            HandleCameraHostOutputLine(line);
+        }
+
         if (!line.Contains("[AUDIO", StringComparison.OrdinalIgnoreCase))
         {
             return;
@@ -2656,6 +3576,73 @@ public sealed partial class MainWindow : Window
         UpdateAudioState(hint);
     }
 
+    private void HandleCameraHostOutputLine(string line)
+    {
+        AppendRecentCameraLogLine(line);
+
+        if (!line.Contains("camera-state=", StringComparison.OrdinalIgnoreCase)
+            && !line.Contains("camera-client-state=", StringComparison.OrdinalIgnoreCase))
+        {
+            return;
+        }
+
+        var key = line.Contains("camera-client-state=", StringComparison.OrdinalIgnoreCase)
+            ? "camera-client-state="
+            : "camera-state=";
+        var state = ExtractLogValue(line, key);
+        _lastCameraStatusLine = line;
+        var isClient = key.StartsWith("camera-client", StringComparison.OrdinalIgnoreCase);
+
+        if (isClient)
+        {
+            _cameraDiagnostics.ClientState = state;
+            _cameraDiagnostics.PermissionGranted = ExtractLogValue(line, "permission=");
+            _cameraDiagnostics.Port = ExtractLogInt(line, "port=", _cameraDiagnostics.Port);
+            ApplyCameraSize(ExtractLogValue(line, "size="));
+            _cameraDiagnostics.Fps = ExtractLogInt(line, "fps=", _cameraDiagnostics.Fps);
+            _cameraDiagnostics.Codec = NonEmpty(ExtractLogValue(line, "codec="), _cameraDiagnostics.Codec);
+            _cameraDiagnostics.ClientPackets = ExtractLogLong(line, "packets=", _cameraDiagnostics.ClientPackets);
+            _cameraDiagnostics.ClientBytes = ExtractLogLong(line, "bytes=", _cameraDiagnostics.ClientBytes);
+            _cameraDiagnostics.ClientKeyFrames = ExtractLogLong(line, "keyFrames=", _cameraDiagnostics.ClientKeyFrames);
+            _cameraDiagnostics.ClientCodecConfigPackets = ExtractLogLong(line, "codecConfigPackets=", _cameraDiagnostics.ClientCodecConfigPackets);
+        }
+        else
+        {
+            _cameraDiagnostics.ServerState = state;
+            _cameraDiagnostics.Port = ExtractLogInt(line, "port=", _cameraDiagnostics.Port);
+            ApplyCameraConfig(ExtractLogValue(line, "config="));
+            _cameraDiagnostics.Codec = NonEmpty(ExtractLogValue(line, "codec="), _cameraDiagnostics.Codec);
+            _cameraDiagnostics.Packets = ExtractLogLong(line, "packets=", _cameraDiagnostics.Packets);
+            _cameraDiagnostics.Frames = ExtractLogLong(line, "frames=", _cameraDiagnostics.Frames);
+            _cameraDiagnostics.Bytes = ExtractLogLong(line, "bytes=", _cameraDiagnostics.Bytes);
+            _cameraDiagnostics.KeyFrames = ExtractLogLong(line, "keyFrames=", _cameraDiagnostics.KeyFrames);
+            _cameraDiagnostics.CodecConfigPackets = ExtractLogLong(line, "codecConfigPackets=", _cameraDiagnostics.CodecConfigPackets);
+            _cameraDiagnostics.DecodedFrames = ExtractLogLong(line, "decodedFrames=", _cameraDiagnostics.DecodedFrames);
+            _cameraDiagnostics.DecodeErrors = ExtractLogLong(line, "decodeErrors=", _cameraDiagnostics.DecodeErrors);
+            _cameraDiagnostics.PreviewFrameSequence = ExtractLogLong(line, "previewSeq=", _cameraDiagnostics.PreviewFrameSequence);
+            _cameraDiagnostics.ApproxFps = ExtractLogDouble(line, "approxFps=", _cameraDiagnostics.ApproxFps);
+            _cameraDiagnostics.ApproxKbps = ExtractLogDouble(line, "approxKbps=", _cameraDiagnostics.ApproxKbps);
+            _cameraDiagnostics.LastFrameAt = NonEmpty(ExtractLogValue(line, "lastFrameAt="), _cameraDiagnostics.LastFrameAt);
+            _cameraDiagnostics.LastDecodedFrameAt = NonEmpty(ExtractLogValue(line, "lastDecodedFrameAt="), _cameraDiagnostics.LastDecodedFrameAt);
+        }
+
+        var decodeError = ExtractLogTail(line, " lastError=");
+        if (!string.IsNullOrWhiteSpace(decodeError))
+        {
+            _cameraDiagnostics.LastError = decodeError;
+        }
+
+        if (state is "unavailable" or "disconnected")
+        {
+            _lastCameraErrorLine = line;
+            var errorMessage = ExtractLogTail(line, " message=");
+            _lastCameraErrorMessage = string.IsNullOrWhiteSpace(errorMessage) ? null : errorMessage;
+            _cameraDiagnostics.LastError = string.IsNullOrWhiteSpace(errorMessage) ? state : errorMessage;
+        }
+
+        UpdateCameraStatusView();
+    }
+
     private static string ExtractLogValue(string line, string key)
     {
         var start = line.IndexOf(key, StringComparison.OrdinalIgnoreCase);
@@ -2692,6 +3679,67 @@ public sealed partial class MainWindow : Window
         start += key.Length;
         var end = line.IndexOf(nextKey, start, StringComparison.OrdinalIgnoreCase);
         return (end < 0 ? line[start..] : line[start..end]).Trim();
+    }
+
+    private static int ExtractLogInt(string line, string key, int fallback)
+    {
+        var value = ExtractLogValue(line, key);
+        return int.TryParse(value, NumberStyles.Integer, CultureInfo.InvariantCulture, out var parsed)
+            ? parsed
+            : fallback;
+    }
+
+    private static long ExtractLogLong(string line, string key, long fallback)
+    {
+        var value = ExtractLogValue(line, key);
+        return long.TryParse(value, NumberStyles.Integer, CultureInfo.InvariantCulture, out var parsed)
+            ? parsed
+            : fallback;
+    }
+
+    private static double ExtractLogDouble(string line, string key, double fallback)
+    {
+        var value = ExtractLogValue(line, key);
+        return double.TryParse(value, NumberStyles.Float, CultureInfo.InvariantCulture, out var parsed)
+            ? parsed
+            : fallback;
+    }
+
+    private void ApplyCameraSize(string value)
+    {
+        var parts = value.Split('x', StringSplitOptions.TrimEntries | StringSplitOptions.RemoveEmptyEntries);
+        if (parts.Length != 2)
+        {
+            return;
+        }
+
+        if (int.TryParse(parts[0], NumberStyles.Integer, CultureInfo.InvariantCulture, out var width) && width > 0)
+        {
+            _cameraDiagnostics.Width = width;
+        }
+
+        if (int.TryParse(parts[1], NumberStyles.Integer, CultureInfo.InvariantCulture, out var height) && height > 0)
+        {
+            _cameraDiagnostics.Height = height;
+        }
+    }
+
+    private void ApplyCameraConfig(string value)
+    {
+        var atIndex = value.IndexOf('@', StringComparison.Ordinal);
+        var size = atIndex >= 0 ? value[..atIndex] : value;
+        ApplyCameraSize(size);
+        if (atIndex >= 0
+            && int.TryParse(value[(atIndex + 1)..], NumberStyles.Integer, CultureInfo.InvariantCulture, out var fps)
+            && fps > 0)
+        {
+            _cameraDiagnostics.Fps = fps;
+        }
+    }
+
+    private static string NonEmpty(string value, string fallback)
+    {
+        return string.IsNullOrWhiteSpace(value) ? fallback : value;
     }
 
     private static string AudioStateHint(AudioDirection direction, AudioCapabilityStatus status)
@@ -3359,6 +4407,216 @@ public sealed partial class MainWindow : Window
         Unsupported,
         EnumerationFailed
     }
+
+    private sealed record VirtualCameraToolResult(int ExitCode, string Stdout, string Stderr);
+
+    private sealed class VirtualCameraDiagnosticsState
+    {
+        public bool Registered { get; set; }
+
+        public bool Running { get; set; }
+
+        public string RegisteredScopeSummary { get; set; } = "";
+
+        public int DeviceCount { get; set; }
+
+        public DateTimeOffset? LastServedAt { get; set; }
+
+        public long SourceFrameSequence { get; set; }
+
+        public string FrameKind { get; set; } = "";
+
+        public string LastToolState { get; set; } = "";
+
+        public string LastError { get; set; } = "";
+
+        public string RegistrationText => Registered ? "已注册" : "未注册";
+
+        public string RunningText => Running ? "运行中" : "已停止";
+    }
+
+    private sealed class CameraDiagnosticsState
+    {
+        public string ServerState { get; set; } = "idle";
+
+        public string ClientState { get; set; } = "unknown";
+
+        public string PermissionGranted { get; set; } = "";
+
+        public int Port { get; set; } = DefaultCameraPort;
+
+        public int Width { get; set; } = 1280;
+
+        public int Height { get; set; } = 720;
+
+        public int Fps { get; set; } = 30;
+
+        public string Codec { get; set; } = "video/avc";
+
+        public long Packets { get; set; }
+
+        public long Frames { get; set; }
+
+        public long Bytes { get; set; }
+
+        public long KeyFrames { get; set; }
+
+        public long CodecConfigPackets { get; set; }
+
+        public long DecodedFrames { get; set; }
+
+        public long DecodeErrors { get; set; }
+
+        public long PreviewFrameSequence { get; set; }
+
+        public double ApproxFps { get; set; }
+
+        public double ApproxKbps { get; set; }
+
+        public string LastFrameAt { get; set; } = "";
+
+        public string LastDecodedFrameAt { get; set; } = "";
+
+        public string LastError { get; set; } = "";
+
+        public long ClientPackets { get; set; }
+
+        public long ClientBytes { get; set; }
+
+        public long ClientKeyFrames { get; set; }
+
+        public long ClientCodecConfigPackets { get; set; }
+
+        public string PermissionText => string.IsNullOrWhiteSpace(PermissionGranted) ? "unknown" : PermissionGranted;
+
+        public void Reset()
+        {
+            ServerState = "idle";
+            ClientState = "unknown";
+            PermissionGranted = "";
+            Port = DefaultCameraPort;
+            Width = 1280;
+            Height = 720;
+            Fps = 30;
+            Codec = "video/avc";
+            Packets = 0;
+            Frames = 0;
+            Bytes = 0;
+            KeyFrames = 0;
+            CodecConfigPackets = 0;
+            DecodedFrames = 0;
+            DecodeErrors = 0;
+            PreviewFrameSequence = 0;
+            ApproxFps = 0;
+            ApproxKbps = 0;
+            LastFrameAt = "";
+            LastDecodedFrameAt = "";
+            LastError = "";
+            ClientPackets = 0;
+            ClientBytes = 0;
+            ClientKeyFrames = 0;
+            ClientCodecConfigPackets = 0;
+        }
+    }
+
+    private sealed class CameraPreviewFrameReader : IDisposable
+    {
+        private const string MapName = @"Local\SideDockCameraPreviewFrame";
+        private const int HeaderSize = 128;
+        private const int Magic = 0x46434453; // SDCF
+        private const int Version = 1;
+        private const int FormatBgra32 = 1;
+        private const int MaxFrameBytes = 2560 * 1440 * 4;
+
+        private readonly MemoryMappedFile _mapping;
+        private readonly MemoryMappedViewAccessor _view;
+
+        private CameraPreviewFrameReader(MemoryMappedFile mapping, MemoryMappedViewAccessor view)
+        {
+            _mapping = mapping;
+            _view = view;
+        }
+
+        public static CameraPreviewFrameReader? TryOpen()
+        {
+            try
+            {
+                var mapping = MemoryMappedFile.OpenExisting(MapName, MemoryMappedFileRights.Read);
+                var view = mapping.CreateViewAccessor(0, 0, MemoryMappedFileAccess.Read);
+                return new CameraPreviewFrameReader(mapping, view);
+            }
+            catch (FileNotFoundException)
+            {
+                return null;
+            }
+        }
+
+        public CameraPreviewFrame? TryReadLatest()
+        {
+            var sequenceBefore = _view.ReadInt64(32);
+            if (sequenceBefore <= 0 || (sequenceBefore & 1) != 0)
+            {
+                return null;
+            }
+
+            var magic = _view.ReadInt32(0);
+            var version = _view.ReadInt32(4);
+            var headerSize = _view.ReadInt32(8);
+            var width = _view.ReadInt32(12);
+            var height = _view.ReadInt32(16);
+            var stride = _view.ReadInt32(20);
+            var format = _view.ReadInt32(24);
+            var frameBytes = _view.ReadInt32(28);
+            var writtenAtUnixMs = _view.ReadInt64(48);
+            if (magic != Magic
+                || version != Version
+                || headerSize != HeaderSize
+                || format != FormatBgra32
+                || width <= 0
+                || height <= 0
+                || stride < width * 4
+                || frameBytes <= 0
+                || frameBytes > MaxFrameBytes
+                || frameBytes != stride * height)
+            {
+                return null;
+            }
+
+            var raw = new byte[frameBytes];
+            _view.ReadArray(HeaderSize, raw, 0, raw.Length);
+
+            var sequenceAfter = _view.ReadInt64(32);
+            if (sequenceAfter != sequenceBefore || (sequenceAfter & 1) != 0)
+            {
+                return null;
+            }
+
+            var bgra = stride == width * 4
+                ? raw
+                : CompactRows(raw, width, height, stride);
+            return new CameraPreviewFrame(sequenceAfter / 2, width, height, writtenAtUnixMs, bgra);
+        }
+
+        public void Dispose()
+        {
+            _view.Dispose();
+            _mapping.Dispose();
+        }
+
+        private static byte[] CompactRows(byte[] raw, int width, int height, int stride)
+        {
+            var rowBytes = width * 4;
+            var compact = new byte[rowBytes * height];
+            for (var y = 0; y < height; y++)
+            {
+                Buffer.BlockCopy(raw, y * stride, compact, y * rowBytes, rowBytes);
+            }
+
+            return compact;
+        }
+    }
+
+    private sealed record CameraPreviewFrame(long Sequence, int Width, int Height, long WrittenAtUnixMs, byte[] Bgra);
 
     private sealed class AudioPreferences
     {
