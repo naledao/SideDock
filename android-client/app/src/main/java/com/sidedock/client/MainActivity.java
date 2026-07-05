@@ -8,6 +8,7 @@ import android.content.SharedPreferences;
 import android.content.pm.PackageManager;
 import android.content.res.Configuration;
 import android.graphics.drawable.GradientDrawable;
+import android.media.AudioManager;
 import android.media.MediaCodecInfo;
 import android.media.MediaCodecList;
 import android.os.Build;
@@ -192,6 +193,7 @@ public final class MainActivity extends Activity implements ControlClient.Listen
     protected void onCreate(Bundle savedInstanceState) {
         super.onCreate(savedInstanceState);
         requestWindowFeature(Window.FEATURE_NO_TITLE);
+        setVolumeControlStream(AudioManager.STREAM_MUSIC);
         keepWindowReadyForVideoSurface();
 
         controlClient = new ControlClient(this);
@@ -695,11 +697,21 @@ public final class MainActivity extends Activity implements ControlClient.Listen
 
     @Override
     public boolean dispatchKeyEvent(KeyEvent event) {
+        if (isLocalVolumeKey(event.getKeyCode())) {
+            return super.dispatchKeyEvent(event);
+        }
+
         if (inputCollector != null && inputCollector.handleKeyEvent(event)) {
             return true;
         }
 
         return super.dispatchKeyEvent(event);
+    }
+
+    private boolean isLocalVolumeKey(int keyCode) {
+        return keyCode == KeyEvent.KEYCODE_VOLUME_UP
+            || keyCode == KeyEvent.KEYCODE_VOLUME_DOWN
+            || keyCode == KeyEvent.KEYCODE_VOLUME_MUTE;
     }
 
     @Override
