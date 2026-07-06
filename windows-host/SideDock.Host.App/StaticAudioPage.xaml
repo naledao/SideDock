@@ -57,6 +57,7 @@
                 </Grid.RowDefinitions>
 
                 <Border
+                    x:Name="AudioStatusBanner"
                     Height="74"
                     Padding="16,0"
                     CornerRadius="7"
@@ -71,31 +72,41 @@
                         </Grid.ColumnDefinitions>
 
                         <Border
+                            x:Name="AudioStatusBannerIconBackground"
                             Width="38"
                             Height="38"
                             CornerRadius="6"
                             Background="#C77C00"
                             VerticalAlignment="Center">
-                            <FontIcon Glyph="&#xE7BA;" FontSize="24" Foreground="White" />
+                            <FontIcon
+                                x:Name="AudioStatusBannerIcon"
+                                Glyph="&#xE7BA;"
+                                FontSize="24"
+                                Foreground="White" />
                         </Border>
 
                         <StackPanel Grid.Column="1" VerticalAlignment="Center" Spacing="5">
                             <TextBlock
-                                Text="音频桥接需要选择端点"
+                                x:Name="AudioStatusBannerTitleText"
+                                Text="音频状态"
                                 FontSize="15"
                                 FontWeight="SemiBold"
                                 Foreground="{StaticResource AudioWarningBrush}" />
                             <TextBlock
-                                Text="请完成麦克风端点绑定以后启用双向音频。"
+                                x:Name="AudioStatusBannerMessageText"
+                                Text="正在读取真实音频状态。"
                                 FontSize="13"
-                                Foreground="#30363D" />
+                                Foreground="#30363D"
+                                TextTrimming="CharacterEllipsis" />
                         </StackPanel>
 
                         <Button
+                            x:Name="AudioStatusBannerCloseButton"
                             Grid.Column="2"
                             Width="32"
                             Height="32"
                             Padding="0"
+                            Click="StatusBannerCloseButton_Click"
                             CornerRadius="5"
                             Background="Transparent"
                             BorderThickness="0"
@@ -112,10 +123,7 @@
                     </Grid.ColumnDefinitions>
 
                     <StackPanel Spacing="14">
-                        <Border
-                            Height="242"
-                            Padding="20,18"
-                            Style="{StaticResource AudioCardStyle}">
+                        <Border Height="242" Padding="20,18" Style="{StaticResource AudioCardStyle}">
                             <Grid RowSpacing="16">
                                 <Grid.RowDefinitions>
                                     <RowDefinition Height="Auto" />
@@ -127,27 +135,14 @@
                                         <ColumnDefinition Width="*" />
                                         <ColumnDefinition Width="Auto" />
                                     </Grid.ColumnDefinitions>
-                                    <TextBlock
-                                        Text="电脑声音发送到 Android"
-                                        FontSize="17"
-                                        FontWeight="SemiBold"
-                                        Foreground="{StaticResource AudioTextBrush}" />
+                                    <TextBlock Text="电脑声音发送到 Android" FontSize="17" FontWeight="SemiBold" Foreground="{StaticResource AudioTextBrush}" />
                                     <StackPanel Grid.Column="1" Orientation="Horizontal" Spacing="12">
-                                        <TextBlock
-                                            Text="已启用"
-                                            VerticalAlignment="Center"
-                                            FontSize="13"
-                                            Foreground="#30363D" />
-                                        <ToggleSwitch IsOn="True" />
+                                        <TextBlock x:Name="SpeakerToggleStatusText" Text="未启用" VerticalAlignment="Center" FontSize="13" Foreground="#30363D" />
+                                        <ToggleSwitch x:Name="SpeakerOutputToggle" Toggled="SpeakerOutputToggle_Toggled" />
                                     </StackPanel>
                                 </Grid>
 
-                                <Rectangle
-                                    Grid.Row="0"
-                                    Height="1"
-                                    Margin="0,34,0,0"
-                                    VerticalAlignment="Bottom"
-                                    Fill="{StaticResource AudioStrokeBrush}" />
+                                <Rectangle Grid.Row="0" Height="1" Margin="0,34,0,0" VerticalAlignment="Bottom" Fill="{StaticResource AudioStrokeBrush}" />
 
                                 <Grid Grid.Row="1" ColumnSpacing="24">
                                     <Grid.ColumnDefinitions>
@@ -160,27 +155,27 @@
                                         <Grid.ColumnDefinitions>
                                             <ColumnDefinition Width="132" />
                                             <ColumnDefinition Width="*" />
+                                            <ColumnDefinition Width="Auto" />
                                         </Grid.ColumnDefinitions>
                                         <Grid.RowDefinitions>
+                                            <RowDefinition Height="Auto" />
                                             <RowDefinition Height="Auto" />
                                             <RowDefinition Height="Auto" />
                                             <RowDefinition Height="Auto" />
                                         </Grid.RowDefinitions>
 
                                         <TextBlock Text="音频源（电脑输出）" VerticalAlignment="Center" Foreground="#30363D" />
-                                        <ComboBox Grid.Column="1" SelectedIndex="0" HorizontalAlignment="Stretch">
-                                            <ComboBoxItem Content="扬声器（Realtek Audio）" />
-                                        </ComboBox>
+                                        <ComboBox x:Name="SpeakerEndpointCombo" Grid.Column="1" HorizontalAlignment="Stretch" SelectionChanged="SpeakerEndpointCombo_SelectionChanged" />
+                                        <Button x:Name="RefreshEndpointsButton" Grid.Column="2" Width="36" Height="34" Padding="0" Click="RefreshEndpointsButton_Click" CornerRadius="5" Background="Transparent" BorderThickness="0" ToolTipService.ToolTip="刷新端点">
+                                            <FontIcon Glyph="&#xE72C;" FontSize="16" Foreground="#111827" />
+                                        </Button>
+                                        <TextBlock x:Name="SpeakerEndpointStatusText" Grid.Row="1" Grid.Column="1" Grid.ColumnSpan="2" Text="暂无端点数据" TextWrapping="Wrap" FontSize="12" Foreground="{StaticResource AudioMutedBrush}" />
 
-                                        <TextBlock Grid.Row="1" Text="捕获模式" VerticalAlignment="Center" Foreground="#30363D" />
-                                        <ComboBox Grid.Row="1" Grid.Column="1" SelectedIndex="0" HorizontalAlignment="Stretch">
-                                            <ComboBoxItem Content="Loopback" />
-                                        </ComboBox>
+                                        <TextBlock Grid.Row="2" Text="捕获模式" VerticalAlignment="Center" Foreground="#30363D" />
+                                        <TextBlock x:Name="SpeakerCaptureModeText" Grid.Row="2" Grid.Column="1" Text="WASAPI Loopback" Foreground="#30363D" />
 
-                                        <TextBlock Grid.Row="2" Text="目标设备（Android）" VerticalAlignment="Center" Foreground="#30363D" />
-                                        <ComboBox Grid.Row="2" Grid.Column="1" SelectedIndex="0" HorizontalAlignment="Stretch">
-                                            <ComboBoxItem Content="Android 音响" />
-                                        </ComboBox>
+                                        <TextBlock Grid.Row="3" Text="目标设备（Android）" VerticalAlignment="Center" Foreground="#30363D" />
+                                        <TextBlock x:Name="SpeakerTargetDeviceText" Grid.Row="3" Grid.Column="1" Text="等待 Android 设备" Foreground="#30363D" TextTrimming="CharacterEllipsis" />
                                     </Grid>
 
                                     <Rectangle Grid.Column="1" Width="1" Fill="{StaticResource AudioStrokeBrush}" />
@@ -199,41 +194,18 @@
                                         </Grid.RowDefinitions>
 
                                         <TextBlock Text="音量" VerticalAlignment="Center" Foreground="#30363D" />
-                                        <StackPanel Grid.Column="1" Orientation="Horizontal" Spacing="4" VerticalAlignment="Center">
-                                            <FontIcon Glyph="&#xE995;" FontSize="16" Margin="0,0,8,0" Foreground="#30363D" />
-                                            <Rectangle Width="6" Height="14" RadiusX="1" RadiusY="1" Fill="{StaticResource AudioBlueBrush}" />
-                                            <Rectangle Width="6" Height="14" RadiusX="1" RadiusY="1" Fill="{StaticResource AudioBlueBrush}" />
-                                            <Rectangle Width="6" Height="14" RadiusX="1" RadiusY="1" Fill="{StaticResource AudioBlueBrush}" />
-                                            <Rectangle Width="6" Height="14" RadiusX="1" RadiusY="1" Fill="{StaticResource AudioBlueBrush}" />
-                                            <Rectangle Width="6" Height="14" RadiusX="1" RadiusY="1" Fill="{StaticResource AudioBlueBrush}" />
-                                            <Rectangle Width="6" Height="14" RadiusX="1" RadiusY="1" Fill="{StaticResource AudioBlueBrush}" />
-                                            <Rectangle Width="6" Height="14" RadiusX="1" RadiusY="1" Fill="{StaticResource AudioBlueBrush}" />
-                                            <Rectangle Width="6" Height="14" RadiusX="1" RadiusY="1" Fill="{StaticResource AudioBlueBrush}" />
-                                            <Rectangle Width="6" Height="14" RadiusX="1" RadiusY="1" Fill="{StaticResource AudioBlueBrush}" />
-                                            <Rectangle Width="6" Height="14" RadiusX="1" RadiusY="1" Fill="{StaticResource AudioBlueBrush}" />
-                                            <Rectangle Width="6" Height="14" RadiusX="1" RadiusY="1" Fill="#CBD5DE" />
-                                            <Rectangle Width="6" Height="14" RadiusX="1" RadiusY="1" Fill="#CBD5DE" />
-                                            <Rectangle Width="6" Height="14" RadiusX="1" RadiusY="1" Fill="#CBD5DE" />
-                                            <Rectangle Width="6" Height="14" RadiusX="1" RadiusY="1" Fill="#CBD5DE" />
-                                        </StackPanel>
-                                        <TextBlock Grid.Column="2" Text="78%" VerticalAlignment="Center" Foreground="#30363D" />
+                                        <TextBlock x:Name="SpeakerLevelText" Grid.Column="1" Grid.ColumnSpan="2" Text="暂无实时数据" Foreground="#30363D" />
 
                                         <TextBlock Grid.Row="1" Text="状态" VerticalAlignment="Center" Foreground="#30363D" />
                                         <StackPanel Grid.Row="1" Grid.Column="1" Grid.ColumnSpan="2" Orientation="Horizontal" Spacing="8">
-                                            <Ellipse Width="10" Height="10" Fill="{StaticResource AudioSuccessBrush}" VerticalAlignment="Center" />
-                                            <TextBlock Text="可用" FontWeight="SemiBold" Foreground="{StaticResource AudioSuccessBrush}" />
+                                            <FontIcon x:Name="SpeakerCardStatusIcon" Glyph="&#xE946;" FontSize="16" Foreground="{StaticResource AudioMutedBrush}" />
+                                            <TextBlock x:Name="SpeakerCardStatusText" Text="暂无数据" FontWeight="SemiBold" Foreground="{StaticResource AudioMutedBrush}" />
                                         </StackPanel>
 
                                         <TextBlock Grid.Row="2" Text="延迟" VerticalAlignment="Center" Foreground="#30363D" />
-                                        <TextBlock Grid.Row="2" Grid.Column="1" Grid.ColumnSpan="2" Text="23 ms" Foreground="#30363D" />
+                                        <TextBlock x:Name="SpeakerLatencyText" Grid.Row="2" Grid.Column="1" Grid.ColumnSpan="2" Text="暂无数据" Foreground="#30363D" />
 
-                                        <Button
-                                            Grid.Row="3"
-                                            Grid.Column="1"
-                                            Grid.ColumnSpan="2"
-                                            MinWidth="124"
-                                            HorizontalAlignment="Right"
-                                            Style="{StaticResource AudioOutlineButtonStyle}">
+                                        <Button x:Name="TestPlaybackButton" Grid.Row="3" Grid.Column="1" Grid.ColumnSpan="2" MinWidth="124" HorizontalAlignment="Right" IsEnabled="False" ToolTipService.ToolTip="暂未实现" Style="{StaticResource AudioOutlineButtonStyle}">
                                             <StackPanel Orientation="Horizontal" Spacing="8">
                                                 <FontIcon Glyph="&#xE768;" FontSize="16" Foreground="#30363D" />
                                                 <TextBlock Text="测试播放" />
@@ -244,10 +216,7 @@
                             </Grid>
                         </Border>
 
-                        <Border
-                            Height="230"
-                            Padding="20,18"
-                            Style="{StaticResource AudioCardStyle}">
+                        <Border Height="230" Padding="20,18" Style="{StaticResource AudioCardStyle}">
                             <Grid RowSpacing="16">
                                 <Grid.RowDefinitions>
                                     <RowDefinition Height="Auto" />
@@ -259,27 +228,14 @@
                                         <ColumnDefinition Width="*" />
                                         <ColumnDefinition Width="Auto" />
                                     </Grid.ColumnDefinitions>
-                                    <TextBlock
-                                        Text="Android 麦克风写入 Windows"
-                                        FontSize="17"
-                                        FontWeight="SemiBold"
-                                        Foreground="{StaticResource AudioTextBrush}" />
+                                    <TextBlock Text="Android 麦克风写入 Windows" FontSize="17" FontWeight="SemiBold" Foreground="{StaticResource AudioTextBrush}" />
                                     <StackPanel Grid.Column="1" Orientation="Horizontal" Spacing="12">
-                                        <TextBlock
-                                            Text="已启用"
-                                            VerticalAlignment="Center"
-                                            FontSize="13"
-                                            Foreground="#30363D" />
-                                        <ToggleSwitch IsOn="True" />
+                                        <TextBlock x:Name="MicrophoneToggleStatusText" Text="未启用" VerticalAlignment="Center" FontSize="13" Foreground="#30363D" />
+                                        <ToggleSwitch x:Name="MicrophoneInputToggle" Toggled="MicrophoneInputToggle_Toggled" />
                                     </StackPanel>
                                 </Grid>
 
-                                <Rectangle
-                                    Grid.Row="0"
-                                    Height="1"
-                                    Margin="0,34,0,0"
-                                    VerticalAlignment="Bottom"
-                                    Fill="{StaticResource AudioStrokeBrush}" />
+                                <Rectangle Grid.Row="0" Height="1" Margin="0,34,0,0" VerticalAlignment="Bottom" Fill="{StaticResource AudioStrokeBrush}" />
 
                                 <Grid Grid.Row="1" ColumnSpacing="24">
                                     <Grid.ColumnDefinitions>
@@ -297,43 +253,20 @@
                                         <Grid.RowDefinitions>
                                             <RowDefinition Height="Auto" />
                                             <RowDefinition Height="Auto" />
+                                            <RowDefinition Height="Auto" />
                                         </Grid.RowDefinitions>
 
-                                        <TextBlock
-                                            Text="麦克风端点（Windows 输入）"
-                                            VerticalAlignment="Center"
-                                            Foreground="#30363D" />
-                                        <ComboBox Grid.Column="1" SelectedIndex="0" HorizontalAlignment="Stretch">
-                                            <ComboBoxItem Content="CABLE Output (VB-Audio Virtual Cable)" />
-                                        </ComboBox>
-                                        <Button
-                                            Grid.Column="2"
-                                            Width="36"
-                                            Height="34"
-                                            Padding="0"
-                                            CornerRadius="5"
-                                            Background="Transparent"
-                                            BorderThickness="0">
+                                        <TextBlock Text="麦克风写入端点" VerticalAlignment="Center" Foreground="#30363D" />
+                                        <ComboBox x:Name="MicrophoneEndpointCombo" Grid.Column="1" HorizontalAlignment="Stretch" SelectionChanged="MicrophoneEndpointCombo_SelectionChanged" />
+                                        <Button x:Name="RefreshMicrophoneEndpointsButton" Grid.Column="2" Width="36" Height="34" Padding="0" Click="RefreshEndpointsButton_Click" CornerRadius="5" Background="Transparent" BorderThickness="0" ToolTipService.ToolTip="刷新端点">
                                             <FontIcon Glyph="&#xE72C;" FontSize="16" Foreground="#111827" />
                                         </Button>
 
-                                        <TextBlock
-                                            Grid.Row="1"
-                                            Text="渲染端点（Windows 输出）"
-                                            VerticalAlignment="Center"
-                                            Foreground="#30363D" />
-                                        <ComboBox Grid.Row="1" Grid.Column="1" SelectedIndex="0" HorizontalAlignment="Stretch">
-                                            <ComboBoxItem Content="CABLE Input (VB-Audio Virtual Cable)" />
-                                        </ComboBox>
-                                        <Button
-                                            Grid.Row="1"
-                                            Grid.Column="2"
-                                            Width="36"
-                                            Height="34"
-                                            Padding="0"
-                                            CornerRadius="5"
-                                            Background="Transparent"
-                                            BorderThickness="0">
+                                        <TextBlock x:Name="MicrophoneEndpointStatusText" Grid.Row="1" Grid.Column="1" Grid.ColumnSpan="2" Text="暂无端点数据" FontSize="12" Foreground="{StaticResource AudioMutedBrush}" TextWrapping="Wrap" />
+
+                                        <TextBlock Grid.Row="2" Text="目标设备（Android）" VerticalAlignment="Center" Foreground="#30363D" />
+                                        <TextBlock x:Name="MicrophoneTargetDeviceText" Grid.Row="2" Grid.Column="1" Text="等待 Android 设备" Foreground="#30363D" TextTrimming="CharacterEllipsis" />
+                                        <Button x:Name="RefreshMicrophoneRenderButton" Grid.Row="2" Grid.Column="2" Width="36" Height="34" Padding="0" Click="RefreshEndpointsButton_Click" CornerRadius="5" Background="Transparent" BorderThickness="0" ToolTipService.ToolTip="刷新端点">
                                             <FontIcon Glyph="&#xE72C;" FontSize="16" Foreground="#111827" />
                                         </Button>
                                     </Grid>
@@ -354,41 +287,18 @@
                                         </Grid.RowDefinitions>
 
                                         <TextBlock Text="输入电平" VerticalAlignment="Center" Foreground="#30363D" />
-                                        <StackPanel Grid.Column="1" Orientation="Horizontal" Spacing="4" VerticalAlignment="Center">
-                                            <FontIcon Glyph="&#xE720;" FontSize="16" Margin="0,0,8,0" Foreground="#30363D" />
-                                            <Rectangle Width="6" Height="14" RadiusX="1" RadiusY="1" Fill="{StaticResource AudioBlueBrush}" />
-                                            <Rectangle Width="6" Height="14" RadiusX="1" RadiusY="1" Fill="{StaticResource AudioBlueBrush}" />
-                                            <Rectangle Width="6" Height="14" RadiusX="1" RadiusY="1" Fill="{StaticResource AudioBlueBrush}" />
-                                            <Rectangle Width="6" Height="14" RadiusX="1" RadiusY="1" Fill="{StaticResource AudioBlueBrush}" />
-                                            <Rectangle Width="6" Height="14" RadiusX="1" RadiusY="1" Fill="{StaticResource AudioBlueBrush}" />
-                                            <Rectangle Width="6" Height="14" RadiusX="1" RadiusY="1" Fill="{StaticResource AudioBlueBrush}" />
-                                            <Rectangle Width="6" Height="14" RadiusX="1" RadiusY="1" Fill="{StaticResource AudioBlueBrush}" />
-                                            <Rectangle Width="6" Height="14" RadiusX="1" RadiusY="1" Fill="{StaticResource AudioBlueBrush}" />
-                                            <Rectangle Width="6" Height="14" RadiusX="1" RadiusY="1" Fill="{StaticResource AudioBlueBrush}" />
-                                            <Rectangle Width="6" Height="14" RadiusX="1" RadiusY="1" Fill="#CBD5DE" />
-                                            <Rectangle Width="6" Height="14" RadiusX="1" RadiusY="1" Fill="#CBD5DE" />
-                                            <Rectangle Width="6" Height="14" RadiusX="1" RadiusY="1" Fill="#CBD5DE" />
-                                            <Rectangle Width="6" Height="14" RadiusX="1" RadiusY="1" Fill="#CBD5DE" />
-                                            <Rectangle Width="6" Height="14" RadiusX="1" RadiusY="1" Fill="#CBD5DE" />
-                                        </StackPanel>
-                                        <TextBlock Grid.Column="2" Text="65%" VerticalAlignment="Center" Foreground="#30363D" />
+                                        <TextBlock x:Name="MicrophoneLevelText" Grid.Column="1" Grid.ColumnSpan="2" Text="暂无实时数据" Foreground="#30363D" />
 
                                         <TextBlock Grid.Row="1" Text="状态" VerticalAlignment="Center" Foreground="#30363D" />
                                         <StackPanel Grid.Row="1" Grid.Column="1" Grid.ColumnSpan="2" Orientation="Horizontal" Spacing="8">
-                                            <FontIcon Glyph="&#xE7BA;" FontSize="16" Foreground="{StaticResource AudioWarningBrush}" />
-                                            <TextBlock Text="需要绑定" FontWeight="SemiBold" Foreground="{StaticResource AudioWarningBrush}" />
+                                            <FontIcon x:Name="MicrophoneCardStatusIcon" Glyph="&#xE946;" FontSize="16" Foreground="{StaticResource AudioMutedBrush}" />
+                                            <TextBlock x:Name="MicrophoneCardStatusText" Text="暂无数据" FontWeight="SemiBold" Foreground="{StaticResource AudioMutedBrush}" />
                                         </StackPanel>
 
                                         <TextBlock Grid.Row="2" Text="延迟" VerticalAlignment="Center" Foreground="#30363D" />
-                                        <TextBlock Grid.Row="2" Grid.Column="1" Grid.ColumnSpan="2" Text="--" Foreground="#30363D" />
+                                        <TextBlock x:Name="MicrophoneLatencyText" Grid.Row="2" Grid.Column="1" Grid.ColumnSpan="2" Text="暂无数据" Foreground="#30363D" />
 
-                                        <Button
-                                            Grid.Row="3"
-                                            Grid.Column="1"
-                                            Grid.ColumnSpan="2"
-                                            MinWidth="124"
-                                            HorizontalAlignment="Right"
-                                            Style="{StaticResource AudioOutlineButtonStyle}">
+                                        <Button x:Name="TestRecordingButton" Grid.Row="3" Grid.Column="1" Grid.ColumnSpan="2" MinWidth="124" HorizontalAlignment="Right" IsEnabled="False" ToolTipService.ToolTip="暂未实现" Style="{StaticResource AudioOutlineButtonStyle}">
                                             <StackPanel Orientation="Horizontal" Spacing="8">
                                                 <FontIcon Glyph="&#xE720;" FontSize="16" Foreground="#30363D" />
                                                 <TextBlock Text="测试录音" />
@@ -401,17 +311,11 @@
 
                         <StackPanel Orientation="Horizontal" Spacing="8">
                             <FontIcon Glyph="&#xE946;" FontSize="14" Foreground="#30363D" />
-                            <TextBlock
-                                Text="提示：请确保虚拟音频线已安装，并在 Windows 声音设置中设置为默认设备（如需要）。"
-                                FontSize="12"
-                                Foreground="{StaticResource AudioMutedBrush}" />
+                            <TextBlock x:Name="AudioInlineHintText" Text="暂无数据。" FontSize="12" Foreground="{StaticResource AudioMutedBrush}" TextWrapping="WrapWholeWords" />
                         </StackPanel>
                     </StackPanel>
 
-                    <Border
-                        Grid.Column="1"
-                        Padding="18"
-                        Style="{StaticResource AudioCardStyle}">
+                    <Border Grid.Column="1" Padding="18" Style="{StaticResource AudioCardStyle}">
                         <Grid RowSpacing="16">
                             <Grid.RowDefinitions>
                                 <RowDefinition Height="Auto" />
@@ -422,11 +326,7 @@
                                 <RowDefinition Height="Auto" />
                             </Grid.RowDefinitions>
 
-                            <TextBlock
-                                Text="端点向导"
-                                FontSize="17"
-                                FontWeight="SemiBold"
-                                Foreground="{StaticResource AudioTextBrush}" />
+                            <TextBlock Text="端点向导" FontSize="17" FontWeight="SemiBold" Foreground="{StaticResource AudioTextBrush}" />
                             <Rectangle Grid.Row="1" Height="1" Fill="{StaticResource AudioStrokeBrush}" />
 
                             <Grid Grid.Row="2" RowSpacing="0">
@@ -450,7 +350,7 @@
                                         <TextBlock Text="安装虚拟音频线" FontSize="15" FontWeight="SemiBold" Foreground="{StaticResource AudioTextBrush}" />
                                         <TextBlock Text="安装或修复 VB-Audio Virtual Cable。" FontSize="12" Foreground="{StaticResource AudioMutedBrush}" />
                                     </StackPanel>
-                                    <FontIcon Grid.Column="2" Glyph="&#xE73E;" FontSize="17" Foreground="{StaticResource AudioSuccessBrush}" />
+                                    <FontIcon x:Name="WizardInstallStepIcon" Grid.Column="2" Glyph="&#xE10A;" FontSize="17" Foreground="{StaticResource AudioMutedBrush}" />
                                 </Grid>
 
                                 <Grid Grid.Row="1" ColumnSpacing="14">
@@ -466,7 +366,7 @@
                                         <TextBlock Text="选择电脑输出" FontSize="15" FontWeight="SemiBold" Foreground="{StaticResource AudioTextBrush}" />
                                         <TextBlock Text="选择要发送到 Android 的电脑声音源。" FontSize="12" Foreground="{StaticResource AudioMutedBrush}" />
                                     </StackPanel>
-                                    <FontIcon Grid.Column="2" Glyph="&#xE73E;" FontSize="17" Foreground="{StaticResource AudioSuccessBrush}" />
+                                    <FontIcon x:Name="WizardSpeakerStepIcon" Grid.Column="2" Glyph="&#xE10A;" FontSize="17" Foreground="{StaticResource AudioMutedBrush}" />
                                 </Grid>
 
                                 <Grid Grid.Row="2" ColumnSpacing="14">
@@ -480,9 +380,9 @@
                                     </Border>
                                     <StackPanel Grid.Column="1" Spacing="4">
                                         <TextBlock Text="选择麦克风端点" FontSize="15" FontWeight="SemiBold" Foreground="{StaticResource AudioTextBrush}" />
-                                        <TextBlock Text="将 CABLE Output 绑定为麦克风输入。" FontSize="12" Foreground="{StaticResource AudioMutedBrush}" />
+                                        <TextBlock Text="选择可写入的虚拟音频端点。" FontSize="12" Foreground="{StaticResource AudioMutedBrush}" />
                                     </StackPanel>
-                                    <FontIcon Grid.Column="2" Glyph="&#xE7BA;" FontSize="17" Foreground="{StaticResource AudioWarningBrush}" />
+                                    <FontIcon x:Name="WizardMicrophoneStepIcon" Grid.Column="2" Glyph="&#xE10A;" FontSize="17" Foreground="{StaticResource AudioMutedBrush}" />
                                 </Grid>
 
                                 <Grid Grid.Row="3" ColumnSpacing="14">
@@ -496,54 +396,43 @@
                                     </Border>
                                     <StackPanel Grid.Column="1" Spacing="4">
                                         <TextBlock Text="测试回声" FontSize="15" FontWeight="SemiBold" Foreground="{StaticResource AudioTextBrush}" />
-                                        <TextBlock Text="测试双向音频是否正常工作。" FontSize="12" Foreground="{StaticResource AudioMutedBrush}" />
+                                        <TextBlock Text="暂未实现真实测试协议。" FontSize="12" Foreground="{StaticResource AudioMutedBrush}" />
                                     </StackPanel>
-                                    <Ellipse Grid.Column="2" Width="18" Height="18" Stroke="{StaticResource AudioStrokeBrush}" StrokeThickness="1" />
+                                    <FontIcon x:Name="WizardTestStepIcon" Grid.Column="2" Glyph="&#xE711;" FontSize="17" Foreground="{StaticResource AudioMutedBrush}" />
                                 </Grid>
                             </Grid>
 
                             <Grid Grid.Row="4" ColumnSpacing="16">
                                 <Grid.ColumnDefinitions>
                                     <ColumnDefinition Width="*" />
+                                    <ColumnDefinition Width="Auto" />
                                     <ColumnDefinition Width="52" />
                                 </Grid.ColumnDefinitions>
-                                <Button Style="{StaticResource AudioPrimaryButtonStyle}">
+                                <Button x:Name="RepairEndpointsButton" Click="InstallVirtualAudioCableButton_Click" Style="{StaticResource AudioPrimaryButtonStyle}">
                                     <StackPanel Orientation="Horizontal" Spacing="10" HorizontalAlignment="Center">
                                         <FontIcon Glyph="&#xE90F;" FontSize="18" Foreground="White" />
                                         <TextBlock Text="修复端点" FontWeight="SemiBold" />
                                     </StackPanel>
                                 </Button>
-                                <Button
-                                    Grid.Column="1"
-                                    Width="52"
-                                    Height="42"
-                                    Padding="0"
-                                    CornerRadius="5"
-                                    Background="#FFFFFF"
-                                    BorderBrush="{StaticResource AudioStrokeBrush}">
-                                    <FontIcon Glyph="&#xE712;" FontSize="17" Foreground="#111827" />
+                                <Button x:Name="TestEchoButton" Grid.Column="1" IsEnabled="False" ToolTipService.ToolTip="暂未实现" Style="{StaticResource AudioOutlineButtonStyle}">
+                                    <StackPanel Orientation="Horizontal" Spacing="8">
+                                        <FontIcon Glyph="&#xE720;" FontSize="16" Foreground="#30363D" />
+                                        <TextBlock Text="测试回声" />
+                                    </StackPanel>
+                                </Button>
+                                <Button x:Name="WizardOpenSoundSettingsButton" Grid.Column="2" Width="52" Height="42" Padding="0" Click="OpenSoundSettingsButton_Click" CornerRadius="5" Background="#FFFFFF" BorderBrush="{StaticResource AudioStrokeBrush}" ToolTipService.ToolTip="打开声音设置">
+                                    <FontIcon Glyph="&#xE713;" FontSize="17" Foreground="#111827" />
                                 </Button>
                             </Grid>
 
-                            <Border
-                                Grid.Row="5"
-                                Padding="12"
-                                CornerRadius="5"
-                                Background="#F8FAFC"
-                                BorderBrush="#8FB8FF"
-                                BorderThickness="1">
+                            <Border Grid.Row="5" Padding="12" CornerRadius="5" Background="#F8FAFC" BorderBrush="#8FB8FF" BorderThickness="1">
                                 <Grid ColumnSpacing="10">
                                     <Grid.ColumnDefinitions>
                                         <ColumnDefinition Width="Auto" />
                                         <ColumnDefinition Width="*" />
                                     </Grid.ColumnDefinitions>
                                     <FontIcon Glyph="&#xE946;" FontSize="16" Foreground="#30363D" />
-                                    <TextBlock
-                                        Grid.Column="1"
-                                        Text="修复端点将自动安装虚拟线缆并设置默认端点。"
-                                        FontSize="12"
-                                        Foreground="#30363D"
-                                        TextWrapping="Wrap" />
+                                    <TextBlock x:Name="WizardRepairHintText" Grid.Column="1" Text="修复端点会启动已有的虚拟音频线安装/修复流程。" FontSize="12" Foreground="#30363D" TextWrapping="Wrap" />
                                 </Grid>
                             </Border>
                         </Grid>
@@ -577,28 +466,18 @@
                                     <RowDefinition Height="Auto" />
                                 </Grid.RowDefinitions>
                                 <TextBlock Text="端点" FontSize="12" Foreground="{StaticResource AudioMutedBrush}" />
-                                <TextBlock Grid.Column="1" Text="CABLE Output" FontSize="12" Foreground="#30363D" />
+                                <TextBlock x:Name="MicrophoneEndpointSummaryText" Grid.Column="1" Text="未绑定" FontSize="12" Foreground="#30363D" TextTrimming="CharacterEllipsis" />
                                 <TextBlock Grid.Row="1" Text="状态" FontSize="12" Foreground="{StaticResource AudioMutedBrush}" />
                                 <StackPanel Grid.Row="1" Grid.Column="1" Orientation="Horizontal" Spacing="6">
-                                    <FontIcon Glyph="&#xE7BA;" FontSize="13" Foreground="{StaticResource AudioWarningBrush}" />
-                                    <TextBlock Text="需要绑定" FontSize="12" FontWeight="SemiBold" Foreground="{StaticResource AudioWarningBrush}" />
+                                    <FontIcon x:Name="MicrophoneSummaryStatusIcon" Glyph="&#xE946;" FontSize="13" Foreground="{StaticResource AudioMutedBrush}" />
+                                    <TextBlock x:Name="MicrophoneSummaryStatusText" Text="暂无数据" FontSize="12" FontWeight="SemiBold" Foreground="{StaticResource AudioMutedBrush}" />
                                 </StackPanel>
                                 <TextBlock Grid.Row="2" Text="格式" FontSize="12" Foreground="{StaticResource AudioMutedBrush}" />
-                                <TextBlock Grid.Row="2" Grid.Column="1" Text="48 kHz, 16-bit, 2ch" FontSize="12" Foreground="#30363D" />
+                                <TextBlock x:Name="MicrophoneFormatText" Grid.Row="2" Grid.Column="1" Text="48 kHz, 16-bit, 2ch" FontSize="12" Foreground="#30363D" />
                                 <TextBlock Grid.Row="3" Text="电平" FontSize="12" Foreground="{StaticResource AudioMutedBrush}" />
-                                <StackPanel Grid.Row="3" Grid.Column="1" Orientation="Horizontal" Spacing="4">
-                                    <Rectangle Width="6" Height="12" Fill="{StaticResource AudioBlueBrush}" />
-                                    <Rectangle Width="6" Height="12" Fill="{StaticResource AudioBlueBrush}" />
-                                    <Rectangle Width="6" Height="12" Fill="{StaticResource AudioBlueBrush}" />
-                                    <Rectangle Width="6" Height="12" Fill="{StaticResource AudioBlueBrush}" />
-                                    <Rectangle Width="6" Height="12" Fill="{StaticResource AudioBlueBrush}" />
-                                    <Rectangle Width="6" Height="12" Fill="{StaticResource AudioBlueBrush}" />
-                                    <Rectangle Width="6" Height="12" Fill="#CBD5DE" />
-                                    <Rectangle Width="6" Height="12" Fill="#CBD5DE" />
-                                    <TextBlock Text="65%" Margin="8,0,0,0" FontSize="12" Foreground="#30363D" />
-                                </StackPanel>
+                                <TextBlock x:Name="MicrophoneLevelSummaryText" Grid.Row="3" Grid.Column="1" Text="暂无实时数据" FontSize="12" Foreground="#30363D" />
                             </Grid>
-                            <Button Style="{StaticResource AudioOutlineButtonStyle}">
+                            <Button x:Name="MicrophoneOpenSoundSettingsButton" Click="OpenSoundSettingsButton_Click" Style="{StaticResource AudioOutlineButtonStyle}">
                                 <StackPanel Orientation="Horizontal" Spacing="8">
                                     <FontIcon Glyph="&#xE713;" FontSize="16" Foreground="#30363D" />
                                     <TextBlock Text="打开声音设置" />
@@ -626,28 +505,18 @@
                                     <RowDefinition Height="Auto" />
                                 </Grid.RowDefinitions>
                                 <TextBlock Text="端点" FontSize="12" Foreground="{StaticResource AudioMutedBrush}" />
-                                <TextBlock Grid.Column="1" Text="Android 音响" FontSize="12" Foreground="#30363D" />
+                                <TextBlock x:Name="SpeakerEndpointSummaryText" Grid.Column="1" Text="未绑定" FontSize="12" Foreground="#30363D" TextTrimming="CharacterEllipsis" />
                                 <TextBlock Grid.Row="1" Text="状态" FontSize="12" Foreground="{StaticResource AudioMutedBrush}" />
                                 <StackPanel Grid.Row="1" Grid.Column="1" Orientation="Horizontal" Spacing="6">
-                                    <Ellipse Width="10" Height="10" Fill="{StaticResource AudioSuccessBrush}" VerticalAlignment="Center" />
-                                    <TextBlock Text="可用" FontSize="12" FontWeight="SemiBold" Foreground="{StaticResource AudioSuccessBrush}" />
+                                    <FontIcon x:Name="SpeakerSummaryStatusIcon" Glyph="&#xE946;" FontSize="13" Foreground="{StaticResource AudioMutedBrush}" />
+                                    <TextBlock x:Name="SpeakerSummaryStatusText" Text="暂无数据" FontSize="12" FontWeight="SemiBold" Foreground="{StaticResource AudioMutedBrush}" />
                                 </StackPanel>
                                 <TextBlock Grid.Row="2" Text="格式" FontSize="12" Foreground="{StaticResource AudioMutedBrush}" />
-                                <TextBlock Grid.Row="2" Grid.Column="1" Text="48 kHz, 16-bit, 2ch" FontSize="12" Foreground="#30363D" />
+                                <TextBlock x:Name="SpeakerFormatText" Grid.Row="2" Grid.Column="1" Text="48 kHz, 16-bit, 2ch" FontSize="12" Foreground="#30363D" />
                                 <TextBlock Grid.Row="3" Text="音量" FontSize="12" Foreground="{StaticResource AudioMutedBrush}" />
-                                <StackPanel Grid.Row="3" Grid.Column="1" Orientation="Horizontal" Spacing="4">
-                                    <Rectangle Width="6" Height="12" Fill="{StaticResource AudioBlueBrush}" />
-                                    <Rectangle Width="6" Height="12" Fill="{StaticResource AudioBlueBrush}" />
-                                    <Rectangle Width="6" Height="12" Fill="{StaticResource AudioBlueBrush}" />
-                                    <Rectangle Width="6" Height="12" Fill="{StaticResource AudioBlueBrush}" />
-                                    <Rectangle Width="6" Height="12" Fill="{StaticResource AudioBlueBrush}" />
-                                    <Rectangle Width="6" Height="12" Fill="{StaticResource AudioBlueBrush}" />
-                                    <Rectangle Width="6" Height="12" Fill="#CBD5DE" />
-                                    <Rectangle Width="6" Height="12" Fill="#CBD5DE" />
-                                    <TextBlock Text="78%" Margin="8,0,0,0" FontSize="12" Foreground="#30363D" />
-                                </StackPanel>
+                                <TextBlock x:Name="SpeakerLevelSummaryText" Grid.Row="3" Grid.Column="1" Text="暂无实时数据" FontSize="12" Foreground="#30363D" />
                             </Grid>
-                            <Button Style="{StaticResource AudioOutlineButtonStyle}">
+                            <Button x:Name="SpeakerOpenSoundSettingsButton" Click="OpenSoundSettingsButton_Click" Style="{StaticResource AudioOutlineButtonStyle}">
                                 <StackPanel Orientation="Horizontal" Spacing="8">
                                     <FontIcon Glyph="&#xE713;" FontSize="16" Foreground="#30363D" />
                                     <TextBlock Text="打开声音设置" />
@@ -678,18 +547,18 @@
                                 <TextBlock Grid.Column="1" Text="VB-Audio Virtual Cable" FontSize="12" Foreground="#30363D" />
                                 <TextBlock Grid.Row="1" Text="状态" FontSize="12" Foreground="{StaticResource AudioMutedBrush}" />
                                 <StackPanel Grid.Row="1" Grid.Column="1" Orientation="Horizontal" Spacing="6">
-                                    <Ellipse Width="10" Height="10" Fill="{StaticResource AudioSuccessBrush}" VerticalAlignment="Center" />
-                                    <TextBlock Text="已安装" FontSize="12" FontWeight="SemiBold" Foreground="{StaticResource AudioSuccessBrush}" />
+                                    <FontIcon x:Name="VirtualCableStatusIcon" Glyph="&#xE946;" FontSize="13" Foreground="{StaticResource AudioMutedBrush}" />
+                                    <TextBlock x:Name="VirtualCableStatusText" Text="暂无数据" FontSize="12" FontWeight="SemiBold" Foreground="{StaticResource AudioMutedBrush}" />
                                 </StackPanel>
                                 <TextBlock Grid.Row="2" Text="版本" FontSize="12" Foreground="{StaticResource AudioMutedBrush}" />
-                                <TextBlock Grid.Row="2" Grid.Column="1" Text="1.1.1.0" FontSize="12" Foreground="#30363D" />
+                                <TextBlock x:Name="VirtualCableVersionText" Grid.Row="2" Grid.Column="1" Text="不可用" FontSize="12" Foreground="#30363D" />
                                 <TextBlock Grid.Row="3" Text="端点" FontSize="12" Foreground="{StaticResource AudioMutedBrush}" />
-                                <TextBlock Grid.Row="3" Grid.Column="1" Text="2 (Input / Output)" FontSize="12" Foreground="#30363D" />
+                                <TextBlock x:Name="VirtualCableEndpointText" Grid.Row="3" Grid.Column="1" Text="暂无数据" FontSize="12" Foreground="#30363D" />
                             </Grid>
-                            <Button Style="{StaticResource AudioOutlineButtonStyle}">
+                            <Button x:Name="ReloadVirtualCableButton" Click="InstallVirtualAudioCableButton_Click" Style="{StaticResource AudioOutlineButtonStyle}">
                                 <StackPanel Orientation="Horizontal" Spacing="8">
                                     <FontIcon Glyph="&#xE72C;" FontSize="16" Foreground="#30363D" />
-                                    <TextBlock Text="重新加载驱动" />
+                                    <TextBlock Text="安装/修复" />
                                 </StackPanel>
                             </Button>
                         </StackPanel>
@@ -702,41 +571,25 @@
                                 <TextBlock Text="最近日志" FontSize="15" FontWeight="SemiBold" Foreground="{StaticResource AudioTextBrush}" />
                             </StackPanel>
                             <Rectangle Height="1" Fill="{StaticResource AudioStrokeBrush}" />
-                            <Grid RowSpacing="8">
+                            <StackPanel x:Name="RecentAudioLogStackPanel" MinHeight="128" Spacing="8" />
+                            <Grid ColumnSpacing="8">
                                 <Grid.ColumnDefinitions>
-                                    <ColumnDefinition Width="Auto" />
                                     <ColumnDefinition Width="*" />
-                                    <ColumnDefinition Width="Auto" />
+                                    <ColumnDefinition Width="*" />
                                 </Grid.ColumnDefinitions>
-                                <Grid.RowDefinitions>
-                                    <RowDefinition Height="Auto" />
-                                    <RowDefinition Height="Auto" />
-                                    <RowDefinition Height="Auto" />
-                                    <RowDefinition Height="Auto" />
-                                    <RowDefinition Height="Auto" />
-                                </Grid.RowDefinitions>
-                                <TextBlock Text="10:42:18" FontSize="12" Foreground="{StaticResource AudioMutedBrush}" />
-                                <TextBlock Grid.Column="1" Text="播放：连接到 Android 音响" FontSize="12" Foreground="#30363D" />
-                                <FontIcon Grid.Column="2" Glyph="&#xE946;" FontSize="13" Foreground="#0B67E3" />
-                                <TextBlock Grid.Row="1" Text="10:42:18" FontSize="12" Foreground="{StaticResource AudioMutedBrush}" />
-                                <TextBlock Grid.Row="1" Grid.Column="1" Text="Capture Loopback 已启动" FontSize="12" Foreground="#30363D" />
-                                <FontIcon Grid.Row="1" Grid.Column="2" Glyph="&#xE946;" FontSize="13" Foreground="#0B67E3" />
-                                <TextBlock Grid.Row="2" Text="10:42:15" FontSize="12" Foreground="{StaticResource AudioMutedBrush}" />
-                                <TextBlock Grid.Row="2" Grid.Column="1" Text="麦克风端点未绑定" FontSize="12" Foreground="#30363D" />
-                                <FontIcon Grid.Row="2" Grid.Column="2" Glyph="&#xE7BA;" FontSize="13" Foreground="{StaticResource AudioWarningBrush}" />
-                                <TextBlock Grid.Row="3" Text="10:42:15" FontSize="12" Foreground="{StaticResource AudioMutedBrush}" />
-                                <TextBlock Grid.Row="3" Grid.Column="1" Text="虚拟音频线已检测" FontSize="12" Foreground="#30363D" />
-                                <FontIcon Grid.Row="3" Grid.Column="2" Glyph="&#xE946;" FontSize="13" Foreground="#0B67E3" />
-                                <TextBlock Grid.Row="4" Text="10:42:10" FontSize="12" Foreground="{StaticResource AudioMutedBrush}" />
-                                <TextBlock Grid.Row="4" Grid.Column="1" Text="音频服务已就绪" FontSize="12" Foreground="#30363D" />
-                                <FontIcon Grid.Row="4" Grid.Column="2" Glyph="&#xE73E;" FontSize="13" Foreground="{StaticResource AudioSuccessBrush}" />
+                                <Button x:Name="CopyAudioLogButton" Click="CopyLogButton_Click" Style="{StaticResource AudioOutlineButtonStyle}">
+                                    <StackPanel Orientation="Horizontal" Spacing="8">
+                                        <FontIcon Glyph="&#xE8C8;" FontSize="16" Foreground="#30363D" />
+                                        <TextBlock Text="复制" />
+                                    </StackPanel>
+                                </Button>
+                                <Button x:Name="ViewAudioLogButton" Grid.Column="1" Click="ShowLogsButton_Click" Style="{StaticResource AudioOutlineButtonStyle}">
+                                    <StackPanel Orientation="Horizontal" Spacing="8">
+                                        <FontIcon Glyph="&#xE8A7;" FontSize="16" Foreground="#30363D" />
+                                        <TextBlock Text="查看" />
+                                    </StackPanel>
+                                </Button>
                             </Grid>
-                            <Button Style="{StaticResource AudioOutlineButtonStyle}">
-                                <StackPanel Orientation="Horizontal" Spacing="8">
-                                    <FontIcon Glyph="&#xE8A7;" FontSize="16" Foreground="#30363D" />
-                                    <TextBlock Text="查看完整日志" />
-                                </StackPanel>
-                            </Button>
                         </StackPanel>
                     </Border>
                 </Grid>

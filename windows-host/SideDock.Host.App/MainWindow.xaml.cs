@@ -229,8 +229,10 @@ public sealed partial class MainWindow : Window
     private bool _syncingOverviewCameraOptions;
     private bool _updatingOverviewCameraSwitch;
     private bool _updatingOverviewAudioSwitch;
+    private bool _updatingStaticAudioPage;
     private bool _overviewCameraOperationInProgress;
     private bool _overviewCameraRequestedEnabled = true;
+    private bool _virtualAudioCableInstallInProgress;
     private VirtualDisplayOverviewState? _virtualDisplayTransientState;
     private string? _virtualDisplayLastError;
     private string? _driverInstallLastError;
@@ -302,6 +304,7 @@ public sealed partial class MainWindow : Window
         InitializeComponent();
         _uiReady = true;
         WireStaticDisplayPage();
+        WireStaticAudioPage();
         StaticOverviewShell.Visibility = StaticOverviewUi ? Visibility.Visible : Visibility.Collapsed;
         LegacyShell.Visibility = StaticOverviewUi ? Visibility.Collapsed : Visibility.Visible;
         if (StaticOverviewUi)
@@ -413,6 +416,19 @@ public sealed partial class MainWindow : Window
         OverviewDisplayPage.ShowLogsRequested += StaticDisplayPage_ShowLogsRequested;
         OverviewDisplayPage.ResolutionChanged += StaticDisplayPage_ResolutionChanged;
         OverviewDisplayPage.RefreshRateChanged += StaticDisplayPage_RefreshRateChanged;
+    }
+
+    private void WireStaticAudioPage()
+    {
+        OverviewAudioPage.RefreshRequested += StaticAudioPage_RefreshRequested;
+        OverviewAudioPage.InstallVirtualAudioCableRequested += StaticAudioPage_InstallVirtualAudioCableRequested;
+        OverviewAudioPage.CopyLogRequested += StaticAudioPage_CopyLogRequested;
+        OverviewAudioPage.ShowLogsRequested += StaticAudioPage_ShowLogsRequested;
+        OverviewAudioPage.OpenSoundSettingsRequested += StaticAudioPage_OpenSoundSettingsRequested;
+        OverviewAudioPage.SpeakerEndpointChanged += StaticAudioPage_SpeakerEndpointChanged;
+        OverviewAudioPage.MicrophoneEndpointChanged += StaticAudioPage_MicrophoneEndpointChanged;
+        OverviewAudioPage.SpeakerEnabledChanged += StaticAudioPage_AudioDirectionEnabledChanged;
+        OverviewAudioPage.MicrophoneEnabledChanged += StaticAudioPage_AudioDirectionEnabledChanged;
     }
 
     private void UpdateOverviewMainContentMinHeight()
@@ -2439,6 +2455,79 @@ public sealed partial class MainWindow : Window
         SyncStaticDisplayOptionToHostCombo(e.Value, OverviewVirtualDisplayRefreshRateCombo, RefreshRateCombo);
     }
 
+    private async void StaticAudioPage_RefreshRequested(object? sender, EventArgs e)
+    {
+        await RefreshAudioEndpointsAsync(showHint: true);
+        UpdateAudioState();
+    }
+
+    private async void StaticAudioPage_InstallVirtualAudioCableRequested(object? sender, EventArgs e)
+    {
+        await InstallVirtualAudioCableAsync();
+    }
+
+    private void StaticAudioPage_CopyLogRequested(object? sender, EventArgs e)
+    {
+        CopyAudioDiagnosticsToClipboard();
+    }
+
+    private async void StaticAudioPage_ShowLogsRequested(object? sender, EventArgs e)
+    {
+        await ShowOverviewLogsDialogAsync();
+    }
+
+    private void StaticAudioPage_OpenSoundSettingsRequested(object? sender, EventArgs e)
+    {
+        var result = OpenWindowsSoundSettings();
+        UpdateAudioState(result.Success
+            ? "Windows 声音设置已打开。"
+            : $"无法打开 Windows 声音设置：{FailureSummary(result.Error)}");
+    }
+
+    private void StaticAudioPage_SpeakerEndpointChanged(object? sender, StaticAudioEndpointChangedEventArgs e)
+    {
+        if (_loadingAudioEndpointChoices || !_audioEndpointChoicesReady)
+        {
+            return;
+        }
+
+        SaveAudioEndpointBinding(AudioEndpointRole.SpeakerCapture, e.SelectedItem as AudioEndpointChoice);
+    }
+
+    private void StaticAudioPage_MicrophoneEndpointChanged(object? sender, StaticAudioEndpointChangedEventArgs e)
+    {
+        if (_loadingAudioEndpointChoices || !_audioEndpointChoicesReady)
+        {
+            return;
+        }
+
+        SaveAudioEndpointBinding(AudioEndpointRole.MicrophoneRender, e.SelectedItem as AudioEndpointChoice);
+    }
+
+    private void StaticAudioPage_AudioDirectionEnabledChanged(object? sender, StaticAudioSwitchChangedEventArgs e)
+    {
+        if (_updatingStaticAudioPage || _loadingAudioPreferences || !_uiReady)
+        {
+            return;
+        }
+
+        AudioDeviceSwitch.IsOn = e.SpeakerEnabled || e.MicrophoneEnabled;
+        SpeakerSwitch.IsOn = e.SpeakerEnabled;
+        MicrophoneSwitch.IsOn = e.MicrophoneEnabled;
+        ApplyAudioSwitchChange(AudioDeviceSwitch, StaticAudioToggleHint(e.SpeakerEnabled, e.MicrophoneEnabled));
+    }
+
+    private static string StaticAudioToggleHint(bool speakerEnabled, bool microphoneEnabled)
+    {
+        return (speakerEnabled, microphoneEnabled) switch
+        {
+            (true, true) => "音频桥接已启用，将使用当前扬声器和麦克风端点偏好。",
+            (true, false) => "当前只启用了电脑声音发送到 Android。",
+            (false, true) => "当前只启用了 Android 麦克风写入 Windows。",
+            _ => "音频桥接已关闭，副屏仍在运行。"
+        };
+    }
+
     private static string BuildDisplayLayoutRefreshSummary(DisplayLayoutSnapshot displayLayout)
     {
         if (!string.IsNullOrWhiteSpace(displayLayout.QueryError))
@@ -3117,6 +3206,36 @@ public sealed partial class MainWindow : Window
         }
     }
 
+    private (bool Success, string? Error) OpenWindowsSoundSettings()
+    {
+        try
+        {
+            Process.Start(new ProcessStartInfo
+            {
+                FileName = "ms-settings:sound",
+                UseShellExecute = true
+            });
+            return (true, null);
+        }
+        catch (Exception firstEx)
+        {
+            try
+            {
+                Process.Start(new ProcessStartInfo
+                {
+                    FileName = "mmsys.cpl",
+                    UseShellExecute = true
+                });
+                return (true, null);
+            }
+            catch (Exception ex)
+            {
+                ShowError("无法打开声音设置", ex.Message);
+                return (false, $"{firstEx.Message}; {ex.Message}");
+            }
+        }
+    }
+
     private async Task StartHostAsync()
     {
         if (_hostProcess is { HasExited: false })
@@ -3380,6 +3499,7 @@ public sealed partial class MainWindow : Window
             };
             SpeakerCaptureEndpointCombo.SelectedIndex = 0;
             MicrophoneRenderEndpointCombo.SelectedIndex = 0;
+            SyncStaticAudioPageEndpointChoices();
         }
         finally
         {
@@ -4623,6 +4743,7 @@ public sealed partial class MainWindow : Window
                 _speakerCaptureEndpointDiagnostics = AudioEndpointDiagnostics.Unsupported(AudioEndpointRole.SpeakerCapture);
                 _microphoneRenderEndpointDiagnostics = AudioEndpointDiagnostics.Unsupported(AudioEndpointRole.MicrophoneRender);
                 SetAudioEndpointStatusTexts();
+                SyncStaticAudioPageEndpointChoices();
                 UpdateAudioState(showHint ? "当前系统不支持 Windows 音频端点枚举。" : null);
                 return;
             }
@@ -4650,6 +4771,7 @@ public sealed partial class MainWindow : Window
                 _boundMicrophoneRenderEndpointName);
 
             SetAudioEndpointStatusTexts();
+            SyncStaticAudioPageEndpointChoices();
             if (!DispatcherQueue.TryEnqueue(() =>
                 {
                     _loadingAudioEndpointChoices = false;
@@ -4667,6 +4789,7 @@ public sealed partial class MainWindow : Window
             _speakerCaptureEndpointDiagnostics = AudioEndpointDiagnostics.EnumerationFailed(AudioEndpointRole.SpeakerCapture, ex.Message);
             _microphoneRenderEndpointDiagnostics = AudioEndpointDiagnostics.EnumerationFailed(AudioEndpointRole.MicrophoneRender, ex.Message);
             SetAudioEndpointStatusTexts();
+            SyncStaticAudioPageEndpointChoices();
             UpdateAudioState(showHint ? $"无法枚举 Windows 音频端点：{ex.Message}" : null);
         }
         finally
@@ -4792,12 +4915,35 @@ public sealed partial class MainWindow : Window
         }
 
         textBlock.Text = diagnostics.Summary;
-        textBlock.Foreground = diagnostics.Health switch
+        textBlock.Foreground = AudioEndpointStatusBrush(diagnostics);
+    }
+
+    private Brush AudioEndpointStatusBrush(AudioEndpointDiagnostics diagnostics)
+    {
+        return diagnostics.Health switch
         {
             AudioEndpointBindingHealth.Ready => _successBrush,
             AudioEndpointBindingHealth.Unknown => _secondaryBrush,
             _ => _warningBrush
         };
+    }
+
+    private void SyncStaticAudioPageEndpointChoices()
+    {
+        if (!StaticOverviewUi || OverviewAudioPage is null)
+        {
+            return;
+        }
+
+        OverviewAudioPage.UpdateEndpointChoices(
+            SpeakerCaptureEndpointCombo.ItemsSource,
+            SpeakerCaptureEndpointCombo.SelectedItem,
+            MicrophoneRenderEndpointCombo.ItemsSource,
+            MicrophoneRenderEndpointCombo.SelectedItem,
+            _speakerCaptureEndpointDiagnostics.Summary,
+            AudioEndpointStatusBrush(_speakerCaptureEndpointDiagnostics),
+            _microphoneRenderEndpointDiagnostics.Summary,
+            AudioEndpointStatusBrush(_microphoneRenderEndpointDiagnostics));
     }
 
     private async Task RefreshAdbDevicesAsync(bool showErrors, string? resolvedAdbPath = null)
@@ -5894,8 +6040,9 @@ public sealed partial class MainWindow : Window
 
     private async Task InstallVirtualAudioCableAsync()
     {
-        InstallVirtualAudioCableButton.IsEnabled = false;
-        VirtualAudioCableInstallStatusText.Text = "正在启动 VB-CABLE 安装器，请在管理员权限弹窗中选择“是”。";
+        SetVirtualAudioCableInstallUi(
+            inProgress: true,
+            "正在启动 VB-CABLE 安装器，请在管理员权限弹窗中选择“是”。");
 
         try
         {
@@ -5918,21 +6065,29 @@ public sealed partial class MainWindow : Window
 
             if (process.ExitCode == 0)
             {
-                VirtualAudioCableInstallStatusText.Text = "VB-CABLE 安装器已关闭。若系统提示重启，请重启后再刷新端点并选择 CABLE Output。";
+                SetVirtualAudioCableInstallUi(
+                    inProgress: true,
+                    "VB-CABLE 安装器已关闭。若系统提示重启，请重启后再刷新端点并选择 CABLE Output。");
             }
             else
             {
-                VirtualAudioCableInstallStatusText.Text = $"VB-CABLE 安装器已退出（退出码 {process.ExitCode}）。如果端点未出现，请重新运行安装或重启电脑。";
+                SetVirtualAudioCableInstallUi(
+                    inProgress: true,
+                    $"VB-CABLE 安装器已退出（退出码 {process.ExitCode}）。如果端点未出现，请重新运行安装或重启电脑。");
             }
         }
         catch (System.ComponentModel.Win32Exception ex) when (ex.NativeErrorCode == 1223)
         {
-            VirtualAudioCableInstallStatusText.Text = "VB-CABLE 安装已取消（未授予管理员权限）。";
+            SetVirtualAudioCableInstallUi(
+                inProgress: true,
+                "VB-CABLE 安装已取消（未授予管理员权限）。");
             ShowError("VB-CABLE 安装已取消", "你在管理员权限弹窗中选择了“否”，安装未开始。请重新点击“安装/修复虚拟音频线”，并在弹窗中选择“是”。");
         }
         catch (Exception ex)
         {
-            VirtualAudioCableInstallStatusText.Text = "VB-CABLE 安装未完成。";
+            SetVirtualAudioCableInstallUi(
+                inProgress: true,
+                "VB-CABLE 安装未完成。");
             ShowErrorWithDetails(
                 "无法安装 VB-CABLE",
                 $"启动或执行 VB-CABLE 安装器时出错：{ex.Message}",
@@ -5940,8 +6095,27 @@ public sealed partial class MainWindow : Window
         }
         finally
         {
-            InstallVirtualAudioCableButton.IsEnabled = true;
+            SetVirtualAudioCableInstallUi(
+                inProgress: false,
+                VirtualAudioCableInstallStatusText?.Text
+                    ?? "没有 CABLE Output 时，可先安装虚拟音频线；安装完成后刷新端点并选择 CABLE Output。");
         }
+    }
+
+    private void SetVirtualAudioCableInstallUi(bool inProgress, string statusText)
+    {
+        _virtualAudioCableInstallInProgress = inProgress;
+        if (InstallVirtualAudioCableButton is not null)
+        {
+            InstallVirtualAudioCableButton.IsEnabled = !inProgress;
+        }
+
+        if (VirtualAudioCableInstallStatusText is not null)
+        {
+            VirtualAudioCableInstallStatusText.Text = statusText;
+        }
+
+        UpdateAudioState(statusText);
     }
 
     private string ResolveDriverInstallerPath()
@@ -8380,6 +8554,11 @@ public sealed partial class MainWindow : Window
                 _recentAudioLogLines.Dequeue();
             }
         }
+
+        if (StaticOverviewUi)
+        {
+            DispatcherQueue.TryEnqueue(() => OverviewAudioPage.UpdateRecentLogs(SnapshotRecentAudioLogLines()));
+        }
     }
 
     private string[] SnapshotRecentAudioLogLines()
@@ -9188,6 +9367,243 @@ public sealed partial class MainWindow : Window
         OverviewAudioStatusText.Foreground = statusBrush;
         OverviewAudioHintText.Text = hintText;
         OverviewAudioHintText.Foreground = statusBrush == _dangerBrush ? _dangerBrush : _overviewNeutralBrush;
+        UpdateStaticAudioPageState(
+            audioEnabled,
+            microphoneIntent,
+            speakerIntent,
+            overallStatus,
+            microphoneStatus,
+            speakerStatus,
+            audioHint);
+    }
+
+    private void UpdateStaticAudioPageState(
+        bool audioEnabled,
+        bool microphoneIntent,
+        bool speakerIntent,
+        AudioCapabilityStatus overallStatus,
+        AudioCapabilityStatus microphoneStatus,
+        AudioCapabilityStatus speakerStatus,
+        string audioHint)
+    {
+        if (!StaticOverviewUi || OverviewAudioPage is null)
+        {
+            return;
+        }
+
+        var (bannerTitle, bannerDetail, bannerTextBrush, bannerBackground, bannerBorder, bannerIconBackground, bannerIconGlyph, bannerSeverity) =
+            BuildStaticAudioBannerView(audioEnabled, microphoneIntent, speakerIntent, overallStatus, microphoneStatus, speakerStatus, audioHint);
+        var microphoneStatusBrush = AudioBrush(microphoneStatus);
+        var speakerStatusBrush = AudioBrush(speakerStatus);
+        var virtualEndpointCount = _microphoneRenderEndpointDiagnostics.AvailableEndpointCount;
+        var virtualCableReady = virtualEndpointCount > 0;
+        var virtualCableStatusBrush = virtualCableReady
+            ? _successBrush
+            : _microphoneRenderEndpointDiagnostics.Health is AudioEndpointBindingHealth.Unsupported or AudioEndpointBindingHealth.EnumerationFailed
+                ? _warningBrush
+                : _secondaryBrush;
+        var virtualCableStatusText = virtualCableReady
+            ? "检测到可写入虚拟端点"
+            : _microphoneRenderEndpointDiagnostics.Health switch
+            {
+                AudioEndpointBindingHealth.Unsupported => "当前系统不可用",
+                AudioEndpointBindingHealth.EnumerationFailed => "端点枚举失败",
+                _ => "未检测到可写入端点"
+            };
+
+        _updatingStaticAudioPage = true;
+        try
+        {
+            OverviewAudioPage.UpdateState(new StaticAudioPageState
+            {
+                BannerTitle = bannerTitle,
+                BannerMessage = bannerDetail,
+                BannerTextBrush = bannerTextBrush,
+                BannerBackground = bannerBackground,
+                BannerBorderBrush = bannerBorder,
+                BannerIconBackground = bannerIconBackground,
+                BannerIconGlyph = bannerIconGlyph,
+                BannerSeverity = bannerSeverity,
+                SpeakerToggleEnabled = audioEnabled && speakerIntent,
+                MicrophoneToggleEnabled = audioEnabled && microphoneIntent,
+                CanChangeSwitches = !_loadingAudioPreferences,
+                CanRefreshEndpoints = true,
+                CanInstallVirtualAudioCable = !_virtualAudioCableInstallInProgress,
+                CanOpenSoundSettings = true,
+                CurrentDeviceText = CurrentAudioDeviceLabel(),
+                HintText = audioHint,
+                HintBrush = bannerTextBrush == _dangerBrush ? _dangerBrush : _overviewNeutralBrush,
+                SpeakerStatusText = AudioDirectionText(AudioDirection.Speaker, speakerStatus),
+                SpeakerStatusBrush = speakerStatusBrush,
+                SpeakerStatusIconGlyph = AudioStatusIconGlyph(speakerStatus),
+                MicrophoneStatusText = AudioDirectionText(AudioDirection.Microphone, microphoneStatus),
+                MicrophoneStatusBrush = microphoneStatusBrush,
+                MicrophoneStatusIconGlyph = AudioStatusIconGlyph(microphoneStatus),
+                SpeakerEndpointSummary = EndpointDisplaySummary(_speakerCaptureEndpointDiagnostics),
+                MicrophoneEndpointSummary = EndpointDisplaySummary(_microphoneRenderEndpointDiagnostics),
+                SpeakerFormatText = "固定 48 kHz, 16-bit, 2ch",
+                MicrophoneFormatText = "固定 48 kHz, 16-bit, 2ch",
+                SpeakerLevelText = "暂无实时音量数据",
+                MicrophoneLevelText = "暂无实时电平数据",
+                SpeakerLatencyText = "暂无数据",
+                MicrophoneLatencyText = "暂无数据",
+                VirtualCableStatusText = virtualCableStatusText,
+                VirtualCableStatusBrush = virtualCableStatusBrush,
+                VirtualCableStatusIconGlyph = virtualCableReady ? "\uE73E" : "\uE7BA",
+                VirtualCableVersionText = "不可用",
+                VirtualCableEndpointText = virtualEndpointCount > 0 ? $"{virtualEndpointCount} 个可写入端点" : "暂无数据",
+                RepairHintText = VirtualAudioCableInstallStatusText?.Text
+                    ?? "修复端点会启动已有的虚拟音频线安装/修复流程。",
+                InstallStepState = virtualCableReady ? StaticAudioStepState.Ready : StaticAudioStepState.Warning,
+                SpeakerStepState = AudioEndpointStepState(_speakerCaptureEndpointDiagnostics, audioEnabled && speakerIntent),
+                MicrophoneStepState = AudioEndpointStepState(_microphoneRenderEndpointDiagnostics, audioEnabled && microphoneIntent)
+            });
+        }
+        finally
+        {
+            _updatingStaticAudioPage = false;
+        }
+
+        SyncStaticAudioPageEndpointChoices();
+        OverviewAudioPage.UpdateRecentLogs(SnapshotRecentAudioLogLines());
+    }
+
+    private (string Title, string Detail, Brush TextBrush, Brush Background, Brush Border, Brush IconBackground, string IconGlyph, StaticAudioBannerSeverity Severity)
+        BuildStaticAudioBannerView(
+            bool audioEnabled,
+            bool microphoneIntent,
+            bool speakerIntent,
+            AudioCapabilityStatus overallStatus,
+            AudioCapabilityStatus microphoneStatus,
+            AudioCapabilityStatus speakerStatus,
+            string audioHint)
+    {
+        if (!audioEnabled || (!microphoneIntent && !speakerIntent))
+        {
+            return (
+                "音频桥接已关闭",
+                audioHint,
+                _secondaryBrush,
+                _overviewNeutralBackgroundBrush,
+                _overviewNeutralBorderBrush,
+                _secondaryBrush,
+                "\uE711",
+                StaticAudioBannerSeverity.Neutral);
+        }
+
+        var endpointIssue = BuildAudioEndpointIssueHint(microphoneIntent, speakerIntent);
+        if (!string.IsNullOrWhiteSpace(endpointIssue))
+        {
+            return (
+                "音频端点需要设置",
+                endpointIssue,
+                _warningBrush,
+                _overviewWarningBackgroundBrush,
+                _overviewWarningBorderBrush,
+                _warningBrush,
+                "\uE7BA",
+                StaticAudioBannerSeverity.Warning);
+        }
+
+        if (microphoneStatus == AudioCapabilityStatus.AuthorizationRequired)
+        {
+            return (
+                "需要 Android 麦克风权限",
+                "请在 Android 设备上允许 SideDock 使用麦克风。",
+                _dangerBrush,
+                _overviewErrorBackgroundBrush,
+                _overviewErrorBorderBrush,
+                _dangerBrush,
+                "\uE783",
+                StaticAudioBannerSeverity.Error);
+        }
+
+        if (overallStatus == AudioCapabilityStatus.Error
+            || microphoneStatus == AudioCapabilityStatus.Error
+            || speakerStatus == AudioCapabilityStatus.Error)
+        {
+            return (
+                "音频桥接异常",
+                audioHint,
+                _dangerBrush,
+                _overviewErrorBackgroundBrush,
+                _overviewErrorBorderBrush,
+                _dangerBrush,
+                "\uE783",
+                StaticAudioBannerSeverity.Error);
+        }
+
+        if (overallStatus is AudioCapabilityStatus.Available
+            or AudioCapabilityStatus.PartialAvailable
+            or AudioCapabilityStatus.Capturing
+            or AudioCapabilityStatus.Playing)
+        {
+            return (
+                AudioOverallText(overallStatus),
+                audioHint,
+                _successBrush,
+                _overviewReadyBackgroundBrush,
+                _overviewReadyBorderBrush,
+                _successBrush,
+                "\uE73E",
+                StaticAudioBannerSeverity.Ready);
+        }
+
+        return (
+            AudioOverallText(overallStatus),
+            audioHint,
+            _secondaryBrush,
+            _overviewNeutralBackgroundBrush,
+            _overviewNeutralBorderBrush,
+            _secondaryBrush,
+            "\uE946",
+            StaticAudioBannerSeverity.Neutral);
+    }
+
+    private static string EndpointDisplaySummary(AudioEndpointDiagnostics diagnostics)
+    {
+        if (!string.IsNullOrWhiteSpace(diagnostics.DisplayName))
+        {
+            return diagnostics.DisplayName;
+        }
+
+        return diagnostics.Health switch
+        {
+            AudioEndpointBindingHealth.Unsupported => "不可用",
+            AudioEndpointBindingHealth.EnumerationFailed => "枚举失败",
+            _ => "未绑定"
+        };
+    }
+
+    private static StaticAudioStepState AudioEndpointStepState(AudioEndpointDiagnostics diagnostics, bool directionEnabled)
+    {
+        if (!directionEnabled)
+        {
+            return StaticAudioStepState.Neutral;
+        }
+
+        return diagnostics.Health switch
+        {
+            AudioEndpointBindingHealth.Ready => StaticAudioStepState.Ready,
+            AudioEndpointBindingHealth.Unsupported or AudioEndpointBindingHealth.EnumerationFailed => StaticAudioStepState.Error,
+            _ => StaticAudioStepState.Warning
+        };
+    }
+
+    private static string AudioStatusIconGlyph(AudioCapabilityStatus status)
+    {
+        return status switch
+        {
+            AudioCapabilityStatus.Available
+                or AudioCapabilityStatus.PartialAvailable
+                or AudioCapabilityStatus.Capturing
+                or AudioCapabilityStatus.Playing => "\uE73E",
+            AudioCapabilityStatus.AuthorizationRequired
+                or AudioCapabilityStatus.Error => "\uE783",
+            AudioCapabilityStatus.Muted => "\uE7BA",
+            AudioCapabilityStatus.Closed => "\uE711",
+            _ => "\uE946"
+        };
     }
 
     private void UpdateOverviewAudioCapabilityOptions(bool audioEnabled)
