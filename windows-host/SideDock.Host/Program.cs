@@ -6005,6 +6005,7 @@ internal static partial class Program
         private readonly LatestFrameQueue<BgraFrame> _capturedFrames;
         private readonly LatestFrameQueue<Nv12Frame> _convertedFrames;
         private readonly LatestFrameQueue<EncodedVideoPacket> _packets;
+        private readonly OverviewPreviewFramePublisher _previewPublisher;
         private CancellationTokenSource? _sourceCts;
         private Task? _captureTask;
         private Task? _convertTask;
@@ -6031,6 +6032,7 @@ internal static partial class Program
             _capturedFrames = new LatestFrameQueue<BgraFrame>(queueCapacity, disposeDropped: frame => frame.Dispose());
             _convertedFrames = new LatestFrameQueue<Nv12Frame>(queueCapacity, disposeDropped: frame => frame.Dispose());
             _packets = new LatestFrameQueue<EncodedVideoPacket>(packetQueueCapacity);
+            _previewPublisher = new OverviewPreviewFramePublisher(message => Log($"PREVIEW {connectionId}", message));
         }
 
         public async ValueTask StartAsync(CancellationToken cancellationToken)
@@ -6143,6 +6145,7 @@ internal static partial class Program
 
             await WhenAllIgnoringCancellation(_captureTask, _convertTask, _encoderTask, _statsTask, _captureStatsTask);
             _packets.Complete();
+            _previewPublisher.Dispose();
             _frameSource.Dispose();
 
             var snapshot = _stats.Snapshot();
@@ -6218,6 +6221,13 @@ internal static partial class Program
                     }
 
                     var timestampMs = generatedAt.ToUnixTimeMilliseconds();
+                    _previewPublisher.TryPublishBgra(
+                        bgraFrame,
+                        _options.VideoWidth,
+                        _options.VideoHeight,
+                        _options.VideoWidth * 4,
+                        frameId,
+                        timestampMs);
                     _stats.RecordGenerated(frameId, timestampMs);
                     var dropped = _capturedFrames.WriteLatest(new BgraFrame(bgraFrame, frameId, timestampMs));
                     if (dropped > 0)
@@ -6536,6 +6546,7 @@ internal static partial class Program
         private readonly LatestFrameQueue<GpuAcquiredFrame> _gpuFrames;
         private readonly LatestFrameQueue<GpuConvertedFrame> _gpuConvertedFrames;
         private readonly LatestFrameQueue<Nv12Frame> _nv12Frames;
+        private readonly OverviewPreviewFramePublisher _previewPublisher;
         private CancellationTokenSource? _sourceCts;
         private Task? _captureTask;
         private Task? _convertTask;
@@ -6575,6 +6586,7 @@ internal static partial class Program
             _gpuFrames = new LatestFrameQueue<GpuAcquiredFrame>(queueCapacity, disposeDropped: frame => frame.Dispose());
             _gpuConvertedFrames = new LatestFrameQueue<GpuConvertedFrame>(queueCapacity, disposeDropped: frame => frame.Dispose());
             _nv12Frames = new LatestFrameQueue<Nv12Frame>(queueCapacity, disposeDropped: frame => frame.Dispose());
+            _previewPublisher = new OverviewPreviewFramePublisher(message => Log($"PREVIEW {connectionId}", message));
         }
 
         public async ValueTask StartAsync(CancellationToken cancellationToken)
@@ -6766,6 +6778,7 @@ internal static partial class Program
             _packets.Complete();
             if (OperatingSystem.IsWindows())
             {
+                _previewPublisher.Dispose();
                 _encoder?.Dispose();
                 _converter?.Dispose();
                 _nv12Readback?.Dispose();
@@ -6917,6 +6930,16 @@ internal static partial class Program
                     }
 
                     var timestampMs = generatedAt.ToUnixTimeMilliseconds();
+                    if (frame is not null)
+                    {
+                        _previewPublisher.TryPublishTexture(
+                            _frameSource.Device,
+                            _frameSource.Context,
+                            frame.Texture,
+                            frame.Sequence,
+                            timestampMs);
+                    }
+
                     var queued = new GpuAcquiredFrame(
                         frame,
                         frameId,
@@ -7998,6 +8021,281 @@ internal static partial class Program
         }
 
         private sealed record TextureReadback(int Width, int Height, byte[] Bytes);
+    }
+
+    private sealed class OverviewPreviewFramePublisher : IDisposable
+    {
+        private const string MapName = @"Local\SideDockOverviewPreviewFrame";
+        private const int HeaderSize = 128;
+        private const int Magic = 0x50464453; // SDFP
+        private const int Version = 1;
+        private const int FormatBgra32 = 1;
+        private const int MaxFrameBytes = 3840 * 2160 * 4;
+        private const int MaxPreviewFps = 15;
+        private static readonly TimeSpan ErrorLogInterval = TimeSpan.FromSeconds(5);
+
+        private readonly Action<string> _log;
+        private readonly long _minPublishTicks = Stopwatch.Frequency / MaxPreviewFps;
+        private MemoryMappedFile? _mapping;
+        private MemoryMappedViewAccessor? _view;
+        private ID3D11Texture2D? _stagingTexture;
+        private byte[]? _rowBuffer;
+        private int _stagingWidth;
+        private int _stagingHeight;
+        private long _frameSequence;
+        private long _lastPublishTicks;
+        private long _lastErrorLogTicks;
+
+        public OverviewPreviewFramePublisher(Action<string> log)
+        {
+            _log = log;
+        }
+
+        public void TryPublishBgra(byte[] bgra, int width, int height, int stride, long sourceSequence, long timestampMs)
+        {
+            if (!ShouldPublish())
+            {
+                return;
+            }
+
+            try
+            {
+                ValidateFrameLayout(width, height, stride);
+                var rowBytes = checked(width * 4);
+                var requiredLength = checked((height - 1) * stride + rowBytes);
+                if (bgra.Length < requiredLength)
+                {
+                    return;
+                }
+
+                var view = EnsureView();
+                BeginFrame(view, width, height, rowBytes, checked(rowBytes * height), sourceSequence, timestampMs);
+                if (stride == rowBytes)
+                {
+                    view.WriteArray(HeaderSize, bgra, 0, rowBytes * height);
+                }
+                else
+                {
+                    for (var y = 0; y < height; y++)
+                    {
+                        view.WriteArray(HeaderSize + y * rowBytes, bgra, y * stride, rowBytes);
+                    }
+                }
+
+                CommitFrame(view);
+            }
+            catch (Exception ex) when (IsPublishFailure(ex))
+            {
+                LogThrottled($"overview preview publish skipped: {FormatPublishException(ex)}");
+            }
+        }
+
+        public void TryPublishTexture(ID3D11Device device, ID3D11DeviceContext context, ID3D11Texture2D texture, long sourceSequence, long timestampMs)
+        {
+            if (!ShouldPublish())
+            {
+                return;
+            }
+
+            MappedSubresource mapped = default;
+            var mappedTexture = false;
+            try
+            {
+                var description = texture.Description;
+                if (description.Format != Format.B8G8R8A8_UNorm)
+                {
+                    return;
+                }
+
+                var width = checked((int)description.Width);
+                var height = checked((int)description.Height);
+                var rowBytes = checked(width * 4);
+                ValidateFrameLayout(width, height, rowBytes);
+
+                var staging = EnsureStagingTexture(device, description);
+                context.CopyResource(staging, texture);
+                context.Flush();
+                context.Map(staging, 0, MapMode.Read, Vortice.Direct3D11.MapFlags.None, out mapped).CheckError();
+                mappedTexture = true;
+
+                var view = EnsureView();
+                BeginFrame(view, width, height, rowBytes, checked(rowBytes * height), sourceSequence, timestampMs);
+                var row = EnsureRowBuffer(rowBytes);
+                for (var y = 0; y < height; y++)
+                {
+                    Marshal.Copy(IntPtr.Add(mapped.DataPointer, checked(y * (int)mapped.RowPitch)), row, 0, rowBytes);
+                    view.WriteArray(HeaderSize + y * rowBytes, row, 0, rowBytes);
+                }
+
+                CommitFrame(view);
+            }
+            catch (Exception ex) when (IsPublishFailure(ex))
+            {
+                LogThrottled($"overview preview GPU readback skipped: {FormatPublishException(ex)}");
+            }
+            finally
+            {
+                if (mappedTexture)
+                {
+                    try
+                    {
+                        context.Unmap(_stagingTexture, 0);
+                    }
+                    catch (Exception ex) when (ex is SharpGenException or COMException or ObjectDisposedException or InvalidOperationException)
+                    {
+                    }
+                }
+            }
+        }
+
+        public void Dispose()
+        {
+            _stagingTexture?.Dispose();
+            _stagingTexture = null;
+            _view?.Dispose();
+            _view = null;
+            _mapping?.Dispose();
+            _mapping = null;
+        }
+
+        private bool ShouldPublish()
+        {
+            var now = Stopwatch.GetTimestamp();
+            var previous = Interlocked.Read(ref _lastPublishTicks);
+            if (previous != 0 && now - previous < _minPublishTicks)
+            {
+                return false;
+            }
+
+            Interlocked.Exchange(ref _lastPublishTicks, now);
+            return true;
+        }
+
+        private MemoryMappedViewAccessor EnsureView()
+        {
+            if (_view is not null)
+            {
+                return _view;
+            }
+
+            _mapping = MemoryMappedFile.CreateOrOpen(
+                MapName,
+                HeaderSize + MaxFrameBytes,
+                MemoryMappedFileAccess.ReadWrite);
+            _view = _mapping.CreateViewAccessor(0, HeaderSize + MaxFrameBytes, MemoryMappedFileAccess.ReadWrite);
+            var existingSequence = _view.ReadInt64(32);
+            if (existingSequence > 0)
+            {
+                _frameSequence = Math.Max(_frameSequence, existingSequence / 2);
+            }
+
+            return _view;
+        }
+
+        private ID3D11Texture2D EnsureStagingTexture(ID3D11Device device, Texture2DDescription sourceDescription)
+        {
+            var width = checked((int)sourceDescription.Width);
+            var height = checked((int)sourceDescription.Height);
+            if (_stagingTexture is not null && _stagingWidth == width && _stagingHeight == height)
+            {
+                return _stagingTexture;
+            }
+
+            _stagingTexture?.Dispose();
+            var stagingDescription = sourceDescription;
+            stagingDescription.BindFlags = BindFlags.None;
+            stagingDescription.MiscFlags = ResourceOptionFlags.None;
+            stagingDescription.Usage = ResourceUsage.Staging;
+            stagingDescription.CPUAccessFlags = CpuAccessFlags.Read;
+            _stagingTexture = device.CreateTexture2D(in stagingDescription);
+            _stagingWidth = width;
+            _stagingHeight = height;
+            return _stagingTexture;
+        }
+
+        private byte[] EnsureRowBuffer(int rowBytes)
+        {
+            if (_rowBuffer is null || _rowBuffer.Length < rowBytes)
+            {
+                _rowBuffer = new byte[rowBytes];
+            }
+
+            return _rowBuffer;
+        }
+
+        private void BeginFrame(
+            MemoryMappedViewAccessor view,
+            int width,
+            int height,
+            int stride,
+            int frameBytes,
+            long sourceSequence,
+            long timestampMs)
+        {
+            var frameSequence = Interlocked.Increment(ref _frameSequence);
+            view.Write(32, checked(frameSequence * 2 - 1));
+            view.Write(0, Magic);
+            view.Write(4, Version);
+            view.Write(8, HeaderSize);
+            view.Write(12, width);
+            view.Write(16, height);
+            view.Write(20, stride);
+            view.Write(24, FormatBgra32);
+            view.Write(28, frameBytes);
+            view.Write(40, sourceSequence);
+            view.Write(48, timestampMs > 0 ? timestampMs : DateTimeOffset.UtcNow.ToUnixTimeMilliseconds());
+        }
+
+        private void CommitFrame(MemoryMappedViewAccessor view)
+        {
+            var frameSequence = Interlocked.Read(ref _frameSequence);
+            view.Write(32, checked(frameSequence * 2));
+        }
+
+        private static void ValidateFrameLayout(int width, int height, int stride)
+        {
+            if (width <= 0 || height <= 0 || stride < width * 4)
+            {
+                throw new ArgumentException($"Invalid preview frame layout {width}x{height} stride={stride}.");
+            }
+
+            var frameBytes = checked(width * height * 4);
+            if (frameBytes <= 0 || frameBytes > MaxFrameBytes)
+            {
+                throw new ArgumentException($"Preview frame size is not supported: {width}x{height}.");
+            }
+        }
+
+        private void LogThrottled(string message)
+        {
+            var now = Stopwatch.GetTimestamp();
+            var previous = Interlocked.Read(ref _lastErrorLogTicks);
+            if (previous != 0 && (now - previous) / (double)Stopwatch.Frequency < ErrorLogInterval.TotalSeconds)
+            {
+                return;
+            }
+
+            Interlocked.Exchange(ref _lastErrorLogTicks, now);
+            _log(message);
+        }
+
+        private static bool IsPublishFailure(Exception ex)
+        {
+            return ex is IOException
+                or UnauthorizedAccessException
+                or ObjectDisposedException
+                or ArgumentException
+                or InvalidOperationException
+                or COMException
+                or SharpGenException;
+        }
+
+        private static string FormatPublishException(Exception ex)
+        {
+            return ex is COMException or SharpGenException
+                ? $"HRESULT=0x{ex.HResult:X8}: {ex.Message}"
+                : ex.Message;
+        }
     }
 
     [SupportedOSPlatform("windows")]

@@ -22,6 +22,13 @@
   </ItemGroup>
 
   <ItemGroup>
+    <Content Include="..\..\assets\SideDock.ico" Link="Assets\SideDock.ico">
+      <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
+      <CopyToPublishDirectory>PreserveNewest</CopyToPublishDirectory>
+    </Content>
+  </ItemGroup>
+
+  <ItemGroup>
     <EmbeddedResource Include="HostPayload.zip" Condition="Exists('HostPayload.zip')" />
     <EmbeddedResource Include="DriverInstallerPayload.zip" Condition="Exists('DriverInstallerPayload.zip')" />
     <EmbeddedResource Include="VirtualAudioCablePayload.zip" Condition="Exists('VirtualAudioCablePayload.zip')" />

@@ -3,6 +3,7 @@ using System.IO.Compression;
 using System.IO.MemoryMappedFiles;
 using System.Globalization;
 using System.Net;
+using System.Net.NetworkInformation;
 using System.Net.Sockets;
 using System.Reflection;
 using System.Runtime.InteropServices;
@@ -10,15 +11,19 @@ using System.Runtime.InteropServices.WindowsRuntime;
 using System.Text;
 using System.Text.Json;
 using Microsoft.UI;
+using Microsoft.UI.Text;
 using Microsoft.UI.Windowing;
 using Microsoft.UI.Xaml;
 using Microsoft.UI.Xaml.Controls;
 using Microsoft.UI.Xaml.Input;
 using Microsoft.UI.Xaml.Media;
 using Microsoft.UI.Xaml.Media.Imaging;
+using XamlRectangle = Microsoft.UI.Xaml.Shapes.Rectangle;
+using XamlShape = Microsoft.UI.Xaml.Shapes.Shape;
 using Windows.ApplicationModel.DataTransfer;
 using Windows.Devices.Enumeration;
 using Windows.Media.Devices;
+using Windows.Storage.Pickers;
 using WinRT.Interop;
 using Microsoft.Win32;
 
@@ -28,6 +33,8 @@ public sealed partial class MainWindow : Window
 {
     private const string HostExe = "SideDock.Host.exe";
     private const string DeviceToolExe = "SideDock.Idd.DeviceTool.exe";
+    private const string SideDockDriverInf = "SideDock.Idd.inf";
+    private const string SideDockDriverBinary = "SideDock.Idd.dll";
     private const string VirtualCameraToolExe = "SideDock.VirtualCamera.Tool.exe";
     private const string VirtualCameraMediaSourceDll = "SideDock.VirtualCamera.MediaSource.dll";
     private const string VirtualCameraMediaSourceClsid = "{951EE24C-E200-4E62-8035-F76214F695D2}";
@@ -35,11 +42,13 @@ public sealed partial class MainWindow : Window
     private const string VirtualAudioCableSetupX64Exe = "VBCABLE_Setup_x64.exe";
     private const string VirtualAudioCableSetupX86Exe = "VBCABLE_Setup.exe";
     private const string VirtualAudioCablePayloadZip = "VirtualAudioCablePayload.zip";
+    private const int DefaultControlPort = 27183;
+    private const int DefaultVideoPort = 27184;
     private const int DefaultAudioPort = 27185;
     private const int DefaultCameraPort = 27186;
     private const int DefaultCameraCommandPort = 27187;
-    private const int DesiredWindowWidth = 1080;
-    private const int DesiredWindowHeight = 760;
+    private const int DesiredWindowWidth = 1440;
+    private const int DesiredWindowHeight = 980;
     private const string AdbExe = "adb.exe";
     private const int SwHide = 0;
     private const int SwShow = 5;
@@ -76,23 +85,50 @@ public sealed partial class MainWindow : Window
     private const int MaxRecentAudioLogLines = 80;
     private const int MaxRecentCameraLogLines = 80;
     private const int CameraPreviewIntervalMs = 33;
+    private const int OverviewPreviewIntervalMs = 33;
+    private const int MaxOverviewDiagnosticsSamples = 11;
     private const string AudioPreferencesFileName = "audio-preferences.json";
+    private static readonly TimeSpan OverviewPreviewStaleAfter = TimeSpan.FromMilliseconds(1500);
+    private static readonly TimeSpan VirtualDisplayStatusCacheDuration = TimeSpan.FromSeconds(30);
     private static readonly string DeviceToolProcessName = Path.GetFileNameWithoutExtension(DeviceToolExe);
     private static readonly UIntPtr WindowSubclassId = new(1);
+    private static readonly bool StaticOverviewUi = true;
 
     private readonly DispatcherTimer _displayStatusTimer = new();
     private readonly DispatcherTimer _cameraPreviewTimer = new();
+    private readonly DispatcherTimer _overviewPreviewTimer = new();
     private readonly DispatcherTimer _virtualCameraStatusTimer = new();
+    private readonly DispatcherTimer _runtimeDiagnosticsTimer = new();
     private readonly object _audioLogGate = new();
     private readonly object _cameraLogGate = new();
     private readonly Queue<string> _recentAudioLogLines = new();
     private readonly Queue<string> _recentCameraLogLines = new();
+    private readonly Queue<double> _overviewCpuSamples = new();
+    private readonly Queue<double> _overviewMemorySamples = new();
     private readonly CameraDiagnosticsState _cameraDiagnostics = new();
     private readonly VirtualCameraDiagnosticsState _virtualCameraDiagnostics = new();
+    private readonly VideoDiagnosticsState _videoDiagnostics = new();
     private readonly Brush _successBrush = new SolidColorBrush(ColorHelper.FromArgb(255, 18, 132, 86));
     private readonly Brush _dangerBrush = new SolidColorBrush(ColorHelper.FromArgb(255, 196, 43, 28));
     private readonly Brush _warningBrush = new SolidColorBrush(ColorHelper.FromArgb(255, 157, 93, 0));
     private readonly Brush _secondaryBrush = new SolidColorBrush(ColorHelper.FromArgb(255, 96, 96, 96));
+    private readonly Brush _overviewPrimaryBrush = new SolidColorBrush(ColorHelper.FromArgb(255, 8, 124, 137));
+    private readonly Brush _overviewNeutralBrush = new SolidColorBrush(ColorHelper.FromArgb(255, 107, 114, 128));
+    private readonly Brush _overviewMutedBrush = new SolidColorBrush(ColorHelper.FromArgb(255, 163, 170, 178));
+    private readonly Brush _overviewNavActiveBackgroundBrush = new SolidColorBrush(ColorHelper.FromArgb(255, 230, 235, 239));
+    private readonly Brush _overviewTransparentBrush = new SolidColorBrush(Colors.Transparent);
+    private readonly Brush _overviewReadyBackgroundBrush = new SolidColorBrush(ColorHelper.FromArgb(255, 240, 250, 236));
+    private readonly Brush _overviewReadyBorderBrush = new SolidColorBrush(ColorHelper.FromArgb(255, 98, 179, 96));
+    private readonly Brush _overviewNeutralBackgroundBrush = new SolidColorBrush(ColorHelper.FromArgb(255, 248, 250, 252));
+    private readonly Brush _overviewNeutralBorderBrush = new SolidColorBrush(ColorHelper.FromArgb(255, 216, 222, 228));
+    private readonly Brush _overviewWarningBackgroundBrush = new SolidColorBrush(ColorHelper.FromArgb(255, 255, 248, 237));
+    private readonly Brush _overviewWarningBorderBrush = new SolidColorBrush(ColorHelper.FromArgb(255, 245, 158, 11));
+    private readonly Brush _overviewErrorBackgroundBrush = new SolidColorBrush(ColorHelper.FromArgb(255, 253, 242, 242));
+    private readonly Brush _overviewErrorBorderBrush = new SolidColorBrush(ColorHelper.FromArgb(255, 248, 113, 113));
+    private readonly Brush _overviewPreviewNeutralBadgeBrush = new SolidColorBrush(ColorHelper.FromArgb(221, 17, 24, 39));
+    private readonly Brush _overviewPreviewReceivingBadgeBrush = new SolidColorBrush(ColorHelper.FromArgb(221, 18, 132, 86));
+    private readonly Brush _overviewPreviewPausedBadgeBrush = new SolidColorBrush(ColorHelper.FromArgb(221, 157, 93, 0));
+    private readonly Brush _overviewPreviewErrorBadgeBrush = new SolidColorBrush(ColorHelper.FromArgb(221, 196, 43, 28));
     private readonly IntPtr _windowHandle;
 
     private Process? _hostProcess;
@@ -129,7 +165,36 @@ public sealed partial class MainWindow : Window
     private string? _lastCameraStatusLine;
     private string? _lastCameraErrorLine;
     private string? _lastCameraErrorMessage;
+    private string? _lastVideoStatsLine;
+    private string? _lastEncoderStatsLine;
+    private int? _lastHostCpuSampleProcessId;
+    private TimeSpan _lastHostCpuSampleProcessorTime;
+    private DateTimeOffset? _lastHostCpuSampleAt;
+    private string? _lastNetworkInterfaceId;
+    private string _lastNetworkInterfaceName = "";
+    private long? _lastNetworkLinkSpeedBps;
+    private long _lastNetworkBytesSent;
+    private long _lastNetworkBytesReceived;
+    private DateTimeOffset? _lastNetworkSampleAt;
+    private double? _lastNetworkSendBps;
+    private double? _lastNetworkReceiveBps;
+    private string _lastOverviewCpuText = "未运行";
+    private string _lastOverviewMemoryText = "未运行";
+    private string _lastOverviewNetworkText = "暂无数据";
+    private string _lastOverviewPacketLossText = "暂无数据";
+    private string _lastOverviewLatencyText = "暂无数据";
+    private string _lastOverviewLatencyDetailText = "等待视频统计";
     private bool _uiReady;
+    private OverviewNavigationItem _overviewNavigationItem = OverviewNavigationItem.Overview;
+    private bool _overviewSidebarCollapsed;
+    private bool _overviewRefreshInProgress;
+    private bool _overviewEnvironmentBannerDismissed;
+    private bool _syncingOverviewConnectionControls;
+    private bool _syncingAdbDeviceSelection;
+    private DateTimeOffset? _lastAdbRefreshCompletedAt;
+    private bool? _lastAdbReverseConfigured;
+    private string? _lastAdbReverseSerial;
+    private string _lastAdbReverseDetail = "启动主机时自动配置 ADB reverse。";
     private bool _restartingForCameraFacing;
     private bool _cameraPreviewEnabled = true;
     private bool _loadingAudioEndpointChoices;
@@ -144,16 +209,122 @@ public sealed partial class MainWindow : Window
     private WriteableBitmap? _cameraPreviewBitmap;
     private long _lastCameraPreviewSequence;
     private DateTimeOffset? _lastCameraPreviewAt;
+    private OverviewPreviewFrameReader? _overviewPreviewReader;
+    private WriteableBitmap? _overviewPreviewBitmap;
+    private long _lastOverviewPreviewSequence;
+    private DateTimeOffset? _lastOverviewPreviewAt;
+    private OverviewPreviewState _overviewPreviewState = OverviewPreviewState.HostNotStarted;
+    private bool _overviewPreviewFillMode;
+    private bool _overviewPreviewOverlayVisible = true;
+    private OverviewHostServiceState _overviewHostServiceState = OverviewHostServiceState.NotStarted;
+    private bool _hostHasStarted;
+    private bool _adbRefreshInProgress;
+    private IReadOnlyList<AdbDeviceRow> _lastAdbDeviceRows = Array.Empty<AdbDeviceRow>();
+    private string _lastAdbStatusText = "等待刷新 Android 设备。";
+    private string _overviewHostDetailText = "等待启动";
+    private bool _syncingVirtualDisplayOptions;
+    private bool _updatingOverviewVirtualDisplaySwitch;
+    private bool _virtualDisplayOperationInProgress;
+    private bool _driverInstallInProgress;
+    private bool _syncingOverviewCameraOptions;
+    private bool _updatingOverviewCameraSwitch;
+    private bool _updatingOverviewAudioSwitch;
+    private bool _overviewCameraOperationInProgress;
+    private bool _overviewCameraRequestedEnabled = true;
+    private VirtualDisplayOverviewState? _virtualDisplayTransientState;
+    private string? _virtualDisplayLastError;
+    private string? _driverInstallLastError;
+    private bool? _virtualDisplayDriverInstalledCache;
+    private DateTimeOffset _virtualDisplayDriverInstalledCheckedAt;
+    private bool? _virtualDisplayToolAvailableCache;
+    private DateTimeOffset _virtualDisplayToolAvailableCheckedAt;
+
+    private enum OverviewHostServiceState
+    {
+        NotStarted,
+        Starting,
+        Running,
+        Stopped,
+        Error
+    }
+
+    private enum OverviewStepState
+    {
+        Waiting,
+        Active,
+        Complete,
+        Warning,
+        Error
+    }
+
+    private enum OverviewNavigationItem
+    {
+        Overview,
+        Connection,
+        Display,
+        Camera,
+        Audio,
+        Diagnostics,
+        Settings
+    }
+
+    private enum OverviewEnvironmentBannerSeverity
+    {
+        Neutral,
+        Ready,
+        Warning,
+        Error
+    }
+
+    private enum VirtualDisplayOverviewState
+    {
+        DriverMissing,
+        DriverInstalling,
+        ToolStopped,
+        Starting,
+        Running,
+        Stopping,
+        Error
+    }
+
+    private enum OverviewPreviewState
+    {
+        HostNotStarted,
+        WaitingSource,
+        Receiving,
+        Paused,
+        Unavailable,
+        Error
+    }
 
     public MainWindow()
     {
         InitializeComponent();
         _uiReady = true;
+        WireStaticDisplayPage();
+        StaticOverviewShell.Visibility = StaticOverviewUi ? Visibility.Visible : Visibility.Collapsed;
+        LegacyShell.Visibility = StaticOverviewUi ? Visibility.Collapsed : Visibility.Visible;
+        if (StaticOverviewUi)
+        {
+            UpdateOverviewSidebarLayout();
+            SetOverviewNavigationItem(OverviewNavigationItem.Connection);
+            OverviewMainScrollViewer.SizeChanged += (_, _) => UpdateOverviewMainContentMinHeight();
+        }
 
         _windowHandle = WindowNative.GetWindowHandle(this);
-        UpdateDpiDiagnosticTitle();
-        ExtendsContentIntoTitleBar = true;
-        SetTitleBar(null);
+        ApplyWindowIcon();
+        if (StaticOverviewUi)
+        {
+            Title = "SideDock Host";
+            ExtendsContentIntoTitleBar = false;
+        }
+        else
+        {
+            UpdateDpiDiagnosticTitle();
+            ExtendsContentIntoTitleBar = true;
+            SetTitleBar(null);
+        }
+
         ResizeWindowForCurrentDpi();
         if (AppWindow.Presenter is OverlappedPresenter presenter)
         {
@@ -161,23 +332,33 @@ public sealed partial class MainWindow : Window
             presenter.IsMaximizable = false;
         }
 
-        RegisterCardWheelScrolling();
-        InitializeTrayIcon();
-        AppWindow.Closing += OnAppWindowClosing;
+        if (!StaticOverviewUi)
+        {
+            RegisterCardWheelScrolling();
+            InitializeTrayIcon();
+            AppWindow.Closing += OnAppWindowClosing;
+        }
+
         Closed += (_, _) =>
         {
+            _runtimeDiagnosticsTimer.Stop();
+            _displayStatusTimer.Stop();
             _cameraPreviewTimer.Stop();
+            _overviewPreviewTimer.Stop();
             _virtualCameraStatusTimer.Stop();
             _cameraPreviewReader?.Dispose();
+            ResetOverviewPreview(clearImage: true);
             DisposeTrayIcon();
             StopHost();
         };
 
         InitializeAdbDeviceCombo();
+        InitializeOverviewConnectionControls();
         InitializeAudioEndpointCombos();
+        InitializeOverviewVirtualDisplayOptions();
+        InitializeOverviewCameraOptions();
         LoadAudioPreferences();
         SetRunningState(false);
-        RefreshVirtualDisplayState();
         UpdateAudioState();
         UpdateCameraStatusView();
         RefreshVirtualCameraStatusFromFiles();
@@ -185,19 +366,1556 @@ public sealed partial class MainWindow : Window
         _displayStatusTimer.Interval = TimeSpan.FromSeconds(2);
         _displayStatusTimer.Tick += (_, _) => RefreshVirtualDisplayState();
         _displayStatusTimer.Start();
+        RefreshVirtualDisplayState();
 
         _cameraPreviewTimer.Interval = TimeSpan.FromMilliseconds(CameraPreviewIntervalMs);
         _cameraPreviewTimer.Tick += (_, _) => UpdateCameraPreview();
-        _cameraPreviewTimer.Start();
+        if (!StaticOverviewUi)
+        {
+            _cameraPreviewTimer.Start();
+        }
+
         UpdateCameraPreviewToggleView();
+
+        _overviewPreviewTimer.Interval = TimeSpan.FromMilliseconds(OverviewPreviewIntervalMs);
+        _overviewPreviewTimer.Tick += (_, _) => UpdateOverviewPreview();
+        if (StaticOverviewUi)
+        {
+            _overviewPreviewTimer.Start();
+        }
+
+        UpdateOverviewPreviewChrome();
+        SetOverviewPreviewState(OverviewPreviewState.HostNotStarted);
 
         _virtualCameraStatusTimer.Interval = TimeSpan.FromSeconds(2);
         _virtualCameraStatusTimer.Tick += (_, _) => RefreshVirtualCameraStatusFromFiles();
         _virtualCameraStatusTimer.Start();
 
+        _runtimeDiagnosticsTimer.Interval = TimeSpan.FromSeconds(2);
+        _runtimeDiagnosticsTimer.Tick += (_, _) => UpdateOverviewRuntimeDiagnostics();
+        _runtimeDiagnosticsTimer.Start();
+        UpdateOverviewRuntimeDiagnostics();
+
         _ = RefreshAdbDevicesAsync(showErrors: false);
         _ = RefreshAudioEndpointsAsync(showHint: false);
         _ = RefreshVirtualCameraStatusAsync();
+        UpdateOverviewConnectionPage();
+        DispatcherQueue.TryEnqueue(UpdateOverviewMainContentMinHeight);
+    }
+
+    private void WireStaticDisplayPage()
+    {
+        OverviewDisplayPage.StartRequested += StaticDisplayPage_StartRequested;
+        OverviewDisplayPage.StopRequested += StaticDisplayPage_StopRequested;
+        OverviewDisplayPage.RefreshRequested += StaticDisplayPage_RefreshRequested;
+        OverviewDisplayPage.InstallDriverRequested += StaticDisplayPage_InstallDriverRequested;
+        OverviewDisplayPage.OpenDisplaySettingsRequested += StaticDisplayPage_OpenDisplaySettingsRequested;
+        OverviewDisplayPage.ShowLogsRequested += StaticDisplayPage_ShowLogsRequested;
+        OverviewDisplayPage.ResolutionChanged += StaticDisplayPage_ResolutionChanged;
+        OverviewDisplayPage.RefreshRateChanged += StaticDisplayPage_RefreshRateChanged;
+    }
+
+    private void UpdateOverviewMainContentMinHeight()
+    {
+        if (!StaticOverviewUi)
+        {
+            return;
+        }
+
+        var viewportHeight = OverviewMainScrollViewer.ActualHeight
+            - OverviewMainScrollViewer.Padding.Top
+            - OverviewMainScrollViewer.Padding.Bottom;
+        if (viewportHeight > 0)
+        {
+            OverviewMainContentGrid.MinHeight = viewportHeight;
+        }
+    }
+
+    private void ApplyWindowIcon()
+    {
+        var iconPath = Path.Combine(AppContext.BaseDirectory, "Assets", "SideDock.ico");
+        if (!File.Exists(iconPath))
+        {
+            iconPath = Path.GetFullPath(Path.Combine(
+                AppContext.BaseDirectory,
+                "..",
+                "..",
+                "..",
+                "..",
+                "..",
+                "..",
+                "assets",
+                "SideDock.ico"));
+        }
+
+        if (File.Exists(iconPath))
+        {
+            AppWindow.SetIcon(iconPath);
+        }
+    }
+
+    private void UpdateOverviewSidebarLayout()
+    {
+        if (!StaticOverviewUi)
+        {
+            return;
+        }
+
+        OverviewSidebarColumn.Width = new GridLength(_overviewSidebarCollapsed ? 76 : 238);
+        OverviewSidebarContent.Padding = _overviewSidebarCollapsed
+            ? new Thickness(12, 18, 12, 22)
+            : new Thickness(18, 18, 18, 22);
+
+        var textVisibility = _overviewSidebarCollapsed ? Visibility.Collapsed : Visibility.Visible;
+        OverviewAppTitleText.Visibility = textVisibility;
+        OverviewSidebarHostStatusPanel.Visibility = textVisibility;
+        OverviewSidebarToggleText.Visibility = textVisibility;
+        OverviewSidebarToggleIcon.Glyph = _overviewSidebarCollapsed ? "\uE76C" : "\uE72B";
+        ToolTipService.SetToolTip(OverviewSidebarToggleButton, _overviewSidebarCollapsed ? "展开菜单" : "折叠菜单");
+
+        foreach (var (_, container, _, _, text) in OverviewNavigationVisuals())
+        {
+            container.Padding = _overviewSidebarCollapsed
+                ? new Thickness(10, 0, 10, 0)
+                : new Thickness(14, 0, 14, 0);
+            text.Visibility = textVisibility;
+        }
+    }
+
+    private (OverviewNavigationItem Item, Border Container, Border Indicator, FontIcon Icon, TextBlock Text)[] OverviewNavigationVisuals()
+    {
+        return new[]
+        {
+            (OverviewNavigationItem.Overview, OverviewNavOverviewItem, OverviewNavOverviewIndicator, OverviewNavOverviewIcon, OverviewNavOverviewText),
+            (OverviewNavigationItem.Connection, OverviewNavConnectionItem, OverviewNavConnectionIndicator, OverviewNavConnectionIcon, OverviewNavConnectionText),
+            (OverviewNavigationItem.Display, OverviewNavDisplayItem, OverviewNavDisplayIndicator, OverviewNavDisplayIcon, OverviewNavDisplayText),
+            (OverviewNavigationItem.Camera, OverviewNavCameraItem, OverviewNavCameraIndicator, OverviewNavCameraIcon, OverviewNavCameraText),
+            (OverviewNavigationItem.Audio, OverviewNavAudioItem, OverviewNavAudioIndicator, OverviewNavAudioIcon, OverviewNavAudioText),
+            (OverviewNavigationItem.Diagnostics, OverviewNavDiagnosticsItem, OverviewNavDiagnosticsIndicator, OverviewNavDiagnosticsIcon, OverviewNavDiagnosticsText),
+            (OverviewNavigationItem.Settings, OverviewNavSettingsItem, OverviewNavSettingsIndicator, OverviewNavSettingsIcon, OverviewNavSettingsText)
+        };
+    }
+
+    private void SetOverviewNavigationItem(OverviewNavigationItem item)
+    {
+        if (!StaticOverviewUi)
+        {
+            return;
+        }
+
+        _overviewNavigationItem = item;
+        foreach (var (navItem, container, indicator, icon, text) in OverviewNavigationVisuals())
+        {
+            var active = navItem == item;
+            container.Background = active ? _overviewNavActiveBackgroundBrush : _overviewTransparentBrush;
+            indicator.Opacity = active ? 1 : 0;
+            icon.Foreground = active ? _overviewPrimaryBrush : new SolidColorBrush(ColorHelper.FromArgb(255, 48, 54, 61));
+            text.Foreground = active ? new SolidColorBrush(ColorHelper.FromArgb(255, 17, 24, 39)) : new SolidColorBrush(ColorHelper.FromArgb(255, 48, 54, 61));
+            text.FontWeight = active ? FontWeights.SemiBold : FontWeights.Normal;
+        }
+
+        UpdateOverviewPageChrome(item);
+    }
+
+    private void UpdateOverviewPageChrome(OverviewNavigationItem item)
+    {
+        if (!StaticOverviewUi)
+        {
+            return;
+        }
+
+        OverviewPageTitleText.Text = item switch
+        {
+            OverviewNavigationItem.Connection => "连接",
+            OverviewNavigationItem.Display => "虚拟显示器",
+            OverviewNavigationItem.Camera => "摄像头",
+            OverviewNavigationItem.Audio => "音频",
+            OverviewNavigationItem.Diagnostics => "诊断",
+            OverviewNavigationItem.Settings => "设置",
+            _ => "设备总览"
+        };
+
+        var showDisplayPage = item == OverviewNavigationItem.Display;
+        var showCameraPage = item == OverviewNavigationItem.Camera;
+        var showAudioPage = item == OverviewNavigationItem.Audio;
+        var showDiagnosticsPage = item == OverviewNavigationItem.Diagnostics;
+        var showSettingsPage = item == OverviewNavigationItem.Settings;
+        OverviewRightShell.Visibility = Visibility.Visible;
+        OverviewDisplayPage.Visibility = showDisplayPage ? Visibility.Visible : Visibility.Collapsed;
+        OverviewCameraScrollViewer.Visibility = showCameraPage ? Visibility.Visible : Visibility.Collapsed;
+        OverviewAudioPage.Visibility = showAudioPage ? Visibility.Visible : Visibility.Collapsed;
+        OverviewDiagnosticsPage.Visibility = showDiagnosticsPage ? Visibility.Visible : Visibility.Collapsed;
+        OverviewSettingsPage.Visibility = showSettingsPage ? Visibility.Visible : Visibility.Collapsed;
+
+        OverviewStartHostButtonText.Text = showCameraPage ? "启动虚拟相机" : "启动主机";
+        OverviewPrimaryActionIcon.Glyph = showCameraPage ? "\uE722" : "\uE768";
+        OverviewStartHostButton.Visibility = showAudioPage || showDiagnosticsPage || showSettingsPage ? Visibility.Collapsed : Visibility.Visible;
+        OverviewDefaultHeaderActions.Visibility = showAudioPage || showDiagnosticsPage || showSettingsPage ? Visibility.Collapsed : Visibility.Visible;
+        OverviewAudioHeaderActions.Visibility = showAudioPage ? Visibility.Visible : Visibility.Collapsed;
+        OverviewSettingsHeaderActions.Visibility = showSettingsPage ? Visibility.Visible : Visibility.Collapsed;
+
+        var showConnectionPage = item == OverviewNavigationItem.Connection;
+        OverviewConnectionScrollViewer.Visibility = showConnectionPage ? Visibility.Visible : Visibility.Collapsed;
+        OverviewMainScrollViewer.Visibility = showConnectionPage || showDisplayPage || showCameraPage || showAudioPage || showDiagnosticsPage || showSettingsPage ? Visibility.Collapsed : Visibility.Visible;
+    }
+
+    private void OpenOverviewNavigationItem(OverviewNavigationItem item)
+    {
+        SetOverviewNavigationItem(item);
+        if (item == OverviewNavigationItem.Overview)
+        {
+            OverviewNavigationDetailPanel.Visibility = Visibility.Collapsed;
+            OverviewMainScrollViewer.ChangeView(null, 0, null);
+            return;
+        }
+
+        if (item == OverviewNavigationItem.Connection)
+        {
+            OverviewNavigationDetailPanel.Visibility = Visibility.Collapsed;
+            OverviewConnectionScrollViewer.ChangeView(null, 0, null);
+            return;
+        }
+
+        if (item == OverviewNavigationItem.Camera)
+        {
+            OverviewNavigationDetailPanel.Visibility = Visibility.Collapsed;
+            OverviewCameraScrollViewer.ChangeView(null, 0, null);
+            return;
+        }
+
+        if (item == OverviewNavigationItem.Settings)
+        {
+            OverviewNavigationDetailPanel.Visibility = Visibility.Collapsed;
+            OverviewSettingsPage.ScrollToTop();
+            return;
+        }
+
+        SetOverviewNavigationDetail(item);
+        OverviewNavigationDetailPanel.Visibility = Visibility.Visible;
+        OverviewNavigationDetailPanel.StartBringIntoView(new BringIntoViewOptions
+        {
+            AnimationDesired = true,
+            VerticalAlignmentRatio = 0
+        });
+    }
+
+    private void SetOverviewNavigationDetail(OverviewNavigationItem item)
+    {
+        var (title, detail, glyph) = item switch
+        {
+            OverviewNavigationItem.Connection => (
+                "连接设置",
+                "连接设置区域已打开。设备选择、ADB reverse 和主机连接状态目前由下方连接向导承载，这里作为新版设置入口占位。",
+                "\uE71B"),
+            OverviewNavigationItem.Display => (
+                "虚拟显示器设置",
+                "虚拟显示器设置区域已打开。分辨率、刷新率和驱动修复入口已接入下方虚拟显示器卡片，这里作为后续集中设置占位。",
+                "\uE7F4"),
+            OverviewNavigationItem.Camera => (
+                "摄像头设置",
+                "摄像头设置区域已打开。镜头方向、分辨率和帧率入口已接入摄像头设置对话框，这里作为后续集中设置占位。",
+                "\uE722"),
+            OverviewNavigationItem.Audio => (
+                "音频设置",
+                "音频设置区域已打开。Windows 输出 loopback 和 Android 麦克风写入端点已接入音频设置对话框，这里作为后续集中设置占位。",
+                "\uE995"),
+            OverviewNavigationItem.Diagnostics => (
+                "详细诊断",
+                "详细诊断区域已打开。运行指标、视频链路、虚拟显示器、摄像头、音频和日志可从诊断详情中查看与复制。",
+                "\uE9D9"),
+            OverviewNavigationItem.Settings => (
+                "综合设置",
+                "综合设置入口已打开。后续会把主机、ADB、显示、摄像头和音频偏好整合到这里。",
+                "\uE713"),
+            _ => (
+                "设备总览",
+                "当前停留在设备总览。",
+                "\uE80F")
+        };
+
+        OverviewNavigationDetailTitleText.Text = title;
+        OverviewNavigationDetailText.Text = detail;
+        OverviewNavigationDetailIcon.Glyph = glyph;
+    }
+
+    private void InitializeOverviewConnectionControls()
+    {
+        if (!StaticOverviewUi)
+        {
+            return;
+        }
+
+        _syncingOverviewConnectionControls = true;
+        try
+        {
+            OverviewControlPortBox.Value = double.IsNaN(ControlPortBox.Value) ? DefaultControlPort : ControlPortBox.Value;
+            OverviewVideoPortBox.Value = double.IsNaN(VideoPortBox.Value) ? DefaultVideoPort : VideoPortBox.Value;
+            OverviewAudioPortBox.Value = DefaultAudioPort;
+            OverviewCameraPortBox.Value = DefaultCameraPort;
+            OverviewAdbPathBox.Text = AdbPathBox.Text;
+            OverviewInputInjectionSwitch.IsOn = InputInjectionSwitch.IsOn;
+            OverviewInputInjectionStatusText.Text = OverviewInputInjectionSwitch.IsOn ? "已启用" : "未启用";
+        }
+        finally
+        {
+            _syncingOverviewConnectionControls = false;
+        }
+
+        UpdateOverviewFooterMachineInfo();
+        UpdateOverviewConnectionPage();
+    }
+
+    private bool CanStartOverviewHost()
+    {
+        return _overviewHostServiceState is OverviewHostServiceState.NotStarted
+            or OverviewHostServiceState.Stopped
+            or OverviewHostServiceState.Error;
+    }
+
+    private void SyncOverviewConnectionControlsToLegacy()
+    {
+        if (!StaticOverviewUi)
+        {
+            return;
+        }
+
+        ControlPortBox.Value = OverviewControlPortBox.Value;
+        VideoPortBox.Value = OverviewVideoPortBox.Value;
+        AdbPathBox.Text = OverviewAdbPathBox.Text;
+        InputInjectionSwitch.IsOn = OverviewInputInjectionSwitch.IsOn;
+    }
+
+    private void UpdateOverviewConnectionPage()
+    {
+        if (!StaticOverviewUi)
+        {
+            return;
+        }
+
+        SyncOverviewConnectionControlsToLegacy();
+        UpdateOverviewConnectionButtons();
+        UpdateOverviewConnectionDeviceSummary();
+        UpdateOverviewConnectionDeviceList();
+        UpdateOverviewConnectionPortStatus();
+        UpdateOverviewConnectionChecklist();
+        UpdateOverviewFooterMachineInfo();
+    }
+
+    private void UpdateOverviewConnectionButtons()
+    {
+        var hostRunning = _hostProcess is { HasExited: false };
+        var starting = _overviewHostServiceState == OverviewHostServiceState.Starting;
+        var busy = _overviewRefreshInProgress || _adbRefreshInProgress || starting;
+        var canEditStartupSettings = !hostRunning && !starting;
+
+        OverviewConnectionStartHostButton.IsEnabled = CanStartOverviewHost() && !busy;
+        OverviewConnectionMoreActionsButton.IsEnabled = true;
+        OverviewConnectionAdbDeviceCombo.IsEnabled = canEditStartupSettings && !_adbRefreshInProgress;
+        OverviewConnectionDeviceListView.IsEnabled = canEditStartupSettings && !_adbRefreshInProgress;
+        OverviewRestoreDefaultPortsButton.IsEnabled = canEditStartupSettings;
+        OverviewAdvancedConnectionOptionsButton.IsEnabled = true;
+        OverviewAdbPathBox.IsEnabled = canEditStartupSettings;
+        OverviewAdbPathBrowseButton.IsEnabled = canEditStartupSettings;
+        OverviewControlPortBox.IsEnabled = canEditStartupSettings;
+        OverviewVideoPortBox.IsEnabled = canEditStartupSettings;
+        OverviewAudioPortBox.IsEnabled = canEditStartupSettings;
+        OverviewCameraPortBox.IsEnabled = canEditStartupSettings;
+        OverviewInputInjectionSwitch.IsEnabled = canEditStartupSettings;
+    }
+
+    private void UpdateOverviewConnectionDeviceSummary()
+    {
+        var selectedChoice = SelectedAdbDeviceChoice();
+        var selectedRow = SelectedAdbDeviceRow();
+        var authorizedRows = _lastAdbDeviceRows
+            .Where(row => row.State.Equals("device", StringComparison.OrdinalIgnoreCase))
+            .ToArray();
+
+        if (selectedRow is not null)
+        {
+            var status = BuildAdbDeviceStatusView(selectedRow.State);
+            OverviewConnectionSelectedDeviceNameText.Text = FormatAdbDeviceDisplayName(selectedRow);
+            OverviewConnectionSelectedDeviceStatusText.Text = status.Text;
+            OverviewConnectionSelectedDeviceStatusText.Foreground = status.Brush;
+            OverviewConnectionSelectedDeviceStatusBadge.Background = status.Background;
+            OverviewConnectionSelectedDeviceStatusBadge.BorderBrush = status.Border;
+            OverviewConnectionSelectedDeviceDetailText.Text = BuildAdbDeviceDetailText(selectedRow);
+            OverviewConnectionSelectedDeviceTransportText.Text = FormatAdbTransport(selectedRow);
+            OverviewConnectionSelectedDeviceCard.BorderBrush = selectedRow.State.Equals("device", StringComparison.OrdinalIgnoreCase)
+                ? _overviewReadyBorderBrush
+                : _overviewWarningBorderBrush;
+            OverviewConnectionDeviceIconBorder.BorderBrush = status.Brush;
+            OverviewConnectionSelectedDeviceBatteryPanel.Visibility = Visibility.Collapsed;
+            return;
+        }
+
+        if (selectedChoice is { Serial.Length: > 0 })
+        {
+            OverviewConnectionSelectedDeviceNameText.Text = selectedChoice.Serial;
+            OverviewConnectionSelectedDeviceStatusText.Text = "未检测到";
+            OverviewConnectionSelectedDeviceStatusText.Foreground = _warningBrush;
+            OverviewConnectionSelectedDeviceStatusBadge.Background = _overviewWarningBackgroundBrush;
+            OverviewConnectionSelectedDeviceStatusBadge.BorderBrush = _overviewWarningBorderBrush;
+            OverviewConnectionSelectedDeviceDetailText.Text = "所选设备不在当前 ADB 列表中，请刷新后重试。";
+            OverviewConnectionSelectedDeviceTransportText.Text = "暂无数据";
+            OverviewConnectionSelectedDeviceCard.BorderBrush = _overviewWarningBorderBrush;
+            OverviewConnectionDeviceIconBorder.BorderBrush = _warningBrush;
+            OverviewConnectionSelectedDeviceBatteryPanel.Visibility = Visibility.Collapsed;
+            return;
+        }
+
+        if (authorizedRows.Length > 1)
+        {
+            OverviewConnectionSelectedDeviceNameText.Text = "请选择设备";
+            OverviewConnectionSelectedDeviceStatusText.Text = "多设备";
+            OverviewConnectionSelectedDeviceStatusText.Foreground = _warningBrush;
+            OverviewConnectionSelectedDeviceStatusBadge.Background = _overviewWarningBackgroundBrush;
+            OverviewConnectionSelectedDeviceStatusBadge.BorderBrush = _overviewWarningBorderBrush;
+            OverviewConnectionSelectedDeviceDetailText.Text = $"检测到 {authorizedRows.Length} 台已授权设备，请从右侧下拉框选择一台。";
+            OverviewConnectionSelectedDeviceTransportText.Text = "ADB";
+            OverviewConnectionSelectedDeviceCard.BorderBrush = _overviewWarningBorderBrush;
+            OverviewConnectionDeviceIconBorder.BorderBrush = _warningBrush;
+            OverviewConnectionSelectedDeviceBatteryPanel.Visibility = Visibility.Collapsed;
+            return;
+        }
+
+        var firstRow = _lastAdbDeviceRows.FirstOrDefault();
+        if (firstRow is not null)
+        {
+            var status = BuildAdbDeviceStatusView(firstRow.State);
+            OverviewConnectionSelectedDeviceNameText.Text = FormatAdbDeviceDisplayName(firstRow);
+            OverviewConnectionSelectedDeviceStatusText.Text = status.Text;
+            OverviewConnectionSelectedDeviceStatusText.Foreground = status.Brush;
+            OverviewConnectionSelectedDeviceStatusBadge.Background = status.Background;
+            OverviewConnectionSelectedDeviceStatusBadge.BorderBrush = status.Border;
+            OverviewConnectionSelectedDeviceDetailText.Text = BuildAdbDeviceDetailText(firstRow);
+            OverviewConnectionSelectedDeviceTransportText.Text = FormatAdbTransport(firstRow);
+            OverviewConnectionSelectedDeviceCard.BorderBrush = _overviewWarningBorderBrush;
+            OverviewConnectionDeviceIconBorder.BorderBrush = status.Brush;
+            OverviewConnectionSelectedDeviceBatteryPanel.Visibility = Visibility.Collapsed;
+            return;
+        }
+
+        OverviewConnectionSelectedDeviceNameText.Text = _adbRefreshInProgress ? "正在刷新" : "暂无设备";
+        OverviewConnectionSelectedDeviceStatusText.Text = _adbRefreshInProgress ? "刷新中" : "等待刷新";
+        OverviewConnectionSelectedDeviceStatusText.Foreground = _overviewNeutralBrush;
+        OverviewConnectionSelectedDeviceStatusBadge.Background = _overviewNeutralBackgroundBrush;
+        OverviewConnectionSelectedDeviceStatusBadge.BorderBrush = _overviewNeutralBorderBrush;
+        OverviewConnectionSelectedDeviceDetailText.Text = _adbRefreshInProgress
+            ? "正在读取 adb devices -l。"
+            : "暂无数据，请连接 USB 并刷新设备。";
+        OverviewConnectionSelectedDeviceTransportText.Text = "暂无数据";
+        OverviewConnectionSelectedDeviceCard.BorderBrush = _overviewNeutralBorderBrush;
+        OverviewConnectionDeviceIconBorder.BorderBrush = _overviewNeutralBrush;
+        OverviewConnectionSelectedDeviceBatteryPanel.Visibility = Visibility.Collapsed;
+    }
+
+    private void UpdateOverviewConnectionDeviceList()
+    {
+        var items = _lastAdbDeviceRows
+            .Select(row => new OverviewConnectionDeviceItem(
+                row.Serial,
+                FormatAdbDeviceDisplayName(row),
+                FormatAdbDeviceState(row.State),
+                BuildAdbDeviceStatusView(row.State).Brush,
+                BuildAdbDeviceStatusView(row.State).DotBrush,
+                FormatAdbTransport(row),
+                FormatLastAdbRefreshText()))
+            .ToArray();
+
+        _syncingAdbDeviceSelection = true;
+        try
+        {
+            OverviewConnectionDeviceListView.ItemsSource = items;
+            OverviewConnectionDeviceListView.Visibility = items.Length > 0 ? Visibility.Visible : Visibility.Collapsed;
+            OverviewConnectionDeviceEmptyText.Visibility = items.Length == 0 ? Visibility.Visible : Visibility.Collapsed;
+            OverviewConnectionDeviceEmptyText.Text = _adbRefreshInProgress
+                ? "正在刷新设备..."
+                : "暂无数据，等待刷新";
+
+            var selectedSerial = SelectedAdbSerial();
+            OverviewConnectionDeviceListView.SelectedItem = items.FirstOrDefault(item =>
+                !string.IsNullOrWhiteSpace(selectedSerial)
+                && item.Serial.Equals(selectedSerial, StringComparison.OrdinalIgnoreCase));
+        }
+        finally
+        {
+            _syncingAdbDeviceSelection = false;
+        }
+    }
+
+    private void UpdateOverviewConnectionChecklist()
+    {
+        var (usbState, usbDetail) = BuildOverviewConnectionUsbStep();
+        SetOverviewConnectionChecklistStep(
+            OverviewConnectionUsbBadge,
+            OverviewConnectionUsbIcon,
+            OverviewConnectionUsbDetailText,
+            OverviewConnectionUsbStatusText,
+            usbDetail,
+            usbState);
+
+        var (authState, authDetail) = BuildOverviewConnectionAuthStep();
+        SetOverviewConnectionChecklistStep(
+            OverviewConnectionAuthBadge,
+            OverviewConnectionAuthIcon,
+            OverviewConnectionAuthDetailText,
+            OverviewConnectionAuthStatusText,
+            authDetail,
+            authState);
+
+        var (reverseState, reverseDetail) = BuildOverviewConnectionReverseStep(authState);
+        SetOverviewConnectionChecklistStep(
+            OverviewConnectionReverseBadge,
+            OverviewConnectionReverseIcon,
+            OverviewConnectionReverseDetailText,
+            OverviewConnectionReverseStatusText,
+            reverseDetail,
+            reverseState);
+
+        var (portState, portDetail) = BuildOverviewConnectionPortStep();
+        SetOverviewConnectionChecklistStep(
+            OverviewConnectionPortBadge,
+            OverviewConnectionPortIcon,
+            OverviewConnectionPortDetailText,
+            OverviewConnectionPortStatusText,
+            portDetail,
+            portState);
+
+        var (readyState, readyDetail) = BuildOverviewConnectionReadyStep(authState, portState);
+        SetOverviewConnectionChecklistStep(
+            OverviewConnectionReadyBadge,
+            OverviewConnectionReadyIcon,
+            OverviewConnectionReadyDetailText,
+            OverviewConnectionReadyStatusText,
+            readyDetail,
+            readyState);
+    }
+
+    private (OverviewStepState State, string Detail) BuildOverviewConnectionUsbStep()
+    {
+        if (_adbRefreshInProgress)
+        {
+            return (OverviewStepState.Active, "正在刷新 ADB 设备列表");
+        }
+
+        if (_lastAdbDeviceRows.Count == 0)
+        {
+            return (OverviewStepState.Waiting, "暂无数据，请刷新设备");
+        }
+
+        var selectedRow = SelectedAdbDeviceRow();
+        if (selectedRow is not null)
+        {
+            if (IsAdbNetworkSerial(selectedRow.Serial))
+            {
+                return (OverviewStepState.Warning, $"当前选择网络 ADB：{selectedRow.Serial}");
+            }
+
+            return IsUsbAdbRow(selectedRow)
+                ? (OverviewStepState.Complete, $"已检测到 USB 设备：{selectedRow.Serial}")
+                : (OverviewStepState.Warning, $"已检测到 ADB 设备，未确认 USB 通道：{selectedRow.Serial}");
+        }
+
+        var usbCount = _lastAdbDeviceRows.Count(IsUsbAdbRow);
+        if (usbCount > 0)
+        {
+            return (OverviewStepState.Complete, $"检测到 {usbCount} 台 USB/ADB 设备");
+        }
+
+        return (OverviewStepState.Warning, "检测到 ADB 设备，但连接方式未知");
+    }
+
+    private (OverviewStepState State, string Detail) BuildOverviewConnectionAuthStep()
+    {
+        var selectedRow = SelectedAdbDeviceRow();
+        if (selectedRow is not null)
+        {
+            if (selectedRow.State.Equals("device", StringComparison.OrdinalIgnoreCase))
+            {
+                return (OverviewStepState.Complete, $"已授权：{selectedRow.Serial}");
+            }
+
+            return selectedRow.State.Equals("offline", StringComparison.OrdinalIgnoreCase)
+                ? (OverviewStepState.Error, $"设备离线：{selectedRow.Serial}")
+                : (OverviewStepState.Warning, $"设备状态为 {selectedRow.State}：{selectedRow.Serial}");
+        }
+
+        var authorizedRows = _lastAdbDeviceRows
+            .Where(row => row.State.Equals("device", StringComparison.OrdinalIgnoreCase))
+            .ToArray();
+        if (authorizedRows.Length == 1)
+        {
+            return (OverviewStepState.Complete, $"已授权：{authorizedRows[0].Serial}");
+        }
+
+        if (authorizedRows.Length > 1)
+        {
+            return (OverviewStepState.Warning, $"检测到 {authorizedRows.Length} 台已授权设备，请选择一台");
+        }
+
+        var unauthorizedRow = _lastAdbDeviceRows.FirstOrDefault(row =>
+            row.State.Equals("unauthorized", StringComparison.OrdinalIgnoreCase));
+        if (unauthorizedRow is not null)
+        {
+            return (OverviewStepState.Warning, $"请在设备上允许 USB 调试：{unauthorizedRow.Serial}");
+        }
+
+        var offlineRow = _lastAdbDeviceRows.FirstOrDefault(row =>
+            row.State.Equals("offline", StringComparison.OrdinalIgnoreCase));
+        if (offlineRow is not null)
+        {
+            return (OverviewStepState.Error, $"设备离线：{offlineRow.Serial}");
+        }
+
+        return _lastAdbDeviceRows.Count > 0
+            ? (OverviewStepState.Warning, "未检测到已授权设备")
+            : (OverviewStepState.Waiting, "等待设备授权状态");
+    }
+
+    private (OverviewStepState State, string Detail) BuildOverviewConnectionReverseStep(OverviewStepState authState)
+    {
+        if (_overviewHostServiceState == OverviewHostServiceState.Starting)
+        {
+            return (OverviewStepState.Active, _lastAdbStatusText);
+        }
+
+        if (_lastAdbReverseConfigured == true)
+        {
+            return (OverviewStepState.Complete, _lastAdbReverseDetail);
+        }
+
+        if (_lastAdbReverseConfigured == false)
+        {
+            return (OverviewStepState.Error, _lastAdbReverseDetail);
+        }
+
+        if (authState == OverviewStepState.Complete)
+        {
+            return (OverviewStepState.Waiting, "启动主机时自动配置 ADB reverse");
+        }
+
+        if (authState == OverviewStepState.Warning)
+        {
+            return (OverviewStepState.Warning, "请先选择并授权设备");
+        }
+
+        return (OverviewStepState.Waiting, "等待授权设备");
+    }
+
+    private (OverviewStepState State, string Detail) BuildOverviewConnectionPortStep()
+    {
+        return BuildOverviewConnectionPortSummary();
+    }
+
+    private (OverviewStepState State, string Detail) BuildOverviewConnectionReadyStep(
+        OverviewStepState authState,
+        OverviewStepState portState)
+    {
+        return _overviewHostServiceState switch
+        {
+            OverviewHostServiceState.Running => (OverviewStepState.Complete, "会话正在运行"),
+            OverviewHostServiceState.Starting => (OverviewStepState.Active, "正在启动会话"),
+            OverviewHostServiceState.Error => (OverviewStepState.Error, _overviewHostDetailText),
+            _ when portState == OverviewStepState.Error => (OverviewStepState.Error, "请修正端口配置后再启动"),
+            _ when authState == OverviewStepState.Complete => (OverviewStepState.Complete, "可以启动会话"),
+            _ when authState == OverviewStepState.Warning => (OverviewStepState.Warning, "请先处理设备选择或授权"),
+            _ => (OverviewStepState.Waiting, "等待设备和端口检查")
+        };
+    }
+
+    private void SetOverviewConnectionChecklistStep(
+        Border badge,
+        FontIcon icon,
+        TextBlock detailText,
+        TextBlock statusText,
+        string detail,
+        OverviewStepState state)
+    {
+        detailText.Text = detail;
+
+        var (status, foreground) = state switch
+        {
+            OverviewStepState.Complete => ("正常", _successBrush),
+            OverviewStepState.Active => ("进行中", _overviewPrimaryBrush),
+            OverviewStepState.Warning => ("警告", _warningBrush),
+            OverviewStepState.Error => ("错误", _dangerBrush),
+            _ => ("待处理", _overviewNeutralBrush)
+        };
+        statusText.Text = status;
+        statusText.Foreground = foreground;
+
+        switch (state)
+        {
+            case OverviewStepState.Complete:
+                badge.Background = _successBrush;
+                badge.BorderBrush = _successBrush;
+                badge.BorderThickness = new Thickness(0);
+                icon.Glyph = "\uE73E";
+                icon.Foreground = new SolidColorBrush(Colors.White);
+                detailText.Foreground = _secondaryBrush;
+                break;
+            case OverviewStepState.Active:
+                badge.Background = _overviewPrimaryBrush;
+                badge.BorderBrush = _overviewPrimaryBrush;
+                badge.BorderThickness = new Thickness(0);
+                icon.Glyph = "\uE768";
+                icon.Foreground = new SolidColorBrush(Colors.White);
+                detailText.Foreground = _overviewPrimaryBrush;
+                break;
+            case OverviewStepState.Warning:
+                badge.Background = _overviewWarningBackgroundBrush;
+                badge.BorderBrush = _overviewWarningBorderBrush;
+                badge.BorderThickness = new Thickness(1);
+                icon.Glyph = "\uE7BA";
+                icon.Foreground = _warningBrush;
+                detailText.Foreground = _warningBrush;
+                break;
+            case OverviewStepState.Error:
+                badge.Background = _overviewErrorBackgroundBrush;
+                badge.BorderBrush = _overviewErrorBorderBrush;
+                badge.BorderThickness = new Thickness(1);
+                icon.Glyph = "\uE783";
+                icon.Foreground = _dangerBrush;
+                detailText.Foreground = _dangerBrush;
+                break;
+            default:
+                badge.Background = _overviewNeutralBackgroundBrush;
+                badge.BorderBrush = _overviewNeutralBorderBrush;
+                badge.BorderThickness = new Thickness(1);
+                icon.Glyph = "\uE711";
+                icon.Foreground = _overviewNeutralBrush;
+                detailText.Foreground = _secondaryBrush;
+                break;
+        }
+    }
+
+    private (TextBlock TextBlock, XamlShape Dot, NumberBox NumberBox, string Name)[] OverviewPortStatusControls()
+    {
+        return new (TextBlock TextBlock, XamlShape Dot, NumberBox NumberBox, string Name)[]
+        {
+            (OverviewControlPortStatusText, OverviewControlPortStatusDot, OverviewControlPortBox, "控制"),
+            (OverviewVideoPortStatusText, OverviewVideoPortStatusDot, OverviewVideoPortBox, "视频"),
+            (OverviewAudioPortStatusText, OverviewAudioPortStatusDot, OverviewAudioPortBox, "音频"),
+            (OverviewCameraPortStatusText, OverviewCameraPortStatusDot, OverviewCameraPortBox, "摄像头")
+        };
+    }
+
+    private void UpdateOverviewConnectionPortStatus()
+    {
+        var activePorts = GetActiveTcpListenerPorts();
+        var hostRunning = _hostProcess is { HasExited: false };
+        var portValues = OverviewPortStatusControls()
+            .Select(port => (port, Valid: TryReadPort(port.NumberBox, out var value), Value: value))
+            .ToArray();
+        var duplicatePorts = portValues
+            .Where(item => item.Valid)
+            .GroupBy(item => item.Value)
+            .Where(group => group.Count() > 1)
+            .Select(group => group.Key)
+            .ToHashSet();
+
+        foreach (var (port, valid, value) in portValues)
+        {
+            string statusText;
+            Brush statusBrush;
+
+            if (!valid)
+            {
+                statusText = "无效";
+                statusBrush = _dangerBrush;
+            }
+            else if (duplicatePorts.Contains(value))
+            {
+                statusText = "重复";
+                statusBrush = _dangerBrush;
+            }
+            else if (activePorts.Contains(value))
+            {
+                statusText = hostRunning ? "使用中" : "被占用";
+                statusBrush = hostRunning ? _successBrush : _dangerBrush;
+            }
+            else
+            {
+                statusText = "可用";
+                statusBrush = _successBrush;
+            }
+
+            port.TextBlock.Text = statusText;
+            port.TextBlock.Foreground = statusBrush;
+            port.Dot.Fill = statusBrush;
+        }
+    }
+
+    private (OverviewStepState State, string Detail) BuildOverviewConnectionPortSummary()
+    {
+        var activePorts = GetActiveTcpListenerPorts();
+        var hostRunning = _hostProcess is { HasExited: false };
+        var portValues = OverviewPortStatusControls()
+            .Select(port => (port.Name, Valid: TryReadPort(port.NumberBox, out var value), Value: value))
+            .ToArray();
+
+        var invalidPorts = portValues.Where(port => !port.Valid).Select(port => port.Name).ToArray();
+        if (invalidPorts.Length > 0)
+        {
+            return (OverviewStepState.Error, $"端口无效：{string.Join("、", invalidPorts)}");
+        }
+
+        var duplicateGroups = portValues
+            .GroupBy(port => port.Value)
+            .Where(group => group.Count() > 1)
+            .ToArray();
+        if (duplicateGroups.Length > 0)
+        {
+            var duplicateText = string.Join("、", duplicateGroups.Select(group => group.Key.ToString(CultureInfo.InvariantCulture)));
+            return (OverviewStepState.Error, $"端口不能重复：{duplicateText}");
+        }
+
+        var occupied = portValues
+            .Where(port => activePorts.Contains(port.Value))
+            .ToArray();
+        if (occupied.Length > 0 && !hostRunning)
+        {
+            var occupiedText = string.Join("、", occupied.Select(port => $"{port.Name} {port.Value}"));
+            return (OverviewStepState.Error, $"端口被占用：{occupiedText}");
+        }
+
+        var ports = string.Join("/", portValues.Select(port => port.Value.ToString(CultureInfo.InvariantCulture)));
+        return hostRunning && occupied.Length > 0
+            ? (OverviewStepState.Complete, $"主机正在使用端口 {ports}")
+            : (OverviewStepState.Complete, $"端口可用：{ports}");
+    }
+
+    private static HashSet<int> GetActiveTcpListenerPorts()
+    {
+        try
+        {
+            return IPGlobalProperties.GetIPGlobalProperties()
+                .GetActiveTcpListeners()
+                .Select(endpoint => endpoint.Port)
+                .ToHashSet();
+        }
+        catch
+        {
+            return new HashSet<int>();
+        }
+    }
+
+    private static bool TryReadPort(NumberBox numberBox, out int port)
+    {
+        port = 0;
+        if (double.IsNaN(numberBox.Value))
+        {
+            return false;
+        }
+
+        port = (int)numberBox.Value;
+        return port is >= 1 and <= 65535;
+    }
+
+    private void UpdateOverviewFooterMachineInfo()
+    {
+        if (!StaticOverviewUi)
+        {
+            return;
+        }
+
+        var footer = BuildOverviewFooterSnapshot();
+        OverviewFooterHostText.Text = footer.HostText;
+        OverviewFooterOsText.Text = footer.OsText;
+        OverviewFooterNetworkText.Text = footer.NetworkText;
+        OverviewFooterNetworkStatusDot.Fill = footer.NetworkBrush;
+    }
+
+    private (string HostText, string OsText, string NetworkText, Brush NetworkBrush) BuildOverviewFooterSnapshot()
+    {
+        var hostText = $"本机：{Environment.MachineName}";
+        var osText = RuntimeInformation.OSDescription;
+        var address = TryGetPrimaryNetworkAddress(out var interfaceName);
+        if (address is null)
+        {
+            return (
+                hostText,
+                osText,
+                string.IsNullOrWhiteSpace(interfaceName) ? "网络：暂无数据" : $"{interfaceName}：暂无数据",
+                _overviewMutedBrush);
+        }
+
+        return (
+            hostText,
+            osText,
+            string.IsNullOrWhiteSpace(interfaceName) ? address.ToString() : $"{interfaceName}：{address}",
+            _successBrush);
+    }
+
+    private static IPAddress? TryGetPrimaryNetworkAddress(out string interfaceName)
+    {
+        interfaceName = string.Empty;
+        try
+        {
+            var networkInterface = FindPrimaryNetworkInterface();
+            if (networkInterface is null)
+            {
+                return null;
+            }
+
+            interfaceName = networkInterface.Name;
+            return networkInterface
+                .GetIPProperties()
+                .UnicastAddresses
+                .Select(address => address.Address)
+                .FirstOrDefault(address => address.AddressFamily == AddressFamily.InterNetwork);
+        }
+        catch
+        {
+            return null;
+        }
+    }
+
+    private (string Text, Brush Brush, Brush DotBrush, Brush Background, Brush Border) BuildAdbDeviceStatusView(string state)
+    {
+        if (state.Equals("device", StringComparison.OrdinalIgnoreCase))
+        {
+            return ("已授权", _successBrush, _successBrush, _overviewReadyBackgroundBrush, _overviewReadyBorderBrush);
+        }
+
+        if (state.Equals("unauthorized", StringComparison.OrdinalIgnoreCase))
+        {
+            return ("未授权", _warningBrush, _warningBrush, _overviewWarningBackgroundBrush, _overviewWarningBorderBrush);
+        }
+
+        if (state.Equals("offline", StringComparison.OrdinalIgnoreCase))
+        {
+            return ("离线", _dangerBrush, _dangerBrush, _overviewErrorBackgroundBrush, _overviewErrorBorderBrush);
+        }
+
+        return (state, _overviewNeutralBrush, _overviewMutedBrush, _overviewNeutralBackgroundBrush, _overviewNeutralBorderBrush);
+    }
+
+    private static string FormatAdbDeviceState(string state)
+    {
+        if (state.Equals("device", StringComparison.OrdinalIgnoreCase))
+        {
+            return "已授权";
+        }
+
+        if (state.Equals("unauthorized", StringComparison.OrdinalIgnoreCase))
+        {
+            return "未授权";
+        }
+
+        if (state.Equals("offline", StringComparison.OrdinalIgnoreCase))
+        {
+            return "离线";
+        }
+
+        return state;
+    }
+
+    private static string FormatAdbTransport(AdbDeviceRow row)
+    {
+        if (IsAdbNetworkSerial(row.Serial))
+        {
+            return "Wi-Fi/网络";
+        }
+
+        return IsUsbAdbRow(row) ? "USB" : "ADB";
+    }
+
+    private static bool IsUsbAdbRow(AdbDeviceRow row)
+    {
+        return row.RawLine.Contains("usb:", StringComparison.OrdinalIgnoreCase);
+    }
+
+    private static bool IsAdbNetworkSerial(string serial)
+    {
+        return serial.Contains(':', StringComparison.Ordinal);
+    }
+
+    private string BuildAdbDeviceDetailText(AdbDeviceRow row)
+    {
+        var model = TryGetAdbDetail(row.RawLine, "model")?.Replace('_', ' ');
+        var product = TryGetAdbDetail(row.RawLine, "product")?.Replace('_', ' ');
+        var androidVersion = "Android 版本：暂无数据";
+        var ip = IsAdbNetworkSerial(row.Serial)
+            ? $"IP：{row.Serial.Split(':', 2)[0]}"
+            : "IP：暂无数据";
+        var deviceInfo = FirstNonEmpty(model, product, "设备信息暂无数据");
+        return $"{deviceInfo} · 序列号：{row.Serial} · {androidVersion} · {ip}";
+    }
+
+    private string FormatLastAdbRefreshText()
+    {
+        if (_lastAdbRefreshCompletedAt is not { } refreshAt)
+        {
+            return "暂无数据";
+        }
+
+        var elapsed = DateTimeOffset.Now - refreshAt;
+        if (elapsed.TotalSeconds < 10)
+        {
+            return "刚刚";
+        }
+
+        if (elapsed.TotalMinutes < 1)
+        {
+            return $"{Math.Max(1, (int)elapsed.TotalSeconds)} 秒前";
+        }
+
+        if (elapsed.TotalHours < 1)
+        {
+            return $"{Math.Max(1, (int)elapsed.TotalMinutes)} 分钟前";
+        }
+
+        return refreshAt.ToString("HH:mm:ss", CultureInfo.CurrentCulture);
+    }
+
+    private void UpdateOverviewActionMenuItems()
+    {
+        if (!StaticOverviewUi)
+        {
+            return;
+        }
+
+        var canStart = CanStartOverviewHost();
+        var running = _overviewHostServiceState == OverviewHostServiceState.Running;
+        var busy = _overviewRefreshInProgress || _adbRefreshInProgress;
+
+        OverviewActionStartHostMenuItem.IsEnabled = canStart && !busy;
+        OverviewActionStopHostMenuItem.IsEnabled = running;
+        OverviewActionRefreshDevicesMenuItem.IsEnabled = !busy;
+        OverviewActionRestartAdbMenuItem.IsEnabled = canStart && !busy;
+        OverviewActionRepairEndpointsMenuItem.IsEnabled = !_overviewRefreshInProgress;
+        OverviewActionOpenDisplaySettingsMenuItem.IsEnabled = true;
+        OverviewActionCopyDiagnosticsMenuItem.IsEnabled = !_overviewRefreshInProgress;
+        OverviewActionOpenLogsMenuItem.IsEnabled = true;
+        OverviewRepairEndpointsButton.IsEnabled = !_overviewRefreshInProgress;
+    }
+
+    private void UpdateOverviewRefreshState()
+    {
+        if (!StaticOverviewUi)
+        {
+            return;
+        }
+
+        var refreshing = _overviewRefreshInProgress || _adbRefreshInProgress;
+        OverviewRefreshAdbDevicesButton.IsEnabled = !refreshing;
+        OverviewRefreshButtonText.Text = refreshing ? "刷新中" : "刷新";
+        OverviewRefreshIcon.Foreground = refreshing ? _overviewNeutralBrush : new SolidColorBrush(ColorHelper.FromArgb(255, 17, 24, 39));
+        UpdateOverviewActionMenuItems();
+    }
+
+    private void SetOverviewHostState(OverviewHostServiceState state, string? detail = null)
+    {
+        _overviewHostServiceState = state;
+        _overviewHostDetailText = detail ?? state switch
+        {
+            OverviewHostServiceState.NotStarted => "等待启动",
+            OverviewHostServiceState.Starting => "正在启动主机",
+            OverviewHostServiceState.Running => "SideDock.Host.exe 正在运行",
+            OverviewHostServiceState.Stopped => "主机已停止",
+            OverviewHostServiceState.Error => "请查看错误提示后重试",
+            _ => "等待启动"
+        };
+
+        if (!StaticOverviewUi)
+        {
+            return;
+        }
+
+        var (statusText, statusBrush, dotBrush) = state switch
+        {
+            OverviewHostServiceState.NotStarted => ("未启动", _dangerBrush, _overviewMutedBrush),
+            OverviewHostServiceState.Starting => ("启动中", _overviewPrimaryBrush, _overviewPrimaryBrush),
+            OverviewHostServiceState.Running => ("运行中", _successBrush, _successBrush),
+            OverviewHostServiceState.Stopped => ("已停止", _secondaryBrush, _overviewMutedBrush),
+            OverviewHostServiceState.Error => ("错误", _dangerBrush, _dangerBrush),
+            _ => ("未启动", _dangerBrush, _overviewMutedBrush)
+        };
+
+        OverviewHostStatusText.Text = statusText;
+        OverviewHostStatusText.Foreground = statusBrush;
+        OverviewHostStatusSubtext.Text = _overviewHostDetailText;
+        OverviewHostStatusDot.Fill = dotBrush;
+        OverviewSidebarHostStatusText.Text = statusText;
+        OverviewSidebarHostStatusText.Foreground = statusBrush;
+        OverviewSidebarHostStatusDot.Fill = dotBrush;
+
+        UpdateOverviewActionButtons();
+        UpdateOverviewConnectionGuide();
+        UpdateOverviewEnvironmentBanner();
+    }
+
+    private void UpdateOverviewActionButtons()
+    {
+        if (!StaticOverviewUi)
+        {
+            return;
+        }
+
+        var canStart = CanStartOverviewHost();
+        var running = _overviewHostServiceState == OverviewHostServiceState.Running;
+
+        OverviewStartHostButton.IsEnabled = canStart && !_overviewRefreshInProgress;
+        OverviewStartHostButtonText.Text = _overviewHostServiceState == OverviewHostServiceState.Starting
+            ? "启动中"
+            : "启动主机";
+        OverviewDisconnectButton.IsEnabled = running;
+        UpdateOverviewRefreshState();
+        UpdateOverviewConnectionPage();
+    }
+
+    private void UpdateOverviewAndroidDeviceState()
+    {
+        if (!StaticOverviewUi)
+        {
+            return;
+        }
+
+        var (stateText, detailText, stateBrush) = BuildOverviewAndroidState();
+        OverviewAndroidStatusText.Text = stateText;
+        OverviewAndroidStatusText.Foreground = stateBrush;
+        OverviewAndroidDetailText.Text = detailText;
+        OverviewAndroidBatteryPanel.Visibility = Visibility.Collapsed;
+
+        UpdateOverviewConnectionGuide();
+        UpdateOverviewEnvironmentBanner();
+    }
+
+    private (string StateText, string DetailText, Brush StateBrush) BuildOverviewAndroidState()
+    {
+        var selectedSerial = SelectedAdbSerial();
+        if (!string.IsNullOrWhiteSpace(selectedSerial))
+        {
+            var selectedRow = SelectedAdbDeviceRow();
+            if (selectedRow is null)
+            {
+                return ("未检测到", $"{selectedSerial} 不在当前设备列表中", _warningBrush);
+            }
+
+            if (selectedRow.State.Equals("device", StringComparison.OrdinalIgnoreCase))
+            {
+                return ("已选择设备", selectedSerial, _successBrush);
+            }
+
+            return selectedRow.State.Equals("offline", StringComparison.OrdinalIgnoreCase)
+                ? ("设备离线", selectedSerial, _dangerBrush)
+                : ("设备未就绪", $"{selectedSerial}: {selectedRow.State}", _warningBrush);
+        }
+
+        var authorizedRows = _lastAdbDeviceRows
+            .Where(row => row.State.Equals("device", StringComparison.OrdinalIgnoreCase))
+            .ToArray();
+        if (authorizedRows.Length > 1)
+        {
+            return ("需选择设备", $"检测到 {authorizedRows.Length} 台已授权设备", _warningBrush);
+        }
+
+        var unauthorizedRow = _lastAdbDeviceRows.FirstOrDefault(row =>
+            row.State.Equals("unauthorized", StringComparison.OrdinalIgnoreCase));
+        if (unauthorizedRow is not null)
+        {
+            return ("未授权", unauthorizedRow.Serial, _warningBrush);
+        }
+
+        var firstUnavailable = _lastAdbDeviceRows.FirstOrDefault();
+        if (firstUnavailable is not null)
+        {
+            return ("不可用", $"{firstUnavailable.Serial}: {firstUnavailable.State}", _warningBrush);
+        }
+
+        return ("未检测到", "请连接 USB 并开启 USB 调试", _overviewNeutralBrush);
+    }
+
+    private void UpdateOverviewConnectionGuide()
+    {
+        if (!StaticOverviewUi)
+        {
+            return;
+        }
+
+        var (deviceStepState, deviceDetail) = BuildOverviewDeviceStepState();
+        SetOverviewWizardStep(
+            OverviewWizardDeviceBadge,
+            OverviewWizardDeviceNumberText,
+            OverviewWizardDeviceDetailText,
+            OverviewWizardDeviceIcon,
+            "1",
+            deviceDetail,
+            deviceStepState);
+
+        var (hostStepState, hostDetail) = _overviewHostServiceState switch
+        {
+            OverviewHostServiceState.Starting => (OverviewStepState.Active, _overviewHostDetailText),
+            OverviewHostServiceState.Running => (OverviewStepState.Complete, "主机服务运行中"),
+            OverviewHostServiceState.Error => (OverviewStepState.Error, _overviewHostDetailText),
+            OverviewHostServiceState.Stopped => (OverviewStepState.Waiting, "主机已停止，可重新启动"),
+            _ => (OverviewStepState.Waiting, "等待启动主机")
+        };
+        SetOverviewWizardStep(
+            OverviewWizardHostBadge,
+            OverviewWizardHostNumberText,
+            OverviewWizardHostDetailText,
+            OverviewWizardHostIcon,
+            "3",
+            hostDetail,
+            hostStepState);
+
+        var selectedSerial = SelectedAdbSerial();
+        var (linkStepState, linkDetail) = _overviewHostServiceState switch
+        {
+            OverviewHostServiceState.Running when !string.IsNullOrWhiteSpace(selectedSerial)
+                => (OverviewStepState.Complete, $"链路已建立：{selectedSerial}"),
+            OverviewHostServiceState.Running
+                => (OverviewStepState.Warning, "主机运行中，等待设备选择"),
+            OverviewHostServiceState.Starting
+                => (OverviewStepState.Active, "正在建立连接链路"),
+            OverviewHostServiceState.Error
+                => (OverviewStepState.Error, "链路未建立"),
+            _ => (OverviewStepState.Waiting, "等待主机运行")
+        };
+        SetOverviewWizardStep(
+            OverviewWizardLinkBadge,
+            OverviewWizardLinkNumberText,
+            OverviewWizardLinkDetailText,
+            OverviewWizardLinkIcon,
+            "4",
+            linkDetail,
+            linkStepState);
+    }
+
+    private (OverviewStepState State, string Detail) BuildOverviewDeviceStepState()
+    {
+        var selectedSerial = SelectedAdbSerial();
+        if (!string.IsNullOrWhiteSpace(selectedSerial))
+        {
+            var selectedRow = SelectedAdbDeviceRow();
+            if (selectedRow is null)
+            {
+                return (OverviewStepState.Warning, $"未检测到已选择设备：{selectedSerial}");
+            }
+
+            if (selectedRow.State.Equals("device", StringComparison.OrdinalIgnoreCase))
+            {
+                return (OverviewStepState.Complete, $"已选择：{selectedSerial}");
+            }
+
+            return selectedRow.State.Equals("offline", StringComparison.OrdinalIgnoreCase)
+                ? (OverviewStepState.Error, $"设备离线：{selectedSerial}")
+                : (OverviewStepState.Warning, $"设备状态为 {selectedRow.State}：{selectedSerial}");
+        }
+
+        var authorizedCount = _lastAdbDeviceRows.Count(row =>
+            row.State.Equals("device", StringComparison.OrdinalIgnoreCase));
+        if (authorizedCount > 1)
+        {
+            return (OverviewStepState.Warning, $"检测到 {authorizedCount} 台设备，请选择一台");
+        }
+
+        var unauthorizedRow = _lastAdbDeviceRows.FirstOrDefault(row =>
+            row.State.Equals("unauthorized", StringComparison.OrdinalIgnoreCase));
+        if (unauthorizedRow is not null)
+        {
+            return (OverviewStepState.Warning, $"未授权：{unauthorizedRow.Serial}");
+        }
+
+        return _lastAdbDeviceRows.Count > 0
+            ? (OverviewStepState.Warning, "未检测到可用授权设备")
+            : (OverviewStepState.Waiting, "等待刷新设备");
+    }
+
+    private void SetOverviewWizardStep(
+        Border badge,
+        TextBlock numberText,
+        TextBlock detailText,
+        FontIcon icon,
+        string number,
+        string detail,
+        OverviewStepState state)
+    {
+        detailText.Text = detail;
+        numberText.Text = number;
+
+        switch (state)
+        {
+            case OverviewStepState.Complete:
+                badge.Background = _successBrush;
+                badge.BorderBrush = _successBrush;
+                badge.BorderThickness = new Thickness(0);
+                numberText.Foreground = new SolidColorBrush(Colors.White);
+                icon.Glyph = "\uE73E";
+                icon.Foreground = _successBrush;
+                detailText.Foreground = _secondaryBrush;
+                break;
+            case OverviewStepState.Active:
+                badge.Background = _overviewPrimaryBrush;
+                badge.BorderBrush = _overviewPrimaryBrush;
+                badge.BorderThickness = new Thickness(0);
+                numberText.Foreground = new SolidColorBrush(Colors.White);
+                icon.Glyph = "\uE768";
+                icon.Foreground = _overviewPrimaryBrush;
+                detailText.Foreground = _overviewPrimaryBrush;
+                break;
+            case OverviewStepState.Warning:
+                badge.Background = _overviewWarningBackgroundBrush;
+                badge.BorderBrush = _overviewWarningBorderBrush;
+                badge.BorderThickness = new Thickness(1);
+                numberText.Foreground = _warningBrush;
+                icon.Glyph = "\uE7BA";
+                icon.Foreground = _warningBrush;
+                detailText.Foreground = _warningBrush;
+                break;
+            case OverviewStepState.Error:
+                badge.Background = _overviewErrorBackgroundBrush;
+                badge.BorderBrush = _overviewErrorBorderBrush;
+                badge.BorderThickness = new Thickness(1);
+                numberText.Foreground = _dangerBrush;
+                icon.Glyph = "\uE783";
+                icon.Foreground = _dangerBrush;
+                detailText.Foreground = _dangerBrush;
+                break;
+            default:
+                badge.Background = _overviewNeutralBackgroundBrush;
+                badge.BorderBrush = _overviewNeutralBorderBrush;
+                badge.BorderThickness = new Thickness(1);
+                numberText.Foreground = new SolidColorBrush(ColorHelper.FromArgb(255, 17, 24, 39));
+                icon.Glyph = "\uE711";
+                icon.Foreground = _overviewNeutralBrush;
+                detailText.Foreground = _secondaryBrush;
+                break;
+        }
+    }
+
+    private void UpdateOverviewEnvironmentBanner()
+    {
+        if (!StaticOverviewUi)
+        {
+            return;
+        }
+
+        if (_overviewRefreshInProgress)
+        {
+            SetOverviewEnvironmentBanner(
+                "正在刷新环境状态",
+                "正在统一刷新 ADB 设备、主机状态、虚拟显示器、摄像头、音频和诊断信息。",
+                _overviewPrimaryBrush,
+                _overviewNeutralBackgroundBrush,
+                _overviewNeutralBorderBrush,
+                "\uE72C",
+                _overviewPrimaryBrush,
+                OverviewEnvironmentBannerSeverity.Neutral);
+            return;
+        }
+
+        var selectedSerial = SelectedAdbSerial();
+        var unauthorizedRow = _lastAdbDeviceRows.FirstOrDefault(row =>
+            row.State.Equals("unauthorized", StringComparison.OrdinalIgnoreCase));
+
+        if (_overviewHostServiceState == OverviewHostServiceState.Starting)
+        {
+            SetOverviewEnvironmentBanner(
+                "正在启动主机",
+                _lastAdbStatusText,
+                _overviewPrimaryBrush,
+                _overviewNeutralBackgroundBrush,
+                _overviewNeutralBorderBrush,
+                "\uE768",
+                _overviewPrimaryBrush,
+                OverviewEnvironmentBannerSeverity.Neutral);
+            return;
+        }
+
+        if (_overviewHostServiceState == OverviewHostServiceState.Error)
+        {
+            SetOverviewEnvironmentBanner(
+                "主机服务错误",
+                _overviewHostDetailText,
+                _dangerBrush,
+                _overviewErrorBackgroundBrush,
+                _overviewErrorBorderBrush,
+                "\uE783",
+                _dangerBrush,
+                OverviewEnvironmentBannerSeverity.Error);
+            return;
+        }
+
+        if (unauthorizedRow is not null && string.IsNullOrWhiteSpace(selectedSerial))
+        {
+            SetOverviewEnvironmentBanner(
+                "Android 设备未授权",
+                $"请在设备 {unauthorizedRow.Serial} 上允许 USB 调试后刷新。",
+                _warningBrush,
+                _overviewWarningBackgroundBrush,
+                _overviewWarningBorderBrush,
+                "\uE7BA",
+                _warningBrush,
+                OverviewEnvironmentBannerSeverity.Warning);
+            return;
+        }
+
+        if (!string.IsNullOrWhiteSpace(selectedSerial)
+            && TryBuildOverviewEnvironmentIssue(out var issueTitle, out var issueDetail, out var issueSeverity))
+        {
+            SetOverviewEnvironmentBanner(
+                issueTitle,
+                issueDetail,
+                issueSeverity == OverviewEnvironmentBannerSeverity.Error ? _dangerBrush : _warningBrush,
+                issueSeverity == OverviewEnvironmentBannerSeverity.Error ? _overviewErrorBackgroundBrush : _overviewWarningBackgroundBrush,
+                issueSeverity == OverviewEnvironmentBannerSeverity.Error ? _overviewErrorBorderBrush : _overviewWarningBorderBrush,
+                issueSeverity == OverviewEnvironmentBannerSeverity.Error ? "\uE783" : "\uE7BA",
+                issueSeverity == OverviewEnvironmentBannerSeverity.Error ? _dangerBrush : _warningBrush,
+                issueSeverity);
+            return;
+        }
+
+        if (_overviewHostServiceState == OverviewHostServiceState.Running
+            && !string.IsNullOrWhiteSpace(selectedSerial))
+        {
+            SetOverviewEnvironmentBanner(
+                "连接环境已就绪",
+                $"主机运行中，Android 设备 {selectedSerial} 已选择。",
+                _successBrush,
+                _overviewReadyBackgroundBrush,
+                _overviewReadyBorderBrush,
+                "\uE73E",
+                _successBrush,
+                OverviewEnvironmentBannerSeverity.Ready);
+            return;
+        }
+
+        if (!string.IsNullOrWhiteSpace(selectedSerial))
+        {
+            SetOverviewEnvironmentBanner(
+                "Android 设备已就绪",
+                $"已选择 {selectedSerial}，可以启动主机服务。",
+                _overviewPrimaryBrush,
+                _overviewNeutralBackgroundBrush,
+                _overviewNeutralBorderBrush,
+                "\uE8EA",
+                _overviewPrimaryBrush,
+                OverviewEnvironmentBannerSeverity.Neutral);
+            return;
+        }
+
+        SetOverviewEnvironmentBanner(
+            "等待 Android 设备",
+            _lastAdbStatusText,
+            _overviewNeutralBrush,
+            _overviewNeutralBackgroundBrush,
+            _overviewNeutralBorderBrush,
+            "\uE711",
+            _overviewNeutralBrush,
+            OverviewEnvironmentBannerSeverity.Neutral);
+    }
+
+    private bool TryBuildOverviewEnvironmentIssue(
+        out string title,
+        out string detail,
+        out OverviewEnvironmentBannerSeverity severity)
+    {
+        var virtualDisplayRunning = IsVirtualDisplayToolRunning();
+        var virtualDisplayState = DetermineVirtualDisplayOverviewState(
+            virtualDisplayRunning,
+            out var driverInstalled,
+            out var toolAvailable);
+        var (displayStatus, displayDetail, _) = BuildVirtualDisplayStatusView(
+            virtualDisplayState,
+            driverInstalled,
+            toolAvailable);
+
+        if (virtualDisplayState == VirtualDisplayOverviewState.Error)
+        {
+            title = "虚拟显示器异常";
+            detail = displayDetail;
+            severity = OverviewEnvironmentBannerSeverity.Error;
+            return true;
+        }
+
+        if (virtualDisplayState == VirtualDisplayOverviewState.DriverMissing)
+        {
+            title = displayStatus;
+            detail = displayDetail;
+            severity = OverviewEnvironmentBannerSeverity.Warning;
+            return true;
+        }
+
+        if (_overviewCameraRequestedEnabled && HasCameraError())
+        {
+            title = "摄像头状态异常";
+            detail = FirstNonEmpty(_cameraDiagnostics.LastError, _virtualCameraDiagnostics.LastError, "摄像头或虚拟摄像头需要检查。");
+            severity = _hostProcess is { HasExited: false }
+                ? OverviewEnvironmentBannerSeverity.Error
+                : OverviewEnvironmentBannerSeverity.Warning;
+            return true;
+        }
+
+        var audioEnabled = AudioDeviceSwitch.IsOn;
+        var audioIssue = audioEnabled
+            ? BuildAudioEndpointIssueHint(MicrophoneSwitch.IsOn, SpeakerSwitch.IsOn)
+            : null;
+        if (!string.IsNullOrWhiteSpace(audioIssue))
+        {
+            title = "音频端点需要设置";
+            detail = audioIssue;
+            severity = OverviewEnvironmentBannerSeverity.Warning;
+            return true;
+        }
+
+        if (_audioOverrideStatus == AudioCapabilityStatus.Error
+            || _microphoneRuntimeStatus == AudioCapabilityStatus.Error
+            || _speakerRuntimeStatus == AudioCapabilityStatus.Error)
+        {
+            title = "音频桥接异常";
+            detail = _lastAudioHint;
+            severity = OverviewEnvironmentBannerSeverity.Error;
+            return true;
+        }
+
+        title = string.Empty;
+        detail = string.Empty;
+        severity = OverviewEnvironmentBannerSeverity.Neutral;
+        return false;
+    }
+
+    private void SetOverviewEnvironmentBanner(
+        string title,
+        string detail,
+        Brush foreground,
+        Brush background,
+        Brush border,
+        string iconGlyph,
+        Brush iconBackground,
+        OverviewEnvironmentBannerSeverity severity = OverviewEnvironmentBannerSeverity.Neutral)
+    {
+        if (severity is OverviewEnvironmentBannerSeverity.Warning or OverviewEnvironmentBannerSeverity.Error)
+        {
+            _overviewEnvironmentBannerDismissed = false;
+        }
+
+        OverviewEnvironmentStatusBanner.Visibility = _overviewEnvironmentBannerDismissed
+            ? Visibility.Collapsed
+            : Visibility.Visible;
+        OverviewEnvironmentStatusBanner.Background = background;
+        OverviewEnvironmentStatusBanner.BorderBrush = border;
+        OverviewEnvironmentStatusIconBackground.Background = iconBackground;
+        OverviewEnvironmentStatusIcon.Glyph = iconGlyph;
+        OverviewEnvironmentStatusTitleText.Text = title;
+        OverviewEnvironmentStatusTitleText.Foreground = foreground;
+        OverviewEnvironmentStatusDetailText.Text = detail;
+        OverviewEnvironmentStatusDetailText.Foreground = foreground;
+
+        OverviewConnectionEnvironmentStatusBanner.Visibility = _overviewEnvironmentBannerDismissed
+            ? Visibility.Collapsed
+            : Visibility.Visible;
+        OverviewConnectionEnvironmentStatusBanner.Background = background;
+        OverviewConnectionEnvironmentStatusBanner.BorderBrush = border;
+        OverviewConnectionEnvironmentStatusIconBackground.Background = iconBackground;
+        OverviewConnectionEnvironmentStatusIcon.Glyph = iconGlyph;
+        OverviewConnectionEnvironmentStatusTitleText.Text = title;
+        OverviewConnectionEnvironmentStatusTitleText.Foreground = foreground;
+        OverviewConnectionEnvironmentStatusDetailText.Text = detail;
+        OverviewConnectionEnvironmentStatusDetailText.Foreground = foreground;
     }
 
     private void RegisterCardWheelScrolling()
@@ -499,6 +2217,246 @@ public sealed partial class MainWindow : Window
         await StartHostAsync();
     }
 
+    private async void OverviewPrimaryActionButton_Click(object sender, RoutedEventArgs e)
+    {
+        if (StaticOverviewUi && _overviewNavigationItem == OverviewNavigationItem.Camera)
+        {
+            await StartCameraPipelineAsync();
+            return;
+        }
+
+        await StartHostAsync();
+    }
+
+    private void OverviewSidebarToggleButton_Click(object sender, RoutedEventArgs e)
+    {
+        _overviewSidebarCollapsed = !_overviewSidebarCollapsed;
+        UpdateOverviewSidebarLayout();
+        SetOverviewNavigationItem(_overviewNavigationItem);
+    }
+
+    private void OverviewNavOverviewButton_Click(object sender, RoutedEventArgs e)
+    {
+        OpenOverviewNavigationItem(OverviewNavigationItem.Overview);
+    }
+
+    private void OverviewNavConnectionButton_Click(object sender, RoutedEventArgs e)
+    {
+        OpenOverviewNavigationItem(OverviewNavigationItem.Connection);
+    }
+
+    private void OverviewNavDisplayButton_Click(object sender, RoutedEventArgs e)
+    {
+        OpenOverviewNavigationItem(OverviewNavigationItem.Display);
+    }
+
+    private void OverviewNavCameraButton_Click(object sender, RoutedEventArgs e)
+    {
+        OpenOverviewNavigationItem(OverviewNavigationItem.Camera);
+    }
+
+    private void OverviewNavAudioButton_Click(object sender, RoutedEventArgs e)
+    {
+        OpenOverviewNavigationItem(OverviewNavigationItem.Audio);
+    }
+
+    private void OverviewNavDiagnosticsButton_Click(object sender, RoutedEventArgs e)
+    {
+        OpenOverviewNavigationItem(OverviewNavigationItem.Diagnostics);
+    }
+
+    private void OverviewNavSettingsButton_Click(object sender, RoutedEventArgs e)
+    {
+        OpenOverviewNavigationItem(OverviewNavigationItem.Settings);
+    }
+
+    private async void OverviewRefreshButton_Click(object sender, RoutedEventArgs e)
+    {
+        await RefreshOverviewAsync(showErrors: true);
+    }
+
+    private async void OverviewAudioHeaderRefreshButton_Click(object sender, RoutedEventArgs e)
+    {
+        await RefreshAudioEndpointsAsync(showHint: true);
+        UpdateAudioState();
+    }
+
+    private async void OverviewAudioHeaderInstallButton_Click(object sender, RoutedEventArgs e)
+    {
+        await InstallVirtualAudioCableAsync();
+    }
+
+    private void OverviewAudioHeaderCopyLogButton_Click(object sender, RoutedEventArgs e)
+    {
+        CopyAudioDiagnosticsToClipboard();
+    }
+
+    private void OverviewActionsMenuFlyout_Opening(object sender, object e)
+    {
+        UpdateOverviewActionButtons();
+    }
+
+    private async void OverviewActionStartHostMenuItem_Click(object sender, RoutedEventArgs e)
+    {
+        await StartHostAsync();
+    }
+
+    private void OverviewActionStopHostMenuItem_Click(object sender, RoutedEventArgs e)
+    {
+        StopHost();
+    }
+
+    private async void OverviewActionRefreshDevicesMenuItem_Click(object sender, RoutedEventArgs e)
+    {
+        await RefreshAdbDevicesAsync(showErrors: true);
+    }
+
+    private async void OverviewActionRestartAdbMenuItem_Click(object sender, RoutedEventArgs e)
+    {
+        await RestartAdbAsync(showErrors: true);
+    }
+
+    private async void OverviewActionRepairEndpointsMenuItem_Click(object sender, RoutedEventArgs e)
+    {
+        await RepairOverviewEndpointsAsync(openSettings: true);
+    }
+
+    private void OverviewActionOpenDisplaySettingsMenuItem_Click(object sender, RoutedEventArgs e)
+    {
+        OpenWindowsDisplaySettings();
+    }
+
+    private void OverviewActionCopyDiagnosticsMenuItem_Click(object sender, RoutedEventArgs e)
+    {
+        CopyOverviewDiagnosticsToClipboard();
+    }
+
+    private async void OverviewActionOpenLogsMenuItem_Click(object sender, RoutedEventArgs e)
+    {
+        await ShowOverviewLogsDialogAsync();
+    }
+
+    private void OverviewSettingsSaveButton_Click(object sender, RoutedEventArgs e)
+    {
+        OverviewSettingsPage.SaveChanges();
+    }
+
+    private void OverviewSettingsRestoreButton_Click(object sender, RoutedEventArgs e)
+    {
+        OverviewSettingsPage.RestoreDefaults();
+    }
+
+    private void OverviewSettingsOpenDataDirectoryButton_Click(object sender, RoutedEventArgs e)
+    {
+        try
+        {
+            var directory = Path.Combine(
+                Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
+                "SideDock");
+            Directory.CreateDirectory(directory);
+            Process.Start(new ProcessStartInfo
+            {
+                FileName = directory,
+                UseShellExecute = true
+            });
+        }
+        catch (Exception ex)
+        {
+            ShowError("无法打开数据目录", ex.Message);
+        }
+    }
+
+    private void OverviewEnvironmentBannerDismissButton_Click(object sender, RoutedEventArgs e)
+    {
+        _overviewEnvironmentBannerDismissed = true;
+        OverviewEnvironmentStatusBanner.Visibility = Visibility.Collapsed;
+        OverviewConnectionEnvironmentStatusBanner.Visibility = Visibility.Collapsed;
+    }
+
+    private async void StaticDisplayPage_StartRequested(object? sender, EventArgs e)
+    {
+        var succeeded = await SetOverviewVirtualDisplayEnabledAsync(true);
+        OverviewDisplayPage.AddActivityLog(
+            succeeded
+                ? "虚拟显示器已启动。"
+                : $"启动虚拟显示器失败：{FailureSummary(_virtualDisplayLastError)}",
+            succeeded ? StaticDisplayActivityKind.Success : StaticDisplayActivityKind.Failure);
+    }
+
+    private async void StaticDisplayPage_StopRequested(object? sender, EventArgs e)
+    {
+        var succeeded = await SetOverviewVirtualDisplayEnabledAsync(false);
+        OverviewDisplayPage.AddActivityLog(
+            succeeded
+                ? "虚拟显示器已停止。"
+                : "停止虚拟显示器失败：仍检测到 DeviceTool 进程。",
+            succeeded ? StaticDisplayActivityKind.Success : StaticDisplayActivityKind.Failure);
+    }
+
+    private void StaticDisplayPage_RefreshRequested(object? sender, EventArgs e)
+    {
+        var displayLayout = RefreshVirtualDisplayState();
+        var refreshFailed = !string.IsNullOrWhiteSpace(displayLayout.QueryError);
+        OverviewDisplayPage.AddActivityLog(
+            BuildDisplayLayoutRefreshSummary(displayLayout),
+            refreshFailed
+                ? StaticDisplayActivityKind.Failure
+                : displayLayout.HasSideDockVirtualDisplay ? StaticDisplayActivityKind.Success : StaticDisplayActivityKind.Warning);
+    }
+
+    private async void StaticDisplayPage_InstallDriverRequested(object? sender, EventArgs e)
+    {
+        var succeeded = await InstallDriverAsync();
+        OverviewDisplayPage.AddActivityLog(
+            succeeded
+                ? "驱动安装/修复流程已完成。"
+                : $"驱动安装/修复未完成：{FailureSummary(_driverInstallLastError)}",
+            succeeded ? StaticDisplayActivityKind.Success : StaticDisplayActivityKind.Failure);
+    }
+
+    private void StaticDisplayPage_OpenDisplaySettingsRequested(object? sender, EventArgs e)
+    {
+        var result = OpenWindowsDisplaySettings();
+        OverviewDisplayPage.AddActivityLog(
+            result.Success
+                ? "Windows 显示设置已打开。"
+                : $"打开显示设置失败：{FailureSummary(result.Error)}",
+            result.Success ? StaticDisplayActivityKind.Success : StaticDisplayActivityKind.Failure);
+    }
+
+    private async void StaticDisplayPage_ShowLogsRequested(object? sender, EventArgs e)
+    {
+        await ShowOverviewLogsDialogAsync();
+    }
+
+    private void StaticDisplayPage_ResolutionChanged(object? sender, StaticDisplayOptionChangedEventArgs e)
+    {
+        SyncStaticDisplayOptionToHostCombo(e.Value, OverviewVirtualDisplayResolutionCombo, ResolutionCombo);
+    }
+
+    private void StaticDisplayPage_RefreshRateChanged(object? sender, StaticDisplayOptionChangedEventArgs e)
+    {
+        SyncStaticDisplayOptionToHostCombo(e.Value, OverviewVirtualDisplayRefreshRateCombo, RefreshRateCombo);
+    }
+
+    private static string BuildDisplayLayoutRefreshSummary(DisplayLayoutSnapshot displayLayout)
+    {
+        if (!string.IsNullOrWhiteSpace(displayLayout.QueryError))
+        {
+            return $"重新检测失败：{displayLayout.QueryError}";
+        }
+
+        var sideDockText = displayLayout.HasSideDockVirtualDisplay
+            ? "已检测到 SideDock 虚拟显示器"
+            : "未检测到 SideDock 虚拟显示器";
+        return $"重新检测完成：{displayLayout.Monitors.Count} 个活动显示器，{sideDockText}。";
+    }
+
+    private static string FailureSummary(string? message)
+    {
+        return string.IsNullOrWhiteSpace(message) ? "请查看弹窗详情或完整日志。" : message;
+    }
+
     private void StopHostButton_Click(object sender, RoutedEventArgs e)
     {
         StopHost();
@@ -511,17 +2469,22 @@ public sealed partial class MainWindow : Window
 
     private async void RestartAdbButton_Click(object sender, RoutedEventArgs e)
     {
+        if (StaticOverviewUi)
+        {
+            return;
+        }
+
         await RestartAdbAsync(showErrors: true);
     }
 
     private void AdbDeviceCombo_SelectionChanged(object sender, SelectionChangedEventArgs e)
     {
-        UpdateAudioState();
+        SyncAdbDeviceSelectionFrom(AdbDeviceCombo);
     }
 
     private async void CameraFacingCombo_SelectionChanged(object sender, SelectionChangedEventArgs e)
     {
-        if (!_uiReady)
+        if (StaticOverviewUi || !_uiReady)
         {
             return;
         }
@@ -552,25 +2515,34 @@ public sealed partial class MainWindow : Window
 
     private void AudioSwitch_Toggled(object sender, RoutedEventArgs e)
     {
-        if (_loadingAudioPreferences)
+        if (StaticOverviewUi || _loadingAudioPreferences)
         {
             return;
         }
 
+        ApplyAudioSwitchChange(sender, AudioToggleHint(sender));
+    }
+
+    private void ApplyAudioSwitchChange(object sender, string hint)
+    {
         _audioOverrideStatus = null;
-        var hint = AudioToggleHint(sender);
         SaveAudioPreferences();
         UpdateAudioState(hint);
     }
 
     private async void RefreshAudioEndpointsButton_Click(object sender, RoutedEventArgs e)
     {
+        if (StaticOverviewUi)
+        {
+            return;
+        }
+
         await RefreshAudioEndpointsAsync(showHint: true);
     }
 
     private void AudioEndpointCombo_SelectionChanged(object sender, SelectionChangedEventArgs e)
     {
-        if (_loadingAudioEndpointChoices || !_audioEndpointChoicesReady)
+        if (StaticOverviewUi || _loadingAudioEndpointChoices || !_audioEndpointChoicesReady)
         {
             return;
         }
@@ -587,6 +2559,11 @@ public sealed partial class MainWindow : Window
 
     private void CopyAudioLogButton_Click(object sender, RoutedEventArgs e)
     {
+        if (StaticOverviewUi)
+        {
+            return;
+        }
+
         try
         {
             var details = BuildAudioDiagnosticsReport();
@@ -602,8 +2579,28 @@ public sealed partial class MainWindow : Window
         }
     }
 
+    private void CopyAudioDiagnosticsToClipboard()
+    {
+        try
+        {
+            var package = new DataPackage { RequestedOperation = DataPackageOperation.Copy };
+            package.SetText(BuildAudioDiagnosticsReport());
+            Clipboard.SetContent(package);
+            Clipboard.Flush();
+        }
+        catch (Exception ex)
+        {
+            ShowError("无法复制音频日志", ex.Message);
+        }
+    }
+
     private void CopyCameraDiagnosticsButton_Click(object sender, RoutedEventArgs e)
     {
+        if (StaticOverviewUi)
+        {
+            return;
+        }
+
         try
         {
             var details = BuildCameraDiagnosticsReport();
@@ -621,42 +2618,503 @@ public sealed partial class MainWindow : Window
 
     private void ToggleCameraPreviewButton_Click(object sender, RoutedEventArgs e)
     {
+        if (StaticOverviewUi)
+        {
+            return;
+        }
+
         SetCameraPreviewEnabled(!_cameraPreviewEnabled);
     }
 
     private async void StartVirtualCameraButton_Click(object sender, RoutedEventArgs e)
     {
+        if (StaticOverviewUi)
+        {
+            return;
+        }
+
         await StartCameraPipelineAsync();
     }
 
     private async void StopVirtualCameraButton_Click(object sender, RoutedEventArgs e)
     {
+        if (StaticOverviewUi)
+        {
+            return;
+        }
+
         await StopCameraPipelineAsync();
     }
 
     private async void RefreshVirtualCameraButton_Click(object sender, RoutedEventArgs e)
     {
+        if (StaticOverviewUi)
+        {
+            return;
+        }
+
         await RefreshVirtualCameraStatusAsync();
     }
 
     private void StartDisplayButton_Click(object sender, RoutedEventArgs e)
     {
+        if (StaticOverviewUi)
+        {
+            return;
+        }
+
         StartVirtualDisplay(failureAction: "启动虚拟显示器失败");
+    }
+
+    private async void OverviewVirtualDisplaySwitch_Toggled(object sender, RoutedEventArgs e)
+    {
+        if (_updatingOverviewVirtualDisplaySwitch || !_uiReady)
+        {
+            return;
+        }
+
+        await SetOverviewVirtualDisplayEnabledAsync(OverviewVirtualDisplaySwitch.IsOn);
+    }
+
+    private void OverviewVirtualDisplayResolutionCombo_SelectionChanged(object sender, SelectionChangedEventArgs e)
+    {
+        SyncVirtualDisplayOptionToHostCombo(OverviewVirtualDisplayResolutionCombo, ResolutionCombo);
+    }
+
+    private void OverviewVirtualDisplayRefreshRateCombo_SelectionChanged(object sender, SelectionChangedEventArgs e)
+    {
+        SyncVirtualDisplayOptionToHostCombo(OverviewVirtualDisplayRefreshRateCombo, RefreshRateCombo);
+    }
+
+    private async void OverviewCameraSwitch_Toggled(object sender, RoutedEventArgs e)
+    {
+        if (_updatingOverviewCameraSwitch || !_uiReady)
+        {
+            return;
+        }
+
+        await SetOverviewCameraEnabledAsync(OverviewCameraSwitch.IsOn);
+    }
+
+    private void OverviewCameraResolutionCombo_SelectionChanged(object sender, SelectionChangedEventArgs e)
+    {
+        SyncOverviewCameraOptionsToDiagnostics();
+    }
+
+    private void OverviewCameraFrameRateCombo_SelectionChanged(object sender, SelectionChangedEventArgs e)
+    {
+        SyncOverviewCameraOptionsToDiagnostics();
     }
 
     private async void InstallDriverButton_Click(object sender, RoutedEventArgs e)
     {
+        if (StaticOverviewUi)
+        {
+            return;
+        }
+
         await InstallDriverAsync();
+    }
+
+    private async void OverviewInstallDriverButton_Click(object sender, RoutedEventArgs e)
+    {
+        await InstallDriverAsync();
+    }
+
+    private void OverviewDisplaySettingsButton_Click(object sender, RoutedEventArgs e)
+    {
+        OpenWindowsDisplaySettings();
+    }
+
+    private void OverviewPreviewFitButton_Click(object sender, RoutedEventArgs e)
+    {
+        _overviewPreviewFillMode = !_overviewPreviewFillMode;
+        UpdateOverviewPreviewChrome();
+    }
+
+    private void OverviewPreviewOverlayButton_Click(object sender, RoutedEventArgs e)
+    {
+        _overviewPreviewOverlayVisible = !_overviewPreviewOverlayVisible;
+        UpdateOverviewPreviewChrome();
+    }
+
+    private void OverviewPreviewSettingsButton_Click(object sender, RoutedEventArgs e)
+    {
+        OpenWindowsDisplaySettings();
+    }
+
+    private async void OverviewCameraSettingsButton_Click(object sender, RoutedEventArgs e)
+    {
+        await ShowOverviewCameraSettingsDialogAsync();
+    }
+
+    private void OverviewAudioSwitch_Toggled(object sender, RoutedEventArgs e)
+    {
+        if (_updatingOverviewAudioSwitch || !_uiReady)
+        {
+            return;
+        }
+
+        SetOverviewAudioEnabled(OverviewAudioSwitch.IsOn);
+    }
+
+    private async void OverviewAudioSettingsButton_Click(object sender, RoutedEventArgs e)
+    {
+        await ShowOverviewAudioSettingsDialogAsync();
+    }
+
+    private async void OverviewDiagnosticsDetailsButton_Click(object sender, RoutedEventArgs e)
+    {
+        await ShowOverviewDiagnosticsDialogAsync();
+    }
+
+    private async void OverviewLogsButton_Click(object sender, RoutedEventArgs e)
+    {
+        await ShowOverviewLogsDialogAsync();
+    }
+
+    private void OverviewConnectionAdbDeviceCombo_SelectionChanged(object sender, SelectionChangedEventArgs e)
+    {
+        SyncAdbDeviceSelectionFrom(OverviewConnectionAdbDeviceCombo);
+    }
+
+    private void OverviewConnectionDeviceListView_SelectionChanged(object sender, SelectionChangedEventArgs e)
+    {
+        if (_syncingAdbDeviceSelection
+            || OverviewConnectionDeviceListView.SelectedItem is not OverviewConnectionDeviceItem item)
+        {
+            return;
+        }
+
+        var choice = FindAdbDeviceChoice(OverviewConnectionAdbDeviceCombo, item.Serial);
+        if (choice is not null)
+        {
+            OverviewConnectionAdbDeviceCombo.SelectedItem = choice;
+        }
+    }
+
+    private void OverviewConnectionPortBox_ValueChanged(NumberBox sender, NumberBoxValueChangedEventArgs args)
+    {
+        if (_syncingOverviewConnectionControls || !_uiReady)
+        {
+            return;
+        }
+
+        _lastAdbReverseConfigured = null;
+        SyncOverviewConnectionControlsToLegacy();
+        UpdateOverviewConnectionPage();
+    }
+
+    private void OverviewAdbPathBox_TextChanged(object sender, TextChangedEventArgs e)
+    {
+        if (_syncingOverviewConnectionControls || !_uiReady)
+        {
+            return;
+        }
+
+        AdbPathBox.Text = OverviewAdbPathBox.Text;
+        _lastAdbReverseConfigured = null;
+        UpdateOverviewConnectionPage();
+    }
+
+    private void OverviewInputInjectionSwitch_Toggled(object sender, RoutedEventArgs e)
+    {
+        if (_syncingOverviewConnectionControls || !_uiReady)
+        {
+            return;
+        }
+
+        InputInjectionSwitch.IsOn = OverviewInputInjectionSwitch.IsOn;
+        OverviewInputInjectionStatusText.Text = OverviewInputInjectionSwitch.IsOn ? "已启用" : "未启用";
+        UpdateOverviewConnectionPage();
+    }
+
+    private void OverviewRestoreDefaultPortsButton_Click(object sender, RoutedEventArgs e)
+    {
+        _syncingOverviewConnectionControls = true;
+        try
+        {
+            OverviewControlPortBox.Value = DefaultControlPort;
+            OverviewVideoPortBox.Value = DefaultVideoPort;
+            OverviewAudioPortBox.Value = DefaultAudioPort;
+            OverviewCameraPortBox.Value = DefaultCameraPort;
+        }
+        finally
+        {
+            _syncingOverviewConnectionControls = false;
+        }
+
+        _lastAdbReverseConfigured = null;
+        SyncOverviewConnectionControlsToLegacy();
+        UpdateOverviewConnectionPage();
+    }
+
+    private async void OverviewAdbPathBrowseButton_Click(object sender, RoutedEventArgs e)
+    {
+        try
+        {
+            var picker = new FileOpenPicker
+            {
+                SuggestedStartLocation = PickerLocationId.ComputerFolder
+            };
+            picker.FileTypeFilter.Add(".exe");
+            InitializeWithWindow.Initialize(picker, _windowHandle);
+
+            var file = await picker.PickSingleFileAsync();
+            if (file is null)
+            {
+                return;
+            }
+
+            OverviewAdbPathBox.Text = file.Path;
+            await RefreshAdbDevicesAsync(showErrors: true);
+        }
+        catch (Exception ex)
+        {
+            await ShowOverviewAdbPathHelpDialogAsync(ex.Message);
+        }
+    }
+
+    private async void OverviewAdvancedConnectionOptionsButton_Click(object sender, RoutedEventArgs e)
+    {
+        await ShowCopyableDetailsDialogAsync(
+            "高级连接选项",
+            "当前连接页使用这些参数启动主机并配置 ADB reverse。",
+            BuildConnectionConfigurationReport(),
+            "复制配置");
+    }
+
+    private async void OverviewConnectionHelpButton_Click(object sender, RoutedEventArgs e)
+    {
+        await ShowUsbDebuggingHelpDialogAsync();
+    }
+
+    private async void OverviewRepairEndpointsButton_Click(object sender, RoutedEventArgs e)
+    {
+        await RepairOverviewEndpointsAsync(openSettings: true);
+    }
+
+    private async Task RefreshOverviewAsync(bool showErrors)
+    {
+        if (_overviewRefreshInProgress)
+        {
+            return;
+        }
+
+        _overviewRefreshInProgress = true;
+        UpdateOverviewRefreshState();
+        UpdateOverviewEnvironmentBanner();
+
+        try
+        {
+            RefreshOverviewHostStateSnapshot();
+            await RefreshAdbDevicesAsync(showErrors);
+            RefreshVirtualDisplayState();
+            await RefreshVirtualCameraStatusAsync();
+            await RefreshAudioEndpointsAsync(showHint: false);
+            UpdateAudioState();
+            UpdateCameraStatusView();
+            UpdateOverviewRuntimeDiagnostics();
+            UpdateOverviewPreview();
+            UpdateOverviewEnvironmentBanner();
+        }
+        finally
+        {
+            _overviewRefreshInProgress = false;
+            UpdateOverviewActionButtons();
+            UpdateOverviewEnvironmentBanner();
+        }
+    }
+
+    private void RefreshOverviewHostStateSnapshot()
+    {
+        if (_overviewHostServiceState == OverviewHostServiceState.Starting)
+        {
+            return;
+        }
+
+        if (_hostProcess is { HasExited: false })
+        {
+            SetOverviewHostState(OverviewHostServiceState.Running, "SideDock.Host.exe 正在运行");
+            return;
+        }
+
+        SetOverviewHostState(
+            _hostHasStarted ? OverviewHostServiceState.Stopped : OverviewHostServiceState.NotStarted,
+            _hostHasStarted ? "主机已停止" : "等待启动");
+    }
+
+    private async Task RepairOverviewEndpointsAsync(bool openSettings)
+    {
+        if (_overviewRefreshInProgress)
+        {
+            return;
+        }
+
+        OverviewRepairEndpointsButton.IsEnabled = false;
+        OverviewActionRepairEndpointsMenuItem.IsEnabled = false;
+        try
+        {
+            await RefreshAudioEndpointsAsync(showHint: true);
+            await RefreshVirtualCameraStatusAsync();
+            UpdateOverviewEnvironmentBanner();
+            if (openSettings)
+            {
+                await ShowOverviewAudioSettingsDialogAsync();
+            }
+        }
+        finally
+        {
+            UpdateOverviewActionMenuItems();
+        }
+    }
+
+    private void CopyOverviewDiagnosticsToClipboard()
+    {
+        try
+        {
+            UpdateOverviewRuntimeDiagnostics();
+            var package = new DataPackage { RequestedOperation = DataPackageOperation.Copy };
+            package.SetText(BuildOverviewDiagnosticsReport());
+            Clipboard.SetContent(package);
+            Clipboard.Flush();
+        }
+        catch (Exception ex)
+        {
+            ShowError("无法复制诊断", ex.Message);
+        }
     }
 
     private async void InstallVirtualAudioCableButton_Click(object sender, RoutedEventArgs e)
     {
+        if (StaticOverviewUi)
+        {
+            return;
+        }
+
         await InstallVirtualAudioCableAsync();
     }
 
     private void StopDisplayButton_Click(object sender, RoutedEventArgs e)
     {
+        if (StaticOverviewUi)
+        {
+            return;
+        }
+
         StopVirtualDisplay();
+    }
+
+    private async Task<bool> SetOverviewVirtualDisplayEnabledAsync(bool enabled)
+    {
+        if (_virtualDisplayOperationInProgress || _driverInstallInProgress)
+        {
+            RefreshVirtualDisplayState();
+            return false;
+        }
+
+        _virtualDisplayOperationInProgress = true;
+        _virtualDisplayTransientState = enabled
+            ? VirtualDisplayOverviewState.Starting
+            : VirtualDisplayOverviewState.Stopping;
+        _virtualDisplayLastError = null;
+        RefreshVirtualDisplayState();
+        var succeeded = false;
+
+        try
+        {
+            await Task.Yield();
+
+            if (enabled)
+            {
+                ManageDisplaySwitch.IsOn = true;
+                if (!StartVirtualDisplay(failureAction: "启动虚拟显示器失败"))
+                {
+                    ManageDisplaySwitch.IsOn = false;
+                    _virtualDisplayLastError ??= "启动虚拟显示器失败。";
+                }
+
+                succeeded = IsVirtualDisplayToolRunning() && string.IsNullOrWhiteSpace(_virtualDisplayLastError);
+            }
+            else
+            {
+                ManageDisplaySwitch.IsOn = false;
+                _hostOwnsVirtualDisplay = false;
+                StopVirtualDisplay();
+                succeeded = !IsVirtualDisplayToolRunning();
+            }
+        }
+        finally
+        {
+            _virtualDisplayTransientState = null;
+            _virtualDisplayOperationInProgress = false;
+            RefreshVirtualDisplayState();
+        }
+
+        return succeeded;
+    }
+
+    private async Task SetOverviewCameraEnabledAsync(bool enabled)
+    {
+        if (_overviewCameraOperationInProgress)
+        {
+            UpdateOverviewCameraState();
+            return;
+        }
+
+        _overviewCameraRequestedEnabled = enabled;
+        _overviewCameraOperationInProgress = true;
+        UpdateOverviewCameraState();
+
+        try
+        {
+            if (enabled)
+            {
+                SyncOverviewCameraOptionsToDiagnostics();
+                await StartCameraPipelineAsync();
+            }
+            else
+            {
+                await StopCameraPipelineAsync();
+            }
+
+            await RefreshVirtualCameraStatusAsync();
+        }
+        finally
+        {
+            _overviewCameraOperationInProgress = false;
+            UpdateOverviewCameraState();
+        }
+    }
+
+    private (bool Success, string? Error) OpenWindowsDisplaySettings()
+    {
+        try
+        {
+            Process.Start(new ProcessStartInfo
+            {
+                FileName = "ms-settings:display",
+                UseShellExecute = true
+            });
+            return (true, null);
+        }
+        catch (Exception firstEx)
+        {
+            try
+            {
+                Process.Start(new ProcessStartInfo
+                {
+                    FileName = "desk.cpl",
+                    UseShellExecute = true
+                });
+                return (true, null);
+            }
+            catch (Exception ex)
+            {
+                ShowError("无法打开显示设置", ex.Message);
+                return (false, $"{firstEx.Message}; {ex.Message}");
+            }
+        }
     }
 
     private async Task StartHostAsync()
@@ -665,6 +3123,8 @@ public sealed partial class MainWindow : Window
         {
             return;
         }
+
+        SyncOverviewConnectionControlsToLegacy();
 
         string? hostPath = null;
         string? arguments = null;
@@ -687,6 +3147,8 @@ public sealed partial class MainWindow : Window
             OverallStatusText.Text = "启动中";
             OverallStatusText.Foreground = _secondaryBrush;
             SetAdbStatus("正在检查 ADB reverse...", _secondaryBrush);
+            SetOverviewHostState(OverviewHostServiceState.Starting, "正在检查 ADB reverse...");
+            UpdateOverviewConnectionPage();
 
             adbPath = ResolveAdbPath(AdbPathBox.Text.Trim());
             var explicitAdbSerial = SelectedAdbSerial();
@@ -696,8 +3158,13 @@ public sealed partial class MainWindow : Window
             var adbPreflight = await ConfigureAdbReverseBeforeHostStartAsync(adbPath, reversePorts, selectedAdbSerial);
             if (!adbPreflight.Success)
             {
+                _lastAdbReverseConfigured = false;
+                _lastAdbReverseSerial = adbPreflight.Serial;
+                _lastAdbReverseDetail = adbPreflight.Summary;
                 SetRunningState(false);
                 SetAdbStatus(adbPreflight.Summary, _dangerBrush);
+                SetOverviewHostState(OverviewHostServiceState.Error, adbPreflight.Summary);
+                UpdateOverviewConnectionPage();
                 ShowErrorWithDetails(
                     "无法配置 ADB reverse",
                     adbPreflight.Summary,
@@ -706,7 +3173,11 @@ public sealed partial class MainWindow : Window
             }
 
             adbSerial = adbPreflight.Serial;
+            _lastAdbReverseConfigured = true;
+            _lastAdbReverseSerial = adbPreflight.Serial;
+            _lastAdbReverseDetail = adbPreflight.Summary;
             SetAdbStatus(adbPreflight.Summary, _successBrush);
+            UpdateOverviewConnectionPage();
 
             if (ShouldManageVirtualDisplayWithHost())
             {
@@ -714,6 +3185,7 @@ public sealed partial class MainWindow : Window
                 if (!StartVirtualDisplay(failureAction: "启动主机时无法启动虚拟显示器"))
                 {
                     SetRunningState(false);
+                    SetOverviewHostState(OverviewHostServiceState.Error, "启动主机时无法启动虚拟显示器。");
                     return;
                 }
 
@@ -789,6 +3261,7 @@ public sealed partial class MainWindow : Window
                 $"启动 SideDock 主机时出错：{ex.Message}。下面是详细诊断信息，点“复制详情”可一键复制后发给开发者排查。",
                 details);
             SetRunningState(false);
+            SetOverviewHostState(OverviewHostServiceState.Error, ex.Message);
             _audioOverrideStatus = AudioCapabilityStatus.Error;
             UpdateAudioState("音频设备暂不可用，主机未启动。");
         }
@@ -796,15 +3269,20 @@ public sealed partial class MainWindow : Window
 
     private string BuildArguments()
     {
+        var (cameraWidth, cameraHeight) = SelectedOverviewCameraResolution();
+        var cameraFps = SelectedOverviewCameraFps();
         var args = new List<string>
         {
             "--video-source", Selected(VideoSourceCombo),
             "--resolution", Selected(ResolutionCombo),
             "--refresh-rate", Selected(RefreshRateCombo),
-            "--control-port", Port(ControlPortBox, "control"),
-            "--video-port", Port(VideoPortBox, "video"),
-            "--audio-port", DefaultAudioPort.ToString(CultureInfo.InvariantCulture),
-            "--camera-port", DefaultCameraPort.ToString(CultureInfo.InvariantCulture),
+            "--control-port", ConfiguredControlPortNumber().ToString(CultureInfo.InvariantCulture),
+            "--video-port", ConfiguredVideoPortNumber().ToString(CultureInfo.InvariantCulture),
+            "--audio-port", ConfiguredAudioPortNumber().ToString(CultureInfo.InvariantCulture),
+            "--camera-port", ConfiguredCameraPortNumber().ToString(CultureInfo.InvariantCulture),
+            "--camera-width", cameraWidth.ToString(CultureInfo.InvariantCulture),
+            "--camera-height", cameraHeight.ToString(CultureInfo.InvariantCulture),
+            "--camera-fps", cameraFps.ToString(CultureInfo.InvariantCulture),
             "--camera-facing", Selected(CameraFacingCombo),
             "--audio-backend", "wasapi-virtual-cable"
         };
@@ -846,21 +3324,42 @@ public sealed partial class MainWindow : Window
 
     private IReadOnlyList<int> GetConfiguredReversePorts()
     {
-        var controlPort = PortNumber(ControlPortBox, "control");
-        var videoPort = PortNumber(VideoPortBox, "video");
+        var controlPort = ConfiguredControlPortNumber();
+        var videoPort = ConfiguredVideoPortNumber();
         var ports = new List<int> { controlPort, videoPort };
         if (AudioDeviceSwitch.IsOn && (MicrophoneSwitch.IsOn || SpeakerSwitch.IsOn))
         {
-            ports.Add(DefaultAudioPort);
+            ports.Add(ConfiguredAudioPortNumber());
         }
 
-        ports.Add(DefaultCameraPort);
+        ports.Add(ConfiguredCameraPortNumber());
         return ports.Distinct().ToArray();
+    }
+
+    private int ConfiguredControlPortNumber()
+    {
+        return PortNumber(StaticOverviewUi ? OverviewControlPortBox : ControlPortBox, "control");
+    }
+
+    private int ConfiguredVideoPortNumber()
+    {
+        return PortNumber(StaticOverviewUi ? OverviewVideoPortBox : VideoPortBox, "video");
+    }
+
+    private int ConfiguredAudioPortNumber()
+    {
+        return StaticOverviewUi ? PortNumber(OverviewAudioPortBox, "audio") : DefaultAudioPort;
+    }
+
+    private int ConfiguredCameraPortNumber()
+    {
+        return StaticOverviewUi ? PortNumber(OverviewCameraPortBox, "camera") : DefaultCameraPort;
     }
 
     private void InitializeAdbDeviceCombo()
     {
         AdbDeviceCombo.DisplayMemberPath = nameof(AdbDeviceChoice.DisplayName);
+        OverviewConnectionAdbDeviceCombo.DisplayMemberPath = nameof(AdbDeviceChoice.DisplayName);
         SetAdbDeviceChoices(Array.Empty<AdbDeviceRow>(), selectedSerial: null);
     }
 
@@ -886,6 +3385,1217 @@ public sealed partial class MainWindow : Window
         {
             _loadingAudioEndpointChoices = false;
         }
+    }
+
+    private void InitializeOverviewVirtualDisplayOptions()
+    {
+        _syncingVirtualDisplayOptions = true;
+        try
+        {
+            SelectComboBoxValue(OverviewVirtualDisplayResolutionCombo, Selected(ResolutionCombo));
+            SelectComboBoxValue(OverviewVirtualDisplayRefreshRateCombo, Selected(RefreshRateCombo));
+        }
+        finally
+        {
+            _syncingVirtualDisplayOptions = false;
+        }
+    }
+
+    private void SyncVirtualDisplayOptionToHostCombo(ComboBox source, ComboBox target)
+    {
+        if (_syncingVirtualDisplayOptions || !_uiReady)
+        {
+            return;
+        }
+
+        _syncingVirtualDisplayOptions = true;
+        try
+        {
+            SelectComboBoxValue(target, Selected(source));
+        }
+        finally
+        {
+            _syncingVirtualDisplayOptions = false;
+        }
+
+        RefreshVirtualDisplayState();
+    }
+
+    private void SyncStaticDisplayOptionToHostCombo(string value, ComboBox overviewCombo, ComboBox hostCombo)
+    {
+        if (_syncingVirtualDisplayOptions || !_uiReady)
+        {
+            return;
+        }
+
+        _syncingVirtualDisplayOptions = true;
+        try
+        {
+            SelectComboBoxValue(hostCombo, value);
+            SelectComboBoxValue(overviewCombo, value);
+        }
+        finally
+        {
+            _syncingVirtualDisplayOptions = false;
+        }
+
+        RefreshVirtualDisplayState();
+    }
+
+    private void InitializeOverviewCameraOptions()
+    {
+        _syncingOverviewCameraOptions = true;
+        try
+        {
+            SelectComboBoxValue(OverviewCameraResolutionCombo, CameraResolutionValue(_cameraDiagnostics.Width, _cameraDiagnostics.Height));
+            SelectComboBoxValue(OverviewCameraFrameRateCombo, _cameraDiagnostics.Fps.ToString(CultureInfo.InvariantCulture));
+        }
+        finally
+        {
+            _syncingOverviewCameraOptions = false;
+        }
+
+        SyncOverviewCameraOptionsToDiagnostics();
+        UpdateOverviewCameraState();
+    }
+
+    private void SyncOverviewCameraOptionsToDiagnostics()
+    {
+        if (_syncingOverviewCameraOptions || !_uiReady)
+        {
+            return;
+        }
+
+        if (_hostProcess is { HasExited: false })
+        {
+            UpdateOverviewCameraState();
+            return;
+        }
+
+        var (width, height) = SelectedOverviewCameraResolution();
+        _cameraDiagnostics.Width = width;
+        _cameraDiagnostics.Height = height;
+        _cameraDiagnostics.Fps = SelectedOverviewCameraFps();
+        UpdateCameraStatusView();
+    }
+
+    private (int Width, int Height) SelectedOverviewCameraResolution()
+    {
+        return Selected(OverviewCameraResolutionCombo).Trim().ToLowerInvariant() switch
+        {
+            "1080p" => (1920, 1080),
+            "2k" => (2560, 1440),
+            _ => (1280, 720)
+        };
+    }
+
+    private int SelectedOverviewCameraFps()
+    {
+        return int.TryParse(Selected(OverviewCameraFrameRateCombo), NumberStyles.Integer, CultureInfo.InvariantCulture, out var fps) && fps > 0
+            ? fps
+            : 30;
+    }
+
+    private static string CameraResolutionValue(int width, int height)
+    {
+        return (width, height) switch
+        {
+            (1920, 1080) => "1080p",
+            (2560, 1440) => "2k",
+            _ => "720p"
+        };
+    }
+
+    private async Task ShowOverviewCameraSettingsDialogAsync()
+    {
+        var hostRunning = _hostProcess is { HasExited: false };
+        var facingCombo = CreateOverviewCameraDialogComboBox(
+            ("后置", "back"),
+            ("前置", "front"));
+        var resolutionCombo = CreateOverviewCameraDialogComboBox(
+            ("720p", "720p"),
+            ("1080p", "1080p"),
+            ("2K", "2k"));
+        var frameRateCombo = CreateOverviewCameraDialogComboBox(
+            ("30", "30"),
+            ("60", "60"),
+            ("120", "120"));
+
+        SelectComboBoxValue(facingCombo, Selected(CameraFacingCombo));
+        SelectComboBoxValue(resolutionCombo, Selected(OverviewCameraResolutionCombo));
+        SelectComboBoxValue(frameRateCombo, Selected(OverviewCameraFrameRateCombo));
+
+        facingCombo.IsEnabled = !hostRunning;
+        resolutionCombo.IsEnabled = !hostRunning;
+        frameRateCombo.IsEnabled = !hostRunning;
+
+        var content = new StackPanel { Spacing = 10, MinWidth = 280 };
+        AddCameraDialogField(content, "镜头", facingCombo);
+        AddCameraDialogField(content, "分辨率", resolutionCombo);
+        AddCameraDialogField(content, "帧率", frameRateCombo);
+        if (hostRunning)
+        {
+            content.Children.Add(new TextBlock
+            {
+                Text = "主机运行中，摄像头配置会在下次启动时生效。",
+                TextWrapping = TextWrapping.Wrap,
+                Foreground = _secondaryBrush
+            });
+        }
+
+        var dialog = new ContentDialog
+        {
+            XamlRoot = StaticOverviewShell.XamlRoot,
+            Title = "摄像头设置",
+            CloseButtonText = hostRunning ? "关闭" : "取消",
+            Content = content
+        };
+        if (!hostRunning)
+        {
+            dialog.PrimaryButtonText = "保存";
+            dialog.DefaultButton = ContentDialogButton.Primary;
+        }
+
+        try
+        {
+            var result = await dialog.ShowAsync();
+            if (hostRunning || result != ContentDialogResult.Primary)
+            {
+                return;
+            }
+
+            _syncingOverviewCameraOptions = true;
+            try
+            {
+                SelectComboBoxValue(CameraFacingCombo, Selected(facingCombo));
+                SelectComboBoxValue(OverviewCameraResolutionCombo, Selected(resolutionCombo));
+                SelectComboBoxValue(OverviewCameraFrameRateCombo, Selected(frameRateCombo));
+            }
+            finally
+            {
+                _syncingOverviewCameraOptions = false;
+            }
+
+            _cameraDiagnostics.Facing = NormalizeCameraFacing(Selected(CameraFacingCombo));
+            SyncOverviewCameraOptionsToDiagnostics();
+        }
+        catch (Exception ex)
+        {
+            ShowError("无法打开摄像头设置", ex.Message);
+        }
+    }
+
+    private static ComboBox CreateOverviewCameraDialogComboBox(params (string Content, string Tag)[] items)
+    {
+        var comboBox = new ComboBox
+        {
+            HorizontalAlignment = HorizontalAlignment.Stretch,
+            MinWidth = 220
+        };
+        foreach (var (content, tag) in items)
+        {
+            comboBox.Items.Add(new ComboBoxItem { Content = content, Tag = tag });
+        }
+
+        comboBox.SelectedIndex = 0;
+        return comboBox;
+    }
+
+    private static void AddCameraDialogField(StackPanel content, string label, ComboBox comboBox)
+    {
+        content.Children.Add(new TextBlock { Text = label });
+        content.Children.Add(comboBox);
+    }
+
+    private static void SelectComboBoxValue(ComboBox comboBox, string value)
+    {
+        if (string.IsNullOrWhiteSpace(value))
+        {
+            return;
+        }
+
+        for (var index = 0; index < comboBox.Items.Count; index++)
+        {
+            if (comboBox.Items[index] is ComboBoxItem item
+                && string.Equals(ComboBoxItemValue(item), value, StringComparison.OrdinalIgnoreCase))
+            {
+                comboBox.SelectedIndex = index;
+                return;
+            }
+        }
+    }
+
+    private static string ComboBoxItemValue(ComboBoxItem item)
+    {
+        return item.Tag?.ToString() ?? item.Content?.ToString() ?? string.Empty;
+    }
+
+    private void SetOverviewAudioEnabled(bool enabled)
+    {
+        if (AudioDeviceSwitch is null)
+        {
+            return;
+        }
+
+        AudioDeviceSwitch.IsOn = enabled;
+        ApplyAudioSwitchChange(AudioDeviceSwitch, OverviewAudioToggleHint(enabled));
+    }
+
+    private string OverviewAudioToggleHint(bool enabled)
+    {
+        var hostRunning = _hostProcess is { HasExited: false };
+        if (enabled)
+        {
+            return hostRunning
+                ? "音频桥接已启用，正在准备音频设备。"
+                : "音频桥接已启用，将在下次启动主机时生效。";
+        }
+
+        return hostRunning
+            ? "音频桥接已关闭，偏好已保存；重启主机后将按关闭状态启动。"
+            : "音频桥接已关闭，将在下次启动主机时保持关闭。";
+    }
+
+    private async Task ShowOverviewAudioSettingsDialogAsync()
+    {
+        if (!_audioEndpointChoicesReady)
+        {
+            await RefreshAudioEndpointsAsync(showHint: false);
+        }
+
+        var speakerEndpointCombo = CreateOverviewAudioEndpointCombo(SpeakerCaptureEndpointCombo);
+        var microphoneEndpointCombo = CreateOverviewAudioEndpointCombo(MicrophoneRenderEndpointCombo);
+        var speakerEndpointStatusText = CreateOverviewAudioEndpointStatusText();
+        var microphoneEndpointStatusText = CreateOverviewAudioEndpointStatusText();
+        var refreshButton = new Button
+        {
+            Padding = new Thickness(10, 6, 10, 6),
+            Content = CreateIconButtonContent("\uE72C", "刷新端点")
+        };
+        var installButton = new Button
+        {
+            Padding = new Thickness(10, 6, 10, 6),
+            Content = CreateIconButtonContent("\uE896", "安装/修复虚拟音频线")
+        };
+
+        var syncingEndpointCombos = false;
+        void SyncFromMainEndpointCombos()
+        {
+            syncingEndpointCombos = true;
+            try
+            {
+                SyncOverviewAudioEndpointCombo(speakerEndpointCombo, SpeakerCaptureEndpointCombo);
+                SyncOverviewAudioEndpointCombo(microphoneEndpointCombo, MicrophoneRenderEndpointCombo);
+            }
+            finally
+            {
+                syncingEndpointCombos = false;
+            }
+
+            SetAudioEndpointStatusText(speakerEndpointStatusText, _speakerCaptureEndpointDiagnostics);
+            SetAudioEndpointStatusText(microphoneEndpointStatusText, _microphoneRenderEndpointDiagnostics);
+        }
+
+        speakerEndpointCombo.SelectionChanged += (_, _) =>
+        {
+            if (syncingEndpointCombos)
+            {
+                return;
+            }
+
+            SetAudioEndpointStatusText(
+                speakerEndpointStatusText,
+                BuildAudioEndpointDiagnosticsFromCombo(AudioEndpointRole.SpeakerCapture, speakerEndpointCombo));
+            SaveAudioEndpointBinding(AudioEndpointRole.SpeakerCapture, speakerEndpointCombo.SelectedItem as AudioEndpointChoice);
+        };
+        microphoneEndpointCombo.SelectionChanged += (_, _) =>
+        {
+            if (syncingEndpointCombos)
+            {
+                return;
+            }
+
+            SetAudioEndpointStatusText(
+                microphoneEndpointStatusText,
+                BuildAudioEndpointDiagnosticsFromCombo(AudioEndpointRole.MicrophoneRender, microphoneEndpointCombo));
+            SaveAudioEndpointBinding(AudioEndpointRole.MicrophoneRender, microphoneEndpointCombo.SelectedItem as AudioEndpointChoice);
+        };
+        refreshButton.Click += async (_, _) =>
+        {
+            refreshButton.IsEnabled = false;
+            try
+            {
+                await RefreshAudioEndpointsAsync(showHint: true);
+                SyncFromMainEndpointCombos();
+            }
+            finally
+            {
+                refreshButton.IsEnabled = true;
+            }
+        };
+        installButton.Click += async (_, _) =>
+        {
+            installButton.IsEnabled = false;
+            try
+            {
+                await InstallVirtualAudioCableAsync();
+                SyncFromMainEndpointCombos();
+            }
+            finally
+            {
+                installButton.IsEnabled = true;
+            }
+        };
+
+        SyncFromMainEndpointCombos();
+
+        var content = new StackPanel
+        {
+            MinWidth = 520,
+            Spacing = 14
+        };
+        content.Children.Add(new TextBlock
+        {
+            Text = "复用旧音频端点配置。电脑声音从 Windows 输出设备 loopback 捕获；Android 麦克风写入到所选虚拟音频端点。",
+            Foreground = _secondaryBrush,
+            TextWrapping = TextWrapping.Wrap
+        });
+        AddOverviewAudioEndpointField(content, "Windows 输出 loopback 端点", speakerEndpointCombo, speakerEndpointStatusText);
+        AddOverviewAudioEndpointField(content, "Android 麦克风写入端点", microphoneEndpointCombo, microphoneEndpointStatusText);
+        content.Children.Add(new TextBlock
+        {
+            Text = "当前后端固定为立体声 / 48 kHz，环绕声和 96 kHz 暂不可用。",
+            Foreground = _secondaryBrush,
+            TextWrapping = TextWrapping.Wrap
+        });
+
+        var actionPanel = new StackPanel
+        {
+            Orientation = Orientation.Horizontal,
+            Spacing = 8,
+            HorizontalAlignment = HorizontalAlignment.Right
+        };
+        actionPanel.Children.Add(refreshButton);
+        actionPanel.Children.Add(installButton);
+        content.Children.Add(actionPanel);
+
+        var dialog = new ContentDialog
+        {
+            XamlRoot = Content.XamlRoot,
+            Title = "音频设置",
+            Content = content,
+            CloseButtonText = "关闭",
+            DefaultButton = ContentDialogButton.Close
+        };
+
+        await dialog.ShowAsync();
+    }
+
+    private static ComboBox CreateOverviewAudioEndpointCombo(ComboBox sourceCombo)
+    {
+        var comboBox = new ComboBox
+        {
+            DisplayMemberPath = nameof(AudioEndpointChoice.DisplayLabel),
+            HorizontalAlignment = HorizontalAlignment.Stretch,
+            MinWidth = 420
+        };
+        SyncOverviewAudioEndpointCombo(comboBox, sourceCombo);
+        return comboBox;
+    }
+
+    private static void SyncOverviewAudioEndpointCombo(ComboBox targetCombo, ComboBox sourceCombo)
+    {
+        targetCombo.ItemsSource = sourceCombo.ItemsSource;
+        targetCombo.SelectedItem = sourceCombo.SelectedItem;
+    }
+
+    private TextBlock CreateOverviewAudioEndpointStatusText()
+    {
+        return new TextBlock
+        {
+            Foreground = _secondaryBrush,
+            TextWrapping = TextWrapping.Wrap
+        };
+    }
+
+    private static void AddOverviewAudioEndpointField(
+        StackPanel content,
+        string label,
+        ComboBox comboBox,
+        TextBlock statusText)
+    {
+        content.Children.Add(new TextBlock { Text = label });
+        content.Children.Add(comboBox);
+        content.Children.Add(statusText);
+    }
+
+    private void UpdateOverviewRuntimeDiagnostics()
+    {
+        if (!StaticOverviewUi || OverviewDiagnosticsCpuText is null)
+        {
+            return;
+        }
+
+        var hostRunning = TryGetRunningHostProcess(out var hostProcess);
+        UpdateOverviewHostProcessDiagnostics(hostRunning ? hostProcess : null);
+        UpdateOverviewNetworkDiagnostics();
+        UpdateOverviewPacketLossDiagnostics(hostRunning);
+        UpdateOverviewLatencyDiagnostics(hostRunning);
+    }
+
+    private bool TryGetRunningHostProcess(out Process? process)
+    {
+        process = _hostProcess;
+        if (process is null)
+        {
+            return false;
+        }
+
+        try
+        {
+            if (process.HasExited)
+            {
+                process = null;
+                return false;
+            }
+
+            return true;
+        }
+        catch
+        {
+            process = null;
+            return false;
+        }
+    }
+
+    private void UpdateOverviewHostProcessDiagnostics(Process? process)
+    {
+        if (process is null)
+        {
+            ResetHostRuntimeSampling();
+            _lastOverviewCpuText = "未运行";
+            _lastOverviewMemoryText = "未运行";
+            OverviewDiagnosticsCpuText.Text = _lastOverviewCpuText;
+            OverviewDiagnosticsCpuText.Foreground = _overviewNeutralBrush;
+            OverviewDiagnosticsMemoryText.Text = _lastOverviewMemoryText;
+            OverviewDiagnosticsMemoryText.Foreground = _overviewNeutralBrush;
+            UpdateOverviewTrendBar(OverviewDiagnosticsCpuTrendBar, _overviewCpuSamples, 100, hasData: false);
+            UpdateOverviewTrendBar(OverviewDiagnosticsMemoryTrendBar, _overviewMemorySamples, 1024, hasData: false);
+            return;
+        }
+
+        try
+        {
+            process.Refresh();
+            var processId = TryGetProcessId(process);
+            var now = DateTimeOffset.UtcNow;
+            var processorTime = process.TotalProcessorTime;
+            double? cpuPercent = null;
+
+            if (processId.HasValue
+                && _lastHostCpuSampleProcessId == processId
+                && _lastHostCpuSampleAt is { } lastSampleAt)
+            {
+                var elapsedSeconds = Math.Max(0, (now - lastSampleAt).TotalSeconds);
+                var processorSeconds = Math.Max(0, (processorTime - _lastHostCpuSampleProcessorTime).TotalSeconds);
+                if (elapsedSeconds > 0.1)
+                {
+                    cpuPercent = Math.Clamp(
+                        processorSeconds / elapsedSeconds / Math.Max(1, Environment.ProcessorCount) * 100.0,
+                        0,
+                        100);
+                }
+            }
+
+            _lastHostCpuSampleProcessId = processId;
+            _lastHostCpuSampleProcessorTime = processorTime;
+            _lastHostCpuSampleAt = now;
+
+            if (cpuPercent.HasValue)
+            {
+                AppendOverviewSample(_overviewCpuSamples, cpuPercent.Value);
+                _lastOverviewCpuText = $"{cpuPercent.Value:F0}%";
+                OverviewDiagnosticsCpuText.Foreground = CpuBrush(cpuPercent.Value);
+            }
+            else
+            {
+                _lastOverviewCpuText = "采样中";
+                OverviewDiagnosticsCpuText.Foreground = _overviewNeutralBrush;
+            }
+
+            var workingSetBytes = Math.Max(0, process.WorkingSet64);
+            var memoryMb = workingSetBytes / 1024.0 / 1024.0;
+            AppendOverviewSample(_overviewMemorySamples, memoryMb);
+            _lastOverviewMemoryText = FormatByteSize(workingSetBytes);
+
+            OverviewDiagnosticsCpuText.Text = _lastOverviewCpuText;
+            OverviewDiagnosticsMemoryText.Text = _lastOverviewMemoryText;
+            OverviewDiagnosticsMemoryText.Foreground = _successBrush;
+            UpdateOverviewTrendBar(OverviewDiagnosticsCpuTrendBar, _overviewCpuSamples, 100, hasData: _overviewCpuSamples.Count > 0);
+            UpdateOverviewTrendBar(
+                OverviewDiagnosticsMemoryTrendBar,
+                _overviewMemorySamples,
+                Math.Max(256, _overviewMemorySamples.DefaultIfEmpty(memoryMb).Max()),
+                hasData: _overviewMemorySamples.Count > 0);
+        }
+        catch
+        {
+            _lastOverviewCpuText = "不可读";
+            _lastOverviewMemoryText = "不可读";
+            OverviewDiagnosticsCpuText.Text = _lastOverviewCpuText;
+            OverviewDiagnosticsCpuText.Foreground = _warningBrush;
+            OverviewDiagnosticsMemoryText.Text = _lastOverviewMemoryText;
+            OverviewDiagnosticsMemoryText.Foreground = _warningBrush;
+        }
+    }
+
+    private void UpdateOverviewNetworkDiagnostics()
+    {
+        var sample = TryReadPrimaryNetworkDiagnostics();
+        if (sample is null || sample.LinkSpeedBps <= 0)
+        {
+            _lastOverviewNetworkText = "暂无数据";
+            _lastNetworkInterfaceName = sample?.Name ?? "";
+            _lastNetworkLinkSpeedBps = null;
+            _lastNetworkSendBps = sample?.SendBps;
+            _lastNetworkReceiveBps = sample?.ReceiveBps;
+            OverviewDiagnosticsNetworkText.Text = _lastOverviewNetworkText;
+            OverviewDiagnosticsNetworkText.Foreground = _overviewNeutralBrush;
+            UpdateOverviewFooterMachineInfo();
+            return;
+        }
+
+        _lastNetworkInterfaceName = sample.Name;
+        _lastNetworkLinkSpeedBps = sample.LinkSpeedBps;
+        _lastNetworkSendBps = sample.SendBps;
+        _lastNetworkReceiveBps = sample.ReceiveBps;
+        _lastOverviewNetworkText = $"链路 {FormatBitRate(sample.LinkSpeedBps)}";
+        OverviewDiagnosticsNetworkText.Text = _lastOverviewNetworkText;
+        OverviewDiagnosticsNetworkText.Foreground = _successBrush;
+        UpdateOverviewFooterMachineInfo();
+    }
+
+    private NetworkDiagnosticsSample? TryReadPrimaryNetworkDiagnostics()
+    {
+        try
+        {
+            var networkInterface = FindPrimaryNetworkInterface();
+            if (networkInterface is null)
+            {
+                return null;
+            }
+
+            var now = DateTimeOffset.UtcNow;
+            var statistics = networkInterface.GetIPv4Statistics();
+            var bytesSent = Math.Max(0, statistics.BytesSent);
+            var bytesReceived = Math.Max(0, statistics.BytesReceived);
+            double? sendBps = null;
+            double? receiveBps = null;
+
+            if (string.Equals(_lastNetworkInterfaceId, networkInterface.Id, StringComparison.Ordinal)
+                && _lastNetworkSampleAt is { } lastSampleAt)
+            {
+                var elapsedSeconds = Math.Max(0, (now - lastSampleAt).TotalSeconds);
+                if (elapsedSeconds > 0.1)
+                {
+                    sendBps = Math.Max(0, bytesSent - _lastNetworkBytesSent) * 8.0 / elapsedSeconds;
+                    receiveBps = Math.Max(0, bytesReceived - _lastNetworkBytesReceived) * 8.0 / elapsedSeconds;
+                }
+            }
+
+            _lastNetworkInterfaceId = networkInterface.Id;
+            _lastNetworkBytesSent = bytesSent;
+            _lastNetworkBytesReceived = bytesReceived;
+            _lastNetworkSampleAt = now;
+
+            return new NetworkDiagnosticsSample(
+                networkInterface.Id,
+                networkInterface.Name,
+                networkInterface.Description,
+                networkInterface.Speed,
+                sendBps,
+                receiveBps);
+        }
+        catch
+        {
+            return null;
+        }
+    }
+
+    private static NetworkInterface? FindPrimaryNetworkInterface()
+    {
+        try
+        {
+            return NetworkInterface.GetAllNetworkInterfaces()
+                .Where(IsUsableNetworkInterface)
+                .OrderByDescending(HasGateway)
+                .ThenByDescending(networkInterface => networkInterface.Speed)
+                .FirstOrDefault();
+        }
+        catch
+        {
+            return null;
+        }
+    }
+
+    private static bool IsUsableNetworkInterface(NetworkInterface networkInterface)
+    {
+        if (networkInterface.OperationalStatus != OperationalStatus.Up
+            || networkInterface.NetworkInterfaceType is NetworkInterfaceType.Loopback or NetworkInterfaceType.Tunnel)
+        {
+            return false;
+        }
+
+        try
+        {
+            return networkInterface.GetIPProperties().UnicastAddresses.Any(address =>
+                address.Address.AddressFamily is AddressFamily.InterNetwork or AddressFamily.InterNetworkV6);
+        }
+        catch
+        {
+            return false;
+        }
+    }
+
+    private static bool HasGateway(NetworkInterface networkInterface)
+    {
+        try
+        {
+            return networkInterface.GetIPProperties().GatewayAddresses.Any(gateway =>
+                !IPAddress.Any.Equals(gateway.Address)
+                && !IPAddress.IPv6Any.Equals(gateway.Address));
+        }
+        catch
+        {
+            return false;
+        }
+    }
+
+    private void UpdateOverviewPacketLossDiagnostics(bool hostRunning)
+    {
+        if (!hostRunning)
+        {
+            _lastOverviewPacketLossText = "暂无数据";
+            OverviewDiagnosticsPacketLossText.Text = _lastOverviewPacketLossText;
+            OverviewDiagnosticsPacketLossText.Foreground = _overviewNeutralBrush;
+            return;
+        }
+
+        if (_videoDiagnostics.TryGetDroppedFrameRate(out var droppedFrameRate))
+        {
+            _lastOverviewPacketLossText = $"丢帧 {droppedFrameRate:F1}%";
+            OverviewDiagnosticsPacketLossText.Text = _lastOverviewPacketLossText;
+            OverviewDiagnosticsPacketLossText.Foreground = droppedFrameRate >= 5
+                ? _warningBrush
+                : _successBrush;
+            return;
+        }
+
+        _lastOverviewPacketLossText = "暂无数据";
+        OverviewDiagnosticsPacketLossText.Text = _lastOverviewPacketLossText;
+        OverviewDiagnosticsPacketLossText.Foreground = _overviewNeutralBrush;
+    }
+
+    private void UpdateOverviewLatencyDiagnostics(bool hostRunning)
+    {
+        if (!hostRunning)
+        {
+            SetOverviewLatencyUnavailable("主机未运行");
+            return;
+        }
+
+        if (_videoDiagnostics.HasRecentVideoStats
+            && _videoDiagnostics.RoughLatencyMs > 0)
+        {
+            _lastOverviewLatencyText = $"~{_videoDiagnostics.RoughLatencyMs:F0} ms";
+            _lastOverviewLatencyDetailText = _videoDiagnostics.LatencyErrorBoundMs > 0
+                ? $"端到端估算 ±{_videoDiagnostics.LatencyErrorBoundMs:F0} ms"
+                : "端到端估算";
+            SetOverviewLatencyView(_videoDiagnostics.RoughLatencyMs, _lastOverviewLatencyDetailText);
+            return;
+        }
+
+        if (_videoDiagnostics.HasRecentVideoStats
+            && _videoDiagnostics.LocalPipelineLatencyMs > 0)
+        {
+            _lastOverviewLatencyText = $"{_videoDiagnostics.LocalPipelineLatencyMs:F0} ms";
+            _lastOverviewLatencyDetailText = "Android 本地链路";
+            SetOverviewLatencyView(_videoDiagnostics.LocalPipelineLatencyMs, _lastOverviewLatencyDetailText);
+            return;
+        }
+
+        if (IsCameraReceiving(_cameraDiagnostics) && _cameraDiagnostics.DecodeLagMs > 0)
+        {
+            _lastOverviewLatencyText = $"{_cameraDiagnostics.DecodeLagMs:F0} ms";
+            _lastOverviewLatencyDetailText = "摄像头解码滞后";
+            SetOverviewLatencyView(_cameraDiagnostics.DecodeLagMs, _lastOverviewLatencyDetailText);
+            return;
+        }
+
+        SetOverviewLatencyUnavailable("等待视频统计");
+    }
+
+    private void SetOverviewLatencyView(double latencyMs, string detail)
+    {
+        OverviewLatencyValueText.Text = _lastOverviewLatencyText;
+        OverviewLatencyDetailText.Text = detail;
+
+        var brush = latencyMs <= 50
+            ? _successBrush
+            : latencyMs <= 100
+                ? _warningBrush
+                : _dangerBrush;
+        OverviewLatencyValueText.Foreground = brush;
+        OverviewLatencyDetailText.Foreground = _overviewNeutralBrush;
+        OverviewLatencyStatusDot.Fill = brush;
+    }
+
+    private void SetOverviewLatencyUnavailable(string detail)
+    {
+        _lastOverviewLatencyText = "暂无数据";
+        _lastOverviewLatencyDetailText = detail;
+        OverviewLatencyValueText.Text = _lastOverviewLatencyText;
+        OverviewLatencyValueText.Foreground = _overviewNeutralBrush;
+        OverviewLatencyDetailText.Text = detail;
+        OverviewLatencyDetailText.Foreground = _overviewNeutralBrush;
+        OverviewLatencyStatusDot.Fill = _overviewMutedBrush;
+    }
+
+    private void ResetHostRuntimeSampling()
+    {
+        _lastHostCpuSampleProcessId = null;
+        _lastHostCpuSampleProcessorTime = TimeSpan.Zero;
+        _lastHostCpuSampleAt = null;
+        _overviewCpuSamples.Clear();
+        _overviewMemorySamples.Clear();
+    }
+
+    private static void AppendOverviewSample(Queue<double> samples, double value)
+    {
+        samples.Enqueue(Math.Max(0, value));
+        while (samples.Count > MaxOverviewDiagnosticsSamples)
+        {
+            samples.Dequeue();
+        }
+    }
+
+    private void UpdateOverviewTrendBar(StackPanel trendBar, Queue<double> samples, double scaleMax, bool hasData)
+    {
+        var bars = trendBar.Children.OfType<XamlRectangle>().ToArray();
+        var values = samples.ToArray();
+        var firstValueIndex = Math.Max(0, bars.Length - values.Length);
+        var safeScaleMax = Math.Max(1, scaleMax);
+
+        for (var index = 0; index < bars.Length; index++)
+        {
+            var bar = bars[index];
+            var valueIndex = index - firstValueIndex;
+            if (!hasData || valueIndex < 0 || valueIndex >= values.Length)
+            {
+                bar.Height = 4;
+                bar.Fill = _overviewNeutralBorderBrush;
+                continue;
+            }
+
+            var value = values[valueIndex];
+            var ratio = Math.Clamp(value / safeScaleMax, 0, 1);
+            bar.Height = 4 + (ratio * 12);
+            bar.Fill = value >= 85
+                ? _dangerBrush
+                : value >= 65
+                    ? _warningBrush
+                    : _successBrush;
+        }
+    }
+
+    private Brush CpuBrush(double cpuPercent)
+    {
+        if (cpuPercent >= 85)
+        {
+            return _dangerBrush;
+        }
+
+        return cpuPercent >= 65 ? _warningBrush : _successBrush;
+    }
+
+    private static string FormatByteSize(long bytes)
+    {
+        if (bytes >= 1024L * 1024L * 1024L)
+        {
+            return $"{bytes / 1024.0 / 1024.0 / 1024.0:F1} GB";
+        }
+
+        return $"{bytes / 1024.0 / 1024.0:F0} MB";
+    }
+
+    private static string FormatBitRate(double bitsPerSecond)
+    {
+        if (bitsPerSecond >= 1_000_000_000)
+        {
+            return $"{bitsPerSecond / 1_000_000_000:F1} Gbps";
+        }
+
+        if (bitsPerSecond >= 1_000_000)
+        {
+            return $"{bitsPerSecond / 1_000_000:F0} Mbps";
+        }
+
+        if (bitsPerSecond >= 1_000)
+        {
+            return $"{bitsPerSecond / 1_000:F0} Kbps";
+        }
+
+        return $"{bitsPerSecond:F0} bps";
+    }
+
+    private async Task ShowOverviewDiagnosticsDialogAsync()
+    {
+        UpdateOverviewRuntimeDiagnostics();
+        await ShowCopyableDetailsDialogAsync(
+            "运行诊断",
+            "综合当前运行指标、视频链路统计、虚拟显示器、摄像头、音频和主机日志。",
+            BuildOverviewDiagnosticsReport(),
+            "复制诊断");
+    }
+
+    private async Task ShowOverviewLogsDialogAsync()
+    {
+        var details = BuildHostLogReport();
+        var hasHostLog = _currentHostLog is not null;
+        await ShowCopyableDetailsDialogAsync(
+            "主机日志",
+            hasHostLog ? "当前或最近一次 Host stdout/stderr 日志。" : "暂无主机日志。",
+            details,
+            "复制日志");
+    }
+
+    private async Task ShowOverviewAdbPathHelpDialogAsync(string reason)
+    {
+        var content = new TextBlock
+        {
+            Text = $"无法打开文件选择器：{reason}\n\n可以直接在 ADB 路径输入框中填写 adb.exe 完整路径，或填写 Android SDK / platform-tools 所在目录。留空时会自动查找随程序打包的 adb、ANDROID_HOME、ANDROID_SDK_ROOT 和本机 Android SDK。",
+            TextWrapping = TextWrapping.Wrap
+        };
+
+        var dialog = new ContentDialog
+        {
+            XamlRoot = StaticOverviewShell.XamlRoot,
+            Title = "设置 ADB 路径",
+            Content = content,
+            CloseButtonText = "知道了",
+            DefaultButton = ContentDialogButton.Close
+        };
+        await dialog.ShowAsync();
+    }
+
+    private async Task ShowUsbDebuggingHelpDialogAsync()
+    {
+        var readmePath = FindRepositoryReadmePath();
+        var details = new StringBuilder();
+        details.AppendLine("USB 调试授权检查");
+        details.AppendLine();
+        details.AppendLine("1. 使用 USB 连接 Android 设备。");
+        details.AppendLine("2. 在设备开发者选项中打开 USB 调试。");
+        details.AppendLine("3. 当设备弹出“允许 USB 调试”时选择允许。");
+        details.AppendLine("4. 回到 SideDock Host 点击“刷新设备”。");
+        details.AppendLine("5. 多台已授权设备同时连接时，请在连接页下拉框选择目标设备。");
+        details.AppendLine();
+        details.AppendLine($"README: {FormatOptional(readmePath)}");
+
+        await ShowCopyableDetailsDialogAsync(
+            "帮助文档",
+            "连接页只显示真实 ADB 检测结果；未授权、离线和多设备场景都需要先在这里处理。",
+            details.ToString(),
+            "复制说明");
+    }
+
+    private string BuildConnectionConfigurationReport()
+    {
+        SyncOverviewConnectionControlsToLegacy();
+
+        var report = new StringBuilder();
+        report.AppendLine("SideDock 连接配置");
+        report.AppendLine($"时间: {DateTimeOffset.Now:yyyy-MM-dd HH:mm:ss zzz}");
+        report.AppendLine($"Host 状态: {_overviewHostServiceState}");
+        report.AppendLine($"ADB 状态: {_lastAdbStatusText}");
+        report.AppendLine($"ADB 路径输入: {FormatOptional(OverviewAdbPathBox.Text.Trim())}");
+        report.AppendLine($"ADB 实际路径: {ResolveAdbPath(OverviewAdbPathBox.Text.Trim())}");
+        report.AppendLine($"已选择设备: {FormatOptional(SelectedAdbSerial())}");
+        report.AppendLine($"控制端口: {FormatNumberBox(OverviewControlPortBox)}");
+        report.AppendLine($"视频端口: {FormatNumberBox(OverviewVideoPortBox)}");
+        report.AppendLine($"音频端口: {FormatNumberBox(OverviewAudioPortBox)}");
+        report.AppendLine($"摄像头端口: {FormatNumberBox(OverviewCameraPortBox)}");
+        report.AppendLine($"启用触控输入: {OverviewInputInjectionSwitch.IsOn}");
+        report.AppendLine($"ADB reverse: {(_lastAdbReverseConfigured.HasValue ? _lastAdbReverseDetail : "待启动时配置")}");
+        report.AppendLine();
+        report.AppendLine("---- ADB 设备 ----");
+        if (_lastAdbDeviceRows.Count == 0)
+        {
+            report.AppendLine("暂无数据。");
+        }
+        else
+        {
+            foreach (var row in _lastAdbDeviceRows)
+            {
+                report.AppendLine(row.RawLine);
+            }
+        }
+
+        return report.ToString();
+    }
+
+    private static string? FindRepositoryReadmePath()
+    {
+        var directory = new DirectoryInfo(AppContext.BaseDirectory);
+        while (directory is not null)
+        {
+            var readmePath = Path.Combine(directory.FullName, "README.md");
+            if (File.Exists(readmePath))
+            {
+                return readmePath;
+            }
+
+            directory = directory.Parent;
+        }
+
+        return null;
+    }
+
+    private string BuildOverviewDiagnosticsReport()
+    {
+        var report = new StringBuilder();
+        report.AppendLine("SideDock 运行诊断报告");
+        report.AppendLine($"时间: {DateTimeOffset.Now:yyyy-MM-dd HH:mm:ss zzz}");
+        report.AppendLine();
+
+        report.AppendLine("---- 运行指标 ----");
+        report.AppendLine($"主机进程: {FormatHostProcessState()}");
+        report.AppendLine($"CPU: {_lastOverviewCpuText}");
+        report.AppendLine($"内存: {_lastOverviewMemoryText}");
+        report.AppendLine($"网络: {_lastOverviewNetworkText}");
+        report.AppendLine($"主要网卡: {FormatOptional(_lastNetworkInterfaceName)}");
+        report.AppendLine($"链路速度: {(_lastNetworkLinkSpeedBps.HasValue ? FormatBitRate(_lastNetworkLinkSpeedBps.Value) : "暂无数据")}");
+        report.AppendLine($"发送速率: {(_lastNetworkSendBps.HasValue ? FormatBitRate(_lastNetworkSendBps.Value) : "暂无数据")}");
+        report.AppendLine($"接收速率: {(_lastNetworkReceiveBps.HasValue ? FormatBitRate(_lastNetworkReceiveBps.Value) : "暂无数据")}");
+        report.AppendLine($"丢包/丢帧: {_lastOverviewPacketLossText}");
+        report.AppendLine($"延迟: {_lastOverviewLatencyText} ({_lastOverviewLatencyDetailText})");
+        report.AppendLine($"ADB 状态: {_lastAdbStatusText}");
+        report.AppendLine($"ADB 设备: {FormatOptional(SelectedAdbSerial())}");
+        report.AppendLine();
+
+        AppendOverviewVideoDiagnostics(report);
+        report.AppendLine();
+        AppendVirtualDisplayDiagnostics(report);
+        report.AppendLine();
+
+        report.AppendLine("---- 摄像头诊断报告 ----");
+        report.Append(BuildCameraDiagnosticsReport());
+        report.AppendLine();
+        report.AppendLine("---- 音频诊断报告 ----");
+        report.Append(BuildAudioDiagnosticsReport());
+
+        return report.ToString();
+    }
+
+    private void AppendOverviewVideoDiagnostics(StringBuilder report)
+    {
+        report.AppendLine("---- 视频链路统计 ----");
+        if (!_videoDiagnostics.HasVideoStats && !_videoDiagnostics.HasEncoderStats)
+        {
+            report.AppendLine("暂无视频链路统计。");
+            return;
+        }
+
+        if (_videoDiagnostics.HasVideoStats)
+        {
+            report.AppendLine($"最近视频统计时间: {_videoDiagnostics.LastVideoStatsAt:yyyy-MM-dd HH:mm:ss zzz}");
+            report.AppendLine($"Android 解码/渲染帧: {_videoDiagnostics.FramesDecoded}/{_videoDiagnostics.FramesRendered}");
+            report.AppendLine($"Android 收包: {_videoDiagnostics.PacketsReceived}");
+            report.AppendLine($"解码/渲染 fps: {_videoDiagnostics.DecodeFps:F1}/{_videoDiagnostics.RenderFps:F1}");
+            report.AppendLine($"新帧/重复帧 fps: {_videoDiagnostics.NewFrameFps:F1}/{_videoDiagnostics.RepeatFrameFps:F1}");
+            report.AppendLine($"端到端估算延迟: {(_videoDiagnostics.RoughLatencyMs > 0 ? $"{_videoDiagnostics.RoughLatencyMs:F0} ms" : "暂无数据")}");
+            report.AppendLine($"Android 本地链路延迟: {(_videoDiagnostics.LocalPipelineLatencyMs > 0 ? $"{_videoDiagnostics.LocalPipelineLatencyMs:F0} ms" : "暂无数据")}");
+            report.AppendLine($"延迟误差范围: {(_videoDiagnostics.LatencyErrorBoundMs > 0 ? $"±{_videoDiagnostics.LatencyErrorBoundMs:F0} ms" : "暂无数据")}");
+            report.AppendLine($"解码错误/重连: {_videoDiagnostics.DecodeErrors}/{_videoDiagnostics.VideoReconnects}");
+            report.AppendLine($"最近视频统计日志: {FormatOptional(_lastVideoStatsLine)}");
+        }
+
+        if (_videoDiagnostics.HasEncoderStats)
+        {
+            report.AppendLine($"编码生成/已编码/已发送/丢弃帧: {_videoDiagnostics.FramesGenerated}/{_videoDiagnostics.FramesEncoded}/{_videoDiagnostics.FramesSent}/{_videoDiagnostics.FramesDropped}");
+            report.AppendLine($"编码输出码率: {(_videoDiagnostics.OutputKbps > 0 ? $"{_videoDiagnostics.OutputKbps:F0} kbps" : "暂无数据")}");
+            report.AppendLine($"Host 本地延迟 P95: {(_videoDiagnostics.LocalLatencyP95Ms > 0 ? $"{_videoDiagnostics.LocalLatencyP95Ms:F1} ms" : "暂无数据")}");
+            report.AppendLine($"最近编码统计日志: {FormatOptional(_lastEncoderStatsLine)}");
+        }
+    }
+
+    private void AppendVirtualDisplayDiagnostics(StringBuilder report)
+    {
+        var running = IsVirtualDisplayToolRunning();
+        var state = DetermineVirtualDisplayOverviewState(running, out var driverInstalled, out var toolAvailable);
+        var (statusText, subtext, _) = BuildVirtualDisplayStatusView(state, driverInstalled, toolAvailable);
+
+        report.AppendLine("---- 虚拟显示器诊断 ----");
+        report.AppendLine($"状态: {statusText}");
+        report.AppendLine($"详情: {subtext}");
+        report.AppendLine($"驱动已安装: {driverInstalled}");
+        report.AppendLine($"工具可用: {toolAvailable}");
+        report.AppendLine($"工具正在运行: {running}");
+        report.AppendLine($"DeviceTool 路径: {FormatOptional(_deviceToolPath)}");
+        report.AppendLine($"进程名: {DeviceToolProcessName}");
+        report.AppendLine($"视频源: {Selected(VideoSourceCombo)}");
+        report.AppendLine($"分辨率/刷新率: {Selected(ResolutionCombo)} / {Selected(RefreshRateCombo)}fps");
+        report.AppendLine($"最后错误: {FormatOptional(_virtualDisplayLastError)}");
+    }
+
+    private string BuildHostLogReport()
+    {
+        var hostLog = _currentHostLog;
+        var recentAudioLines = SnapshotRecentAudioLogLines();
+        var recentCameraLines = SnapshotRecentCameraLogLines();
+        var hasRecentLines = recentAudioLines.Length > 0 || recentCameraLines.Length > 0;
+        if (hostLog is null && !hasRecentLines)
+        {
+            return "暂无主机日志";
+        }
+
+        var report = new StringBuilder();
+        report.AppendLine("SideDock 主机日志");
+        report.AppendLine($"时间: {DateTimeOffset.Now:yyyy-MM-dd HH:mm:ss zzz}");
+        report.AppendLine($"主机进程: {FormatHostProcessState()}");
+        report.AppendLine();
+
+        report.AppendLine("---- Host stdout/stderr ----");
+        if (hostLog is null)
+        {
+            report.AppendLine("暂无主机日志");
+        }
+        else
+        {
+            report.Append(hostLog.Snapshot());
+        }
+
+        report.AppendLine();
+        report.AppendLine("---- 最近摄像头日志 ----");
+        if (recentCameraLines.Length == 0)
+        {
+            report.AppendLine("(还没有捕获到 [CAMERA] 日志)");
+        }
+        else
+        {
+            foreach (var line in recentCameraLines)
+            {
+                report.AppendLine(line);
+            }
+        }
+
+        report.AppendLine();
+        report.AppendLine("---- 最近音频日志 ----");
+        if (recentAudioLines.Length == 0)
+        {
+            report.AppendLine("(还没有捕获到 [AUDIO] 日志)");
+        }
+        else
+        {
+            foreach (var line in recentAudioLines)
+            {
+                report.AppendLine(line);
+            }
+        }
+
+        return report.ToString();
+    }
+
+    private async Task ShowCopyableDetailsDialogAsync(
+        string title,
+        string summary,
+        string details,
+        string copyButtonText)
+    {
+        var summaryText = new TextBlock
+        {
+            Text = summary,
+            TextWrapping = TextWrapping.Wrap
+        };
+
+        var detailBox = new TextBox
+        {
+            Text = details,
+            IsReadOnly = true,
+            AcceptsReturn = true,
+            TextWrapping = TextWrapping.NoWrap,
+            FontFamily = new FontFamily("Consolas"),
+            IsSpellCheckEnabled = false,
+            MinWidth = 640,
+            MaxHeight = 520
+        };
+        ScrollViewer.SetVerticalScrollBarVisibility(detailBox, ScrollBarVisibility.Auto);
+        ScrollViewer.SetHorizontalScrollBarVisibility(detailBox, ScrollBarVisibility.Auto);
+
+        var panel = new StackPanel { Spacing = 12 };
+        panel.Children.Add(summaryText);
+        panel.Children.Add(detailBox);
+
+        var dialog = new ContentDialog
+        {
+            XamlRoot = Content.XamlRoot,
+            Title = title,
+            Content = panel,
+            PrimaryButtonText = copyButtonText,
+            CloseButtonText = "关闭",
+            DefaultButton = ContentDialogButton.Primary
+        };
+        dialog.Resources["ContentDialogMaxWidth"] = 900.0;
+
+        dialog.PrimaryButtonClick += (sender, args) =>
+        {
+            args.Cancel = true;
+            try
+            {
+                var package = new DataPackage { RequestedOperation = DataPackageOperation.Copy };
+                package.SetText(details);
+                Clipboard.SetContent(package);
+                Clipboard.Flush();
+                sender.PrimaryButtonText = "已复制";
+            }
+            catch
+            {
+                sender.PrimaryButtonText = "复制失败，请手动选择文本复制";
+            }
+        };
+
+        await dialog.ShowAsync();
+    }
+
+    private static StackPanel CreateIconButtonContent(string glyph, string text)
+    {
+        var content = new StackPanel
+        {
+            Orientation = Orientation.Horizontal,
+            Spacing = 6
+        };
+        content.Children.Add(new FontIcon { Glyph = glyph, FontSize = 14 });
+        content.Children.Add(new TextBlock { Text = text });
+        return content;
+    }
+
+    private static AudioEndpointDiagnostics BuildAudioEndpointDiagnosticsFromCombo(
+        AudioEndpointRole role,
+        ComboBox comboBox)
+    {
+        var endpointCount = 0;
+        foreach (var item in comboBox.Items)
+        {
+            if (item is AudioEndpointChoice { IsBound: true, IsPresent: true })
+            {
+                endpointCount++;
+            }
+        }
+
+        return AudioEndpointDiagnostics.FromSelection(
+            role,
+            comboBox.SelectedItem as AudioEndpointChoice,
+            endpointCount);
     }
 
     private async Task RefreshAudioEndpointsAsync(bool showHint)
@@ -1093,6 +4803,9 @@ public sealed partial class MainWindow : Window
     private async Task RefreshAdbDevicesAsync(bool showErrors, string? resolvedAdbPath = null)
     {
         var selectedSerial = SelectedAdbSerial();
+        _adbRefreshInProgress = true;
+        UpdateOverviewActionButtons();
+        UpdateOverviewConnectionPage();
         RefreshAdbDevicesButton.IsEnabled = false;
         RestartAdbButton.IsEnabled = false;
 
@@ -1128,9 +4841,17 @@ public sealed partial class MainWindow : Window
             }
 
             var rows = ParseAdbDevices(devices.Stdout).ToArray();
+            _lastAdbRefreshCompletedAt = DateTimeOffset.Now;
+            _lastAdbReverseConfigured = null;
             SetAdbDeviceChoices(rows, selectedSerial);
             var authorizedCount = rows.Count(row => row.State.Equals("device", StringComparison.OrdinalIgnoreCase));
-            if (authorizedCount == 0)
+            var unauthorizedDevice = rows.FirstOrDefault(row =>
+                row.State.Equals("unauthorized", StringComparison.OrdinalIgnoreCase));
+            if (authorizedCount == 0 && unauthorizedDevice is not null)
+            {
+                SetAdbStatus($"检测到 Android 设备但未授权：{unauthorizedDevice.Serial}", _warningBrush);
+            }
+            else if (authorizedCount == 0)
             {
                 SetAdbStatus("未检测到已授权 Android 设备。", _secondaryBrush);
             }
@@ -1159,9 +4880,12 @@ public sealed partial class MainWindow : Window
         }
         finally
         {
+            _adbRefreshInProgress = false;
             var controlsEnabled = CanUseAdbControls();
             RefreshAdbDevicesButton.IsEnabled = controlsEnabled;
             RestartAdbButton.IsEnabled = controlsEnabled;
+            UpdateOverviewActionButtons();
+            UpdateOverviewConnectionPage();
         }
     }
 
@@ -1176,6 +4900,7 @@ public sealed partial class MainWindow : Window
         AdbDeviceCombo.IsEnabled = false;
         RefreshAdbDevicesButton.IsEnabled = false;
         RestartAdbButton.IsEnabled = false;
+        UpdateOverviewConnectionPage();
 
         try
         {
@@ -1239,6 +4964,7 @@ public sealed partial class MainWindow : Window
             AdbDeviceCombo.IsEnabled = controlsEnabled;
             RefreshAdbDevicesButton.IsEnabled = controlsEnabled;
             RestartAdbButton.IsEnabled = controlsEnabled;
+            UpdateOverviewConnectionPage();
         }
     }
 
@@ -1249,6 +4975,7 @@ public sealed partial class MainWindow : Window
 
     private void SetAdbDeviceChoices(IReadOnlyList<AdbDeviceRow> rows, string? selectedSerial)
     {
+        _lastAdbDeviceRows = rows.ToArray();
         var choices = new List<AdbDeviceChoice>
         {
             new(null, "自动选择（仅一台设备时）", string.Empty, string.Empty)
@@ -1259,8 +4986,6 @@ public sealed partial class MainWindow : Window
             FormatAdbDeviceDisplayName(row),
             row.State,
             row.RawLine)));
-
-        AdbDeviceCombo.ItemsSource = choices;
 
         var selectedChoice = choices.FirstOrDefault(choice =>
             !string.IsNullOrWhiteSpace(choice.Serial) &&
@@ -1273,15 +4998,112 @@ public sealed partial class MainWindow : Window
             selectedChoice = authorizedChoices.Length == 1 ? authorizedChoices[0] : choices[0];
         }
 
-        AdbDeviceCombo.SelectedItem = selectedChoice;
+        _syncingAdbDeviceSelection = true;
+        try
+        {
+            AdbDeviceCombo.ItemsSource = choices;
+            OverviewConnectionAdbDeviceCombo.ItemsSource = choices;
+            AdbDeviceCombo.SelectedItem = selectedChoice;
+            OverviewConnectionAdbDeviceCombo.SelectedItem = selectedChoice;
+        }
+        finally
+        {
+            _syncingAdbDeviceSelection = false;
+        }
+
         UpdateAudioState();
+        UpdateOverviewAndroidDeviceState();
+        UpdateOverviewConnectionPage();
     }
 
     private string? SelectedAdbSerial()
     {
-        return AdbDeviceCombo.SelectedItem is AdbDeviceChoice { Serial.Length: > 0 } choice
+        return SelectedAdbDeviceChoice() is { Serial.Length: > 0 } choice
             ? choice.Serial
             : null;
+    }
+
+    private AdbDeviceChoice? SelectedAdbDeviceChoice()
+    {
+        if (AdbDeviceCombo.SelectedItem is AdbDeviceChoice choice)
+        {
+            return choice;
+        }
+
+        return OverviewConnectionAdbDeviceCombo.SelectedItem as AdbDeviceChoice;
+    }
+
+    private AdbDeviceRow? SelectedAdbDeviceRow()
+    {
+        var selectedSerial = SelectedAdbSerial();
+        return string.IsNullOrWhiteSpace(selectedSerial)
+            ? null
+            : _lastAdbDeviceRows.FirstOrDefault(row =>
+                row.Serial.Equals(selectedSerial, StringComparison.OrdinalIgnoreCase));
+    }
+
+    private void SyncAdbDeviceSelectionFrom(ComboBox source)
+    {
+        if (_syncingAdbDeviceSelection)
+        {
+            return;
+        }
+
+        var selectedChoice = source.SelectedItem as AdbDeviceChoice;
+        _syncingAdbDeviceSelection = true;
+        try
+        {
+            if (!ReferenceEquals(source, AdbDeviceCombo))
+            {
+                AdbDeviceCombo.SelectedItem = FindAdbDeviceChoice(AdbDeviceCombo, selectedChoice?.Serial)
+                    ?? AdbDeviceCombo.Items.OfType<AdbDeviceChoice>().FirstOrDefault();
+            }
+
+            if (!ReferenceEquals(source, OverviewConnectionAdbDeviceCombo))
+            {
+                OverviewConnectionAdbDeviceCombo.SelectedItem = FindAdbDeviceChoice(
+                    OverviewConnectionAdbDeviceCombo,
+                    selectedChoice?.Serial)
+                    ?? OverviewConnectionAdbDeviceCombo.Items.OfType<AdbDeviceChoice>().FirstOrDefault();
+            }
+
+            var selectedSerial = selectedChoice?.Serial;
+            if (OverviewConnectionDeviceListView.ItemsSource is IEnumerable<OverviewConnectionDeviceItem> items)
+            {
+                OverviewConnectionDeviceListView.SelectedItem = items.FirstOrDefault(item =>
+                    !string.IsNullOrWhiteSpace(selectedSerial)
+                    && item.Serial.Equals(selectedSerial, StringComparison.OrdinalIgnoreCase));
+            }
+        }
+        finally
+        {
+            _syncingAdbDeviceSelection = false;
+        }
+
+        _lastAdbReverseConfigured = null;
+        UpdateAudioState();
+        UpdateOverviewAndroidDeviceState();
+        UpdateOverviewConnectionPage();
+    }
+
+    private static AdbDeviceChoice? FindAdbDeviceChoice(ComboBox comboBox, string? serial)
+    {
+        foreach (var item in comboBox.Items.OfType<AdbDeviceChoice>())
+        {
+            if (string.IsNullOrWhiteSpace(serial))
+            {
+                if (string.IsNullOrWhiteSpace(item.Serial))
+                {
+                    return item;
+                }
+            }
+            else if (item.Serial?.Equals(serial, StringComparison.OrdinalIgnoreCase) == true)
+            {
+                return item;
+            }
+        }
+
+        return null;
     }
 
     private static string FormatAdbDeviceDisplayName(AdbDeviceRow row)
@@ -1830,6 +5652,7 @@ public sealed partial class MainWindow : Window
     {
         if (IsVirtualDisplayToolRunning())
         {
+            _virtualDisplayLastError = null;
             RefreshVirtualDisplayState();
             return true;
         }
@@ -1862,10 +5685,13 @@ public sealed partial class MainWindow : Window
             }
 
             SaveVirtualDisplayLog(BuildVirtualDisplayStartupDetails());
+            _virtualDisplayLastError = null;
             return true;
         }
         catch (Exception ex)
         {
+            _virtualDisplayLastError = ex.Message;
+            InvalidateVirtualDisplayAvailabilityCaches();
             var details = BuildVirtualDisplayFailureDetails(ex, exitCode, diagnostics);
             SaveVirtualDisplayLog(details);
 
@@ -1912,6 +5738,7 @@ public sealed partial class MainWindow : Window
         }
 
         _deviceToolProcess = null;
+        _virtualDisplayLastError = null;
         RefreshVirtualDisplayState();
     }
 
@@ -1957,10 +5784,40 @@ public sealed partial class MainWindow : Window
             $"未找到 {DeviceToolExe}。请先安装 SideDock 驱动包，或先构建 SideDock.Idd.DeviceTool。");
     }
 
-    private async Task InstallDriverAsync()
+    private void SetDriverInstallButtonsEnabled(bool enabled)
     {
-        InstallDriverButton.IsEnabled = false;
-        DriverInstallStatusText.Text = "正在启动驱动安装器，请在管理员权限弹窗中选择“是”。";
+        InstallDriverButton.IsEnabled = enabled;
+        OverviewInstallDriverButton.IsEnabled = enabled && !_virtualDisplayOperationInProgress;
+    }
+
+    private void SetDriverInstallStatus(string text)
+    {
+        DriverInstallStatusText.Text = text;
+        OverviewVirtualDisplayHintText.Text = text;
+    }
+
+    private void InvalidateVirtualDisplayAvailabilityCaches()
+    {
+        _virtualDisplayDriverInstalledCache = null;
+        _virtualDisplayToolAvailableCache = null;
+        _virtualDisplayDriverInstalledCheckedAt = DateTimeOffset.MinValue;
+        _virtualDisplayToolAvailableCheckedAt = DateTimeOffset.MinValue;
+    }
+
+    private async Task<bool> InstallDriverAsync()
+    {
+        if (_driverInstallInProgress)
+        {
+            return false;
+        }
+
+        _driverInstallInProgress = true;
+        _driverInstallLastError = null;
+        _virtualDisplayTransientState = VirtualDisplayOverviewState.DriverInstalling;
+        SetDriverInstallButtonsEnabled(false);
+        SetDriverInstallStatus("正在启动驱动安装器，请在管理员权限弹窗中选择“是”。");
+        RefreshVirtualDisplayState();
+        var succeeded = false;
 
         // The installer runs elevated (runas), so we cannot capture its stdout/stderr
         // directly. Instead we hand it a result-file path; it writes a full diagnostic
@@ -1987,12 +5844,16 @@ public sealed partial class MainWindow : Window
             if (process.ExitCode == 0)
             {
                 _deviceToolPath = null;
-                DriverInstallStatusText.Text = "驱动安装流程已完成。若显示器没有立即出现，请点“启动显示器”。";
+                _virtualDisplayLastError = null;
+                InvalidateVirtualDisplayAvailabilityCaches();
+                SetDriverInstallStatus("驱动安装流程已完成。若显示器没有立即出现，请打开虚拟显示器开关。");
                 TryDeleteFile(reportPath);
+                succeeded = true;
             }
             else
             {
-                DriverInstallStatusText.Text = $"驱动安装未完成（退出码 {process.ExitCode}）。点开详情可一键复制。";
+                _driverInstallLastError = $"安装器退出码 {process.ExitCode}";
+                SetDriverInstallStatus($"驱动安装未完成（退出码 {process.ExitCode}）。点开详情可一键复制。");
                 var report = TryReadFile(reportPath);
                 var summary = $"安装器以退出码 {process.ExitCode} 结束。下面是详细诊断信息，点“复制详情”可一键复制后发给开发者排查。";
                 var details = !string.IsNullOrWhiteSpace(report)
@@ -2005,12 +5866,14 @@ public sealed partial class MainWindow : Window
         }
         catch (System.ComponentModel.Win32Exception ex) when (ex.NativeErrorCode == 1223)
         {
-            DriverInstallStatusText.Text = "驱动安装已取消（未授予管理员权限）。";
+            _driverInstallLastError = "用户取消了管理员权限授权";
+            SetDriverInstallStatus("驱动安装已取消（未授予管理员权限）。");
             ShowError("驱动安装已取消", "你在管理员权限弹窗中选择了“否”，安装未开始。请重新点击“安装/修复驱动”，并在弹窗中选择“是”。");
         }
         catch (Exception ex)
         {
-            DriverInstallStatusText.Text = "驱动安装未完成。";
+            _driverInstallLastError = ex.Message;
+            SetDriverInstallStatus("驱动安装未完成。");
             var report = TryReadFile(reportPath);
             var details = !string.IsNullOrWhiteSpace(report)
                 ? $"日志文件: {reportPath}{Environment.NewLine}{Environment.NewLine}{report}"
@@ -2019,9 +5882,14 @@ public sealed partial class MainWindow : Window
         }
         finally
         {
-            InstallDriverButton.IsEnabled = true;
+            _driverInstallInProgress = false;
+            _virtualDisplayTransientState = null;
+            SetDriverInstallButtonsEnabled(true);
+            InvalidateVirtualDisplayAvailabilityCaches();
             RefreshVirtualDisplayState();
         }
+
+        return succeeded;
     }
 
     private async Task InstallVirtualAudioCableAsync()
@@ -2420,6 +6288,7 @@ public sealed partial class MainWindow : Window
 
         _audioOverrideStatus = AudioCapabilityStatus.Error;
         UpdateAudioState("音频设备暂不可用，主机进程已退出。");
+        SetOverviewHostState(OverviewHostServiceState.Error, "主机进程已退出。");
 
         var exitCode = TryGetExitCode(process);
         var summary = exitCode.HasValue
@@ -2469,6 +6338,8 @@ public sealed partial class MainWindow : Window
         report.AppendLine($"刷新率: {Selected(RefreshRateCombo)}");
         report.AppendLine($"控制端口: {FormatNumberBox(ControlPortBox)}");
         report.AppendLine($"视频端口: {FormatNumberBox(VideoPortBox)}");
+        report.AppendLine($"音频端口: {(StaticOverviewUi ? FormatNumberBox(OverviewAudioPortBox) : DefaultAudioPort.ToString(CultureInfo.InvariantCulture))}");
+        report.AppendLine($"摄像头端口: {(StaticOverviewUi ? FormatNumberBox(OverviewCameraPortBox) : DefaultCameraPort.ToString(CultureInfo.InvariantCulture))}");
         report.AppendLine($"启用触控输入: {InputInjectionSwitch.IsOn}");
         report.AppendLine($"自动管理虚拟显示器: {ManageDisplaySwitch.IsOn}");
 
@@ -2660,16 +6531,400 @@ public sealed partial class MainWindow : Window
         return double.IsNaN(numberBox.Value) ? "(无效)" : ((int)numberBox.Value).ToString();
     }
 
-    private void RefreshVirtualDisplayState()
+    private DisplayLayoutSnapshot RefreshVirtualDisplayState()
     {
         var running = IsVirtualDisplayToolRunning();
-        StartDisplayButton.IsEnabled = !running;
-        StopDisplayButton.IsEnabled = running;
-        DisplayStatusText.Text = running ? "显示器已启动" : "显示器未启动";
-        DisplayStatusText.Foreground = running ? _successBrush : _dangerBrush;
-        DisplayStatusSubtext.Text = running
-            ? "SideDock 虚拟显示器工具正在运行。"
-            : "虚拟显示器工具未运行。";
+        var displayLayout = DisplayLayoutQuery.GetCurrent();
+        var state = DetermineVirtualDisplayOverviewState(running, out var driverInstalled, out var toolAvailable);
+        var (statusText, subtext, statusBrush) = BuildVirtualDisplayStatusView(state, driverInstalled, toolAvailable);
+        var displayOperationEnabled = !_virtualDisplayOperationInProgress && !_driverInstallInProgress;
+
+        StartDisplayButton.IsEnabled = displayOperationEnabled && !running;
+        StopDisplayButton.IsEnabled = displayOperationEnabled && running;
+        DisplayStatusText.Text = statusText;
+        DisplayStatusText.Foreground = statusBrush;
+        DisplayStatusSubtext.Text = subtext;
+
+        _updatingOverviewVirtualDisplaySwitch = true;
+        try
+        {
+            OverviewVirtualDisplaySwitch.IsOn = state == VirtualDisplayOverviewState.Starting
+                || (running && state != VirtualDisplayOverviewState.Stopping);
+        }
+        finally
+        {
+            _updatingOverviewVirtualDisplaySwitch = false;
+        }
+
+        OverviewVirtualDisplaySwitch.IsEnabled = displayOperationEnabled
+            && state is not VirtualDisplayOverviewState.DriverInstalling;
+        OverviewVirtualDisplayStatusText.Text = statusText;
+        OverviewVirtualDisplayStatusText.Foreground = statusBrush;
+        OverviewVirtualDisplayHintText.Text = BuildOverviewVirtualDisplayHint(state, subtext, running);
+        OverviewInstallDriverButton.IsEnabled = displayOperationEnabled;
+        UpdateOverviewVirtualDisplayOptionsEnabled(running);
+        UpdateStaticDisplayPageState(
+            state,
+            running,
+            driverInstalled,
+            toolAvailable,
+            statusText,
+            subtext,
+            statusBrush,
+            displayOperationEnabled,
+            displayLayout);
+
+        return displayLayout;
+    }
+
+    private void UpdateStaticDisplayPageState(
+        VirtualDisplayOverviewState state,
+        bool running,
+        bool driverInstalled,
+        bool toolAvailable,
+        string statusText,
+        string subtext,
+        Brush statusBrush,
+        bool displayOperationEnabled,
+        DisplayLayoutSnapshot displayLayout)
+    {
+        var (bannerBackground, bannerBorder, bannerGlyph, bannerIconBackground, bannerSeverity) = BuildStaticDisplayBannerView(state);
+        var (driverStatusText, driverStatusBrush) = BuildStaticDisplayDriverStatus(state, running, driverInstalled);
+        var (toolStatusText, toolStatusBrush) = BuildStaticDisplayToolStatus(state, running, toolAvailable);
+        var (permissionStatusText, permissionStatusBrush) = BuildStaticDisplayPermissionStatus(state);
+        var footer = BuildOverviewFooterSnapshot();
+        var hostRunning = _hostProcess is { HasExited: false };
+
+        OverviewDisplayPage.UpdateVirtualDisplayState(new StaticDisplayPageState
+        {
+            StatusText = statusText,
+            StatusDetail = BuildOverviewVirtualDisplayHint(state, subtext, running),
+            StatusBrush = statusBrush,
+            BannerBackground = bannerBackground,
+            BannerBorderBrush = bannerBorder,
+            BannerIconGlyph = bannerGlyph,
+            BannerIconBackground = bannerIconBackground,
+            BannerSeverity = bannerSeverity,
+            DriverStatusText = driverStatusText,
+            DriverStatusBrush = driverStatusBrush,
+            DeviceToolStatusText = toolStatusText,
+            DeviceToolStatusBrush = toolStatusBrush,
+            SystemPermissionStatusText = permissionStatusText,
+            SystemPermissionStatusBrush = permissionStatusBrush,
+            AutostartStatusText = "未管理",
+            CanStart = displayOperationEnabled && !running,
+            CanStop = displayOperationEnabled && running,
+            CanInstallDriver = displayOperationEnabled,
+            CanRefresh = !_driverInstallInProgress,
+            CanOpenDisplaySettings = true,
+            CanChangeDisplayOptions = displayOperationEnabled && !running && !hostRunning,
+            VirtualDisplayRunning = running,
+            DisplayLayout = displayLayout,
+            Resolution = Selected(ResolutionCombo),
+            RefreshRate = Selected(RefreshRateCombo),
+            FooterHostText = footer.HostText,
+            FooterOsText = footer.OsText,
+            FooterNetworkText = footer.NetworkText,
+            FooterNetworkBrush = footer.NetworkBrush
+        });
+    }
+
+    private (Brush Background, Brush Border, string Glyph, Brush IconBackground, StaticDisplayBannerSeverity Severity) BuildStaticDisplayBannerView(
+        VirtualDisplayOverviewState state)
+    {
+        return state switch
+        {
+            VirtualDisplayOverviewState.Running => (
+                _overviewReadyBackgroundBrush,
+                _overviewReadyBorderBrush,
+                "\uE73E",
+                _successBrush,
+                StaticDisplayBannerSeverity.Ready),
+            VirtualDisplayOverviewState.Error => (
+                _overviewErrorBackgroundBrush,
+                _overviewErrorBorderBrush,
+                "\uE783",
+                _dangerBrush,
+                StaticDisplayBannerSeverity.Error),
+            VirtualDisplayOverviewState.DriverMissing => (
+                _overviewWarningBackgroundBrush,
+                _overviewWarningBorderBrush,
+                "\uE7BA",
+                _warningBrush,
+                StaticDisplayBannerSeverity.Warning),
+            VirtualDisplayOverviewState.DriverInstalling
+                or VirtualDisplayOverviewState.Starting
+                or VirtualDisplayOverviewState.Stopping => (
+                    _overviewNeutralBackgroundBrush,
+                    _overviewNeutralBorderBrush,
+                    "\uE768",
+                    _overviewPrimaryBrush,
+                    StaticDisplayBannerSeverity.Neutral),
+            _ => (
+                _overviewNeutralBackgroundBrush,
+                _overviewNeutralBorderBrush,
+                "\uE946",
+                _overviewPrimaryBrush,
+                StaticDisplayBannerSeverity.Neutral)
+        };
+    }
+
+    private (string Text, Brush Brush) BuildStaticDisplayDriverStatus(
+        VirtualDisplayOverviewState state,
+        bool running,
+        bool driverInstalled)
+    {
+        if (state == VirtualDisplayOverviewState.DriverInstalling)
+        {
+            return ("安装中", _overviewPrimaryBrush);
+        }
+
+        if (running || driverInstalled)
+        {
+            return ("已安装", _successBrush);
+        }
+
+        return ("未安装", _warningBrush);
+    }
+
+    private (string Text, Brush Brush) BuildStaticDisplayToolStatus(
+        VirtualDisplayOverviewState state,
+        bool running,
+        bool toolAvailable)
+    {
+        if (state is VirtualDisplayOverviewState.Starting or VirtualDisplayOverviewState.Stopping)
+        {
+            return ("处理中", _overviewPrimaryBrush);
+        }
+
+        if (running)
+        {
+            return ("运行中", _successBrush);
+        }
+
+        if (toolAvailable)
+        {
+            return ("可用", _successBrush);
+        }
+
+        return ("缺失", _warningBrush);
+    }
+
+    private (string Text, Brush Brush) BuildStaticDisplayPermissionStatus(VirtualDisplayOverviewState state)
+    {
+        return state switch
+        {
+            VirtualDisplayOverviewState.DriverInstalling => ("等待授权", _overviewPrimaryBrush),
+            VirtualDisplayOverviewState.DriverMissing => ("需要管理员安装", _warningBrush),
+            VirtualDisplayOverviewState.Error => ("需要检查", _dangerBrush),
+            VirtualDisplayOverviewState.Starting or VirtualDisplayOverviewState.Stopping => ("处理中", _overviewPrimaryBrush),
+            _ => ("正常", _successBrush)
+        };
+    }
+
+    private VirtualDisplayOverviewState DetermineVirtualDisplayOverviewState(
+        bool running,
+        out bool driverInstalled,
+        out bool toolAvailable)
+    {
+        if (_virtualDisplayTransientState is { } transientState)
+        {
+            driverInstalled = running || _virtualDisplayDriverInstalledCache == true;
+            toolAvailable = running || _virtualDisplayToolAvailableCache == true;
+            return transientState;
+        }
+
+        if (_driverInstallInProgress)
+        {
+            driverInstalled = running || _virtualDisplayDriverInstalledCache == true;
+            toolAvailable = running || _virtualDisplayToolAvailableCache == true;
+            return VirtualDisplayOverviewState.DriverInstalling;
+        }
+
+        driverInstalled = running || IsVirtualDisplayDriverInstalledCached();
+        toolAvailable = running || IsVirtualDisplayToolAvailableCached();
+
+        if (running)
+        {
+            return VirtualDisplayOverviewState.Running;
+        }
+
+        if (!driverInstalled || !toolAvailable)
+        {
+            return VirtualDisplayOverviewState.DriverMissing;
+        }
+
+        return string.IsNullOrWhiteSpace(_virtualDisplayLastError)
+            ? VirtualDisplayOverviewState.ToolStopped
+            : VirtualDisplayOverviewState.Error;
+    }
+
+    private (string StatusText, string Subtext, Brush StatusBrush) BuildVirtualDisplayStatusView(
+        VirtualDisplayOverviewState state,
+        bool driverInstalled,
+        bool toolAvailable)
+    {
+        return state switch
+        {
+            VirtualDisplayOverviewState.DriverInstalling => (
+                "安装中",
+                "正在启动驱动安装器，请在管理员权限弹窗中选择“是”。",
+                _overviewPrimaryBrush),
+            VirtualDisplayOverviewState.Starting => (
+                "启动中",
+                "正在启动 SideDock 虚拟显示器工具。",
+                _overviewPrimaryBrush),
+            VirtualDisplayOverviewState.Running => (
+                "运行中",
+                "SideDock 虚拟显示器工具正在运行。",
+                _successBrush),
+            VirtualDisplayOverviewState.Stopping => (
+                "停止中",
+                "正在停止 SideDock 虚拟显示器工具。",
+                _overviewPrimaryBrush),
+            VirtualDisplayOverviewState.Error => (
+                "启动失败",
+                string.IsNullOrWhiteSpace(_virtualDisplayLastError)
+                    ? "虚拟显示器启动失败，请安装/修复驱动后重试。"
+                    : $"虚拟显示器启动失败：{_virtualDisplayLastError}",
+                _dangerBrush),
+            VirtualDisplayOverviewState.DriverMissing when !driverInstalled => (
+                "未安装驱动",
+                "需要先安装/修复 SideDock 虚拟显示驱动。",
+                _warningBrush),
+            VirtualDisplayOverviewState.DriverMissing when !toolAvailable => (
+                "需要修复驱动",
+                $"未找到 {DeviceToolExe}，请使用安装/修复驱动恢复工具组件。",
+                _warningBrush),
+            _ => (
+                "未运行",
+                "驱动已安装，虚拟显示器工具未运行。",
+                _secondaryBrush)
+        };
+    }
+
+    private string BuildOverviewVirtualDisplayHint(
+        VirtualDisplayOverviewState state,
+        string subtext,
+        bool running)
+    {
+        if (running || _hostProcess is { HasExited: false })
+        {
+            return $"{subtext} 分辨率和帧率停止后可修改，下次启动主机生效。";
+        }
+
+        return state == VirtualDisplayOverviewState.ToolStopped
+            ? $"{subtext} 当前参数：{Selected(ResolutionCombo)} / {Selected(RefreshRateCombo)}fps。"
+            : subtext;
+    }
+
+    private void UpdateOverviewVirtualDisplayOptionsEnabled(bool virtualDisplayRunning)
+    {
+        var hostRunning = _hostProcess is { HasExited: false };
+        var enabled = !_virtualDisplayOperationInProgress
+            && !_driverInstallInProgress
+            && !virtualDisplayRunning
+            && !hostRunning;
+
+        OverviewVirtualDisplayResolutionCombo.IsEnabled = enabled;
+        OverviewVirtualDisplayRefreshRateCombo.IsEnabled = enabled;
+    }
+
+    private bool IsVirtualDisplayDriverInstalledCached()
+    {
+        var now = DateTimeOffset.UtcNow;
+        if (_virtualDisplayDriverInstalledCache.HasValue
+            && now - _virtualDisplayDriverInstalledCheckedAt < VirtualDisplayStatusCacheDuration)
+        {
+            return _virtualDisplayDriverInstalledCache.Value;
+        }
+
+        var installed = TryCheckSideDockDisplayDriverPackageInstalled();
+        _virtualDisplayDriverInstalledCache = installed;
+        _virtualDisplayDriverInstalledCheckedAt = now;
+        return installed;
+    }
+
+    private bool IsVirtualDisplayToolAvailableCached()
+    {
+        var now = DateTimeOffset.UtcNow;
+        if (!string.IsNullOrWhiteSpace(_deviceToolPath) && File.Exists(_deviceToolPath))
+        {
+            _virtualDisplayToolAvailableCache = true;
+            _virtualDisplayToolAvailableCheckedAt = now;
+            return true;
+        }
+
+        if (_virtualDisplayToolAvailableCache.HasValue
+            && now - _virtualDisplayToolAvailableCheckedAt < VirtualDisplayStatusCacheDuration)
+        {
+            return _virtualDisplayToolAvailableCache.Value;
+        }
+
+        try
+        {
+            _deviceToolPath = ResolveDeviceToolPath();
+            _virtualDisplayToolAvailableCache = true;
+        }
+        catch
+        {
+            _deviceToolPath = null;
+            _virtualDisplayToolAvailableCache = false;
+        }
+
+        _virtualDisplayToolAvailableCheckedAt = now;
+        return _virtualDisplayToolAvailableCache.Value;
+    }
+
+    private static bool TryCheckSideDockDisplayDriverPackageInstalled()
+    {
+        try
+        {
+            var startInfo = new ProcessStartInfo
+            {
+                FileName = "pnputil.exe",
+                Arguments = "/enum-drivers",
+                UseShellExecute = false,
+                CreateNoWindow = true,
+                RedirectStandardOutput = true,
+                RedirectStandardError = true,
+                StandardOutputEncoding = Encoding.UTF8,
+                StandardErrorEncoding = Encoding.UTF8
+            };
+
+            using var process = Process.Start(startInfo);
+            if (process is null)
+            {
+                return false;
+            }
+
+            var stdoutTask = process.StandardOutput.ReadToEndAsync();
+            var stderrTask = process.StandardError.ReadToEndAsync();
+            if (!process.WaitForExit(5000))
+            {
+                try
+                {
+                    process.Kill(entireProcessTree: true);
+                    process.WaitForExit(1000);
+                }
+                catch
+                {
+                }
+
+                return false;
+            }
+
+            var output = stdoutTask.GetAwaiter().GetResult()
+                + Environment.NewLine
+                + stderrTask.GetAwaiter().GetResult();
+
+            return output.Contains(SideDockDriverInf, StringComparison.OrdinalIgnoreCase)
+                || output.Contains(SideDockDriverBinary, StringComparison.OrdinalIgnoreCase);
+        }
+        catch
+        {
+            return false;
+        }
     }
 
     private static bool IsVirtualDisplayToolRunning()
@@ -2707,6 +6962,11 @@ public sealed partial class MainWindow : Window
 
     private void SetRunningState(bool running)
     {
+        if (running)
+        {
+            _hostHasStarted = true;
+        }
+
         StartHostButton.IsEnabled = !running;
         StopHostButton.IsEnabled = running;
         AdbDeviceCombo.IsEnabled = !running;
@@ -2727,13 +6987,224 @@ public sealed partial class MainWindow : Window
             _speakerRuntimeStatus = null;
         }
 
+        SetOverviewHostState(
+            running
+                ? OverviewHostServiceState.Running
+                : _hostHasStarted
+                    ? OverviewHostServiceState.Stopped
+                    : OverviewHostServiceState.NotStarted,
+            running
+                ? "SideDock.Host.exe 正在运行"
+                : _hostHasStarted
+                    ? "主机已停止"
+                    : "等待启动");
         UpdateAudioState(running ? "正在准备音频设备。" : "等待 Android 设备连接。");
+        RefreshVirtualDisplayState();
+        UpdateOverviewCameraState();
+        UpdateOverviewRuntimeDiagnostics();
+        if (running)
+        {
+            UpdateOverviewPreview();
+        }
+        else
+        {
+            ResetOverviewPreview(clearImage: true);
+            SetOverviewPreviewState(OverviewPreviewState.HostNotStarted);
+        }
+
+        UpdateOverviewConnectionPage();
     }
 
     private void SetAdbStatus(string text, Brush brush)
     {
+        _lastAdbStatusText = text;
         AdbStatusText.Text = text;
         AdbStatusText.Foreground = brush;
+        UpdateOverviewAndroidDeviceState();
+        UpdateOverviewConnectionPage();
+    }
+
+    private void UpdateOverviewPreview()
+    {
+        if (!StaticOverviewUi)
+        {
+            return;
+        }
+
+        if (!IsHostRunningForPreview())
+        {
+            ResetOverviewPreview(clearImage: true);
+            SetOverviewPreviewState(OverviewPreviewState.HostNotStarted);
+            return;
+        }
+
+        try
+        {
+            _overviewPreviewReader ??= OverviewPreviewFrameReader.TryOpen();
+            if (_overviewPreviewReader is null)
+            {
+                ResetOverviewPreview(clearImage: true, keepReader: true);
+                SetOverviewPreviewState(OverviewPreviewState.WaitingSource);
+                return;
+            }
+
+            var frame = _overviewPreviewReader.TryReadLatest(_lastOverviewPreviewSequence);
+            if (frame is null)
+            {
+                UpdateOverviewPreviewStaleness();
+                return;
+            }
+
+            if (_overviewPreviewBitmap is null
+                || _overviewPreviewBitmap.PixelWidth != frame.Width
+                || _overviewPreviewBitmap.PixelHeight != frame.Height)
+            {
+                _overviewPreviewBitmap = new WriteableBitmap(frame.Width, frame.Height);
+                OverviewPreviewImage.Source = _overviewPreviewBitmap;
+            }
+
+            using (var stream = _overviewPreviewBitmap.PixelBuffer.AsStream())
+            {
+                stream.Seek(0, SeekOrigin.Begin);
+                stream.Write(frame.Bgra, 0, frame.Bgra.Length);
+            }
+
+            _overviewPreviewBitmap.Invalidate();
+            _lastOverviewPreviewSequence = frame.Sequence;
+            _lastOverviewPreviewAt = DateTimeOffset.FromUnixTimeMilliseconds(frame.WrittenAtUnixMs);
+            SetOverviewPreviewState(OverviewPreviewState.Receiving);
+        }
+        catch (FileNotFoundException)
+        {
+            ResetOverviewPreview(clearImage: true);
+            SetOverviewPreviewState(OverviewPreviewState.WaitingSource);
+        }
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException or ObjectDisposedException or ArgumentException)
+        {
+            ResetOverviewPreview(clearImage: true);
+            SetOverviewPreviewState(OverviewPreviewState.Error, ex.Message);
+        }
+    }
+
+    private bool IsHostRunningForPreview()
+    {
+        return _overviewHostServiceState == OverviewHostServiceState.Running
+            && _hostProcess is { HasExited: false };
+    }
+
+    private void UpdateOverviewPreviewStaleness()
+    {
+        if (_lastOverviewPreviewAt is null)
+        {
+            SetOverviewPreviewState(OverviewPreviewState.WaitingSource);
+            return;
+        }
+
+        var age = DateTimeOffset.UtcNow - _lastOverviewPreviewAt.Value.ToUniversalTime();
+        SetOverviewPreviewState(age > OverviewPreviewStaleAfter
+            ? OverviewPreviewState.Paused
+            : OverviewPreviewState.Receiving);
+    }
+
+    private void ResetOverviewPreview(bool clearImage, bool keepReader = false)
+    {
+        if (!keepReader)
+        {
+            _overviewPreviewReader?.Dispose();
+            _overviewPreviewReader = null;
+        }
+
+        _lastOverviewPreviewSequence = 0;
+        _lastOverviewPreviewAt = null;
+        if (!clearImage)
+        {
+            return;
+        }
+
+        _overviewPreviewBitmap = null;
+        if (OverviewPreviewImage is not null)
+        {
+            OverviewPreviewImage.Source = null;
+        }
+    }
+
+    private void SetOverviewPreviewState(OverviewPreviewState state, string? detail = null)
+    {
+        _overviewPreviewState = state;
+        if (OverviewPreviewStatusText is null)
+        {
+            return;
+        }
+
+        OverviewPreviewStatusText.Text = state switch
+        {
+            OverviewPreviewState.HostNotStarted => "主机未启动",
+            OverviewPreviewState.WaitingSource => "等待视频源",
+            OverviewPreviewState.Receiving => "正在接收画面",
+            OverviewPreviewState.Paused => "画面暂停",
+            OverviewPreviewState.Unavailable => "预览不可用",
+            OverviewPreviewState.Error => "预览错误",
+            _ => "等待预览"
+        };
+
+        OverviewPreviewStatusBadge.Background = state switch
+        {
+            OverviewPreviewState.Receiving => _overviewPreviewReceivingBadgeBrush,
+            OverviewPreviewState.Paused => _overviewPreviewPausedBadgeBrush,
+            OverviewPreviewState.Error => _overviewPreviewErrorBadgeBrush,
+            OverviewPreviewState.Unavailable => _overviewPreviewErrorBadgeBrush,
+            _ => _overviewPreviewNeutralBadgeBrush
+        };
+
+        var hasImage = OverviewPreviewImage?.Source is not null;
+        var showEmpty = state is OverviewPreviewState.HostNotStarted or OverviewPreviewState.WaitingSource or OverviewPreviewState.Unavailable or OverviewPreviewState.Error
+            || !hasImage;
+        OverviewPreviewEmptyState.Visibility = showEmpty ? Visibility.Visible : Visibility.Collapsed;
+        OverviewPreviewEmptyStateText.Text = detail ?? state switch
+        {
+            OverviewPreviewState.HostNotStarted => "启动主机后显示副屏实时画面",
+            OverviewPreviewState.WaitingSource => "等待虚拟显示器或 Android 视频连接",
+            OverviewPreviewState.Receiving => "正在显示来自 SideDock Host 的实时帧",
+            OverviewPreviewState.Paused => hasImage ? "画面暂无新帧" : "画面暂停，暂无可显示帧",
+            OverviewPreviewState.Unavailable => "当前预览帧源不可用",
+            OverviewPreviewState.Error => "预览缓存暂不可读",
+            _ => "等待预览"
+        };
+    }
+
+    private void UpdateOverviewPreviewChrome()
+    {
+        if (OverviewPreviewImage is not null)
+        {
+            OverviewPreviewImage.Stretch = _overviewPreviewFillMode ? Stretch.UniformToFill : Stretch.Uniform;
+        }
+
+        if (OverviewPreviewFitIcon is not null)
+        {
+            OverviewPreviewFitIcon.Glyph = _overviewPreviewFillMode ? "\uE73F" : "\uE740";
+        }
+
+        if (OverviewPreviewFitButton is not null)
+        {
+            ToolTipService.SetToolTip(
+                OverviewPreviewFitButton,
+                _overviewPreviewFillMode ? "切换为完整适配" : "切换为填充裁切");
+        }
+
+        if (OverviewPreviewOverlay is not null)
+        {
+            OverviewPreviewOverlay.Visibility = _overviewPreviewOverlayVisible ? Visibility.Visible : Visibility.Collapsed;
+        }
+
+        if (OverviewPreviewOverlayRestoreButton is not null)
+        {
+            OverviewPreviewOverlayRestoreButton.Visibility = _overviewPreviewOverlayVisible ? Visibility.Collapsed : Visibility.Visible;
+        }
+
+        if (OverviewPreviewOverlayIcon is not null)
+        {
+            OverviewPreviewOverlayIcon.Glyph = _overviewPreviewOverlayVisible ? "\uE890" : "\uED1A";
+        }
     }
 
     private void UpdateCameraPreview()
@@ -2863,6 +7334,7 @@ public sealed partial class MainWindow : Window
     {
         if (CameraStatusText is null)
         {
+            UpdateOverviewCameraState();
             return;
         }
 
@@ -2885,6 +7357,161 @@ public sealed partial class MainWindow : Window
             CameraErrorText.Text = virtualCamera.LastError;
             CameraErrorText.Foreground = _warningBrush;
         }
+
+        UpdateOverviewCameraState();
+    }
+
+    private void UpdateOverviewCameraState()
+    {
+        if (!StaticOverviewUi || OverviewCameraStatusText is null)
+        {
+            return;
+        }
+
+        var (statusText, hintText, statusBrush) = BuildOverviewCameraStatusView();
+        var hostRunning = _hostProcess is { HasExited: false };
+
+        _updatingOverviewCameraSwitch = true;
+        try
+        {
+            OverviewCameraSwitch.IsOn = _overviewCameraRequestedEnabled;
+        }
+        finally
+        {
+            _updatingOverviewCameraSwitch = false;
+        }
+
+        OverviewCameraSwitch.IsEnabled = !_overviewCameraOperationInProgress;
+        OverviewCameraStatusText.Text = statusText;
+        OverviewCameraStatusText.Foreground = statusBrush;
+        OverviewCameraHintText.Text = hintText;
+        UpdateOverviewCameraOptionsEnabled(hostRunning);
+    }
+
+    private (string StatusText, string HintText, Brush StatusBrush) BuildOverviewCameraStatusView()
+    {
+        var camera = _cameraDiagnostics;
+        var virtualCamera = _virtualCameraDiagnostics;
+        var hostRunning = _hostProcess is { HasExited: false };
+        var selectedConfig = FormatSelectedOverviewCameraConfig();
+
+        if (_overviewCameraOperationInProgress)
+        {
+            return _overviewCameraRequestedEnabled
+                ? ("启动中", $"正在启动摄像头管线，配置：{selectedConfig}。", _overviewPrimaryBrush)
+                : ("停止中", "正在停止摄像头管线和虚拟摄像头。", _overviewPrimaryBrush);
+        }
+
+        if (hostRunning
+            && _overviewCameraRequestedEnabled
+            && (IsCameraErrorState(camera.ServerState)
+                || IsCameraErrorState(camera.ClientState)
+                || HasCameraError()))
+        {
+            var error = FirstNonEmpty(camera.LastError, virtualCamera.LastError, "摄像头启动失败或运行异常。");
+            return ("启动失败/错误", error, _dangerBrush);
+        }
+
+        if (!hostRunning)
+        {
+            if (virtualCamera.Running && _overviewCameraRequestedEnabled)
+            {
+                return ("虚拟摄像头运行中", "SideDock Camera 已在 Windows 中运行；主机未启动，Android 暂不会供帧。", _successBrush);
+            }
+
+            return ("未启动", $"主机未启动。当前摄像头配置将在下次启动生效：{selectedConfig}。", _secondaryBrush);
+        }
+
+        if (IsCameraDisabledState(camera.ServerState)
+            || IsCameraDisabledState(camera.ClientState)
+            || !_overviewCameraRequestedEnabled)
+        {
+            return ("未启动", $"摄像头管线已关闭。下次启动配置：{selectedConfig}。", _secondaryBrush);
+        }
+
+        if (IsCameraPermissionMissing(camera))
+        {
+            return ("Android 未授权摄像头权限", "请在 Android 设备上允许 SideDock 使用摄像头。", _warningBrush);
+        }
+
+        if (IsCameraReceiving(camera))
+        {
+            return ("接收中", $"Android 摄像头流正在接收，虚拟摄像头{virtualCamera.RunningText}。", _successBrush);
+        }
+
+        if (virtualCamera.Running)
+        {
+            return ("虚拟摄像头运行中", "SideDock Camera 已在 Windows 中运行，正在等待 Android 摄像头供帧。", _successBrush);
+        }
+
+        if (IsCameraWaitingForAndroid(camera.ServerState)
+            || IsCameraWaitingForAndroid(camera.ClientState))
+        {
+            return ("等待 Android 设备", $"等待 Android 连接并发送摄像头流。当前配置：{selectedConfig}。", _warningBrush);
+        }
+
+        return ("等待 Android 设备", $"主机已运行，正在等待 Android 摄像头状态。当前配置：{selectedConfig}。", _warningBrush);
+    }
+
+    private void UpdateOverviewCameraOptionsEnabled(bool hostRunning)
+    {
+        var enabled = !hostRunning && !_overviewCameraOperationInProgress;
+        OverviewCameraResolutionCombo.IsEnabled = enabled;
+        OverviewCameraFrameRateCombo.IsEnabled = enabled;
+        OverviewCameraSettingsButton.IsEnabled = !_overviewCameraOperationInProgress;
+    }
+
+    private bool HasCameraError()
+    {
+        return !string.IsNullOrWhiteSpace(_cameraDiagnostics.LastError)
+            || !string.IsNullOrWhiteSpace(_virtualCameraDiagnostics.LastError);
+    }
+
+    private static bool IsCameraErrorState(string state)
+    {
+        return StateEquals(state, "unavailable")
+            || StateEquals(state, "error")
+            || StateEquals(state, "failed");
+    }
+
+    private static bool IsCameraDisabledState(string state)
+    {
+        return StateEquals(state, "disabled")
+            || StateEquals(state, "idle");
+    }
+
+    private static bool IsCameraWaitingForAndroid(string state)
+    {
+        return StateEquals(state, "listening")
+            || StateEquals(state, "connected")
+            || StateEquals(state, "disconnected")
+            || StateEquals(state, "preparing")
+            || StateEquals(state, "unknown");
+    }
+
+    private static bool IsCameraPermissionMissing(CameraDiagnosticsState camera)
+    {
+        return StateEquals(camera.ServerState, "waiting_permission")
+            || StateEquals(camera.ClientState, "waiting_permission")
+            || StateEquals(camera.ServerState, "authorization_required")
+            || StateEquals(camera.ClientState, "authorization_required");
+    }
+
+    private static bool IsCameraReceiving(CameraDiagnosticsState camera)
+    {
+        return StateEquals(camera.ServerState, "receiving")
+            || StateEquals(camera.ClientState, "capturing");
+    }
+
+    private static bool StateEquals(string state, string expected)
+    {
+        return state.Trim().Equals(expected, StringComparison.OrdinalIgnoreCase);
+    }
+
+    private string FormatSelectedOverviewCameraConfig()
+    {
+        var (width, height) = SelectedOverviewCameraResolution();
+        return $"{width}x{height}@{SelectedOverviewCameraFps()}";
     }
 
     private async Task RunVirtualCameraCommandAsync(string command)
@@ -3577,10 +8204,12 @@ public sealed partial class MainWindow : Window
         report.AppendLine($"Android 麦克风写入端点状态: {_microphoneRenderEndpointDiagnostics.Summary}");
         report.AppendLine($"Android 麦克风写入 endpoint id: {FormatOptional(_boundMicrophoneRenderEndpointId)}");
         report.AppendLine($"Android 麦克风写入端点名称: {FormatOptional(_boundMicrophoneRenderEndpointName)}");
-        report.AppendLine($"音频端口: {DefaultAudioPort}");
-        report.AppendLine($"摄像头端口: {DefaultCameraPort}");
+        var audioPortText = StaticOverviewUi ? FormatNumberBox(OverviewAudioPortBox) : DefaultAudioPort.ToString(CultureInfo.InvariantCulture);
+        var cameraPortText = StaticOverviewUi ? FormatNumberBox(OverviewCameraPortBox) : DefaultCameraPort.ToString(CultureInfo.InvariantCulture);
+        report.AppendLine($"音频端口: {audioPortText}");
+        report.AppendLine($"摄像头端口: {cameraPortText}");
         report.AppendLine($"摄像头方向: {Selected(CameraFacingCombo)}");
-        report.AppendLine($"摄像头 reverse: tcp:{DefaultCameraPort} -> tcp:{DefaultCameraPort}");
+        report.AppendLine($"摄像头 reverse: tcp:{cameraPortText} -> tcp:{cameraPortText}");
         report.AppendLine($"控制端口: {FormatNumberBox(ControlPortBox)}");
         report.AppendLine($"视频端口: {FormatNumberBox(VideoPortBox)}");
         report.AppendLine($"视频源: {Selected(VideoSourceCombo)}");
@@ -3653,7 +8282,8 @@ public sealed partial class MainWindow : Window
         report.AppendLine($"主机状态: {OverallStatusText.Text}");
         report.AppendLine($"主机进程: {FormatHostProcessState()}");
         report.AppendLine($"ADB reverse 状态: {AdbStatusText.Text}");
-        report.AppendLine($"摄像头 reverse: tcp:{DefaultCameraPort} -> tcp:{DefaultCameraPort}");
+        var cameraPortText = StaticOverviewUi ? FormatNumberBox(OverviewCameraPortBox) : DefaultCameraPort.ToString(CultureInfo.InvariantCulture);
+        report.AppendLine($"摄像头 reverse: tcp:{cameraPortText} -> tcp:{cameraPortText}");
         AppendCameraDiagnosticsSummary(report);
         report.AppendLine($"最后摄像头状态日志: {FormatOptional(_lastCameraStatusLine)}");
         report.AppendLine($"最后摄像头错误日志: {FormatOptional(_lastCameraErrorLine)}");
@@ -3803,8 +8433,16 @@ public sealed partial class MainWindow : Window
         _lastCameraStatusLine = null;
         _lastCameraErrorLine = null;
         _lastCameraErrorMessage = null;
+        _lastVideoStatsLine = null;
+        _lastEncoderStatsLine = null;
         _cameraDiagnostics.Reset();
+        _videoDiagnostics.Reset();
+        ResetHostRuntimeSampling();
         _cameraDiagnostics.Facing = NormalizeCameraFacing(Selected(CameraFacingCombo));
+        var (cameraWidth, cameraHeight) = SelectedOverviewCameraResolution();
+        _cameraDiagnostics.Width = cameraWidth;
+        _cameraDiagnostics.Height = cameraHeight;
+        _cameraDiagnostics.Fps = SelectedOverviewCameraFps();
 
         if (CopyAudioLogButtonText is not null)
         {
@@ -3817,6 +8455,7 @@ public sealed partial class MainWindow : Window
         }
 
         UpdateCameraStatusView();
+        UpdateOverviewRuntimeDiagnostics();
     }
 
     private string FormatHostProcessState()
@@ -3844,6 +8483,18 @@ public sealed partial class MainWindow : Window
         if (line.Contains("[CAMERA", StringComparison.OrdinalIgnoreCase))
         {
             HandleCameraHostOutputLine(line);
+        }
+
+        if (line.Contains("video stats", StringComparison.OrdinalIgnoreCase))
+        {
+            HandleVideoStatsHostOutputLine(line);
+        }
+
+        if (line.Contains("[ENCODER", StringComparison.OrdinalIgnoreCase)
+            && (line.Contains(" stats ", StringComparison.OrdinalIgnoreCase)
+                || line.Contains("stop generated=", StringComparison.OrdinalIgnoreCase)))
+        {
+            HandleEncoderStatsHostOutputLine(line);
         }
 
         if (!line.Contains("[AUDIO", StringComparison.OrdinalIgnoreCase))
@@ -3929,6 +8580,71 @@ public sealed partial class MainWindow : Window
             ? AudioUnavailableHint(direction, errorMessage)
             : AudioStateHint(direction, nextStatus.Value);
         UpdateAudioState(hint);
+    }
+
+    private void HandleVideoStatsHostOutputLine(string line)
+    {
+        _lastVideoStatsLine = line;
+        _videoDiagnostics.HasVideoStats = true;
+        _videoDiagnostics.LastVideoStatsAt = DateTimeOffset.Now;
+        _videoDiagnostics.FramesDecoded = ExtractLogLong(line, "decoded=", _videoDiagnostics.FramesDecoded);
+        _videoDiagnostics.FramesRendered = ExtractLogLong(line, "rendered=", _videoDiagnostics.FramesRendered);
+        _videoDiagnostics.PacketsReceived = ExtractLogLong(line, "packets=", _videoDiagnostics.PacketsReceived);
+        _videoDiagnostics.DecodeFps = ExtractLogDouble(line, "decode=", _videoDiagnostics.DecodeFps);
+        _videoDiagnostics.RenderFps = ExtractLogDouble(line, "render=", _videoDiagnostics.RenderFps);
+        _videoDiagnostics.NewFrameFps = ExtractLogDouble(line, "new=", _videoDiagnostics.NewFrameFps);
+        _videoDiagnostics.RepeatFrameFps = ExtractLogDouble(line, "repeat=", _videoDiagnostics.RepeatFrameFps);
+        _videoDiagnostics.DecodeErrors = ExtractLogLong(line, "decodeErrors=", _videoDiagnostics.DecodeErrors);
+        _videoDiagnostics.VideoReconnects = ExtractLogLong(line, "reconnects=", _videoDiagnostics.VideoReconnects);
+
+        if (TryExtractLogDouble(line, "local=", out var localLatencyMs))
+        {
+            _videoDiagnostics.LocalPipelineLatencyMs = localLatencyMs;
+        }
+
+        if (TryExtractLogDouble(line, "e2e=", out var roughLatencyMs))
+        {
+            _videoDiagnostics.RoughLatencyMs = roughLatencyMs;
+        }
+
+        if (TryExtractLogDouble(line, "err=", out var latencyErrorBoundMs))
+        {
+            _videoDiagnostics.LatencyErrorBoundMs = latencyErrorBoundMs;
+        }
+
+        if (TryExtractLogLong(line, "droppedFrames=", out var droppedFrames))
+        {
+            _videoDiagnostics.HasDroppedFrameStats = true;
+            _videoDiagnostics.DroppedFrames = droppedFrames;
+        }
+
+        UpdateOverviewRuntimeDiagnostics();
+    }
+
+    private void HandleEncoderStatsHostOutputLine(string line)
+    {
+        _lastEncoderStatsLine = line;
+        _videoDiagnostics.HasEncoderStats = true;
+        _videoDiagnostics.LastEncoderStatsAt = DateTimeOffset.Now;
+
+        _videoDiagnostics.FramesGenerated = ExtractLogLong(line, "generated=", _videoDiagnostics.FramesGenerated);
+        _videoDiagnostics.FramesEncoded = ExtractLogLong(line, "encoded=", _videoDiagnostics.FramesEncoded);
+        _videoDiagnostics.FramesSent = ExtractLogLong(line, "sent=", _videoDiagnostics.FramesSent);
+        _videoDiagnostics.FramesDropped = ExtractLogLong(line, "dropped=", _videoDiagnostics.FramesDropped);
+        _videoDiagnostics.LateFrames = ExtractLogLong(line, "late=", _videoDiagnostics.LateFrames);
+        _videoDiagnostics.StreamFps = ExtractLogDouble(line, "streamFps=", _videoDiagnostics.StreamFps);
+
+        if (TryExtractLogDouble(line, "localLatencyP95=", out var localLatencyP95Ms))
+        {
+            _videoDiagnostics.LocalLatencyP95Ms = localLatencyP95Ms;
+        }
+
+        if (TryExtractLogDouble(line, "kbps=", out var outputKbps))
+        {
+            _videoDiagnostics.OutputKbps = outputKbps;
+        }
+
+        UpdateOverviewRuntimeDiagnostics();
     }
 
     private void HandleCameraHostOutputLine(string line)
@@ -4061,6 +8777,43 @@ public sealed partial class MainWindow : Window
         return double.TryParse(value, NumberStyles.Float, CultureInfo.InvariantCulture, out var parsed)
             ? parsed
             : fallback;
+    }
+
+    private static bool TryExtractLogLong(string line, string key, out long parsed)
+    {
+        var value = ExtractLogValue(line, key);
+        return long.TryParse(value, NumberStyles.Integer, CultureInfo.InvariantCulture, out parsed);
+    }
+
+    private static bool TryExtractLogDouble(string line, string key, out double parsed)
+    {
+        var value = ExtractLogValue(line, key);
+        return TryParseLogDouble(value, out parsed);
+    }
+
+    private static bool TryParseLogDouble(string value, out double parsed)
+    {
+        parsed = 0;
+        value = value.Trim();
+        if (value.StartsWith("+/-", StringComparison.Ordinal))
+        {
+            value = value[3..];
+        }
+
+        var end = 0;
+        while (end < value.Length)
+        {
+            var c = value[end];
+            if (!char.IsDigit(c) && c is not '.' and not '-' and not '+')
+            {
+                break;
+            }
+
+            end++;
+        }
+
+        return end > 0
+            && double.TryParse(value[..end], NumberStyles.Float, CultureInfo.InvariantCulture, out parsed);
     }
 
     private void ApplyCameraSize(string value)
@@ -4382,8 +9135,139 @@ public sealed partial class MainWindow : Window
         SetAudioStatusText(MicrophoneStatusText, AudioDirectionText(AudioDirection.Microphone, microphoneStatus), microphoneStatus);
         SetAudioStatusText(SpeakerStatusText, AudioDirectionText(AudioDirection.Speaker, speakerStatus), speakerStatus);
 
-        _lastAudioHint = BuildAudioHint(audioEnabled, microphoneIntent, speakerIntent, overallStatus, hint);
-        AudioHintText.Text = _lastAudioHint;
+        var audioHint = BuildAudioHint(audioEnabled, microphoneIntent, speakerIntent, overallStatus, hint);
+        _lastAudioHint = audioHint;
+        AudioHintText.Text = audioHint;
+        UpdateOverviewAudioState(
+            audioEnabled,
+            microphoneIntent,
+            speakerIntent,
+            overallStatus,
+            microphoneStatus,
+            speakerStatus,
+            audioHint);
+    }
+
+    private void UpdateOverviewAudioState(
+        bool audioEnabled,
+        bool microphoneIntent,
+        bool speakerIntent,
+        AudioCapabilityStatus overallStatus,
+        AudioCapabilityStatus microphoneStatus,
+        AudioCapabilityStatus speakerStatus,
+        string audioHint)
+    {
+        if (!StaticOverviewUi || OverviewAudioStatusText is null)
+        {
+            return;
+        }
+
+        _updatingOverviewAudioSwitch = true;
+        try
+        {
+            OverviewAudioSwitch.IsOn = audioEnabled;
+        }
+        finally
+        {
+            _updatingOverviewAudioSwitch = false;
+        }
+
+        OverviewAudioSwitch.IsEnabled = !_loadingAudioPreferences;
+        OverviewAudioSettingsButton.IsEnabled = true;
+        UpdateOverviewAudioCapabilityOptions(audioEnabled);
+
+        var (statusText, hintText, statusBrush) = BuildOverviewAudioStatusView(
+            audioEnabled,
+            microphoneIntent,
+            speakerIntent,
+            overallStatus,
+            microphoneStatus,
+            speakerStatus,
+            audioHint);
+        OverviewAudioStatusText.Text = statusText;
+        OverviewAudioStatusText.Foreground = statusBrush;
+        OverviewAudioHintText.Text = hintText;
+        OverviewAudioHintText.Foreground = statusBrush == _dangerBrush ? _dangerBrush : _overviewNeutralBrush;
+    }
+
+    private void UpdateOverviewAudioCapabilityOptions(bool audioEnabled)
+    {
+        if (OverviewAudioModeOptions is null || OverviewAudioSampleRateOptions is null)
+        {
+            return;
+        }
+
+        var optionsOpacity = audioEnabled ? 1.0 : 0.7;
+        OverviewAudioModeOptions.Opacity = optionsOpacity;
+        OverviewAudioSampleRateOptions.Opacity = optionsOpacity;
+        OverviewAudioSurroundModeOption.Opacity = 0.55;
+        OverviewAudio96KSampleRateOption.Opacity = 0.55;
+        OverviewAudioSurroundModeOption.IsHitTestVisible = false;
+        OverviewAudio96KSampleRateOption.IsHitTestVisible = false;
+    }
+
+    private (string StatusText, string HintText, Brush StatusBrush) BuildOverviewAudioStatusView(
+        bool audioEnabled,
+        bool microphoneIntent,
+        bool speakerIntent,
+        AudioCapabilityStatus overallStatus,
+        AudioCapabilityStatus microphoneStatus,
+        AudioCapabilityStatus speakerStatus,
+        string audioHint)
+    {
+        var hostRunning = _hostProcess is { HasExited: false };
+
+        if (!audioEnabled || (!microphoneIntent && !speakerIntent))
+        {
+            return (
+                "未启用",
+                hostRunning
+                    ? "音频桥接已关闭；当前偏好会用于下次启动主机。"
+                    : "音频桥接已关闭，将在下次启动主机时保持关闭。",
+                _secondaryBrush);
+        }
+
+        var endpointIssue = BuildAudioEndpointIssueHint(microphoneIntent, speakerIntent);
+        if (!string.IsNullOrWhiteSpace(endpointIssue))
+        {
+            return ("音频设备暂不可用", endpointIssue, _warningBrush);
+        }
+
+        if (!hostRunning && overallStatus == AudioCapabilityStatus.WaitingDevice)
+        {
+            return ("等待 Android 设备", "音频桥接已启用，将在下次启动主机时生效。", _secondaryBrush);
+        }
+
+        if (microphoneStatus == AudioCapabilityStatus.AuthorizationRequired)
+        {
+            return ("需要 Android 麦克风权限", "请在 Android 设备上允许 SideDock 使用麦克风。", _dangerBrush);
+        }
+
+        if (speakerStatus == AudioCapabilityStatus.Playing)
+        {
+            return ("音响播放中", audioHint, _successBrush);
+        }
+
+        if (microphoneStatus == AudioCapabilityStatus.Capturing)
+        {
+            return ("麦克风采集中", audioHint, _successBrush);
+        }
+
+        return overallStatus switch
+        {
+            AudioCapabilityStatus.Closed => ("未启用", audioHint, _secondaryBrush),
+            AudioCapabilityStatus.WaitingDevice => ("等待 Android 设备", audioHint, _warningBrush),
+            AudioCapabilityStatus.Preparing => ("正在准备音频设备", audioHint, _overviewPrimaryBrush),
+            AudioCapabilityStatus.Available => ("音频设备可用", audioHint, _successBrush),
+            AudioCapabilityStatus.PartialAvailable => ("音频设备可用", audioHint, _successBrush),
+            AudioCapabilityStatus.Capturing => ("麦克风采集中", audioHint, _successBrush),
+            AudioCapabilityStatus.Playing => ("音响播放中", audioHint, _successBrush),
+            AudioCapabilityStatus.AuthorizationRequired => ("需要 Android 麦克风权限", audioHint, _dangerBrush),
+            AudioCapabilityStatus.Reconnecting => ("等待 Android 设备", audioHint, _warningBrush),
+            AudioCapabilityStatus.Error => ("音频设备暂不可用", audioHint, _dangerBrush),
+            AudioCapabilityStatus.Muted => ("音频设备已静音", audioHint, _warningBrush),
+            _ => ("等待 Android 设备", audioHint, _secondaryBrush)
+        };
     }
 
     private AudioCapabilityStatus CurrentAudioBaseStatus()
@@ -4774,7 +9658,136 @@ public sealed partial class MainWindow : Window
         EnumerationFailed
     }
 
+    private sealed record NetworkDiagnosticsSample(
+        string Id,
+        string Name,
+        string Description,
+        long LinkSpeedBps,
+        double? SendBps,
+        double? ReceiveBps);
+
     private sealed record VirtualCameraToolResult(int ExitCode, string Stdout, string Stderr);
+
+    private sealed class VideoDiagnosticsState
+    {
+        private static readonly TimeSpan RecentStatsWindow = TimeSpan.FromSeconds(10);
+
+        public bool HasVideoStats { get; set; }
+
+        public bool HasEncoderStats { get; set; }
+
+        public bool HasDroppedFrameStats { get; set; }
+
+        public DateTimeOffset LastVideoStatsAt { get; set; }
+
+        public DateTimeOffset LastEncoderStatsAt { get; set; }
+
+        public long FramesDecoded { get; set; }
+
+        public long FramesRendered { get; set; }
+
+        public long PacketsReceived { get; set; }
+
+        public long DroppedFrames { get; set; }
+
+        public long DecodeErrors { get; set; }
+
+        public long VideoReconnects { get; set; }
+
+        public double DecodeFps { get; set; }
+
+        public double RenderFps { get; set; }
+
+        public double NewFrameFps { get; set; }
+
+        public double RepeatFrameFps { get; set; }
+
+        public double LocalPipelineLatencyMs { get; set; }
+
+        public double RoughLatencyMs { get; set; }
+
+        public double LatencyErrorBoundMs { get; set; }
+
+        public long FramesGenerated { get; set; }
+
+        public long FramesEncoded { get; set; }
+
+        public long FramesSent { get; set; }
+
+        public long FramesDropped { get; set; }
+
+        public long LateFrames { get; set; }
+
+        public double StreamFps { get; set; }
+
+        public double LocalLatencyP95Ms { get; set; }
+
+        public double OutputKbps { get; set; }
+
+        public bool HasRecentVideoStats =>
+            HasVideoStats && DateTimeOffset.Now - LastVideoStatsAt <= RecentStatsWindow;
+
+        public bool TryGetDroppedFrameRate(out double rate)
+        {
+            if (HasDroppedFrameStats)
+            {
+                var totalClientFrames = FramesDecoded + DroppedFrames;
+                if (totalClientFrames <= 0)
+                {
+                    totalClientFrames = PacketsReceived + DroppedFrames;
+                }
+
+                if (totalClientFrames > 0)
+                {
+                    rate = DroppedFrames * 100.0 / totalClientFrames;
+                    return true;
+                }
+            }
+
+            if (HasEncoderStats)
+            {
+                var totalHostFrames = FramesSent + FramesDropped;
+                if (totalHostFrames > 0)
+                {
+                    rate = FramesDropped * 100.0 / totalHostFrames;
+                    return true;
+                }
+            }
+
+            rate = 0;
+            return false;
+        }
+
+        public void Reset()
+        {
+            HasVideoStats = false;
+            HasEncoderStats = false;
+            HasDroppedFrameStats = false;
+            LastVideoStatsAt = default;
+            LastEncoderStatsAt = default;
+            FramesDecoded = 0;
+            FramesRendered = 0;
+            PacketsReceived = 0;
+            DroppedFrames = 0;
+            DecodeErrors = 0;
+            VideoReconnects = 0;
+            DecodeFps = 0;
+            RenderFps = 0;
+            NewFrameFps = 0;
+            RepeatFrameFps = 0;
+            LocalPipelineLatencyMs = 0;
+            RoughLatencyMs = 0;
+            LatencyErrorBoundMs = 0;
+            FramesGenerated = 0;
+            FramesEncoded = 0;
+            FramesSent = 0;
+            FramesDropped = 0;
+            LateFrames = 0;
+            StreamFps = 0;
+            LocalLatencyP95Ms = 0;
+            OutputKbps = 0;
+        }
+    }
 
     private sealed class VirtualCameraDiagnosticsState
     {
@@ -4890,6 +9903,111 @@ public sealed partial class MainWindow : Window
             ClientCodecConfigPackets = 0;
         }
     }
+
+    private sealed class OverviewPreviewFrameReader : IDisposable
+    {
+        private const string MapName = @"Local\SideDockOverviewPreviewFrame";
+        private const int HeaderSize = 128;
+        private const int Magic = 0x50464453; // SDFP
+        private const int Version = 1;
+        private const int FormatBgra32 = 1;
+        private const int MaxFrameBytes = 3840 * 2160 * 4;
+
+        private readonly MemoryMappedFile _mapping;
+        private readonly MemoryMappedViewAccessor _view;
+
+        private OverviewPreviewFrameReader(MemoryMappedFile mapping, MemoryMappedViewAccessor view)
+        {
+            _mapping = mapping;
+            _view = view;
+        }
+
+        public static OverviewPreviewFrameReader? TryOpen()
+        {
+            try
+            {
+                var mapping = MemoryMappedFile.OpenExisting(MapName, MemoryMappedFileRights.Read);
+                var view = mapping.CreateViewAccessor(0, 0, MemoryMappedFileAccess.Read);
+                return new OverviewPreviewFrameReader(mapping, view);
+            }
+            catch (FileNotFoundException)
+            {
+                return null;
+            }
+        }
+
+        public OverviewPreviewFrame? TryReadLatest(long lastSeenSequence)
+        {
+            var sequenceBefore = _view.ReadInt64(32);
+            if (sequenceBefore <= 0 || (sequenceBefore & 1) != 0)
+            {
+                return null;
+            }
+
+            var frameSequence = sequenceBefore / 2;
+            if (frameSequence <= lastSeenSequence)
+            {
+                return null;
+            }
+
+            var magic = _view.ReadInt32(0);
+            var version = _view.ReadInt32(4);
+            var headerSize = _view.ReadInt32(8);
+            var width = _view.ReadInt32(12);
+            var height = _view.ReadInt32(16);
+            var stride = _view.ReadInt32(20);
+            var format = _view.ReadInt32(24);
+            var frameBytes = _view.ReadInt32(28);
+            var writtenAtUnixMs = _view.ReadInt64(48);
+            if (magic != Magic
+                || version != Version
+                || headerSize != HeaderSize
+                || format != FormatBgra32
+                || width <= 0
+                || height <= 0
+                || stride < width * 4
+                || frameBytes <= 0
+                || frameBytes > MaxFrameBytes
+                || frameBytes != stride * height)
+            {
+                throw new InvalidDataException("预览帧缓存格式不匹配。");
+            }
+
+            var raw = new byte[frameBytes];
+            _view.ReadArray(HeaderSize, raw, 0, raw.Length);
+
+            var sequenceAfter = _view.ReadInt64(32);
+            if (sequenceAfter != sequenceBefore || (sequenceAfter & 1) != 0)
+            {
+                return null;
+            }
+
+            var bgra = stride == width * 4
+                ? raw
+                : CompactRows(raw, width, height, stride);
+            return new OverviewPreviewFrame(frameSequence, width, height, writtenAtUnixMs, bgra);
+        }
+
+        public void Dispose()
+        {
+            _view.Dispose();
+            _mapping.Dispose();
+        }
+
+        private static byte[] CompactRows(byte[] raw, int width, int height, int stride)
+        {
+            var rowBytes = width * 4;
+            var compact = new byte[rowBytes * height];
+            for (var y = 0; y < height; y++)
+            {
+                Buffer.BlockCopy(raw, y * stride, compact, y * rowBytes, rowBytes);
+            }
+
+            return compact;
+        }
+    }
+
+    private sealed record OverviewPreviewFrame(long Sequence, int Width, int Height, long WrittenAtUnixMs, byte[] Bgra);
 
     private sealed class CameraPreviewFrameReader : IDisposable
     {
@@ -5410,6 +10528,15 @@ public sealed partial class MainWindow : Window
     private sealed record AdbDeviceChoice(string? Serial, string DisplayName, string State, string RawLine);
 
     private sealed record AdbDeviceRow(string Serial, string State, string RawLine);
+
+    private sealed record OverviewConnectionDeviceItem(
+        string Serial,
+        string Name,
+        string StatusText,
+        Brush StatusBrush,
+        Brush StatusDotBrush,
+        string TransportText,
+        string LastCheckedText);
 
     private sealed record DeviceToolDiagnostics(int? ExitCode, string Output, bool TimedOut);
 }
