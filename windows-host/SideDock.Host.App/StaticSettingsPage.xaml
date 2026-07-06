@@ -206,7 +206,15 @@
                                         <ColumnDefinition Width="42" />
                                     </Grid.ColumnDefinitions>
                                     <TextBox x:Name="AdbPathBox" Text="C:\platform-tools\adb.exe" HorizontalAlignment="Stretch" />
-                                    <Button Grid.Column="1" Width="42" Padding="0" CornerRadius="0,5,5,0" Background="White" BorderBrush="{StaticResource SettingsStrokeBrush}">
+                                    <Button
+                                        x:Name="AdbPathBrowseButton"
+                                        Grid.Column="1"
+                                        Width="42"
+                                        Padding="0"
+                                        CornerRadius="0,5,5,0"
+                                        Background="White"
+                                        BorderBrush="{StaticResource SettingsStrokeBrush}"
+                                        Click="AdbPathBrowseButton_Click">
                                         <FontIcon Glyph="&#xE8B7;" FontSize="16" Foreground="#30363D" />
                                     </Button>
                                 </Grid>
