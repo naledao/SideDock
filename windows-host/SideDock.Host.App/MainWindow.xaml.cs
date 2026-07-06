@@ -232,6 +232,7 @@ public sealed partial class MainWindow : Window
     private bool _updatingOverviewAudioSwitch;
     private bool _overviewCameraOperationInProgress;
     private bool _overviewCameraRequestedEnabled = true;
+    private bool _overviewCameraBannerDismissed;
     private VirtualDisplayOverviewState? _virtualDisplayTransientState;
     private string? _virtualDisplayLastError;
     private string? _driverInstallLastError;
@@ -557,6 +558,17 @@ public sealed partial class MainWindow : Window
         var showConnectionPage = item == OverviewNavigationItem.Connection;
         OverviewConnectionScrollViewer.Visibility = showConnectionPage ? Visibility.Visible : Visibility.Collapsed;
         OverviewMainScrollViewer.Visibility = showConnectionPage || showDisplayPage || showCameraPage || showAudioPage || showDiagnosticsPage || showSettingsPage ? Visibility.Collapsed : Visibility.Visible;
+
+        if (showCameraPage)
+        {
+            if (_cameraPreviewEnabled)
+            {
+                _cameraPreviewTimer.Start();
+                UpdateCameraPreview();
+            }
+
+            UpdateCameraStatusView();
+        }
     }
 
     private void OpenOverviewNavigationItem(OverviewNavigationItem item)
@@ -652,6 +664,7 @@ public sealed partial class MainWindow : Window
             OverviewVideoPortBox.Value = double.IsNaN(VideoPortBox.Value) ? DefaultVideoPort : VideoPortBox.Value;
             OverviewAudioPortBox.Value = DefaultAudioPort;
             OverviewCameraPortBox.Value = DefaultCameraPort;
+            OverviewCameraPagePortBox.Value = OverviewCameraPortBox.Value;
             OverviewAdbPathBox.Text = AdbPathBox.Text;
             OverviewInputInjectionSwitch.IsOn = InputInjectionSwitch.IsOn;
             OverviewInputInjectionStatusText.Text = OverviewInputInjectionSwitch.IsOn ? "已启用" : "未启用";
@@ -2221,7 +2234,7 @@ public sealed partial class MainWindow : Window
     {
         if (StaticOverviewUi && _overviewNavigationItem == OverviewNavigationItem.Camera)
         {
-            await StartCameraPipelineAsync();
+            await SetOverviewCameraEnabledAsync(true);
             return;
         }
 
@@ -2615,41 +2628,21 @@ public sealed partial class MainWindow : Window
 
     private void ToggleCameraPreviewButton_Click(object sender, RoutedEventArgs e)
     {
-        if (StaticOverviewUi)
-        {
-            return;
-        }
-
         SetCameraPreviewEnabled(!_cameraPreviewEnabled);
     }
 
     private async void StartVirtualCameraButton_Click(object sender, RoutedEventArgs e)
     {
-        if (StaticOverviewUi)
-        {
-            return;
-        }
-
-        await StartCameraPipelineAsync();
+        await SetOverviewCameraEnabledAsync(true);
     }
 
     private async void StopVirtualCameraButton_Click(object sender, RoutedEventArgs e)
     {
-        if (StaticOverviewUi)
-        {
-            return;
-        }
-
-        await StopCameraPipelineAsync();
+        await SetOverviewCameraEnabledAsync(false);
     }
 
     private async void RefreshVirtualCameraButton_Click(object sender, RoutedEventArgs e)
     {
-        if (StaticOverviewUi)
-        {
-            return;
-        }
-
         await RefreshVirtualCameraStatusAsync();
     }
 
@@ -2705,12 +2698,80 @@ public sealed partial class MainWindow : Window
 
     private void OverviewCameraResolutionCombo_SelectionChanged(object sender, SelectionChangedEventArgs e)
     {
+        SyncOverviewCameraComboSelection(OverviewCameraResolutionCombo, OverviewCameraPageResolutionCombo);
         SyncOverviewCameraOptionsToDiagnostics();
     }
 
     private void OverviewCameraFrameRateCombo_SelectionChanged(object sender, SelectionChangedEventArgs e)
     {
+        SyncOverviewCameraComboSelection(OverviewCameraFrameRateCombo, OverviewCameraPageFrameRateCombo);
         SyncOverviewCameraOptionsToDiagnostics();
+    }
+
+    private void OverviewCameraPageFacingCombo_SelectionChanged(object sender, SelectionChangedEventArgs e)
+    {
+        SyncOverviewCameraComboSelection(OverviewCameraPageFacingCombo, CameraFacingCombo);
+        SyncOverviewCameraOptionsToDiagnostics();
+    }
+
+    private void OverviewCameraPageResolutionCombo_SelectionChanged(object sender, SelectionChangedEventArgs e)
+    {
+        SyncOverviewCameraComboSelection(OverviewCameraPageResolutionCombo, OverviewCameraResolutionCombo);
+        SyncOverviewCameraOptionsToDiagnostics();
+    }
+
+    private void OverviewCameraPageFrameRateCombo_SelectionChanged(object sender, SelectionChangedEventArgs e)
+    {
+        SyncOverviewCameraComboSelection(OverviewCameraPageFrameRateCombo, OverviewCameraFrameRateCombo);
+        SyncOverviewCameraOptionsToDiagnostics();
+    }
+
+    private void OverviewCameraPagePortBox_ValueChanged(NumberBox sender, NumberBoxValueChangedEventArgs args)
+    {
+        if (_syncingOverviewCameraOptions || !_uiReady)
+        {
+            return;
+        }
+
+        _syncingOverviewCameraOptions = true;
+        try
+        {
+            OverviewCameraPortBox.Value = sender.Value;
+        }
+        finally
+        {
+            _syncingOverviewCameraOptions = false;
+        }
+
+        _lastAdbReverseConfigured = null;
+        SyncOverviewCameraOptionsToDiagnostics();
+        UpdateOverviewConnectionPage();
+    }
+
+    private void OverviewCameraPreviewStartButton_Click(object sender, RoutedEventArgs e)
+    {
+        SetCameraPreviewEnabled(true);
+    }
+
+    private void OverviewCameraPreviewStopButton_Click(object sender, RoutedEventArgs e)
+    {
+        SetCameraPreviewEnabled(false);
+    }
+
+    private async void OverviewCameraReconnectButton_Click(object sender, RoutedEventArgs e)
+    {
+        await RestartCameraPipelineFromUiAsync();
+    }
+
+    private async void OverviewCameraShowEventsButton_Click(object sender, RoutedEventArgs e)
+    {
+        await ShowOverviewLogsDialogAsync();
+    }
+
+    private void OverviewCameraLinkBannerCloseButton_Click(object sender, RoutedEventArgs e)
+    {
+        _overviewCameraBannerDismissed = true;
+        OverviewCameraLinkBanner.Visibility = Visibility.Collapsed;
     }
 
     private async void InstallDriverButton_Click(object sender, RoutedEventArgs e)
@@ -2808,6 +2869,7 @@ public sealed partial class MainWindow : Window
         }
 
         _lastAdbReverseConfigured = null;
+        SyncOverviewCameraPagePortFromConnection();
         SyncOverviewConnectionControlsToLegacy();
         UpdateOverviewConnectionPage();
     }
@@ -2852,6 +2914,7 @@ public sealed partial class MainWindow : Window
         }
 
         _lastAdbReverseConfigured = null;
+        SyncOverviewCameraPagePortFromConnection();
         SyncOverviewConnectionControlsToLegacy();
         UpdateOverviewConnectionPage();
     }
@@ -3633,8 +3696,13 @@ public sealed partial class MainWindow : Window
         _syncingOverviewCameraOptions = true;
         try
         {
+            SelectComboBoxValue(OverviewCameraPageFacingCombo, Selected(CameraFacingCombo));
             SelectComboBoxValue(OverviewCameraResolutionCombo, CameraResolutionValue(_cameraDiagnostics.Width, _cameraDiagnostics.Height));
             SelectComboBoxValue(OverviewCameraFrameRateCombo, _cameraDiagnostics.Fps.ToString(CultureInfo.InvariantCulture));
+            SelectComboBoxValue(OverviewCameraPageResolutionCombo, Selected(OverviewCameraResolutionCombo));
+            SelectComboBoxValue(OverviewCameraPageFrameRateCombo, Selected(OverviewCameraFrameRateCombo));
+            SelectComboBoxValue(OverviewCameraPageCodecCombo, _cameraDiagnostics.Codec);
+            OverviewCameraPagePortBox.Value = OverviewCameraPortBox.Value;
         }
         finally
         {
@@ -3662,7 +3730,49 @@ public sealed partial class MainWindow : Window
         _cameraDiagnostics.Width = width;
         _cameraDiagnostics.Height = height;
         _cameraDiagnostics.Fps = SelectedOverviewCameraFps();
+        _cameraDiagnostics.Facing = NormalizeCameraFacing(Selected(CameraFacingCombo));
+        if (TryReadPort(OverviewCameraPortBox, out var cameraPort))
+        {
+            _cameraDiagnostics.Port = cameraPort;
+        }
+
         UpdateCameraStatusView();
+    }
+
+    private void SyncOverviewCameraComboSelection(ComboBox source, ComboBox target)
+    {
+        if (_syncingOverviewCameraOptions || !_uiReady)
+        {
+            return;
+        }
+
+        _syncingOverviewCameraOptions = true;
+        try
+        {
+            SelectComboBoxValue(target, Selected(source));
+        }
+        finally
+        {
+            _syncingOverviewCameraOptions = false;
+        }
+    }
+
+    private void SyncOverviewCameraPagePortFromConnection()
+    {
+        if (_syncingOverviewCameraOptions || OverviewCameraPagePortBox is null)
+        {
+            return;
+        }
+
+        _syncingOverviewCameraOptions = true;
+        try
+        {
+            OverviewCameraPagePortBox.Value = OverviewCameraPortBox.Value;
+        }
+        finally
+        {
+            _syncingOverviewCameraOptions = false;
+        }
     }
 
     private (int Width, int Height) SelectedOverviewCameraResolution()
@@ -3756,6 +3866,9 @@ public sealed partial class MainWindow : Window
                 SelectComboBoxValue(CameraFacingCombo, Selected(facingCombo));
                 SelectComboBoxValue(OverviewCameraResolutionCombo, Selected(resolutionCombo));
                 SelectComboBoxValue(OverviewCameraFrameRateCombo, Selected(frameRateCombo));
+                SelectComboBoxValue(OverviewCameraPageFacingCombo, Selected(facingCombo));
+                SelectComboBoxValue(OverviewCameraPageResolutionCombo, Selected(resolutionCombo));
+                SelectComboBoxValue(OverviewCameraPageFrameRateCombo, Selected(frameRateCombo));
             }
             finally
             {
@@ -7415,8 +7528,7 @@ public sealed partial class MainWindow : Window
             _cameraPreviewReader ??= CameraPreviewFrameReader.TryOpen();
             if (_cameraPreviewReader is null)
             {
-                CameraPreviewPlaceholderText.Visibility = Visibility.Visible;
-                CameraPreviewPlaceholderText.Text = "等待摄像头解码帧";
+                SetCameraPreviewPlaceholder("等待摄像头解码帧", visible: true);
                 return;
             }
 
@@ -7432,7 +7544,7 @@ public sealed partial class MainWindow : Window
                 || _cameraPreviewBitmap.PixelHeight != frame.Height)
             {
                 _cameraPreviewBitmap = new WriteableBitmap(frame.Width, frame.Height);
-                CameraPreviewImage.Source = _cameraPreviewBitmap;
+                SetCameraPreviewImageSource(_cameraPreviewBitmap);
             }
 
             using (var stream = _cameraPreviewBitmap.PixelBuffer.AsStream())
@@ -7445,23 +7557,21 @@ public sealed partial class MainWindow : Window
             _lastCameraPreviewSequence = frame.Sequence;
             _lastCameraPreviewAt = DateTimeOffset.FromUnixTimeMilliseconds(frame.WrittenAtUnixMs);
             _cameraDiagnostics.PreviewFrameSequence = Math.Max(_cameraDiagnostics.PreviewFrameSequence, frame.Sequence);
-            CameraPreviewPlaceholderText.Visibility = Visibility.Collapsed;
+            SetCameraPreviewPlaceholder("", visible: false);
             UpdateCameraStatusView();
         }
         catch (FileNotFoundException)
         {
             _cameraPreviewReader?.Dispose();
             _cameraPreviewReader = null;
-            CameraPreviewPlaceholderText.Visibility = Visibility.Visible;
-            CameraPreviewPlaceholderText.Text = "等待摄像头解码帧";
+            SetCameraPreviewPlaceholder("等待摄像头解码帧", visible: true);
         }
         catch (Exception ex) when (ex is IOException or UnauthorizedAccessException or ObjectDisposedException or ArgumentException)
         {
             _cameraPreviewReader?.Dispose();
             _cameraPreviewReader = null;
             _cameraDiagnostics.LastError = ex.Message;
-            CameraPreviewPlaceholderText.Visibility = Visibility.Visible;
-            CameraPreviewPlaceholderText.Text = "预览缓存暂不可读";
+            SetCameraPreviewPlaceholder("预览缓存暂不可读", visible: true);
             UpdateCameraStatusView();
         }
     }
@@ -7470,7 +7580,7 @@ public sealed partial class MainWindow : Window
     {
         if (_lastCameraPreviewAt is null)
         {
-            CameraPreviewPlaceholderText.Visibility = CameraPreviewImage.Source is null ? Visibility.Visible : Visibility.Collapsed;
+            SetCameraPreviewPlaceholder("等待摄像头解码帧", CameraPreviewImage.Source is null);
             return;
         }
 
@@ -7481,15 +7591,22 @@ public sealed partial class MainWindow : Window
     {
         if (_cameraPreviewEnabled == enabled)
         {
+            if (enabled)
+            {
+                _cameraPreviewTimer.Start();
+                SetCameraPreviewPlaceholder("等待摄像头解码帧", CameraPreviewImage.Source is null);
+                UpdateCameraPreview();
+            }
+
             UpdateCameraPreviewToggleView();
+            UpdateCameraStatusView();
             return;
         }
 
         _cameraPreviewEnabled = enabled;
         if (enabled)
         {
-            CameraPreviewPlaceholderText.Text = "等待摄像头解码帧";
-            CameraPreviewPlaceholderText.Visibility = CameraPreviewImage.Source is null ? Visibility.Visible : Visibility.Collapsed;
+            SetCameraPreviewPlaceholder("等待摄像头解码帧", CameraPreviewImage.Source is null);
             _cameraPreviewTimer.Start();
             UpdateCameraPreview();
         }
@@ -7499,9 +7616,8 @@ public sealed partial class MainWindow : Window
             _cameraPreviewReader?.Dispose();
             _cameraPreviewReader = null;
             _cameraPreviewBitmap = null;
-            CameraPreviewImage.Source = null;
-            CameraPreviewPlaceholderText.Text = "Windows 预览已关闭";
-            CameraPreviewPlaceholderText.Visibility = Visibility.Visible;
+            SetCameraPreviewImageSource(null);
+            SetCameraPreviewPlaceholder("Windows 预览已关闭", visible: true);
         }
 
         UpdateCameraPreviewToggleView();
@@ -7526,11 +7642,34 @@ public sealed partial class MainWindow : Window
             : "已关闭";
     }
 
+    private void SetCameraPreviewImageSource(ImageSource? source)
+    {
+        CameraPreviewImage.Source = source;
+        if (StaticOverviewUi && OverviewCameraPreviewImage is not null)
+        {
+            OverviewCameraPreviewImage.Source = source;
+        }
+    }
+
+    private void SetCameraPreviewPlaceholder(string text, bool visible)
+    {
+        var visibility = visible ? Visibility.Visible : Visibility.Collapsed;
+        CameraPreviewPlaceholderText.Text = text;
+        CameraPreviewPlaceholderText.Visibility = visibility;
+
+        if (StaticOverviewUi && OverviewCameraPreviewPlaceholderText is not null)
+        {
+            OverviewCameraPreviewPlaceholderText.Text = text;
+            OverviewCameraPreviewPlaceholderPanel.Visibility = visibility;
+        }
+    }
+
     private void UpdateCameraStatusView()
     {
         if (CameraStatusText is null)
         {
             UpdateOverviewCameraState();
+            UpdateOverviewCameraPageView();
             return;
         }
 
@@ -7555,6 +7694,434 @@ public sealed partial class MainWindow : Window
         }
 
         UpdateOverviewCameraState();
+        UpdateOverviewCameraPageView();
+    }
+
+    private void UpdateOverviewCameraPageView()
+    {
+        if (!StaticOverviewUi || OverviewCameraLinkBanner is null)
+        {
+            return;
+        }
+
+        UpdateOverviewCameraLinkBanner();
+        UpdateOverviewCameraPreviewStats();
+        UpdateOverviewCameraReceiveStatus();
+        UpdateOverviewCameraEncodingStatus();
+        UpdateOverviewCameraErrorStatus();
+        UpdateOverviewVirtualCameraCard();
+        UpdateOverviewCameraRecentEvents();
+    }
+
+    private void UpdateOverviewCameraLinkBanner()
+    {
+        var camera = _cameraDiagnostics;
+        var virtualCamera = _virtualCameraDiagnostics;
+        var hostRunning = _hostProcess is { HasExited: false };
+        var error = FirstNonEmpty(camera.LastError, virtualCamera.LastError, _lastCameraErrorMessage);
+
+        string title;
+        string detail;
+        string glyph;
+        Brush foreground;
+        Brush background;
+        Brush border;
+
+        if (!string.IsNullOrWhiteSpace(error) || IsCameraErrorState(camera.ServerState) || IsCameraErrorState(camera.ClientState))
+        {
+            title = "摄像头链路异常";
+            detail = string.IsNullOrWhiteSpace(error) ? "摄像头或虚拟相机报告了错误状态。" : error;
+            glyph = "\uE783";
+            foreground = _dangerBrush;
+            background = _overviewErrorBackgroundBrush;
+            border = _overviewErrorBorderBrush;
+        }
+        else if (IsCameraReceiving(camera) && virtualCamera.Running)
+        {
+            title = "摄像头链路正常";
+            detail = $"视频流正在接收，虚拟相机{virtualCamera.RunningText}，供帧 {FormatVirtualCameraServedAt(virtualCamera.LastServedAt)}。";
+            glyph = "\uE73E";
+            foreground = _successBrush;
+            background = _overviewReadyBackgroundBrush;
+            border = _overviewReadyBorderBrush;
+        }
+        else if (IsCameraPermissionMissing(camera))
+        {
+            title = "等待 Android 摄像头权限";
+            detail = "请在 Android 设备上允许 SideDock 使用摄像头。";
+            glyph = "\uE7BA";
+            foreground = _warningBrush;
+            background = _overviewWarningBackgroundBrush;
+            border = _overviewWarningBorderBrush;
+        }
+        else if (!hostRunning)
+        {
+            title = virtualCamera.Running ? "虚拟相机已启动" : "摄像头未启动";
+            detail = virtualCamera.Running
+                ? "SideDock Camera 已在 Windows 中运行；主机启动后会等待 Android 供帧。"
+                : $"当前启动前配置：{FormatSelectedOverviewCameraConfig()}，端口 {FormatConfiguredCameraPortText()}。";
+            glyph = virtualCamera.Running ? "\uE722" : "\uE7BA";
+            foreground = virtualCamera.Running ? _successBrush : _overviewNeutralBrush;
+            background = virtualCamera.Running ? _overviewReadyBackgroundBrush : _overviewNeutralBackgroundBrush;
+            border = virtualCamera.Running ? _overviewReadyBorderBrush : _overviewNeutralBorderBrush;
+        }
+        else if (IsCameraReceiving(camera))
+        {
+            title = "正在接收摄像头流";
+            detail = $"已接收 {camera.Frames} 帧，已解码 {camera.DecodedFrames} 帧，虚拟相机{virtualCamera.RunningText}。";
+            glyph = "\uE73E";
+            foreground = _successBrush;
+            background = _overviewReadyBackgroundBrush;
+            border = _overviewReadyBorderBrush;
+        }
+        else
+        {
+            title = "等待 Android 摄像头流";
+            detail = $"主机已运行，正在等待 Android 摄像头状态。当前配置：{FormatSelectedOverviewCameraConfig()}。";
+            glyph = "\uE7BA";
+            foreground = _warningBrush;
+            background = _overviewWarningBackgroundBrush;
+            border = _overviewWarningBorderBrush;
+        }
+
+        OverviewCameraLinkBanner.Visibility = _overviewCameraBannerDismissed ? Visibility.Collapsed : Visibility.Visible;
+        OverviewCameraLinkBanner.Background = background;
+        OverviewCameraLinkBanner.BorderBrush = border;
+        OverviewCameraLinkIconHost.Background = foreground;
+        OverviewCameraLinkIcon.Glyph = glyph;
+        OverviewCameraLinkTitleText.Text = title;
+        OverviewCameraLinkTitleText.Foreground = foreground;
+        OverviewCameraLinkDetailText.Text = detail;
+        OverviewCameraLinkDetailText.Foreground = _secondaryBrush;
+    }
+
+    private void UpdateOverviewCameraPreviewStats()
+    {
+        var camera = _cameraDiagnostics;
+        OverviewCameraPreviewFpsText.Text = camera.ApproxFps > 0
+            ? camera.ApproxFps.ToString("F1", CultureInfo.InvariantCulture)
+            : "--";
+        OverviewCameraPreviewBitrateText.Text = camera.ApproxKbps > 0
+            ? (camera.ApproxKbps / 1000d).ToString("F1", CultureInfo.InvariantCulture)
+            : "--";
+        OverviewCameraPreviewFramesText.Text = FormatCompactCount(camera.Frames);
+        OverviewCameraPreviewDecodedText.Text = FormatCompactCount(camera.DecodedFrames);
+        OverviewCameraPreviewStartButton.IsEnabled = !_cameraPreviewEnabled;
+        OverviewCameraPreviewStopButton.IsEnabled = _cameraPreviewEnabled;
+        OverviewCameraReconnectButton.IsEnabled = !_overviewCameraOperationInProgress;
+    }
+
+    private void UpdateOverviewCameraReceiveStatus()
+    {
+        var camera = _cameraDiagnostics;
+        var (statusText, statusBrush) = BuildCameraReceiveStatus();
+        OverviewCameraReceiveStatusText.Text = statusText;
+        OverviewCameraReceiveStatusText.Foreground = statusBrush;
+        OverviewCameraReceiveStatusDot.Fill = statusBrush;
+        OverviewCameraReceiveProtocolText.Text = "TCP";
+        OverviewCameraReceiveAddressText.Text = $"127.0.0.1:{FormatConfiguredCameraPortText()}";
+        OverviewCameraReceivePacketsText.Text = $"{FormatCompactCount(camera.Packets)} / {FormatByteCount(camera.Bytes)}";
+        OverviewCameraReceiveLastFrameText.Text = FormatCameraAge(camera.LastFrameAt);
+    }
+
+    private (string Text, Brush Brush) BuildCameraReceiveStatus()
+    {
+        var camera = _cameraDiagnostics;
+        var hostRunning = _hostProcess is { HasExited: false };
+
+        if (!string.IsNullOrWhiteSpace(camera.LastError) || IsCameraErrorState(camera.ServerState) || IsCameraErrorState(camera.ClientState))
+        {
+            return ("错误", _dangerBrush);
+        }
+
+        if (!_overviewCameraRequestedEnabled || IsCameraDisabledState(camera.ServerState) || IsCameraDisabledState(camera.ClientState))
+        {
+            return ("未启动", _secondaryBrush);
+        }
+
+        if (IsCameraPermissionMissing(camera))
+        {
+            return ("未授权", _warningBrush);
+        }
+
+        if (IsCameraReceiving(camera))
+        {
+            return ("接收中", _successBrush);
+        }
+
+        return hostRunning ? ("等待 Android", _warningBrush) : ("未启动", _secondaryBrush);
+    }
+
+    private void UpdateOverviewCameraEncodingStatus()
+    {
+        var camera = _cameraDiagnostics;
+        SelectComboBoxValue(OverviewCameraPageCodecCombo, camera.Codec);
+        OverviewCameraEncodingCodecText.Text = FormatCameraCodec(camera.Codec);
+        OverviewCameraEncodingResolutionText.Text = $"{camera.Width}×{camera.Height}";
+        OverviewCameraEncodingFpsText.Text = camera.ApproxFps > 0
+            ? $"{camera.ApproxFps:F1} fps"
+            : $"{camera.Fps} fps 配置";
+        OverviewCameraEncodingBitrateText.Text = FormatCameraBitrate(camera.ApproxKbps);
+        OverviewCameraEncodingDecodeLagText.Text = camera.DecodeLagMs > 0
+            ? $"{camera.DecodeLagMs:F0} ms"
+            : "--";
+    }
+
+    private void UpdateOverviewCameraErrorStatus()
+    {
+        var camera = _cameraDiagnostics;
+        var error = FirstNonEmpty(camera.LastError, _virtualCameraDiagnostics.LastError, _lastCameraErrorMessage);
+        if (!string.IsNullOrWhiteSpace(error))
+        {
+            OverviewCameraErrorIconBorder.BorderBrush = _dangerBrush;
+            OverviewCameraErrorIcon.Foreground = _dangerBrush;
+            OverviewCameraErrorIcon.Glyph = "\uE783";
+            OverviewCameraErrorSummaryText.Text = "需要检查";
+            OverviewCameraErrorSummaryText.Foreground = _dangerBrush;
+            OverviewCameraErrorDetailText.Text = error;
+            OverviewCameraErrorDetailText.Foreground = _dangerBrush;
+            return;
+        }
+
+        if (camera.DecodeErrors > 0)
+        {
+            OverviewCameraErrorIconBorder.BorderBrush = _warningBrush;
+            OverviewCameraErrorIcon.Foreground = _warningBrush;
+            OverviewCameraErrorIcon.Glyph = "\uE7BA";
+            OverviewCameraErrorSummaryText.Text = "有警告";
+            OverviewCameraErrorSummaryText.Foreground = _warningBrush;
+            OverviewCameraErrorDetailText.Text = $"累计解码错误 {camera.DecodeErrors} 次。";
+            OverviewCameraErrorDetailText.Foreground = _warningBrush;
+            return;
+        }
+
+        OverviewCameraErrorIconBorder.BorderBrush = _successBrush;
+        OverviewCameraErrorIcon.Foreground = _successBrush;
+        OverviewCameraErrorIcon.Glyph = "\uE73E";
+        OverviewCameraErrorSummaryText.Text = "无";
+        OverviewCameraErrorSummaryText.Foreground = _successBrush;
+        OverviewCameraErrorDetailText.Text = "未检测到任何错误或警告。";
+        OverviewCameraErrorDetailText.Foreground = _secondaryBrush;
+    }
+
+    private void UpdateOverviewVirtualCameraCard()
+    {
+        var virtualCamera = _virtualCameraDiagnostics;
+        OverviewVirtualCameraRegistrationText.Text = virtualCamera.Registered
+            ? string.IsNullOrWhiteSpace(virtualCamera.RegisteredScopeSummary)
+                ? "已注册"
+                : $"已注册 ({virtualCamera.RegisteredScopeSummary})"
+            : "未注册";
+        OverviewVirtualCameraRegistrationText.Foreground = virtualCamera.Registered ? _successBrush : _secondaryBrush;
+
+        if (IsVirtualCameraServing(virtualCamera))
+        {
+            OverviewVirtualCameraServingText.Text = $"供帧中 · 源帧 {virtualCamera.SourceFrameSequence}";
+            OverviewVirtualCameraServingText.Foreground = _successBrush;
+        }
+        else if (virtualCamera.Running)
+        {
+            OverviewVirtualCameraServingText.Text = $"等待供帧 · {FormatVirtualCameraServedAt(virtualCamera.LastServedAt)}";
+            OverviewVirtualCameraServingText.Foreground = _warningBrush;
+        }
+        else
+        {
+            OverviewVirtualCameraServingText.Text = "已停止";
+            OverviewVirtualCameraServingText.Foreground = _secondaryBrush;
+        }
+    }
+
+    private static bool IsVirtualCameraServing(VirtualCameraDiagnosticsState virtualCamera)
+    {
+        if (virtualCamera.LastServedAt is null)
+        {
+            return false;
+        }
+
+        var age = DateTimeOffset.UtcNow - virtualCamera.LastServedAt.Value.ToUniversalTime();
+        return virtualCamera.Running && age.TotalSeconds <= 5;
+    }
+
+    private void UpdateOverviewCameraRecentEvents()
+    {
+        var events = SnapshotRecentCameraLogLines()
+            .Reverse()
+            .Take(5)
+            .Select(line =>
+            {
+                var (time, text) = FormatCameraEventLine(line);
+                return (Text: text, Time: time, Brush: CameraEventBrush(text));
+            })
+            .ToList();
+
+        if (events.Count == 0)
+        {
+            AddCameraSyntheticEvents(events);
+        }
+
+        var dots = new[] { OverviewCameraEventDot0, OverviewCameraEventDot1, OverviewCameraEventDot2, OverviewCameraEventDot3, OverviewCameraEventDot4 };
+        var texts = new[] { OverviewCameraEventText0, OverviewCameraEventText1, OverviewCameraEventText2, OverviewCameraEventText3, OverviewCameraEventText4 };
+        var times = new[] { OverviewCameraEventTime0, OverviewCameraEventTime1, OverviewCameraEventTime2, OverviewCameraEventTime3, OverviewCameraEventTime4 };
+
+        for (var index = 0; index < dots.Length; index++)
+        {
+            if (index < events.Count)
+            {
+                SetOverviewCameraEventRow(dots[index], texts[index], times[index], events[index].Text, events[index].Time, events[index].Brush, visible: true);
+            }
+            else
+            {
+                SetOverviewCameraEventRow(dots[index], texts[index], times[index], "", "", _overviewMutedBrush, visible: false);
+            }
+        }
+    }
+
+    private void AddCameraSyntheticEvents(List<(string Text, string Time, Brush Brush)> events)
+    {
+        if (!string.IsNullOrWhiteSpace(_lastCameraStatusLine))
+        {
+            events.Add(("最近摄像头状态已更新", "--", _successBrush));
+        }
+
+        if (_virtualCameraDiagnostics.LastServedAt is not null)
+        {
+            events.Add(($"虚拟相机最近供帧，源帧 {_virtualCameraDiagnostics.SourceFrameSequence}", _virtualCameraDiagnostics.LastServedAt.Value.ToLocalTime().ToString("HH:mm:ss", CultureInfo.InvariantCulture), _successBrush));
+        }
+
+        if (!string.IsNullOrWhiteSpace(_virtualCameraDiagnostics.LastToolState))
+        {
+            events.Add(($"虚拟相机工具状态：{_virtualCameraDiagnostics.LastToolState}", "--", _overviewNeutralBrush));
+        }
+
+        events.Add((_cameraPreviewEnabled ? $"Windows 预览：{FormatCameraPreviewState()}" : "Windows 预览已关闭", "--", _cameraPreviewEnabled ? _overviewNeutralBrush : _warningBrush));
+
+        if (events.Count == 0)
+        {
+            events.Add(("暂无摄像头事件", "--", _overviewMutedBrush));
+        }
+    }
+
+    private void SetOverviewCameraEventRow(
+        XamlShape dot,
+        TextBlock textBlock,
+        TextBlock timeBlock,
+        string text,
+        string time,
+        Brush brush,
+        bool visible)
+    {
+        var visibility = visible ? Visibility.Visible : Visibility.Collapsed;
+        dot.Visibility = visibility;
+        textBlock.Visibility = visibility;
+        timeBlock.Visibility = visibility;
+        dot.Fill = brush;
+        textBlock.Text = text;
+        timeBlock.Text = time;
+    }
+
+    private (string Time, string Text) FormatCameraEventLine(string line)
+    {
+        var text = line.Trim();
+        var time = "--";
+        if (text.StartsWith("[", StringComparison.Ordinal))
+        {
+            var end = text.IndexOf(']');
+            if (end > 1)
+            {
+                time = text[1..end];
+                if (time.Length > 8)
+                {
+                    time = time[..8];
+                }
+
+                text = text[(end + 1)..].Trim();
+            }
+        }
+
+        text = text
+            .Replace("[camera_status]", "", StringComparison.OrdinalIgnoreCase)
+            .Replace("[camera_error]", "", StringComparison.OrdinalIgnoreCase)
+            .Trim();
+        return (time, string.IsNullOrWhiteSpace(text) ? "摄像头事件已更新" : text);
+    }
+
+    private Brush CameraEventBrush(string text)
+    {
+        if (ContainsAny(text, "error", "failed", "exception", "denied", "错误", "失败", "异常"))
+        {
+            return _dangerBrush;
+        }
+
+        if (ContainsAny(text, "waiting", "preparing", "stopped", "等待", "准备", "停止"))
+        {
+            return _warningBrush;
+        }
+
+        return _successBrush;
+    }
+
+    private static bool ContainsAny(string text, params string[] values)
+    {
+        return values.Any(value => text.Contains(value, StringComparison.OrdinalIgnoreCase));
+    }
+
+    private string FormatConfiguredCameraPortText()
+    {
+        return TryReadPort(OverviewCameraPortBox, out var port)
+            ? port.ToString(CultureInfo.InvariantCulture)
+            : "端口无效";
+    }
+
+    private static string FormatCameraCodec(string codec)
+    {
+        return codec.Trim().Equals("video/avc", StringComparison.OrdinalIgnoreCase)
+            ? "video/avc (H.264)"
+            : string.IsNullOrWhiteSpace(codec) ? "--" : codec;
+    }
+
+    private static string FormatCameraBitrate(double kbps)
+    {
+        if (kbps <= 0)
+        {
+            return "--";
+        }
+
+        return kbps >= 1000
+            ? $"{kbps / 1000d:F1} Mbps"
+            : $"{kbps:F0} Kbps";
+    }
+
+    private static string FormatCompactCount(long value)
+    {
+        if (value >= 1_000_000)
+        {
+            return $"{value / 1_000_000d:F1}M";
+        }
+
+        return value >= 10_000
+            ? $"{value / 1_000d:F1}K"
+            : value.ToString(CultureInfo.InvariantCulture);
+    }
+
+    private static string FormatByteCount(long bytes)
+    {
+        if (bytes <= 0)
+        {
+            return "--";
+        }
+
+        string[] units = { "B", "KB", "MB", "GB" };
+        var value = (double)bytes;
+        var unitIndex = 0;
+        while (value >= 1024 && unitIndex < units.Length - 1)
+        {
+            value /= 1024;
+            unitIndex++;
+        }
+
+        return unitIndex == 0
+            ? $"{value:F0} {units[unitIndex]}"
+            : $"{value:F1} {units[unitIndex]}";
     }
 
     private void UpdateOverviewCameraState()
@@ -7652,9 +8219,18 @@ public sealed partial class MainWindow : Window
     private void UpdateOverviewCameraOptionsEnabled(bool hostRunning)
     {
         var enabled = !hostRunning && !_overviewCameraOperationInProgress;
+        SyncOverviewCameraPagePortFromConnection();
         OverviewCameraResolutionCombo.IsEnabled = enabled;
         OverviewCameraFrameRateCombo.IsEnabled = enabled;
+        OverviewCameraPageFacingCombo.IsEnabled = enabled;
+        OverviewCameraPageResolutionCombo.IsEnabled = enabled;
+        OverviewCameraPageFrameRateCombo.IsEnabled = enabled;
+        OverviewCameraPageCodecCombo.IsEnabled = false;
+        OverviewCameraPagePortBox.IsEnabled = enabled;
         OverviewCameraSettingsButton.IsEnabled = !_overviewCameraOperationInProgress;
+        OverviewCameraPageConfigHintText.Text = hostRunning
+            ? "主机运行中，镜头、分辨率、帧率和端口会在下次启动摄像头管线时生效。"
+            : "镜头、分辨率、帧率和端口会在下次启动摄像头管线时生效。编码格式由当前链路上报。";
     }
 
     private bool HasCameraError()
@@ -7763,6 +8339,31 @@ public sealed partial class MainWindow : Window
         SetCameraPreviewEnabled(false);
         await SendHostCameraConfigCommandAsync(enabled: false);
         await RunVirtualCameraCommandAsync("stop");
+    }
+
+    private async Task RestartCameraPipelineFromUiAsync()
+    {
+        if (_overviewCameraOperationInProgress)
+        {
+            UpdateOverviewCameraState();
+            return;
+        }
+
+        _overviewCameraRequestedEnabled = true;
+        _overviewCameraOperationInProgress = true;
+        UpdateOverviewCameraState();
+        try
+        {
+            await StopCameraPipelineAsync();
+            await StartCameraPipelineAsync();
+            await RefreshVirtualCameraStatusAsync();
+        }
+        finally
+        {
+            _overviewCameraOperationInProgress = false;
+            UpdateOverviewCameraState();
+            UpdateCameraStatusView();
+        }
     }
 
     private async Task SendHostCameraConfigCommandAsync(bool enabled)
@@ -8172,6 +8773,8 @@ public sealed partial class MainWindow : Window
         StartVirtualCameraButton.IsEnabled = enabled;
         StopVirtualCameraButton.IsEnabled = enabled;
         RefreshVirtualCameraButton.IsEnabled = enabled;
+        OverviewStartVirtualCameraButton.IsEnabled = enabled;
+        OverviewStopVirtualCameraButton.IsEnabled = enabled;
     }
 
     private string ResolveVirtualCameraToolPath()
