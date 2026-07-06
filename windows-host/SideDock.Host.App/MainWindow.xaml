@@ -2455,6 +2455,7 @@
                         Visibility="Collapsed">
                         <StackPanel Spacing="14">
                             <Border
+                                x:Name="OverviewCameraLinkBanner"
                                 Height="64"
                                 Padding="16,0"
                                 CornerRadius="7"
@@ -2467,14 +2468,23 @@
                                         <ColumnDefinition Width="*" />
                                         <ColumnDefinition Width="Auto" />
                                     </Grid.ColumnDefinitions>
-                                    <Border Width="38" Height="38" CornerRadius="19" Background="#2D922D">
-                                        <FontIcon Glyph="&#xE73E;" FontSize="22" Foreground="White" />
+                                    <Border x:Name="OverviewCameraLinkIconHost" Width="38" Height="38" CornerRadius="19" Background="#2D922D">
+                                        <FontIcon x:Name="OverviewCameraLinkIcon" Glyph="&#xE73E;" FontSize="22" Foreground="White" />
                                     </Border>
                                     <StackPanel Grid.Column="1" VerticalAlignment="Center" Spacing="3">
-                                        <TextBlock Text="摄像头链路正常" FontSize="15" FontWeight="SemiBold" Foreground="#178118" />
-                                        <TextBlock Text="视频流稳定，虚拟相机已就绪。" FontSize="13" Foreground="#5B6570" />
+                                        <TextBlock x:Name="OverviewCameraLinkTitleText" Text="摄像头链路正常" FontSize="15" FontWeight="SemiBold" Foreground="#178118" />
+                                        <TextBlock x:Name="OverviewCameraLinkDetailText" Text="视频流稳定，虚拟相机已就绪。" FontSize="13" Foreground="#5B6570" />
                                     </StackPanel>
-                                    <Button Grid.Column="2" Width="32" Height="32" Padding="0" CornerRadius="5" Background="Transparent" BorderThickness="0">
+                                    <Button
+                                        x:Name="OverviewCameraLinkBannerCloseButton"
+                                        Grid.Column="2"
+                                        Width="32"
+                                        Height="32"
+                                        Padding="0"
+                                        CornerRadius="5"
+                                        Background="Transparent"
+                                        BorderThickness="0"
+                                        Click="OverviewCameraLinkBannerCloseButton_Click">
                                         <FontIcon Glyph="&#xE711;" FontSize="14" Foreground="#172033" />
                                     </Button>
                                 </Grid>
@@ -2495,6 +2505,7 @@
                                         <TextBlock Text="摄像头预览" FontSize="16" FontWeight="SemiBold" Foreground="#111827" />
 
                                         <Border
+                                            x:Name="OverviewCameraPreviewFrame"
                                             Grid.Row="1"
                                             MinHeight="420"
                                             CornerRadius="7"
@@ -2519,6 +2530,9 @@
                                                             Fill="#4F8BD6FF" />
                                                     </Canvas>
                                                 </Viewbox>
+                                                <Image
+                                                    x:Name="OverviewCameraPreviewImage"
+                                                    Stretch="UniformToFill" />
                                                 <Grid Opacity="0.16">
                                                     <Grid.RowDefinitions>
                                                         <RowDefinition Height="*" />
@@ -2571,17 +2585,29 @@
                                                     BorderBrush="#55FFFFFF">
                                                     <FontIcon Glyph="&#xE740;" FontSize="16" Foreground="White" />
                                                 </Button>
-                                                <Border
-                                                    Width="70"
-                                                    Height="70"
-                                                    CornerRadius="35"
-                                                    Background="#5CFFFFFF"
-                                                    BorderBrush="#BFFFFFFF"
-                                                    BorderThickness="1"
+                                                <StackPanel
+                                                    x:Name="OverviewCameraPreviewPlaceholderPanel"
                                                     HorizontalAlignment="Center"
-                                                    VerticalAlignment="Center">
-                                                    <FontIcon Glyph="&#xE722;" FontSize="36" Foreground="White" />
-                                                </Border>
+                                                    VerticalAlignment="Center"
+                                                    Spacing="10">
+                                                    <Border
+                                                        Width="70"
+                                                        Height="70"
+                                                        CornerRadius="35"
+                                                        Background="#5CFFFFFF"
+                                                        BorderBrush="#BFFFFFFF"
+                                                        BorderThickness="1"
+                                                        HorizontalAlignment="Center">
+                                                        <FontIcon Glyph="&#xE722;" FontSize="36" Foreground="White" />
+                                                    </Border>
+                                                    <TextBlock
+                                                        x:Name="OverviewCameraPreviewPlaceholderText"
+                                                        Text="等待摄像头解码帧"
+                                                        Foreground="White"
+                                                        FontSize="14"
+                                                        FontWeight="SemiBold"
+                                                        HorizontalAlignment="Center" />
+                                                </StackPanel>
                                                 <Border
                                                     Height="76"
                                                     Margin="10"
@@ -2600,7 +2626,7 @@
                                                         </Grid.ColumnDefinitions>
                                                         <StackPanel>
                                                             <StackPanel Orientation="Horizontal" Spacing="6">
-                                                                <TextBlock Text="29.8" FontSize="24" FontWeight="SemiBold" Foreground="White" />
+                                                                <TextBlock x:Name="OverviewCameraPreviewFpsText" Text="--" FontSize="24" FontWeight="SemiBold" Foreground="White" />
                                                                 <TextBlock Text="fps" FontSize="13" Foreground="#F2FFFFFF" VerticalAlignment="Center" />
                                                             </StackPanel>
                                                             <TextBlock Text="帧率" FontSize="13" Foreground="#F2FFFFFF" />
@@ -2608,7 +2634,7 @@
                                                         <Border Grid.Column="1" BorderBrush="#59FFFFFF" BorderThickness="1,0,0,0" Padding="22,0,0,0">
                                                             <StackPanel>
                                                                 <StackPanel Orientation="Horizontal" Spacing="6">
-                                                                    <TextBlock Text="3.2" FontSize="24" FontWeight="SemiBold" Foreground="White" />
+                                                                    <TextBlock x:Name="OverviewCameraPreviewBitrateText" Text="--" FontSize="24" FontWeight="SemiBold" Foreground="White" />
                                                                     <TextBlock Text="Mbps" FontSize="13" Foreground="#F2FFFFFF" VerticalAlignment="Center" />
                                                                 </StackPanel>
                                                                 <TextBlock Text="码率" FontSize="13" Foreground="#F2FFFFFF" />
@@ -2618,7 +2644,7 @@
                                                             <StackPanel>
                                                                 <StackPanel Orientation="Horizontal" Spacing="6">
                                                                     <TextBlock Text="frames" FontSize="13" Foreground="#F2FFFFFF" VerticalAlignment="Center" />
-                                                                    <TextBlock Text="1248" FontSize="24" FontWeight="SemiBold" Foreground="White" />
+                                                                    <TextBlock x:Name="OverviewCameraPreviewFramesText" Text="0" FontSize="24" FontWeight="SemiBold" Foreground="White" />
                                                                 </StackPanel>
                                                                 <TextBlock Text="已接收帧" FontSize="13" Foreground="#F2FFFFFF" />
                                                             </StackPanel>
@@ -2627,7 +2653,7 @@
                                                             <StackPanel>
                                                                 <StackPanel Orientation="Horizontal" Spacing="6">
                                                                     <TextBlock Text="decoded" FontSize="13" Foreground="#F2FFFFFF" VerticalAlignment="Center" />
-                                                                    <TextBlock Text="1244" FontSize="24" FontWeight="SemiBold" Foreground="White" />
+                                                                    <TextBlock x:Name="OverviewCameraPreviewDecodedText" Text="0" FontSize="24" FontWeight="SemiBold" Foreground="White" />
                                                                 </StackPanel>
                                                                 <TextBlock Text="已解码帧" FontSize="13" Foreground="#F2FFFFFF" />
                                                             </StackPanel>
@@ -2654,18 +2680,16 @@
                                                     <ColumnDefinition Width="*" />
                                                 </Grid.ColumnDefinitions>
                                                 <TextBlock Text="相机选择" FontSize="14" Foreground="#111827" VerticalAlignment="Center" />
-                                                <Grid Grid.Column="1" Height="34">
-                                                    <Grid.ColumnDefinitions>
-                                                        <ColumnDefinition Width="*" />
-                                                        <ColumnDefinition Width="*" />
-                                                    </Grid.ColumnDefinitions>
-                                                    <Border Background="#087C89" CornerRadius="4,0,0,4">
-                                                        <TextBlock Text="后置" Foreground="White" FontWeight="SemiBold" HorizontalAlignment="Center" VerticalAlignment="Center" />
-                                                    </Border>
-                                                    <Border Grid.Column="1" BorderBrush="#D8DEE4" BorderThickness="0,1,1,1" CornerRadius="0,4,4,0">
-                                                        <TextBlock Text="前置" Foreground="#111827" HorizontalAlignment="Center" VerticalAlignment="Center" />
-                                                    </Border>
-                                                </Grid>
+                                                <ComboBox
+                                                    x:Name="OverviewCameraPageFacingCombo"
+                                                    Grid.Column="1"
+                                                    Height="34"
+                                                    SelectedIndex="0"
+                                                    SelectionChanged="OverviewCameraPageFacingCombo_SelectionChanged"
+                                                    HorizontalAlignment="Stretch">
+                                                    <ComboBoxItem Content="后置" Tag="back" />
+                                                    <ComboBoxItem Content="前置" Tag="front" />
+                                                </ComboBox>
                                             </Grid>
                                             <Grid ColumnSpacing="12">
                                                 <Grid.ColumnDefinitions>
@@ -2673,9 +2697,15 @@
                                                     <ColumnDefinition Width="*" />
                                                 </Grid.ColumnDefinitions>
                                                 <TextBlock Text="分辨率" FontSize="14" Foreground="#111827" VerticalAlignment="Center" />
-                                                <ComboBox Grid.Column="1" SelectedIndex="0" HorizontalAlignment="Stretch">
-                                                    <ComboBoxItem Content="1280×720 (16:9)" />
-                                                    <ComboBoxItem Content="1920×1080 (16:9)" />
+                                                <ComboBox
+                                                    x:Name="OverviewCameraPageResolutionCombo"
+                                                    Grid.Column="1"
+                                                    SelectedIndex="0"
+                                                    SelectionChanged="OverviewCameraPageResolutionCombo_SelectionChanged"
+                                                    HorizontalAlignment="Stretch">
+                                                    <ComboBoxItem Content="1280×720 (16:9)" Tag="720p" />
+                                                    <ComboBoxItem Content="1920×1080 (16:9)" Tag="1080p" />
+                                                    <ComboBoxItem Content="2560×1440 (16:9)" Tag="2k" />
                                                 </ComboBox>
                                             </Grid>
                                             <Grid ColumnSpacing="12">
@@ -2684,9 +2714,15 @@
                                                     <ColumnDefinition Width="*" />
                                                 </Grid.ColumnDefinitions>
                                                 <TextBlock Text="帧率" FontSize="14" Foreground="#111827" VerticalAlignment="Center" />
-                                                <ComboBox Grid.Column="1" SelectedIndex="0" HorizontalAlignment="Stretch">
-                                                    <ComboBoxItem Content="30 fps" />
-                                                    <ComboBoxItem Content="60 fps" />
+                                                <ComboBox
+                                                    x:Name="OverviewCameraPageFrameRateCombo"
+                                                    Grid.Column="1"
+                                                    SelectedIndex="0"
+                                                    SelectionChanged="OverviewCameraPageFrameRateCombo_SelectionChanged"
+                                                    HorizontalAlignment="Stretch">
+                                                    <ComboBoxItem Content="30 fps" Tag="30" />
+                                                    <ComboBoxItem Content="60 fps" Tag="60" />
+                                                    <ComboBoxItem Content="120 fps" Tag="120" />
                                                 </ComboBox>
                                             </Grid>
                                             <Grid ColumnSpacing="12">
@@ -2695,9 +2731,15 @@
                                                     <ColumnDefinition Width="*" />
                                                 </Grid.ColumnDefinitions>
                                                 <TextBlock Text="编码格式" FontSize="14" Foreground="#111827" VerticalAlignment="Center" />
-                                                <ComboBox Grid.Column="1" SelectedIndex="0" HorizontalAlignment="Stretch">
-                                                    <ComboBoxItem Content="video/avc" />
-                                                    <ComboBoxItem Content="video/hevc" />
+                                                <ComboBox
+                                                    x:Name="OverviewCameraPageCodecCombo"
+                                                    Grid.Column="1"
+                                                    SelectedIndex="0"
+                                                    IsEnabled="False"
+                                                    ToolTipService.ToolTip="编码格式由当前摄像头链路上报，本轮暂不支持手动切换。"
+                                                    HorizontalAlignment="Stretch">
+                                                    <ComboBoxItem Content="video/avc" Tag="video/avc" />
+                                                    <ComboBoxItem Content="video/hevc" Tag="video/hevc" />
                                                 </ComboBox>
                                             </Grid>
                                             <Grid ColumnSpacing="12">
@@ -2706,8 +2748,22 @@
                                                     <ColumnDefinition Width="*" />
                                                 </Grid.ColumnDefinitions>
                                                 <TextBlock Text="端口" FontSize="14" Foreground="#111827" VerticalAlignment="Center" />
-                                                <NumberBox Grid.Column="1" Value="27186" Minimum="1" Maximum="65535" SpinButtonPlacementMode="Compact" />
+                                                <NumberBox
+                                                    x:Name="OverviewCameraPagePortBox"
+                                                    Grid.Column="1"
+                                                    Value="27186"
+                                                    Minimum="1"
+                                                    Maximum="65535"
+                                                    SmallChange="1"
+                                                    ValueChanged="OverviewCameraPagePortBox_ValueChanged"
+                                                    SpinButtonPlacementMode="Compact" />
                                             </Grid>
+                                            <TextBlock
+                                                x:Name="OverviewCameraPageConfigHintText"
+                                                Text="这些配置会在下次启动摄像头管线时生效。"
+                                                FontSize="12"
+                                                Foreground="#5B6570"
+                                                TextWrapping="Wrap" />
                                             <Grid ColumnSpacing="8" RowSpacing="8">
                                                 <Grid.RowDefinitions>
                                                     <RowDefinition Height="Auto" />
@@ -2717,19 +2773,34 @@
                                                     <ColumnDefinition Width="*" />
                                                     <ColumnDefinition Width="*" />
                                                 </Grid.ColumnDefinitions>
-                                                <Button Height="34" Background="#087C89" BorderBrush="#087C89" Foreground="White">
+                                                <Button
+                                                    x:Name="OverviewCameraPreviewStartButton"
+                                                    Height="34"
+                                                    Background="#087C89"
+                                                    BorderBrush="#087C89"
+                                                    Foreground="White"
+                                                    Click="OverviewCameraPreviewStartButton_Click">
                                                     <StackPanel Orientation="Horizontal" Spacing="8" HorizontalAlignment="Center">
                                                         <FontIcon Glyph="&#xE768;" FontSize="14" Foreground="White" />
                                                         <TextBlock Text="开启预览" />
                                                     </StackPanel>
                                                 </Button>
-                                                <Button Grid.Column="1" Height="34">
+                                                <Button
+                                                    x:Name="OverviewCameraPreviewStopButton"
+                                                    Grid.Column="1"
+                                                    Height="34"
+                                                    Click="OverviewCameraPreviewStopButton_Click">
                                                     <StackPanel Orientation="Horizontal" Spacing="8" HorizontalAlignment="Center">
                                                         <FontIcon Glyph="&#xE711;" FontSize="14" />
                                                         <TextBlock Text="关闭预览" />
                                                     </StackPanel>
                                                 </Button>
-                                                <Button Grid.Row="1" Grid.ColumnSpan="2" Height="34">
+                                                <Button
+                                                    x:Name="OverviewCameraReconnectButton"
+                                                    Grid.Row="1"
+                                                    Grid.ColumnSpan="2"
+                                                    Height="34"
+                                                    Click="OverviewCameraReconnectButton_Click">
                                                     <StackPanel Orientation="Horizontal" Spacing="8" HorizontalAlignment="Center">
                                                         <FontIcon Glyph="&#xE72C;" FontSize="14" />
                                                         <TextBlock Text="重新连接" />
@@ -2744,24 +2815,34 @@
                                             <TextBlock Text="虚拟相机" FontSize="16" FontWeight="SemiBold" Foreground="#111827" />
                                             <Grid>
                                                 <TextBlock Text="状态" FontSize="13" Foreground="#111827" />
-                                                <TextBlock Text="已注册" FontSize="13" Foreground="#178118" FontWeight="SemiBold" HorizontalAlignment="Right" />
+                                                <TextBlock x:Name="OverviewVirtualCameraRegistrationText" Text="未注册" FontSize="13" Foreground="#5B6570" FontWeight="SemiBold" HorizontalAlignment="Right" />
                                             </Grid>
                                             <Grid>
                                                 <TextBlock Text="供帧状态" FontSize="13" Foreground="#111827" />
-                                                <TextBlock Text="供帧中" FontSize="13" Foreground="#178118" FontWeight="SemiBold" HorizontalAlignment="Right" />
+                                                <TextBlock x:Name="OverviewVirtualCameraServingText" Text="--" FontSize="13" Foreground="#5B6570" FontWeight="SemiBold" HorizontalAlignment="Right" />
                                             </Grid>
                                             <Grid ColumnSpacing="12">
                                                 <Grid.ColumnDefinitions>
                                                     <ColumnDefinition Width="*" />
                                                     <ColumnDefinition Width="*" />
                                                 </Grid.ColumnDefinitions>
-                                                <Button Click="StartVirtualCameraButton_Click" Height="34" Background="#087C89" BorderBrush="#087C89" Foreground="White">
+                                                <Button
+                                                    x:Name="OverviewStartVirtualCameraButton"
+                                                    Click="StartVirtualCameraButton_Click"
+                                                    Height="34"
+                                                    Background="#087C89"
+                                                    BorderBrush="#087C89"
+                                                    Foreground="White">
                                                     <StackPanel Orientation="Horizontal" Spacing="8" HorizontalAlignment="Center">
                                                         <FontIcon Glyph="&#xE768;" FontSize="14" Foreground="White" />
                                                         <TextBlock Text="注册/启动" />
                                                     </StackPanel>
                                                 </Button>
-                                                <Button Grid.Column="1" Click="StopVirtualCameraButton_Click" Height="34">
+                                                <Button
+                                                    x:Name="OverviewStopVirtualCameraButton"
+                                                    Grid.Column="1"
+                                                    Click="StopVirtualCameraButton_Click"
+                                                    Height="34">
                                                     <StackPanel Orientation="Horizontal" Spacing="8" HorizontalAlignment="Center">
                                                         <FontIcon Glyph="&#xE71A;" FontSize="14" />
                                                         <TextBlock Text="停止" />
@@ -2798,17 +2879,17 @@
                                             </Grid.RowDefinitions>
                                             <TextBlock Text="连接状态" FontSize="12" Foreground="#5B6570" />
                                             <StackPanel Grid.Column="1" Orientation="Horizontal" Spacing="8" HorizontalAlignment="Right">
-                                                <Ellipse Width="8" Height="8" Fill="#178118" VerticalAlignment="Center" />
-                                                <TextBlock Text="已连接" FontSize="13" Foreground="#178118" />
+                                                <Ellipse x:Name="OverviewCameraReceiveStatusDot" Width="8" Height="8" Fill="#6B7280" VerticalAlignment="Center" />
+                                                <TextBlock x:Name="OverviewCameraReceiveStatusText" Text="未启动" FontSize="13" Foreground="#5B6570" />
                                             </StackPanel>
                                             <TextBlock Grid.Row="1" Text="传输协议" FontSize="12" Foreground="#5B6570" />
-                                            <TextBlock Grid.Row="1" Grid.Column="1" Text="TCP" FontSize="13" Foreground="#111827" HorizontalAlignment="Right" />
+                                            <TextBlock x:Name="OverviewCameraReceiveProtocolText" Grid.Row="1" Grid.Column="1" Text="TCP" FontSize="13" Foreground="#111827" HorizontalAlignment="Right" />
                                             <TextBlock Grid.Row="2" Text="本地地址" FontSize="12" Foreground="#5B6570" />
-                                            <TextBlock Grid.Row="2" Grid.Column="1" Text="127.0.0.1:27186" FontSize="13" Foreground="#111827" HorizontalAlignment="Right" />
-                                            <TextBlock Grid.Row="3" Text="链路延迟" FontSize="12" Foreground="#5B6570" />
-                                            <TextBlock Grid.Row="3" Grid.Column="1" Text="18 ms" FontSize="13" Foreground="#111827" HorizontalAlignment="Right" />
-                                            <TextBlock Grid.Row="4" Text="抖动" FontSize="12" Foreground="#5B6570" />
-                                            <TextBlock Grid.Row="4" Grid.Column="1" Text="2 ms" FontSize="13" Foreground="#111827" HorizontalAlignment="Right" />
+                                            <TextBlock x:Name="OverviewCameraReceiveAddressText" Grid.Row="2" Grid.Column="1" Text="127.0.0.1:27186" FontSize="13" Foreground="#111827" HorizontalAlignment="Right" />
+                                            <TextBlock Grid.Row="3" Text="数据包" FontSize="12" Foreground="#5B6570" />
+                                            <TextBlock x:Name="OverviewCameraReceivePacketsText" Grid.Row="3" Grid.Column="1" Text="0" FontSize="13" Foreground="#111827" HorizontalAlignment="Right" />
+                                            <TextBlock Grid.Row="4" Text="最近帧" FontSize="12" Foreground="#5B6570" />
+                                            <TextBlock x:Name="OverviewCameraReceiveLastFrameText" Grid.Row="4" Grid.Column="1" Text="--" FontSize="13" Foreground="#111827" HorizontalAlignment="Right" />
                                         </Grid>
                                     </StackPanel>
                                 </Border>
@@ -2829,15 +2910,15 @@
                                                 <RowDefinition Height="Auto" />
                                             </Grid.RowDefinitions>
                                             <TextBlock Text="编码格式" FontSize="12" Foreground="#5B6570" />
-                                            <TextBlock Grid.Column="1" Text="video/avc (H.264)" FontSize="13" Foreground="#111827" HorizontalAlignment="Right" />
+                                            <TextBlock x:Name="OverviewCameraEncodingCodecText" Grid.Column="1" Text="video/avc" FontSize="13" Foreground="#111827" HorizontalAlignment="Right" />
                                             <TextBlock Grid.Row="1" Text="分辨率" FontSize="12" Foreground="#5B6570" />
-                                            <TextBlock Grid.Row="1" Grid.Column="1" Text="1280×720" FontSize="13" Foreground="#111827" HorizontalAlignment="Right" />
+                                            <TextBlock x:Name="OverviewCameraEncodingResolutionText" Grid.Row="1" Grid.Column="1" Text="1280×720" FontSize="13" Foreground="#111827" HorizontalAlignment="Right" />
                                             <TextBlock Grid.Row="2" Text="帧率" FontSize="12" Foreground="#5B6570" />
-                                            <TextBlock Grid.Row="2" Grid.Column="1" Text="30 fps" FontSize="13" Foreground="#111827" HorizontalAlignment="Right" />
+                                            <TextBlock x:Name="OverviewCameraEncodingFpsText" Grid.Row="2" Grid.Column="1" Text="-- fps" FontSize="13" Foreground="#111827" HorizontalAlignment="Right" />
                                             <TextBlock Grid.Row="3" Text="码率" FontSize="12" Foreground="#5B6570" />
-                                            <TextBlock Grid.Row="3" Grid.Column="1" Text="3.2 Mbps" FontSize="13" Foreground="#111827" HorizontalAlignment="Right" />
-                                            <TextBlock Grid.Row="4" Text="编码延迟" FontSize="12" Foreground="#5B6570" />
-                                            <TextBlock Grid.Row="4" Grid.Column="1" Text="11 ms" FontSize="13" Foreground="#111827" HorizontalAlignment="Right" />
+                                            <TextBlock x:Name="OverviewCameraEncodingBitrateText" Grid.Row="3" Grid.Column="1" Text="--" FontSize="13" Foreground="#111827" HorizontalAlignment="Right" />
+                                            <TextBlock Grid.Row="4" Text="解码延迟" FontSize="12" Foreground="#5B6570" />
+                                            <TextBlock x:Name="OverviewCameraEncodingDecodeLagText" Grid.Row="4" Grid.Column="1" Text="--" FontSize="13" Foreground="#111827" HorizontalAlignment="Right" />
                                         </Grid>
                                     </StackPanel>
                                 </Border>
@@ -2851,12 +2932,12 @@
                                         <TextBlock Text="错误" FontSize="16" FontWeight="SemiBold" Foreground="#111827" />
                                         <StackPanel Grid.Row="1" VerticalAlignment="Center" Spacing="12">
                                             <StackPanel Orientation="Horizontal" Spacing="12" HorizontalAlignment="Center">
-                                                <Border Width="32" Height="32" CornerRadius="16" BorderBrush="#178118" BorderThickness="1.5">
-                                                    <FontIcon Glyph="&#xE73E;" FontSize="17" Foreground="#178118" />
+                                                <Border x:Name="OverviewCameraErrorIconBorder" Width="32" Height="32" CornerRadius="16" BorderBrush="#178118" BorderThickness="1.5">
+                                                    <FontIcon x:Name="OverviewCameraErrorIcon" Glyph="&#xE73E;" FontSize="17" Foreground="#178118" />
                                                 </Border>
-                                                <TextBlock Text="无" FontSize="18" FontWeight="SemiBold" Foreground="#178118" VerticalAlignment="Center" />
+                                                <TextBlock x:Name="OverviewCameraErrorSummaryText" Text="无" FontSize="18" FontWeight="SemiBold" Foreground="#178118" VerticalAlignment="Center" />
                                             </StackPanel>
-                                            <TextBlock Text="未检测到任何错误或警告。" FontSize="13" Foreground="#5B6570" HorizontalAlignment="Center" />
+                                            <TextBlock x:Name="OverviewCameraErrorDetailText" Text="未检测到任何错误或警告。" FontSize="13" Foreground="#5B6570" HorizontalAlignment="Center" TextWrapping="WrapWholeWords" TextAlignment="Center" />
                                         </StackPanel>
                                     </Grid>
                                 </Border>
@@ -2882,32 +2963,43 @@
                                                 <RowDefinition Height="Auto" />
                                                 <RowDefinition Height="Auto" />
                                             </Grid.RowDefinitions>
-                                            <Ellipse Width="8" Height="8" Fill="#178118" VerticalAlignment="Center" />
-                                            <TextBlock Grid.Column="1" Text="虚拟相机已注册" FontSize="12" Foreground="#5B6570" />
-                                            <TextBlock Grid.Column="2" Text="10:42:18" FontSize="12" Foreground="#5B6570" HorizontalAlignment="Right" />
-                                            <Ellipse Grid.Row="1" Width="8" Height="8" Fill="#178118" VerticalAlignment="Center" />
-                                            <TextBlock Grid.Row="1" Grid.Column="1" Text="开始接收视频流" FontSize="12" Foreground="#5B6570" />
-                                            <TextBlock Grid.Row="1" Grid.Column="2" Text="10:42:18" FontSize="12" Foreground="#5B6570" HorizontalAlignment="Right" />
-                                            <Ellipse Grid.Row="2" Width="8" Height="8" Fill="#178118" VerticalAlignment="Center" />
-                                            <TextBlock Grid.Row="2" Grid.Column="1" Text="开始供帧到虚拟相机" FontSize="12" Foreground="#5B6570" />
-                                            <TextBlock Grid.Row="2" Grid.Column="2" Text="10:42:19" FontSize="12" Foreground="#5B6570" HorizontalAlignment="Right" />
-                                            <Ellipse Grid.Row="3" Width="8" Height="8" Fill="#178118" VerticalAlignment="Center" />
-                                            <TextBlock Grid.Row="3" Grid.Column="1" Text="摄像头链路已就绪" FontSize="12" Foreground="#5B6570" />
-                                            <TextBlock Grid.Row="3" Grid.Column="2" Text="10:42:20" FontSize="12" Foreground="#5B6570" HorizontalAlignment="Right" />
-                                            <Ellipse Grid.Row="4" Width="8" Height="8" Fill="#178118" VerticalAlignment="Center" />
-                                            <TextBlock Grid.Row="4" Grid.Column="1" Text="预览已启动" FontSize="12" Foreground="#5B6570" />
-                                            <TextBlock Grid.Row="4" Grid.Column="2" Text="10:42:21" FontSize="12" Foreground="#5B6570" HorizontalAlignment="Right" />
+                                            <Ellipse x:Name="OverviewCameraEventDot0" Width="8" Height="8" Fill="#6B7280" VerticalAlignment="Center" />
+                                            <TextBlock x:Name="OverviewCameraEventText0" Grid.Column="1" Text="暂无摄像头事件" FontSize="12" Foreground="#5B6570" TextTrimming="CharacterEllipsis" />
+                                            <TextBlock x:Name="OverviewCameraEventTime0" Grid.Column="2" Text="--" FontSize="12" Foreground="#5B6570" HorizontalAlignment="Right" />
+                                            <Ellipse x:Name="OverviewCameraEventDot1" Grid.Row="1" Width="8" Height="8" Fill="#6B7280" VerticalAlignment="Center" />
+                                            <TextBlock x:Name="OverviewCameraEventText1" Grid.Row="1" Grid.Column="1" Text="" FontSize="12" Foreground="#5B6570" TextTrimming="CharacterEllipsis" />
+                                            <TextBlock x:Name="OverviewCameraEventTime1" Grid.Row="1" Grid.Column="2" Text="" FontSize="12" Foreground="#5B6570" HorizontalAlignment="Right" />
+                                            <Ellipse x:Name="OverviewCameraEventDot2" Grid.Row="2" Width="8" Height="8" Fill="#6B7280" VerticalAlignment="Center" />
+                                            <TextBlock x:Name="OverviewCameraEventText2" Grid.Row="2" Grid.Column="1" Text="" FontSize="12" Foreground="#5B6570" TextTrimming="CharacterEllipsis" />
+                                            <TextBlock x:Name="OverviewCameraEventTime2" Grid.Row="2" Grid.Column="2" Text="" FontSize="12" Foreground="#5B6570" HorizontalAlignment="Right" />
+                                            <Ellipse x:Name="OverviewCameraEventDot3" Grid.Row="3" Width="8" Height="8" Fill="#6B7280" VerticalAlignment="Center" />
+                                            <TextBlock x:Name="OverviewCameraEventText3" Grid.Row="3" Grid.Column="1" Text="" FontSize="12" Foreground="#5B6570" TextTrimming="CharacterEllipsis" />
+                                            <TextBlock x:Name="OverviewCameraEventTime3" Grid.Row="3" Grid.Column="2" Text="" FontSize="12" Foreground="#5B6570" HorizontalAlignment="Right" />
+                                            <Ellipse x:Name="OverviewCameraEventDot4" Grid.Row="4" Width="8" Height="8" Fill="#6B7280" VerticalAlignment="Center" />
+                                            <TextBlock x:Name="OverviewCameraEventText4" Grid.Row="4" Grid.Column="1" Text="" FontSize="12" Foreground="#5B6570" TextTrimming="CharacterEllipsis" />
+                                            <TextBlock x:Name="OverviewCameraEventTime4" Grid.Row="4" Grid.Column="2" Text="" FontSize="12" Foreground="#5B6570" HorizontalAlignment="Right" />
                                         </Grid>
-                                        <Grid Grid.Row="2" ColumnSpacing="10" Margin="0,12,0,0">
-                                            <Grid.ColumnDefinitions>
-                                                <ColumnDefinition Width="24" />
-                                                <ColumnDefinition Width="*" />
-                                                <ColumnDefinition Width="20" />
-                                            </Grid.ColumnDefinitions>
-                                            <FontIcon Glyph="&#xE713;" FontSize="16" Foreground="#5B6570" />
-                                            <TextBlock Grid.Column="1" Text="查看全部事件" FontSize="13" Foreground="#5B6570" VerticalAlignment="Center" />
-                                            <FontIcon Grid.Column="2" Glyph="&#xE76C;" FontSize="13" Foreground="#5B6570" />
-                                        </Grid>
+                                        <Button
+                                            x:Name="OverviewCameraShowEventsButton"
+                                            Grid.Row="2"
+                                            Margin="0,12,0,0"
+                                            Padding="0"
+                                            HorizontalAlignment="Stretch"
+                                            HorizontalContentAlignment="Stretch"
+                                            Background="Transparent"
+                                            BorderThickness="0"
+                                            Click="OverviewCameraShowEventsButton_Click">
+                                            <Grid ColumnSpacing="10">
+                                                <Grid.ColumnDefinitions>
+                                                    <ColumnDefinition Width="24" />
+                                                    <ColumnDefinition Width="*" />
+                                                    <ColumnDefinition Width="20" />
+                                                </Grid.ColumnDefinitions>
+                                                <FontIcon Glyph="&#xE713;" FontSize="16" Foreground="#5B6570" />
+                                                <TextBlock Grid.Column="1" Text="查看全部事件" FontSize="13" Foreground="#5B6570" VerticalAlignment="Center" />
+                                                <FontIcon Grid.Column="2" Glyph="&#xE76C;" FontSize="13" Foreground="#5B6570" />
+                                            </Grid>
+                                        </Button>
                                     </Grid>
                                 </Border>
                             </Grid>
