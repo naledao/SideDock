@@ -276,58 +276,6 @@
                         </Button>
                     </StackPanel>
 
-                    <StackPanel
-                        x:Name="OverviewSettingsHeaderActions"
-                        Grid.Column="1"
-                        Grid.ColumnSpan="3"
-                        Margin="26,0,0,0"
-                        Orientation="Horizontal"
-                        Spacing="14"
-                        VerticalAlignment="Center"
-                        Visibility="Collapsed">
-                        <Button
-                            x:Name="OverviewSettingsSaveButton"
-                            MinWidth="124"
-                            Height="40"
-                            Padding="18,0"
-                            CornerRadius="6"
-                            Background="#087C89"
-                            BorderBrush="#087C89"
-                            Click="OverviewSettingsSaveButton_Click">
-                            <StackPanel Orientation="Horizontal" Spacing="10">
-                                <FontIcon Glyph="&#xE73E;" FontSize="16" Foreground="White" />
-                                <TextBlock Text="保存" VerticalAlignment="Center" FontSize="14" FontWeight="SemiBold" Foreground="White" />
-                            </StackPanel>
-                        </Button>
-                        <Button
-                            x:Name="OverviewSettingsRestoreButton"
-                            MinWidth="128"
-                            Height="36"
-                            Padding="16,0"
-                            CornerRadius="5"
-                            Background="White"
-                            BorderBrush="#D8DEE4"
-                            Click="OverviewSettingsRestoreButton_Click">
-                            <StackPanel Orientation="Horizontal" Spacing="10">
-                                <FontIcon Glyph="&#xE72C;" FontSize="16" Foreground="#30363D" />
-                                <TextBlock Text="恢复默认" VerticalAlignment="Center" FontSize="13" Foreground="#30363D" />
-                            </StackPanel>
-                        </Button>
-                        <Button
-                            x:Name="OverviewSettingsOpenDataDirectoryButton"
-                            MinWidth="154"
-                            Height="36"
-                            Padding="16,0"
-                            CornerRadius="5"
-                            Background="White"
-                            BorderBrush="#D8DEE4"
-                            Click="OverviewSettingsOpenDataDirectoryButton_Click">
-                            <StackPanel Orientation="Horizontal" Spacing="10">
-                                <FontIcon Glyph="&#xE8B7;" FontSize="16" Foreground="#30363D" />
-                                <TextBlock Text="打开数据目录" VerticalAlignment="Center" FontSize="13" Foreground="#30363D" />
-                            </StackPanel>
-                        </Button>
-                    </StackPanel>
                 </Grid>
             </Border>
 
@@ -472,6 +420,57 @@
                             <StackPanel Orientation="Horizontal" Spacing="10">
                                 <FontIcon Glyph="&#xE8C8;" FontSize="17" Foreground="#111827" />
                                 <TextBlock Text="复制日志" VerticalAlignment="Center" FontSize="13" Foreground="#111827" />
+                            </StackPanel>
+                        </Button>
+                    </StackPanel>
+
+                    <StackPanel
+                        x:Name="OverviewSettingsHeaderActions"
+                        Grid.Column="3"
+                        Orientation="Horizontal"
+                        Spacing="12"
+                        VerticalAlignment="Center"
+                        Visibility="Collapsed">
+                        <Button
+                            x:Name="OverviewSettingsSaveButton"
+                            MinWidth="124"
+                            Height="40"
+                            Padding="18,0"
+                            CornerRadius="6"
+                            Background="#087C89"
+                            BorderBrush="#087C89"
+                            Click="OverviewSettingsSaveButton_Click">
+                            <StackPanel Orientation="Horizontal" Spacing="10">
+                                <FontIcon Glyph="&#xE73E;" FontSize="16" Foreground="White" />
+                                <TextBlock Text="保存" VerticalAlignment="Center" FontSize="14" FontWeight="SemiBold" Foreground="White" />
+                            </StackPanel>
+                        </Button>
+                        <Button
+                            x:Name="OverviewSettingsRestoreButton"
+                            MinWidth="128"
+                            Height="36"
+                            Padding="16,0"
+                            CornerRadius="5"
+                            Background="White"
+                            BorderBrush="#D8DEE4"
+                            Click="OverviewSettingsRestoreButton_Click">
+                            <StackPanel Orientation="Horizontal" Spacing="10">
+                                <FontIcon Glyph="&#xE72C;" FontSize="16" Foreground="#30363D" />
+                                <TextBlock Text="恢复默认" VerticalAlignment="Center" FontSize="13" Foreground="#30363D" />
+                            </StackPanel>
+                        </Button>
+                        <Button
+                            x:Name="OverviewSettingsOpenDataDirectoryButton"
+                            MinWidth="154"
+                            Height="36"
+                            Padding="16,0"
+                            CornerRadius="5"
+                            Background="White"
+                            BorderBrush="#D8DEE4"
+                            Click="OverviewSettingsOpenDataDirectoryButton_Click">
+                            <StackPanel Orientation="Horizontal" Spacing="10">
+                                <FontIcon Glyph="&#xE8B7;" FontSize="16" Foreground="#30363D" />
+                                <TextBlock Text="打开数据目录" VerticalAlignment="Center" FontSize="13" Foreground="#30363D" />
                             </StackPanel>
                         </Button>
                     </StackPanel>
