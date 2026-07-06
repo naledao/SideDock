@@ -15,15 +15,14 @@
         <SolidColorBrush x:Key="DiagBodyBrush" Color="#30363D" />
         <SolidColorBrush x:Key="DiagMutedBrush" Color="#66717D" />
         <SolidColorBrush x:Key="DiagPrimaryBrush" Color="#087C89" />
-        <SolidColorBrush x:Key="DiagPrimarySoftBrush" Color="#E7F4F5" />
+        <SolidColorBrush x:Key="DiagGreenBrush" Color="#168A1A" />
+        <SolidColorBrush x:Key="DiagGreenSoftBrush" Color="#F2FFF0" />
         <SolidColorBrush x:Key="DiagBlueBrush" Color="#1267D8" />
         <SolidColorBrush x:Key="DiagBlueSoftBrush" Color="#EAF4FF" />
-        <SolidColorBrush x:Key="DiagGreenBrush" Color="#238A25" />
-        <SolidColorBrush x:Key="DiagGreenSoftBrush" Color="#ECFAE8" />
-        <SolidColorBrush x:Key="DiagOrangeBrush" Color="#B86B00" />
-        <SolidColorBrush x:Key="DiagRedBrush" Color="#C6281D" />
-        <SolidColorBrush x:Key="DiagPurpleBrush" Color="#5363E6" />
-        <SolidColorBrush x:Key="DiagPurpleSoftBrush" Color="#EEF0FF" />
+        <SolidColorBrush x:Key="DiagPurpleBrush" Color="#4C3DB3" />
+        <SolidColorBrush x:Key="DiagPurpleSoftBrush" Color="#F0EEFF" />
+        <SolidColorBrush x:Key="DiagOrangeBrush" Color="#D77800" />
+        <SolidColorBrush x:Key="DiagOrangeSoftBrush" Color="#FFF4E5" />
 
         <Style x:Key="DiagCardStyle" TargetType="Border">
             <Setter Property="CornerRadius" Value="7" />
@@ -32,87 +31,60 @@
             <Setter Property="BorderThickness" Value="1" />
         </Style>
 
-        <Style x:Key="DiagOutlineButtonStyle" TargetType="Button">
+        <Style x:Key="DiagHeaderButtonStyle" TargetType="Button">
             <Setter Property="Height" Value="38" />
+            <Setter Property="MinWidth" Value="108" />
             <Setter Property="Padding" Value="14,0" />
             <Setter Property="CornerRadius" Value="5" />
             <Setter Property="Background" Value="#FFFFFF" />
             <Setter Property="BorderBrush" Value="{StaticResource DiagStrokeBrush}" />
-            <Setter Property="Foreground" Value="{StaticResource DiagTextBrush}" />
+            <Setter Property="BorderThickness" Value="1" />
         </Style>
 
-        <Style x:Key="DiagIconButtonStyle" TargetType="Button">
-            <Setter Property="Width" Value="38" />
-            <Setter Property="Height" Value="38" />
-            <Setter Property="Padding" Value="0" />
+        <Style x:Key="DiagSmallButtonStyle" TargetType="Button">
+            <Setter Property="Height" Value="34" />
+            <Setter Property="Padding" Value="10,0" />
             <Setter Property="CornerRadius" Value="5" />
-            <Setter Property="Background" Value="Transparent" />
-            <Setter Property="BorderThickness" Value="0" />
+            <Setter Property="Background" Value="#FFFFFF" />
+            <Setter Property="BorderBrush" Value="{StaticResource DiagStrokeBrush}" />
+            <Setter Property="BorderThickness" Value="1" />
         </Style>
     </UserControl.Resources>
 
     <Grid Background="{StaticResource DiagPageBackgroundBrush}">
         <Grid.RowDefinitions>
-            <RowDefinition Height="86" />
+            <RowDefinition Height="78" />
             <RowDefinition Height="*" />
         </Grid.RowDefinitions>
 
         <Grid Padding="28,0,28,0">
             <Grid.ColumnDefinitions>
-                <ColumnDefinition Width="Auto" />
-                <ColumnDefinition Width="Auto" />
                 <ColumnDefinition Width="*" />
                 <ColumnDefinition Width="Auto" />
             </Grid.ColumnDefinitions>
-
             <TextBlock
                 Text="诊断"
                 VerticalAlignment="Center"
                 FontSize="24"
                 FontWeight="SemiBold"
                 Foreground="{StaticResource DiagTextBrush}" />
-
-            <Button
-                Grid.Column="1"
-                Margin="36,0,0,0"
-                MinWidth="170"
-                Height="48"
-                Padding="22,0"
-                CornerRadius="7"
-                Background="{StaticResource DiagPrimaryBrush}"
-                BorderBrush="{StaticResource DiagPrimaryBrush}">
-                <StackPanel Orientation="Horizontal" Spacing="12">
-                    <FontIcon Glyph="&#xE768;" FontSize="17" Foreground="White" />
-                    <TextBlock
-                        Text="启动主机"
-                        VerticalAlignment="Center"
-                        FontSize="16"
-                        FontWeight="SemiBold"
-                        Foreground="White" />
-                </StackPanel>
-            </Button>
-
-            <StackPanel
-                Grid.Column="3"
-                Orientation="Horizontal"
-                Spacing="28"
-                VerticalAlignment="Center">
-                <Button Style="{StaticResource DiagIconButtonStyle}">
-                    <StackPanel Orientation="Horizontal" Spacing="8">
-                        <FontIcon Glyph="&#xE72C;" FontSize="20" Foreground="#30363D" />
-                        <TextBlock Text="刷新" VerticalAlignment="Center" FontSize="14" Foreground="#30363D" />
+            <StackPanel Grid.Column="1" Orientation="Horizontal" Spacing="18" VerticalAlignment="Center">
+                <Button Style="{StaticResource DiagHeaderButtonStyle}">
+                    <StackPanel Orientation="Horizontal" Spacing="10">
+                        <FontIcon Glyph="&#xE8C8;" FontSize="17" Foreground="#30363D" />
+                        <TextBlock Text="复制全部" VerticalAlignment="Center" FontSize="14" Foreground="{StaticResource DiagBodyBrush}" />
                     </StackPanel>
                 </Button>
-                <Button
-                    MinWidth="96"
-                    Height="38"
-                    Padding="0"
-                    Background="Transparent"
-                    BorderThickness="0">
-                    <StackPanel Orientation="Horizontal" Spacing="8">
-                        <FontIcon Glyph="&#xE713;" FontSize="20" Foreground="#30363D" />
-                        <TextBlock Text="操作" VerticalAlignment="Center" FontSize="14" Foreground="#30363D" />
-                        <FontIcon Glyph="&#xE70D;" FontSize="12" Foreground="#30363D" />
+                <Button Style="{StaticResource DiagHeaderButtonStyle}" MinWidth="126">
+                    <StackPanel Orientation="Horizontal" Spacing="10">
+                        <FontIcon Glyph="&#xE898;" FontSize="17" Foreground="#30363D" />
+                        <TextBlock Text="导出日志" VerticalAlignment="Center" FontSize="14" Foreground="{StaticResource DiagBodyBrush}" />
+                    </StackPanel>
+                </Button>
+                <Button Style="{StaticResource DiagHeaderButtonStyle}">
+                    <StackPanel Orientation="Horizontal" Spacing="10">
+                        <FontIcon Glyph="&#xE72C;" FontSize="18" Foreground="#30363D" />
+                        <TextBlock Text="刷新" VerticalAlignment="Center" FontSize="14" Foreground="{StaticResource DiagBodyBrush}" />
                     </StackPanel>
                 </Button>
             </StackPanel>
@@ -120,89 +92,40 @@
 
         <ScrollViewer
             Grid.Row="1"
-            Padding="28,0,28,0"
+            Padding="28,0,28,22"
             VerticalScrollBarVisibility="Auto"
             HorizontalScrollBarVisibility="Disabled">
-            <Grid RowSpacing="14" Margin="0,0,0,22">
+            <Grid RowSpacing="14">
                 <Grid.RowDefinitions>
                     <RowDefinition Height="70" />
-                    <RowDefinition Height="96" />
-                    <RowDefinition Height="118" />
-                    <RowDefinition Height="520" />
-                    <RowDefinition Height="250" />
+                    <RowDefinition Height="106" />
+                    <RowDefinition Height="402" />
+                    <RowDefinition Height="236" />
                 </Grid.RowDefinitions>
 
                 <Border
                     Style="{StaticResource DiagCardStyle}"
-                    Padding="22,0">
-                    <Grid ColumnSpacing="20">
+                    Padding="16,0"
+                    Background="{StaticResource DiagGreenSoftBrush}"
+                    BorderBrush="#78BD78">
+                    <Grid ColumnSpacing="18">
                         <Grid.ColumnDefinitions>
-                            <ColumnDefinition Width="Auto" />
+                            <ColumnDefinition Width="44" />
                             <ColumnDefinition Width="*" />
                             <ColumnDefinition Width="Auto" />
                         </Grid.ColumnDefinitions>
-                        <Border
-                            Width="44"
-                            Height="44"
-                            CornerRadius="22"
-                            Background="#747B86">
-                            <FontIcon Glyph="&#xE711;" FontSize="22" Foreground="White" />
+                        <Border Width="38" Height="38" CornerRadius="19" Background="{StaticResource DiagGreenBrush}">
+                            <FontIcon Glyph="&#xE73E;" FontSize="22" Foreground="#FFFFFF" />
                         </Border>
                         <StackPanel Grid.Column="1" VerticalAlignment="Center" Spacing="4">
-                            <TextBlock
-                                Text="等待 Android 设备"
-                                FontSize="18"
-                                FontWeight="SemiBold"
-                                Foreground="#66717D" />
-                            <TextBlock
-                                Text="检测到 2 台 Android 设备，请选择后启动。"
-                                FontSize="13"
-                                Foreground="#66717D" />
+                            <TextBlock Text="运行诊断正常" FontSize="18" FontWeight="SemiBold" Foreground="{StaticResource DiagGreenBrush}" />
+                            <TextBlock Text="所有关键服务运行正常，系统性能良好。" FontSize="13" Foreground="{StaticResource DiagBodyBrush}" />
                         </StackPanel>
-                        <Button
-                            Grid.Column="2"
-                            Width="32"
-                            Height="32"
-                            Padding="0"
-                            Background="Transparent"
-                            BorderThickness="0">
-                            <FontIcon Glyph="&#xE711;" FontSize="14" Foreground="#30363D" />
-                        </Button>
+                        <FontIcon Grid.Column="2" Glyph="&#xE711;" FontSize="14" Foreground="#30363D" VerticalAlignment="Center" />
                     </Grid>
                 </Border>
 
-                <Border
-                    Grid.Row="1"
-                    Style="{StaticResource DiagCardStyle}"
-                    Padding="24,0">
-                    <Grid ColumnSpacing="20">
-                        <Grid.ColumnDefinitions>
-                            <ColumnDefinition Width="Auto" />
-                            <ColumnDefinition Width="*" />
-                        </Grid.ColumnDefinitions>
-                        <Border
-                            Width="52"
-                            Height="52"
-                            CornerRadius="26"
-                            Background="{StaticResource DiagPrimaryBrush}">
-                            <FontIcon Glyph="&#xE9D9;" FontSize="26" Foreground="White" />
-                        </Border>
-                        <StackPanel Grid.Column="1" VerticalAlignment="Center" Spacing="5">
-                            <TextBlock
-                                Text="详细诊断"
-                                FontSize="18"
-                                FontWeight="SemiBold"
-                                Foreground="{StaticResource DiagTextBrush}" />
-                            <TextBlock
-                                Text="详细诊断区域已打开。运行指标、视频链路、虚拟显示器、摄像头、音频和日志可从诊断详情中查看与复制。"
-                                FontSize="13"
-                                Foreground="{StaticResource DiagBodyBrush}"
-                                TextWrapping="Wrap" />
-                        </StackPanel>
-                    </Grid>
-                </Border>
-
-                <Grid Grid.Row="2" ColumnSpacing="18">
+                <Grid Grid.Row="1" ColumnSpacing="18">
                     <Grid.ColumnDefinitions>
                         <ColumnDefinition Width="*" />
                         <ColumnDefinition Width="*" />
@@ -210,514 +133,505 @@
                         <ColumnDefinition Width="*" />
                     </Grid.ColumnDefinitions>
 
-                    <Border Style="{StaticResource DiagCardStyle}" Padding="22,0">
-                        <Grid ColumnSpacing="20">
+                    <Border Style="{StaticResource DiagCardStyle}" Padding="14,0">
+                        <Grid ColumnSpacing="14">
                             <Grid.ColumnDefinitions>
-                                <ColumnDefinition Width="76" />
-                                <ColumnDefinition Width="*" />
-                            </Grid.ColumnDefinitions>
-                            <Border
-                                Width="66"
-                                Height="68"
-                                CornerRadius="8"
-                                Background="{StaticResource DiagGreenSoftBrush}">
-                                <FontIcon Glyph="&#xE8EA;" FontSize="33" Foreground="{StaticResource DiagGreenBrush}" />
-                            </Border>
-                            <StackPanel Grid.Column="1" VerticalAlignment="Center" Spacing="5">
-                                <TextBlock Text="Android 设备" FontSize="13" Foreground="#30363D" />
-                                <TextBlock Text="需选择设备" FontSize="22" FontWeight="SemiBold" Foreground="{StaticResource DiagOrangeBrush}" />
-                                <TextBlock Text="检测到 2 台已授权设备" FontSize="12" Foreground="#30363D" />
-                            </StackPanel>
-                        </Grid>
-                    </Border>
-
-                    <Border Grid.Column="1" Style="{StaticResource DiagCardStyle}" Padding="22,0">
-                        <Grid ColumnSpacing="20">
-                            <Grid.ColumnDefinitions>
-                                <ColumnDefinition Width="76" />
+                                <ColumnDefinition Width="66" />
                                 <ColumnDefinition Width="*" />
                                 <ColumnDefinition Width="Auto" />
                             </Grid.ColumnDefinitions>
-                            <Border
-                                Width="66"
-                                Height="68"
-                                CornerRadius="8"
-                                Background="#EEF5FF">
-                                <FontIcon Glyph="&#xE713;" FontSize="33" Foreground="{StaticResource DiagBlueBrush}" />
+                            <Border Width="58" Height="60" CornerRadius="8" Background="{StaticResource DiagBlueSoftBrush}">
+                                <FontIcon Glyph="&#xE7F4;" FontSize="31" Foreground="{StaticResource DiagBlueBrush}" />
                             </Border>
                             <StackPanel Grid.Column="1" VerticalAlignment="Center" Spacing="5">
-                                <TextBlock Text="主机服务" FontSize="13" Foreground="#30363D" />
-                                <TextBlock Text="未启动" FontSize="22" FontWeight="SemiBold" Foreground="{StaticResource DiagRedBrush}" />
-                                <TextBlock Text="等待启动" FontSize="12" Foreground="#30363D" />
+                                <TextBlock Text="Host" FontSize="13" Foreground="{StaticResource DiagBodyBrush}" TextTrimming="CharacterEllipsis" />
+                                <TextBlock Text="运行中" FontSize="22" FontWeight="SemiBold" Foreground="{StaticResource DiagGreenBrush}" TextTrimming="CharacterEllipsis" />
+                                <TextBlock Text="正常运行 01:24:36" FontSize="12" Foreground="{StaticResource DiagBodyBrush}" TextTrimming="CharacterEllipsis" />
                             </StackPanel>
-                            <Ellipse Grid.Column="2" Width="9" Height="9" Fill="#AEB6C0" VerticalAlignment="Top" />
+                            <Ellipse Grid.Column="2" Width="8" Height="8" Fill="{StaticResource DiagGreenBrush}" VerticalAlignment="Top" Margin="0,18,0,0" />
                         </Grid>
                     </Border>
 
-                    <Border Grid.Column="2" Style="{StaticResource DiagCardStyle}" Padding="22,0">
-                        <Grid ColumnSpacing="20">
+                    <Border Grid.Column="1" Style="{StaticResource DiagCardStyle}" Padding="14,0">
+                        <Grid ColumnSpacing="14">
                             <Grid.ColumnDefinitions>
-                                <ColumnDefinition Width="76" />
+                                <ColumnDefinition Width="66" />
                                 <ColumnDefinition Width="*" />
                                 <ColumnDefinition Width="Auto" />
                             </Grid.ColumnDefinitions>
-                            <Border
-                                Width="66"
-                                Height="68"
-                                CornerRadius="8"
-                                Background="{StaticResource DiagBlueSoftBrush}">
-                                <FontIcon Glyph="&#xE714;" FontSize="33" Foreground="{StaticResource DiagBlueBrush}" />
+                            <Border Width="58" Height="60" CornerRadius="8" Background="#EEF9ED">
+                                <FontIcon Glyph="&#xE71B;" FontSize="31" Foreground="{StaticResource DiagGreenBrush}" />
                             </Border>
                             <StackPanel Grid.Column="1" VerticalAlignment="Center" Spacing="5">
-                                <TextBlock Text="视频链路" FontSize="13" Foreground="#30363D" />
-                                <TextBlock Text="720p 120 fps" FontSize="21" FontWeight="SemiBold" Foreground="{StaticResource DiagBlueBrush}" />
-                                <TextBlock Text="H.264 · 20 Mbps" FontSize="12" Foreground="#30363D" />
+                                <TextBlock Text="ADB reverse" FontSize="13" Foreground="{StaticResource DiagBodyBrush}" TextTrimming="CharacterEllipsis" />
+                                <TextBlock Text="正常" FontSize="22" FontWeight="SemiBold" Foreground="{StaticResource DiagGreenBrush}" TextTrimming="CharacterEllipsis" />
+                                <TextBlock Text="4 个端口已映射" FontSize="12" Foreground="{StaticResource DiagBodyBrush}" TextTrimming="CharacterEllipsis" />
                             </StackPanel>
-                            <Ellipse Grid.Column="2" Width="9" Height="9" Fill="{StaticResource DiagGreenBrush}" VerticalAlignment="Top" />
+                            <Ellipse Grid.Column="2" Width="8" Height="8" Fill="{StaticResource DiagGreenBrush}" VerticalAlignment="Top" Margin="0,18,0,0" />
                         </Grid>
                     </Border>
 
-                    <Border Grid.Column="3" Style="{StaticResource DiagCardStyle}" Padding="22,0">
-                        <Grid ColumnSpacing="20">
+                    <Border Grid.Column="2" Style="{StaticResource DiagCardStyle}" Padding="14,0">
+                        <Grid ColumnSpacing="14">
                             <Grid.ColumnDefinitions>
-                                <ColumnDefinition Width="76" />
+                                <ColumnDefinition Width="66" />
                                 <ColumnDefinition Width="*" />
                                 <ColumnDefinition Width="Auto" />
                             </Grid.ColumnDefinitions>
-                            <Border
-                                Width="66"
-                                Height="68"
-                                CornerRadius="8"
-                                Background="{StaticResource DiagGreenSoftBrush}">
-                                <FontIcon Glyph="&#xE916;" FontSize="33" Foreground="{StaticResource DiagGreenBrush}" />
+                            <Border Width="58" Height="60" CornerRadius="8" Background="{StaticResource DiagPurpleSoftBrush}">
+                                <FontIcon Glyph="&#xE9D2;" FontSize="32" Foreground="{StaticResource DiagPurpleBrush}" />
                             </Border>
                             <StackPanel Grid.Column="1" VerticalAlignment="Center" Spacing="5">
-                                <TextBlock Text="端到端延迟" FontSize="13" Foreground="#30363D" />
-                                <TextBlock Text="暂无数据" FontSize="22" FontWeight="SemiBold" Foreground="#66717D" />
-                                <TextBlock Text="主机未运行" FontSize="12" Foreground="#30363D" />
+                                <TextBlock Text="丢包率" FontSize="13" Foreground="{StaticResource DiagBodyBrush}" TextTrimming="CharacterEllipsis" />
+                                <TextBlock Text="0.0%" FontSize="22" FontWeight="SemiBold" Foreground="{StaticResource DiagGreenBrush}" TextTrimming="CharacterEllipsis" />
+                                <TextBlock Text="良好" FontSize="12" Foreground="{StaticResource DiagBodyBrush}" TextTrimming="CharacterEllipsis" />
                             </StackPanel>
-                            <Ellipse Grid.Column="2" Width="9" Height="9" Fill="#AEB6C0" VerticalAlignment="Top" />
+                            <Ellipse Grid.Column="2" Width="8" Height="8" Fill="{StaticResource DiagGreenBrush}" VerticalAlignment="Top" Margin="0,18,0,0" />
+                        </Grid>
+                    </Border>
+
+                    <Border Grid.Column="3" Style="{StaticResource DiagCardStyle}" Padding="14,0">
+                        <Grid ColumnSpacing="14">
+                            <Grid.ColumnDefinitions>
+                                <ColumnDefinition Width="66" />
+                                <ColumnDefinition Width="*" />
+                                <ColumnDefinition Width="Auto" />
+                            </Grid.ColumnDefinitions>
+                            <Border Width="58" Height="60" CornerRadius="8" Background="{StaticResource DiagOrangeSoftBrush}">
+                                <FontIcon Glyph="&#xE916;" FontSize="32" Foreground="{StaticResource DiagOrangeBrush}" />
+                            </Border>
+                            <StackPanel Grid.Column="1" VerticalAlignment="Center" Spacing="5">
+                                <TextBlock Text="延迟" FontSize="13" Foreground="{StaticResource DiagBodyBrush}" TextTrimming="CharacterEllipsis" />
+                                <TextBlock Text="22 ms" FontSize="22" FontWeight="SemiBold" Foreground="{StaticResource DiagGreenBrush}" TextTrimming="CharacterEllipsis" />
+                                <TextBlock Text="优秀" FontSize="12" Foreground="{StaticResource DiagBodyBrush}" TextTrimming="CharacterEllipsis" />
+                            </StackPanel>
+                            <Ellipse Grid.Column="2" Width="8" Height="8" Fill="{StaticResource DiagGreenBrush}" VerticalAlignment="Top" Margin="0,18,0,0" />
                         </Grid>
                     </Border>
                 </Grid>
 
-                <Grid Grid.Row="3" ColumnSpacing="22">
+                <Grid Grid.Row="2" ColumnSpacing="22">
                     <Grid.ColumnDefinitions>
-                        <ColumnDefinition Width="1.75*" />
-                        <ColumnDefinition Width="1*" />
-                    </Grid.ColumnDefinitions>
-
-                    <Border Style="{StaticResource DiagCardStyle}" Padding="18">
-                        <Grid RowSpacing="12">
-                            <Grid.RowDefinitions>
-                                <RowDefinition Height="Auto" />
-                                <RowDefinition Height="*" />
-                            </Grid.RowDefinitions>
-                            <TextBlock
-                                Text="实时副屏预览"
-                                FontSize="16"
-                                FontWeight="SemiBold"
-                                Foreground="{StaticResource DiagTextBrush}" />
-                            <Border
-                                Grid.Row="1"
-                                CornerRadius="8"
-                                Background="#08111F"
-                                BorderBrush="#152235"
-                                BorderThickness="1">
-                                <Grid>
-                                    <Border
-                                        Width="98"
-                                        Height="36"
-                                        Margin="30,20,0,0"
-                                        Padding="12,0"
-                                        HorizontalAlignment="Left"
-                                        VerticalAlignment="Top"
-                                        CornerRadius="7"
-                                        Background="#101A2A">
-                                        <TextBlock
-                                            Text="主机未启动"
-                                            VerticalAlignment="Center"
-                                            FontSize="13"
-                                            Foreground="#DFE6EE" />
-                                    </Border>
-
-                                    <StackPanel
-                                        Margin="0,20,18,0"
-                                        Orientation="Horizontal"
-                                        Spacing="10"
-                                        HorizontalAlignment="Right"
-                                        VerticalAlignment="Top">
-                                        <Button Style="{StaticResource DiagOutlineButtonStyle}" Width="46" Padding="0" Background="#0E1828" BorderBrush="#293449">
-                                            <FontIcon Glyph="&#xE740;" FontSize="18" Foreground="#DFE6EE" />
-                                        </Button>
-                                        <Button Style="{StaticResource DiagOutlineButtonStyle}" Width="46" Padding="0" Background="#0E1828" BorderBrush="#293449">
-                                            <FontIcon Glyph="&#xE890;" FontSize="18" Foreground="#DFE6EE" />
-                                        </Button>
-                                        <Button Style="{StaticResource DiagOutlineButtonStyle}" Width="46" Padding="0" Background="#0E1828" BorderBrush="#293449">
-                                            <FontIcon Glyph="&#xE713;" FontSize="18" Foreground="#DFE6EE" />
-                                        </Button>
-                                    </StackPanel>
-
-                                    <StackPanel HorizontalAlignment="Center" VerticalAlignment="Center" Spacing="16">
-                                        <FontIcon Glyph="&#xE7F4;" FontSize="42" Foreground="#6FD4FF" />
-                                        <TextBlock
-                                            Text="启动主机后显示副屏实时画面"
-                                            FontSize="16"
-                                            Foreground="#DFE6EE"
-                                            TextAlignment="Center" />
-                                    </StackPanel>
-                                </Grid>
-                            </Border>
-                        </Grid>
-                    </Border>
-
-                    <Border Grid.Column="1" Style="{StaticResource DiagCardStyle}" Padding="20,18">
-                        <Grid RowSpacing="16">
-                            <Grid.RowDefinitions>
-                                <RowDefinition Height="Auto" />
-                                <RowDefinition Height="1" />
-                                <RowDefinition Height="*" />
-                                <RowDefinition Height="Auto" />
-                            </Grid.RowDefinitions>
-                            <Grid>
-                                <Grid.ColumnDefinitions>
-                                    <ColumnDefinition Width="*" />
-                                    <ColumnDefinition Width="Auto" />
-                                </Grid.ColumnDefinitions>
-                                <TextBlock Text="连接向导" FontSize="16" FontWeight="SemiBold" Foreground="{StaticResource DiagTextBrush}" />
-                                <Button Grid.Column="1" Style="{StaticResource DiagOutlineButtonStyle}" Height="38">
-                                    <StackPanel Orientation="Horizontal" Spacing="8">
-                                        <FontIcon Glyph="&#xE90F;" FontSize="17" Foreground="#30363D" />
-                                        <TextBlock Text="修复端点" VerticalAlignment="Center" FontSize="13" Foreground="#30363D" />
-                                    </StackPanel>
-                                </Button>
-                            </Grid>
-                            <Rectangle Grid.Row="1" Fill="{StaticResource DiagSoftStrokeBrush}" />
-
-                            <Grid Grid.Row="2">
-                                <Grid.ColumnDefinitions>
-                                    <ColumnDefinition Width="54" />
-                                    <ColumnDefinition Width="*" />
-                                    <ColumnDefinition Width="Auto" />
-                                </Grid.ColumnDefinitions>
-                                <Grid.RowDefinitions>
-                                    <RowDefinition Height="86" />
-                                    <RowDefinition Height="86" />
-                                    <RowDefinition Height="86" />
-                                    <RowDefinition Height="86" />
-                                </Grid.RowDefinitions>
-
-                                <Rectangle
-                                    Grid.RowSpan="4"
-                                    Width="1"
-                                    Fill="#CDD6DF"
-                                    HorizontalAlignment="Center"
-                                    Margin="0,42,0,42" />
-
-                                <Border
-                                    Width="38"
-                                    Height="38"
-                                    CornerRadius="19"
-                                    Background="#FFF8EC"
-                                    BorderBrush="#F5A623"
-                                    BorderThickness="1">
-                                    <TextBlock Text="1" HorizontalAlignment="Center" VerticalAlignment="Center" FontSize="14" Foreground="#B86B00" />
-                                </Border>
-                                <StackPanel Grid.Column="1" VerticalAlignment="Center" Spacing="5">
-                                    <TextBlock Text="选择设备" FontSize="15" FontWeight="SemiBold" Foreground="#30363D" />
-                                    <TextBlock Text="检测到 2 台设备，请选择一台" FontSize="13" FontWeight="SemiBold" Foreground="{StaticResource DiagOrangeBrush}" />
-                                </StackPanel>
-                                <FontIcon Grid.Column="2" Glyph="&#xE7BA;" FontSize="18" Foreground="{StaticResource DiagOrangeBrush}" VerticalAlignment="Center" />
-
-                                <Border Grid.Row="1" Width="38" Height="38" CornerRadius="19" Background="#F3F6FA" BorderBrush="#D8DEE4" BorderThickness="1">
-                                    <TextBlock Text="2" HorizontalAlignment="Center" VerticalAlignment="Center" FontSize="14" Foreground="#66717D" />
-                                </Border>
-                                <StackPanel Grid.Row="1" Grid.Column="1" VerticalAlignment="Center" Spacing="5">
-                                    <TextBlock Text="ADB reverse" FontSize="15" FontWeight="SemiBold" Foreground="#30363D" />
-                                    <TextBlock Text="随启动主机自动检查" FontSize="13" Foreground="#66717D" />
-                                </StackPanel>
-                                <FontIcon Grid.Row="1" Grid.Column="2" Glyph="&#xE711;" FontSize="16" Foreground="#66717D" VerticalAlignment="Center" />
-
-                                <Border Grid.Row="2" Width="38" Height="38" CornerRadius="19" Background="#F3F6FA" BorderBrush="#D8DEE4" BorderThickness="1">
-                                    <TextBlock Text="3" HorizontalAlignment="Center" VerticalAlignment="Center" FontSize="14" Foreground="#66717D" />
-                                </Border>
-                                <StackPanel Grid.Row="2" Grid.Column="1" VerticalAlignment="Center" Spacing="5">
-                                    <TextBlock Text="启动服务" FontSize="15" FontWeight="SemiBold" Foreground="#30363D" />
-                                    <TextBlock Text="等待启动主机" FontSize="13" Foreground="#66717D" />
-                                </StackPanel>
-                                <FontIcon Grid.Row="2" Grid.Column="2" Glyph="&#xE711;" FontSize="16" Foreground="#66717D" VerticalAlignment="Center" />
-
-                                <Border Grid.Row="3" Width="38" Height="38" CornerRadius="19" Background="#F3F6FA" BorderBrush="#D8DEE4" BorderThickness="1">
-                                    <TextBlock Text="4" HorizontalAlignment="Center" VerticalAlignment="Center" FontSize="14" Foreground="#66717D" />
-                                </Border>
-                                <StackPanel Grid.Row="3" Grid.Column="1" VerticalAlignment="Center" Spacing="5">
-                                    <TextBlock Text="连接链路" FontSize="15" FontWeight="SemiBold" Foreground="#30363D" />
-                                    <TextBlock Text="等待主机运行" FontSize="13" Foreground="#66717D" />
-                                </StackPanel>
-                                <FontIcon Grid.Row="3" Grid.Column="2" Glyph="&#xE711;" FontSize="16" Foreground="#66717D" VerticalAlignment="Center" />
-                            </Grid>
-
-                            <Grid Grid.Row="3">
-                                <Grid.ColumnDefinitions>
-                                    <ColumnDefinition Width="Auto" />
-                                    <ColumnDefinition Width="*" />
-                                    <ColumnDefinition Width="Auto" />
-                                </Grid.ColumnDefinitions>
-                                <Button
-                                    IsEnabled="False"
-                                    MinWidth="132"
-                                    Height="44"
-                                    Padding="18,0"
-                                    CornerRadius="7"
-                                    Background="#F4F6F8"
-                                    BorderBrush="#E1E6EA">
-                                    <TextBlock Text="断开连接" FontSize="14" />
-                                </Button>
-                                <Button Grid.Column="2" Width="56" Height="44" Padding="0" CornerRadius="7" Background="#FFFFFF" BorderBrush="{StaticResource DiagSoftStrokeBrush}">
-                                    <FontIcon Glyph="&#xE712;" FontSize="20" Foreground="#30363D" />
-                                </Button>
-                            </Grid>
-                        </Grid>
-                    </Border>
-                </Grid>
-
-                <Grid Grid.Row="4" ColumnSpacing="16">
-                    <Grid.ColumnDefinitions>
-                        <ColumnDefinition Width="*" />
-                        <ColumnDefinition Width="*" />
-                        <ColumnDefinition Width="*" />
-                        <ColumnDefinition Width="1.18*" />
+                        <ColumnDefinition Width="1.78*" />
+                        <ColumnDefinition Width="0.88*" />
                     </Grid.ColumnDefinitions>
 
                     <Border Style="{StaticResource DiagCardStyle}" Padding="16">
-                        <Grid RowSpacing="10">
+                        <Grid RowSpacing="12">
                             <Grid.RowDefinitions>
-                                <RowDefinition Height="Auto" />
+                                <RowDefinition Height="36" />
                                 <RowDefinition Height="*" />
-                                <RowDefinition Height="Auto" />
                             </Grid.RowDefinitions>
-                            <Grid ColumnSpacing="14">
-                                <Grid.ColumnDefinitions>
-                                    <ColumnDefinition Width="54" />
-                                    <ColumnDefinition Width="*" />
-                                    <ColumnDefinition Width="Auto" />
-                                </Grid.ColumnDefinitions>
-                                <Border Width="52" Height="52" CornerRadius="26" Background="{StaticResource DiagPrimaryBrush}">
-                                    <FontIcon Glyph="&#xE7F4;" FontSize="27" Foreground="White" />
-                                </Border>
-                                <TextBlock Grid.Column="1" Text="虚拟显示器" VerticalAlignment="Center" FontSize="16" FontWeight="SemiBold" Foreground="{StaticResource DiagTextBrush}" />
-                                <ToggleSwitch Grid.Column="2" IsOn="False" VerticalAlignment="Center" />
+                            <Grid>
+                                <TextBlock Text="实时日志" FontSize="16" FontWeight="SemiBold" Foreground="{StaticResource DiagTextBrush}" VerticalAlignment="Center" />
+                                <StackPanel Orientation="Horizontal" HorizontalAlignment="Right" Spacing="12" VerticalAlignment="Center">
+                                    <TextBlock Text="自动滚动" FontSize="13" Foreground="{StaticResource DiagBodyBrush}" VerticalAlignment="Center" />
+                                    <Border Width="42" Height="22" CornerRadius="11" Background="{StaticResource DiagPrimaryBrush}">
+                                        <Ellipse Width="16" Height="16" Margin="22,0,4,0" Fill="#FFFFFF" />
+                                    </Border>
+                                    <Button Style="{StaticResource DiagSmallButtonStyle}" Width="38" Padding="0">
+                                        <FontIcon Glyph="&#xE71C;" FontSize="16" Foreground="#30363D" />
+                                    </Button>
+                                    <Button Style="{StaticResource DiagSmallButtonStyle}" MinWidth="52">
+                                        <TextBlock Text="清空" FontSize="13" Foreground="{StaticResource DiagBodyBrush}" />
+                                    </Button>
+                                </StackPanel>
                             </Grid>
-                            <Grid Grid.Row="1" RowSpacing="8" ColumnSpacing="12">
+
+                            <Grid Grid.Row="1" RowSpacing="12">
                                 <Grid.RowDefinitions>
-                                    <RowDefinition Height="Auto" />
-                                    <RowDefinition Height="Auto" />
-                                    <RowDefinition Height="Auto" />
+                                    <RowDefinition Height="30" />
+                                    <RowDefinition Height="*" />
                                 </Grid.RowDefinitions>
-                                <Grid.ColumnDefinitions>
-                                    <ColumnDefinition Width="76" />
-                                    <ColumnDefinition Width="*" />
-                                </Grid.ColumnDefinitions>
-                                <TextBlock Text="状态" FontSize="13" Foreground="#30363D" />
-                                <TextBlock Grid.Column="1" Text="未运行" HorizontalAlignment="Right" FontSize="13" Foreground="#66717D" />
-                                <TextBlock Grid.Row="1" Text="分辨率" FontSize="13" Foreground="#30363D" />
-                                <ComboBox Grid.Row="1" Grid.Column="1" SelectedIndex="0" HorizontalAlignment="Stretch" Height="34">
-                                    <ComboBoxItem Content="720p" />
-                                </ComboBox>
-                                <TextBlock Grid.Row="2" Text="帧率" FontSize="13" Foreground="#30363D" />
-                                <ComboBox Grid.Row="2" Grid.Column="1" SelectedIndex="0" HorizontalAlignment="Stretch" Height="34">
-                                    <ComboBoxItem Content="120" />
-                                </ComboBox>
-                            </Grid>
-                            <Grid Grid.Row="2" ColumnSpacing="10">
-                                <Grid.ColumnDefinitions>
-                                    <ColumnDefinition Width="*" />
-                                    <ColumnDefinition Width="*" />
-                                </Grid.ColumnDefinitions>
-                                <Button Height="34" Padding="8,0" Background="#FFFFFF" BorderBrush="{StaticResource DiagStrokeBrush}">
-                                    <StackPanel Orientation="Horizontal" Spacing="6">
-                                        <FontIcon Glyph="&#xE896;" FontSize="15" />
-                                        <TextBlock Text="安装/修复" FontSize="13" />
-                                    </StackPanel>
-                                </Button>
-                                <Button Grid.Column="1" Height="34" Padding="8,0" Background="#FFFFFF" BorderBrush="{StaticResource DiagStrokeBrush}">
-                                    <StackPanel Orientation="Horizontal" Spacing="6">
-                                        <FontIcon Glyph="&#xE713;" FontSize="15" />
-                                        <TextBlock Text="显示设置" FontSize="13" />
-                                        <FontIcon Glyph="&#xE72A;" FontSize="11" />
-                                    </StackPanel>
-                                </Button>
+                                <StackPanel Orientation="Horizontal" Spacing="0">
+                                    <Border Width="60" CornerRadius="5,0,0,5" Background="{StaticResource DiagPrimaryBrush}">
+                                        <TextBlock Text="全部" HorizontalAlignment="Center" VerticalAlignment="Center" FontSize="12" FontWeight="SemiBold" Foreground="#FFFFFF" />
+                                    </Border>
+                                    <Border Width="60" BorderBrush="{StaticResource DiagStrokeBrush}" BorderThickness="1,1,0,1">
+                                        <TextBlock Text="Host" HorizontalAlignment="Center" VerticalAlignment="Center" FontSize="12" Foreground="{StaticResource DiagBodyBrush}" />
+                                    </Border>
+                                    <Border Width="60" BorderBrush="{StaticResource DiagStrokeBrush}" BorderThickness="1,1,0,1">
+                                        <TextBlock Text="ADB" HorizontalAlignment="Center" VerticalAlignment="Center" FontSize="12" Foreground="{StaticResource DiagBodyBrush}" />
+                                    </Border>
+                                    <Border Width="70" BorderBrush="{StaticResource DiagStrokeBrush}" BorderThickness="1,1,0,1">
+                                        <TextBlock Text="摄像头" HorizontalAlignment="Center" VerticalAlignment="Center" FontSize="12" Foreground="{StaticResource DiagBodyBrush}" />
+                                    </Border>
+                                    <Border Width="60" CornerRadius="0,5,5,0" BorderBrush="{StaticResource DiagStrokeBrush}" BorderThickness="1">
+                                        <TextBlock Text="音频" HorizontalAlignment="Center" VerticalAlignment="Center" FontSize="12" Foreground="{StaticResource DiagBodyBrush}" />
+                                    </Border>
+                                </StackPanel>
+
+                                <Border Grid.Row="1" CornerRadius="6" BorderBrush="{StaticResource DiagStrokeBrush}" BorderThickness="1" Background="#FBFCFD" Padding="14,10">
+                                    <Grid>
+                                        <Grid.RowDefinitions>
+                                            <RowDefinition Height="24" />
+                                            <RowDefinition Height="24" />
+                                            <RowDefinition Height="24" />
+                                            <RowDefinition Height="24" />
+                                            <RowDefinition Height="24" />
+                                            <RowDefinition Height="24" />
+                                            <RowDefinition Height="24" />
+                                            <RowDefinition Height="24" />
+                                            <RowDefinition Height="24" />
+                                            <RowDefinition Height="24" />
+                                        </Grid.RowDefinitions>
+                                        <Grid.ColumnDefinitions>
+                                            <ColumnDefinition Width="176" />
+                                            <ColumnDefinition Width="64" />
+                                            <ColumnDefinition Width="86" />
+                                            <ColumnDefinition Width="*" />
+                                        </Grid.ColumnDefinitions>
+
+                                        <TextBlock Text="2025-05-26 10:42:18.123" FontFamily="Consolas" FontSize="12" Foreground="{StaticResource DiagBodyBrush}" />
+                                        <TextBlock Grid.Column="1" Text="[INFO]" FontFamily="Consolas" FontSize="12" Foreground="{StaticResource DiagGreenBrush}" />
+                                        <TextBlock Grid.Column="2" Text="Host" FontFamily="Consolas" FontSize="12" Foreground="{StaticResource DiagBodyBrush}" />
+                                        <TextBlock Grid.Column="3" Text="Host service started, version 1.3.0" FontFamily="Consolas" FontSize="12" Foreground="{StaticResource DiagBodyBrush}" TextTrimming="CharacterEllipsis" />
+
+                                        <TextBlock Grid.Row="1" Text="2025-05-26 10:42:18.246" FontFamily="Consolas" FontSize="12" Foreground="{StaticResource DiagBodyBrush}" />
+                                        <TextBlock Grid.Row="1" Grid.Column="1" Text="[INFO]" FontFamily="Consolas" FontSize="12" Foreground="{StaticResource DiagGreenBrush}" />
+                                        <TextBlock Grid.Row="1" Grid.Column="2" Text="Connect" FontFamily="Consolas" FontSize="12" Foreground="{StaticResource DiagBodyBrush}" />
+                                        <TextBlock Grid.Row="1" Grid.Column="3" Text="Device HA1K3AX0 connected via USB" FontFamily="Consolas" FontSize="12" Foreground="{StaticResource DiagBodyBrush}" TextTrimming="CharacterEllipsis" />
+
+                                        <TextBlock Grid.Row="2" Text="2025-05-26 10:42:18.512" FontFamily="Consolas" FontSize="12" Foreground="{StaticResource DiagBodyBrush}" />
+                                        <TextBlock Grid.Row="2" Grid.Column="1" Text="[INFO]" FontFamily="Consolas" FontSize="12" Foreground="{StaticResource DiagGreenBrush}" />
+                                        <TextBlock Grid.Row="2" Grid.Column="2" Text="ADB" FontFamily="Consolas" FontSize="12" Foreground="{StaticResource DiagBodyBrush}" />
+                                        <TextBlock Grid.Row="2" Grid.Column="3" Text="ADB device authorized" FontFamily="Consolas" FontSize="12" Foreground="{StaticResource DiagBodyBrush}" TextTrimming="CharacterEllipsis" />
+
+                                        <TextBlock Grid.Row="3" Text="2025-05-26 10:42:18.784" FontFamily="Consolas" FontSize="12" Foreground="{StaticResource DiagBodyBrush}" />
+                                        <TextBlock Grid.Row="3" Grid.Column="1" Text="[INFO]" FontFamily="Consolas" FontSize="12" Foreground="{StaticResource DiagGreenBrush}" />
+                                        <TextBlock Grid.Row="3" Grid.Column="2" Text="ADB" FontFamily="Consolas" FontSize="12" Foreground="{StaticResource DiagBodyBrush}" />
+                                        <TextBlock Grid.Row="3" Grid.Column="3" Text="Reverse port forwarded: tcp:27183 -> tcp:27183" FontFamily="Consolas" FontSize="12" Foreground="{StaticResource DiagBodyBrush}" TextTrimming="CharacterEllipsis" />
+
+                                        <TextBlock Grid.Row="4" Text="2025-05-26 10:42:18.785" FontFamily="Consolas" FontSize="12" Foreground="{StaticResource DiagBodyBrush}" />
+                                        <TextBlock Grid.Row="4" Grid.Column="1" Text="[INFO]" FontFamily="Consolas" FontSize="12" Foreground="{StaticResource DiagGreenBrush}" />
+                                        <TextBlock Grid.Row="4" Grid.Column="2" Text="ADB" FontFamily="Consolas" FontSize="12" Foreground="{StaticResource DiagBodyBrush}" />
+                                        <TextBlock Grid.Row="4" Grid.Column="3" Text="Reverse port forwarded: tcp:27184 -> tcp:27184" FontFamily="Consolas" FontSize="12" Foreground="{StaticResource DiagBodyBrush}" TextTrimming="CharacterEllipsis" />
+
+                                        <TextBlock Grid.Row="5" Text="2025-05-26 10:42:18.786" FontFamily="Consolas" FontSize="12" Foreground="{StaticResource DiagBodyBrush}" />
+                                        <TextBlock Grid.Row="5" Grid.Column="1" Text="[INFO]" FontFamily="Consolas" FontSize="12" Foreground="{StaticResource DiagGreenBrush}" />
+                                        <TextBlock Grid.Row="5" Grid.Column="2" Text="ADB" FontFamily="Consolas" FontSize="12" Foreground="{StaticResource DiagBodyBrush}" />
+                                        <TextBlock Grid.Row="5" Grid.Column="3" Text="Reverse port forwarded: tcp:27185 -> tcp:27185" FontFamily="Consolas" FontSize="12" Foreground="{StaticResource DiagBodyBrush}" TextTrimming="CharacterEllipsis" />
+
+                                        <TextBlock Grid.Row="6" Text="2025-05-26 10:42:18.787" FontFamily="Consolas" FontSize="12" Foreground="{StaticResource DiagBodyBrush}" />
+                                        <TextBlock Grid.Row="6" Grid.Column="1" Text="[INFO]" FontFamily="Consolas" FontSize="12" Foreground="{StaticResource DiagGreenBrush}" />
+                                        <TextBlock Grid.Row="6" Grid.Column="2" Text="ADB" FontFamily="Consolas" FontSize="12" Foreground="{StaticResource DiagBodyBrush}" />
+                                        <TextBlock Grid.Row="6" Grid.Column="3" Text="Reverse port forwarded: tcp:27186 -> tcp:27186" FontFamily="Consolas" FontSize="12" Foreground="{StaticResource DiagBodyBrush}" TextTrimming="CharacterEllipsis" />
+
+                                        <TextBlock Grid.Row="7" Text="2025-05-26 10:42:19.102" FontFamily="Consolas" FontSize="12" Foreground="{StaticResource DiagBodyBrush}" />
+                                        <TextBlock Grid.Row="7" Grid.Column="1" Text="[INFO]" FontFamily="Consolas" FontSize="12" Foreground="{StaticResource DiagGreenBrush}" />
+                                        <TextBlock Grid.Row="7" Grid.Column="2" Text="Display" FontFamily="Consolas" FontSize="12" Foreground="{StaticResource DiagBodyBrush}" />
+                                        <TextBlock Grid.Row="7" Grid.Column="3" Text="Virtual display started (1920x1080@120Hz)" FontFamily="Consolas" FontSize="12" Foreground="{StaticResource DiagBodyBrush}" TextTrimming="CharacterEllipsis" />
+
+                                        <TextBlock Grid.Row="8" Text="2025-05-26 10:42:19.135" FontFamily="Consolas" FontSize="12" Foreground="{StaticResource DiagBodyBrush}" />
+                                        <TextBlock Grid.Row="8" Grid.Column="1" Text="[INFO]" FontFamily="Consolas" FontSize="12" Foreground="{StaticResource DiagGreenBrush}" />
+                                        <TextBlock Grid.Row="8" Grid.Column="2" Text="Camera" FontFamily="Consolas" FontSize="12" Foreground="{StaticResource DiagBodyBrush}" />
+                                        <TextBlock Grid.Row="8" Grid.Column="3" Text="Camera streaming started (1280x720@30fps)" FontFamily="Consolas" FontSize="12" Foreground="{StaticResource DiagBodyBrush}" TextTrimming="CharacterEllipsis" />
+
+                                        <TextBlock Grid.Row="9" Text="2025-05-26 10:42:21.543" FontFamily="Consolas" FontSize="12" Foreground="{StaticResource DiagBodyBrush}" />
+                                        <TextBlock Grid.Row="9" Grid.Column="1" Text="[INFO]" FontFamily="Consolas" FontSize="12" Foreground="{StaticResource DiagGreenBrush}" />
+                                        <TextBlock Grid.Row="9" Grid.Column="2" Text="Perf" FontFamily="Consolas" FontSize="12" Foreground="{StaticResource DiagBodyBrush}" />
+                                        <TextBlock Grid.Row="9" Grid.Column="3" Text="avg_latency=22ms, fps=120, bitrate=20.3Mbps" FontFamily="Consolas" FontSize="12" Foreground="{StaticResource DiagBodyBrush}" TextTrimming="CharacterEllipsis" />
+
+                                        <Rectangle Width="4" Height="210" Fill="#AEB6C0" RadiusX="2" RadiusY="2" HorizontalAlignment="Right" Margin="0,22,2,0" VerticalAlignment="Top" />
+                                    </Grid>
+                                </Border>
                             </Grid>
                         </Grid>
                     </Border>
 
                     <Border Grid.Column="1" Style="{StaticResource DiagCardStyle}" Padding="16">
-                        <Grid RowSpacing="10">
+                        <Grid RowSpacing="8">
                             <Grid.RowDefinitions>
-                                <RowDefinition Height="Auto" />
+                                <RowDefinition Height="32" />
                                 <RowDefinition Height="*" />
-                                <RowDefinition Height="Auto" />
+                                <RowDefinition Height="34" />
                             </Grid.RowDefinitions>
-                            <Grid ColumnSpacing="14">
-                                <Grid.ColumnDefinitions>
-                                    <ColumnDefinition Width="54" />
-                                    <ColumnDefinition Width="*" />
-                                    <ColumnDefinition Width="Auto" />
-                                </Grid.ColumnDefinitions>
-                                <Border Width="52" Height="52" CornerRadius="26" Background="#5CB7F0">
-                                    <FontIcon Glyph="&#xE722;" FontSize="27" Foreground="White" />
-                                </Border>
-                                <TextBlock Grid.Column="1" Text="摄像头" VerticalAlignment="Center" FontSize="16" FontWeight="SemiBold" Foreground="{StaticResource DiagTextBrush}" />
-                                <ToggleSwitch Grid.Column="2" IsOn="True" VerticalAlignment="Center" />
-                            </Grid>
-                            <Grid Grid.Row="1" RowSpacing="8" ColumnSpacing="12">
+                            <TextBlock Text="健康检查" FontSize="16" FontWeight="SemiBold" Foreground="{StaticResource DiagTextBrush}" />
+                            <Grid Grid.Row="1">
                                 <Grid.RowDefinitions>
-                                    <RowDefinition Height="Auto" />
-                                    <RowDefinition Height="Auto" />
-                                    <RowDefinition Height="Auto" />
+                                    <RowDefinition Height="48" />
+                                    <RowDefinition Height="48" />
+                                    <RowDefinition Height="48" />
+                                    <RowDefinition Height="48" />
+                                    <RowDefinition Height="48" />
+                                    <RowDefinition Height="48" />
                                 </Grid.RowDefinitions>
                                 <Grid.ColumnDefinitions>
-                                    <ColumnDefinition Width="76" />
+                                    <ColumnDefinition Width="42" />
                                     <ColumnDefinition Width="*" />
+                                    <ColumnDefinition Width="52" />
+                                    <ColumnDefinition Width="24" />
                                 </Grid.ColumnDefinitions>
-                                <TextBlock Text="状态" FontSize="13" Foreground="#30363D" />
-                                <TextBlock Grid.Column="1" Text="未启动" HorizontalAlignment="Right" FontSize="13" Foreground="#66717D" />
-                                <TextBlock Grid.Row="1" Text="分辨率" FontSize="13" Foreground="#30363D" />
-                                <ComboBox Grid.Row="1" Grid.Column="1" SelectedIndex="0" HorizontalAlignment="Stretch" Height="34">
-                                    <ComboBoxItem Content="720p" />
-                                </ComboBox>
-                                <TextBlock Grid.Row="2" Text="帧率" FontSize="13" Foreground="#30363D" />
-                                <ComboBox Grid.Row="2" Grid.Column="1" SelectedIndex="0" HorizontalAlignment="Stretch" Height="34">
-                                    <ComboBoxItem Content="30" />
-                                </ComboBox>
-                            </Grid>
-                            <Button Grid.Row="2" Height="34" Padding="10,0" HorizontalAlignment="Left" Background="#FFFFFF" BorderBrush="{StaticResource DiagStrokeBrush}">
-                                <StackPanel Orientation="Horizontal" Spacing="8">
-                                    <FontIcon Glyph="&#xE713;" FontSize="15" />
-                                    <TextBlock Text="摄像头设置" FontSize="13" />
-                                    <FontIcon Glyph="&#xE72A;" FontSize="11" />
+
+                                <FontIcon Glyph="&#xE83D;" FontSize="21" Foreground="{StaticResource DiagBodyBrush}" VerticalAlignment="Center" />
+                                <StackPanel Grid.Column="1" VerticalAlignment="Center" Spacing="3">
+                                    <TextBlock Text="Android 授权" FontSize="13" FontWeight="SemiBold" Foreground="{StaticResource DiagBodyBrush}" TextTrimming="CharacterEllipsis" />
+                                    <TextBlock Text="设备已授权" FontSize="12" Foreground="{StaticResource DiagMutedBrush}" TextTrimming="CharacterEllipsis" />
                                 </StackPanel>
-                            </Button>
+                                <TextBlock Grid.Column="2" Text="正常" FontSize="13" FontWeight="SemiBold" Foreground="{StaticResource DiagGreenBrush}" VerticalAlignment="Center" />
+                                <FontIcon Grid.Column="3" Glyph="&#xE73E;" FontSize="14" Foreground="{StaticResource DiagGreenBrush}" VerticalAlignment="Center" />
+
+                                <Border Grid.Row="1" Grid.ColumnSpan="4" Height="1" Background="{StaticResource DiagSoftStrokeBrush}" VerticalAlignment="Top" />
+                                <FontIcon Grid.Row="1" Glyph="&#xE7F4;" FontSize="21" Foreground="{StaticResource DiagBodyBrush}" VerticalAlignment="Center" />
+                                <StackPanel Grid.Row="1" Grid.Column="1" VerticalAlignment="Center" Spacing="3">
+                                    <TextBlock Text="端口监听" FontSize="13" FontWeight="SemiBold" Foreground="{StaticResource DiagBodyBrush}" TextTrimming="CharacterEllipsis" />
+                                    <TextBlock Text="4/4 端口正常监听" FontSize="12" Foreground="{StaticResource DiagMutedBrush}" TextTrimming="CharacterEllipsis" />
+                                </StackPanel>
+                                <TextBlock Grid.Row="1" Grid.Column="2" Text="正常" FontSize="13" FontWeight="SemiBold" Foreground="{StaticResource DiagGreenBrush}" VerticalAlignment="Center" />
+                                <FontIcon Grid.Row="1" Grid.Column="3" Glyph="&#xE73E;" FontSize="14" Foreground="{StaticResource DiagGreenBrush}" VerticalAlignment="Center" />
+
+                                <Border Grid.Row="2" Grid.ColumnSpan="4" Height="1" Background="{StaticResource DiagSoftStrokeBrush}" VerticalAlignment="Top" />
+                                <FontIcon Grid.Row="2" Glyph="&#xE71B;" FontSize="21" Foreground="{StaticResource DiagBodyBrush}" VerticalAlignment="Center" />
+                                <StackPanel Grid.Row="2" Grid.Column="1" VerticalAlignment="Center" Spacing="3">
+                                    <TextBlock Text="ADB reverse" FontSize="13" FontWeight="SemiBold" Foreground="{StaticResource DiagBodyBrush}" TextTrimming="CharacterEllipsis" />
+                                    <TextBlock Text="4/4 端口已映射" FontSize="12" Foreground="{StaticResource DiagMutedBrush}" TextTrimming="CharacterEllipsis" />
+                                </StackPanel>
+                                <TextBlock Grid.Row="2" Grid.Column="2" Text="正常" FontSize="13" FontWeight="SemiBold" Foreground="{StaticResource DiagGreenBrush}" VerticalAlignment="Center" />
+                                <FontIcon Grid.Row="2" Grid.Column="3" Glyph="&#xE73E;" FontSize="14" Foreground="{StaticResource DiagGreenBrush}" VerticalAlignment="Center" />
+
+                                <Border Grid.Row="3" Grid.ColumnSpan="4" Height="1" Background="{StaticResource DiagSoftStrokeBrush}" VerticalAlignment="Top" />
+                                <FontIcon Grid.Row="3" Glyph="&#xE7F4;" FontSize="21" Foreground="{StaticResource DiagBodyBrush}" VerticalAlignment="Center" />
+                                <StackPanel Grid.Row="3" Grid.Column="1" VerticalAlignment="Center" Spacing="3">
+                                    <TextBlock Text="虚拟显示器" FontSize="13" FontWeight="SemiBold" Foreground="{StaticResource DiagBodyBrush}" TextTrimming="CharacterEllipsis" />
+                                    <TextBlock Text="1920 x 1080 @ 120 Hz" FontSize="12" Foreground="{StaticResource DiagMutedBrush}" TextTrimming="CharacterEllipsis" />
+                                </StackPanel>
+                                <TextBlock Grid.Row="3" Grid.Column="2" Text="正常" FontSize="13" FontWeight="SemiBold" Foreground="{StaticResource DiagGreenBrush}" VerticalAlignment="Center" />
+                                <FontIcon Grid.Row="3" Grid.Column="3" Glyph="&#xE73E;" FontSize="14" Foreground="{StaticResource DiagGreenBrush}" VerticalAlignment="Center" />
+
+                                <Border Grid.Row="4" Grid.ColumnSpan="4" Height="1" Background="{StaticResource DiagSoftStrokeBrush}" VerticalAlignment="Top" />
+                                <FontIcon Grid.Row="4" Glyph="&#xE722;" FontSize="21" Foreground="{StaticResource DiagBodyBrush}" VerticalAlignment="Center" />
+                                <StackPanel Grid.Row="4" Grid.Column="1" VerticalAlignment="Center" Spacing="3">
+                                    <TextBlock Text="虚拟相机" FontSize="13" FontWeight="SemiBold" Foreground="{StaticResource DiagBodyBrush}" TextTrimming="CharacterEllipsis" />
+                                    <TextBlock Text="1280 x 720 @ 30 fps" FontSize="12" Foreground="{StaticResource DiagMutedBrush}" TextTrimming="CharacterEllipsis" />
+                                </StackPanel>
+                                <TextBlock Grid.Row="4" Grid.Column="2" Text="正常" FontSize="13" FontWeight="SemiBold" Foreground="{StaticResource DiagGreenBrush}" VerticalAlignment="Center" />
+                                <FontIcon Grid.Row="4" Grid.Column="3" Glyph="&#xE73E;" FontSize="14" Foreground="{StaticResource DiagGreenBrush}" VerticalAlignment="Center" />
+
+                                <Border Grid.Row="5" Grid.ColumnSpan="4" Height="1" Background="{StaticResource DiagSoftStrokeBrush}" VerticalAlignment="Top" />
+                                <FontIcon Grid.Row="5" Glyph="&#xE995;" FontSize="21" Foreground="{StaticResource DiagBodyBrush}" VerticalAlignment="Center" />
+                                <StackPanel Grid.Row="5" Grid.Column="1" VerticalAlignment="Center" Spacing="3">
+                                    <TextBlock Text="音频端点" FontSize="13" FontWeight="SemiBold" Foreground="{StaticResource DiagBodyBrush}" TextTrimming="CharacterEllipsis" />
+                                    <TextBlock Text="播放和录音端点检查" FontSize="12" Foreground="{StaticResource DiagMutedBrush}" TextTrimming="CharacterEllipsis" />
+                                </StackPanel>
+                                <TextBlock Grid.Row="5" Grid.Column="2" Text="警告" FontSize="13" FontWeight="SemiBold" Foreground="{StaticResource DiagOrangeBrush}" VerticalAlignment="Center" />
+                                <FontIcon Grid.Row="5" Grid.Column="3" Glyph="&#xE7BA;" FontSize="15" Foreground="{StaticResource DiagOrangeBrush}" VerticalAlignment="Center" />
+                            </Grid>
+
+                            <Border Grid.Row="2" BorderBrush="{StaticResource DiagSoftStrokeBrush}" BorderThickness="1,1,1,0">
+                                <StackPanel Orientation="Horizontal" HorizontalAlignment="Center" Spacing="8">
+                                    <FontIcon Glyph="&#xE72C;" FontSize="14" Foreground="{StaticResource DiagBodyBrush}" />
+                                    <TextBlock Text="重新检查" FontSize="13" Foreground="{StaticResource DiagBodyBrush}" VerticalAlignment="Center" />
+                                </StackPanel>
+                            </Border>
+                        </Grid>
+                    </Border>
+                </Grid>
+
+                <Grid Grid.Row="3" ColumnSpacing="18">
+                    <Grid.ColumnDefinitions>
+                        <ColumnDefinition Width="1.28*" />
+                        <ColumnDefinition Width="1*" />
+                        <ColumnDefinition Width="0.92*" />
+                    </Grid.ColumnDefinitions>
+
+                    <Border Style="{StaticResource DiagCardStyle}" Padding="16">
+                        <Grid RowSpacing="8">
+                            <Grid.RowDefinitions>
+                                <RowDefinition Height="34" />
+                                <RowDefinition Height="*" />
+                                <RowDefinition Height="20" />
+                            </Grid.RowDefinitions>
+                            <Grid>
+                                <TextBlock Text="性能趋势" FontSize="16" FontWeight="SemiBold" Foreground="{StaticResource DiagTextBrush}" />
+                                <StackPanel HorizontalAlignment="Right" Orientation="Horizontal" Spacing="0">
+                                    <Border Width="58" Height="28" CornerRadius="5,0,0,5" Background="{StaticResource DiagPrimaryBrush}">
+                                        <TextBlock Text="1 分钟" HorizontalAlignment="Center" VerticalAlignment="Center" FontSize="12" FontWeight="SemiBold" Foreground="#FFFFFF" />
+                                    </Border>
+                                    <Border Width="58" Height="28" BorderBrush="{StaticResource DiagStrokeBrush}" BorderThickness="1,1,0,1">
+                                        <TextBlock Text="5 分钟" HorizontalAlignment="Center" VerticalAlignment="Center" FontSize="12" Foreground="{StaticResource DiagBodyBrush}" />
+                                    </Border>
+                                    <Border Width="58" Height="28" CornerRadius="0,5,5,0" BorderBrush="{StaticResource DiagStrokeBrush}" BorderThickness="1">
+                                        <TextBlock Text="15 分钟" HorizontalAlignment="Center" VerticalAlignment="Center" FontSize="12" Foreground="{StaticResource DiagBodyBrush}" />
+                                    </Border>
+                                </StackPanel>
+                            </Grid>
+
+                            <Grid Grid.Row="1">
+                                <Grid.RowDefinitions>
+                                    <RowDefinition Height="20" />
+                                    <RowDefinition Height="*" />
+                                </Grid.RowDefinitions>
+                                <StackPanel Orientation="Horizontal" Spacing="18">
+                                    <StackPanel Orientation="Horizontal" Spacing="6">
+                                        <Rectangle Width="16" Height="3" Fill="#0FA3B1" RadiusX="1" RadiusY="1" VerticalAlignment="Center" />
+                                        <TextBlock Text="CPU" FontSize="12" Foreground="{StaticResource DiagBodyBrush}" />
+                                    </StackPanel>
+                                    <StackPanel Orientation="Horizontal" Spacing="6">
+                                        <Rectangle Width="16" Height="3" Fill="#2E6DEB" RadiusX="1" RadiusY="1" VerticalAlignment="Center" />
+                                        <TextBlock Text="内存" FontSize="12" Foreground="{StaticResource DiagBodyBrush}" />
+                                    </StackPanel>
+                                    <StackPanel Orientation="Horizontal" Spacing="6">
+                                        <Rectangle Width="16" Height="3" Fill="#4AAE52" RadiusX="1" RadiusY="1" VerticalAlignment="Center" />
+                                        <TextBlock Text="网络 (Mbps)" FontSize="12" Foreground="{StaticResource DiagBodyBrush}" />
+                                    </StackPanel>
+                                </StackPanel>
+
+                                <Grid Grid.Row="1">
+                                    <Grid.ColumnDefinitions>
+                                        <ColumnDefinition Width="28" />
+                                        <ColumnDefinition Width="*" />
+                                        <ColumnDefinition Width="28" />
+                                    </Grid.ColumnDefinitions>
+                                    <Grid.RowDefinitions>
+                                        <RowDefinition Height="*" />
+                                        <RowDefinition Height="*" />
+                                        <RowDefinition Height="*" />
+                                    </Grid.RowDefinitions>
+                                    <TextBlock Text="100%" FontSize="11" Foreground="{StaticResource DiagMutedBrush}" />
+                                    <TextBlock Grid.Row="1" Text="50%" FontSize="11" Foreground="{StaticResource DiagMutedBrush}" VerticalAlignment="Center" />
+                                    <TextBlock Grid.Row="2" Text="0%" FontSize="11" Foreground="{StaticResource DiagMutedBrush}" VerticalAlignment="Bottom" />
+                                    <TextBlock Grid.Column="2" Text="100" FontSize="11" Foreground="{StaticResource DiagMutedBrush}" HorizontalAlignment="Right" />
+                                    <TextBlock Grid.Row="1" Grid.Column="2" Text="50" FontSize="11" Foreground="{StaticResource DiagMutedBrush}" HorizontalAlignment="Right" VerticalAlignment="Center" />
+                                    <TextBlock Grid.Row="2" Grid.Column="2" Text="0" FontSize="11" Foreground="{StaticResource DiagMutedBrush}" HorizontalAlignment="Right" VerticalAlignment="Bottom" />
+
+                                    <Canvas Grid.Column="1" Grid.RowSpan="3" Margin="4,6,4,12">
+                                        <Line X1="0" Y1="0" X2="360" Y2="0" Stroke="#E7EBEF" StrokeThickness="1" />
+                                        <Line X1="0" Y1="55" X2="360" Y2="55" Stroke="#E7EBEF" StrokeThickness="1" />
+                                        <Line X1="0" Y1="110" X2="360" Y2="110" Stroke="#E7EBEF" StrokeThickness="1" />
+                                        <Rectangle Canvas.Left="0" Canvas.Top="88" Width="7" Height="22" Fill="#82D896" />
+                                        <Rectangle Canvas.Left="12" Canvas.Top="82" Width="7" Height="28" Fill="#82D896" />
+                                        <Rectangle Canvas.Left="24" Canvas.Top="74" Width="7" Height="36" Fill="#82D896" />
+                                        <Rectangle Canvas.Left="36" Canvas.Top="70" Width="7" Height="40" Fill="#82D896" />
+                                        <Rectangle Canvas.Left="48" Canvas.Top="92" Width="7" Height="18" Fill="#82D896" />
+                                        <Rectangle Canvas.Left="60" Canvas.Top="76" Width="7" Height="34" Fill="#82D896" />
+                                        <Rectangle Canvas.Left="72" Canvas.Top="62" Width="7" Height="48" Fill="#82D896" />
+                                        <Rectangle Canvas.Left="84" Canvas.Top="45" Width="7" Height="65" Fill="#82D896" />
+                                        <Rectangle Canvas.Left="96" Canvas.Top="87" Width="7" Height="23" Fill="#82D896" />
+                                        <Rectangle Canvas.Left="108" Canvas.Top="93" Width="7" Height="17" Fill="#82D896" />
+                                        <Rectangle Canvas.Left="132" Canvas.Top="91" Width="7" Height="19" Fill="#82D896" />
+                                        <Rectangle Canvas.Left="144" Canvas.Top="82" Width="7" Height="28" Fill="#82D896" />
+                                        <Rectangle Canvas.Left="156" Canvas.Top="75" Width="7" Height="35" Fill="#82D896" />
+                                        <Rectangle Canvas.Left="168" Canvas.Top="82" Width="7" Height="28" Fill="#82D896" />
+                                        <Rectangle Canvas.Left="192" Canvas.Top="83" Width="7" Height="27" Fill="#82D896" />
+                                        <Rectangle Canvas.Left="216" Canvas.Top="90" Width="7" Height="20" Fill="#82D896" />
+                                        <Rectangle Canvas.Left="240" Canvas.Top="82" Width="7" Height="28" Fill="#82D896" />
+                                        <Rectangle Canvas.Left="264" Canvas.Top="66" Width="7" Height="44" Fill="#82D896" />
+                                        <Rectangle Canvas.Left="300" Canvas.Top="86" Width="7" Height="24" Fill="#82D896" />
+                                        <Rectangle Canvas.Left="312" Canvas.Top="76" Width="7" Height="34" Fill="#82D896" />
+                                        <Rectangle Canvas.Left="324" Canvas.Top="72" Width="7" Height="38" Fill="#82D896" />
+                                        <Rectangle Canvas.Left="336" Canvas.Top="80" Width="7" Height="30" Fill="#82D896" />
+                                        <Polyline Points="0,28 12,22 24,27 36,20 48,25 60,30 72,24 84,28 96,21 108,20 120,27 132,25 144,24 156,27 168,25 180,21 192,28 204,22 216,25 228,29 240,23 252,26 264,20 276,25 288,27 300,24 312,18 324,22 336,25 352,28" Stroke="#0FA3B1" StrokeThickness="2" />
+                                        <Polyline Points="0,54 12,59 24,55 36,49 48,52 60,48 72,51 84,47 96,50 108,48 120,50 132,51 144,55 156,57 168,60 180,58 192,56 204,54 216,49 228,52 240,55 252,54 264,50 276,52 288,48 300,53 312,55 324,51 336,57 352,52" Stroke="#2E6DEB" StrokeThickness="2" />
+                                    </Canvas>
+                                </Grid>
+                            </Grid>
+
+                            <Grid Grid.Row="2">
+                                <TextBlock Text="10:41:20" FontSize="11" Foreground="{StaticResource DiagMutedBrush}" />
+                                <TextBlock Text="10:41:35" FontSize="11" Foreground="{StaticResource DiagMutedBrush}" HorizontalAlignment="Center" />
+                                <TextBlock Text="10:41:50" FontSize="11" Foreground="{StaticResource DiagMutedBrush}" HorizontalAlignment="Right" Margin="0,0,104,0" />
+                                <TextBlock Text="10:42:05" FontSize="11" Foreground="{StaticResource DiagMutedBrush}" HorizontalAlignment="Right" Margin="0,0,36,0" />
+                            </Grid>
+                        </Grid>
+                    </Border>
+
+                    <Border Grid.Column="1" Style="{StaticResource DiagCardStyle}" Padding="16">
+                        <Grid RowSpacing="8">
+                            <Grid.RowDefinitions>
+                                <RowDefinition Height="30" />
+                                <RowDefinition Height="*" />
+                                <RowDefinition Height="30" />
+                            </Grid.RowDefinitions>
+                            <TextBlock Text="端口映射" FontSize="16" FontWeight="SemiBold" Foreground="{StaticResource DiagTextBrush}" />
+                            <Grid Grid.Row="1" RowSpacing="0">
+                                <Grid.RowDefinitions>
+                                    <RowDefinition Height="24" />
+                                    <RowDefinition Height="24" />
+                                    <RowDefinition Height="24" />
+                                    <RowDefinition Height="24" />
+                                    <RowDefinition Height="24" />
+                                </Grid.RowDefinitions>
+                                <Grid.ColumnDefinitions>
+                                    <ColumnDefinition Width="56" />
+                                    <ColumnDefinition Width="*" />
+                                    <ColumnDefinition Width="82" />
+                                    <ColumnDefinition Width="82" />
+                                </Grid.ColumnDefinitions>
+                                <TextBlock Text="端口" FontSize="12" Foreground="{StaticResource DiagBodyBrush}" />
+                                <TextBlock Grid.Column="1" Text="用途" FontSize="12" Foreground="{StaticResource DiagBodyBrush}" />
+                                <TextBlock Grid.Column="2" Text="本地状态" FontSize="12" Foreground="{StaticResource DiagBodyBrush}" />
+                                <TextBlock Grid.Column="3" Text="映射状态" FontSize="12" Foreground="{StaticResource DiagBodyBrush}" />
+
+                                <TextBlock Grid.Row="1" Text="27183" FontSize="13" Foreground="{StaticResource DiagBodyBrush}" />
+                                <TextBlock Grid.Row="1" Grid.Column="1" Text="控制" FontSize="13" Foreground="{StaticResource DiagBodyBrush}" />
+                                <StackPanel Grid.Row="1" Grid.Column="2" Orientation="Horizontal" Spacing="6">
+                                    <Ellipse Width="8" Height="8" Fill="{StaticResource DiagGreenBrush}" VerticalAlignment="Center" />
+                                    <TextBlock Text="监听中" FontSize="13" Foreground="{StaticResource DiagBodyBrush}" />
+                                </StackPanel>
+                                <StackPanel Grid.Row="1" Grid.Column="3" Orientation="Horizontal" Spacing="6">
+                                    <Ellipse Width="8" Height="8" Fill="{StaticResource DiagGreenBrush}" VerticalAlignment="Center" />
+                                    <TextBlock Text="已映射" FontSize="13" Foreground="{StaticResource DiagBodyBrush}" />
+                                </StackPanel>
+
+                                <TextBlock Grid.Row="2" Text="27184" FontSize="13" Foreground="{StaticResource DiagBodyBrush}" />
+                                <TextBlock Grid.Row="2" Grid.Column="1" Text="视频" FontSize="13" Foreground="{StaticResource DiagBodyBrush}" />
+                                <StackPanel Grid.Row="2" Grid.Column="2" Orientation="Horizontal" Spacing="6">
+                                    <Ellipse Width="8" Height="8" Fill="{StaticResource DiagGreenBrush}" VerticalAlignment="Center" />
+                                    <TextBlock Text="监听中" FontSize="13" Foreground="{StaticResource DiagBodyBrush}" />
+                                </StackPanel>
+                                <StackPanel Grid.Row="2" Grid.Column="3" Orientation="Horizontal" Spacing="6">
+                                    <Ellipse Width="8" Height="8" Fill="{StaticResource DiagGreenBrush}" VerticalAlignment="Center" />
+                                    <TextBlock Text="已映射" FontSize="13" Foreground="{StaticResource DiagBodyBrush}" />
+                                </StackPanel>
+
+                                <TextBlock Grid.Row="3" Text="27185" FontSize="13" Foreground="{StaticResource DiagBodyBrush}" />
+                                <TextBlock Grid.Row="3" Grid.Column="1" Text="音频" FontSize="13" Foreground="{StaticResource DiagBodyBrush}" />
+                                <StackPanel Grid.Row="3" Grid.Column="2" Orientation="Horizontal" Spacing="6">
+                                    <Ellipse Width="8" Height="8" Fill="{StaticResource DiagGreenBrush}" VerticalAlignment="Center" />
+                                    <TextBlock Text="监听中" FontSize="13" Foreground="{StaticResource DiagBodyBrush}" />
+                                </StackPanel>
+                                <StackPanel Grid.Row="3" Grid.Column="3" Orientation="Horizontal" Spacing="6">
+                                    <Ellipse Width="8" Height="8" Fill="{StaticResource DiagGreenBrush}" VerticalAlignment="Center" />
+                                    <TextBlock Text="已映射" FontSize="13" Foreground="{StaticResource DiagBodyBrush}" />
+                                </StackPanel>
+
+                                <TextBlock Grid.Row="4" Text="27186" FontSize="13" Foreground="{StaticResource DiagBodyBrush}" />
+                                <TextBlock Grid.Row="4" Grid.Column="1" Text="摄像头" FontSize="13" Foreground="{StaticResource DiagBodyBrush}" />
+                                <StackPanel Grid.Row="4" Grid.Column="2" Orientation="Horizontal" Spacing="6">
+                                    <Ellipse Width="8" Height="8" Fill="{StaticResource DiagGreenBrush}" VerticalAlignment="Center" />
+                                    <TextBlock Text="监听中" FontSize="13" Foreground="{StaticResource DiagBodyBrush}" />
+                                </StackPanel>
+                                <StackPanel Grid.Row="4" Grid.Column="3" Orientation="Horizontal" Spacing="6">
+                                    <Ellipse Width="8" Height="8" Fill="{StaticResource DiagGreenBrush}" VerticalAlignment="Center" />
+                                    <TextBlock Text="已映射" FontSize="13" Foreground="{StaticResource DiagBodyBrush}" />
+                                </StackPanel>
+                            </Grid>
+                            <Grid Grid.Row="2">
+                                <TextBlock Text="查看完整端口信息" FontSize="13" Foreground="{StaticResource DiagPrimaryBrush}" VerticalAlignment="Center" />
+                                <FontIcon Glyph="&#xE72A;" FontSize="14" Foreground="{StaticResource DiagBodyBrush}" HorizontalAlignment="Right" VerticalAlignment="Center" />
+                            </Grid>
                         </Grid>
                     </Border>
 
                     <Border Grid.Column="2" Style="{StaticResource DiagCardStyle}" Padding="16">
                         <Grid RowSpacing="10">
                             <Grid.RowDefinitions>
-                                <RowDefinition Height="Auto" />
+                                <RowDefinition Height="30" />
                                 <RowDefinition Height="*" />
-                                <RowDefinition Height="Auto" />
+                                <RowDefinition Height="34" />
                             </Grid.RowDefinitions>
-                            <Grid ColumnSpacing="14">
-                                <Grid.ColumnDefinitions>
-                                    <ColumnDefinition Width="54" />
-                                    <ColumnDefinition Width="*" />
-                                    <ColumnDefinition Width="Auto" />
-                                </Grid.ColumnDefinitions>
-                                <Border Width="52" Height="52" CornerRadius="26" Background="{StaticResource DiagPurpleBrush}">
-                                    <FontIcon Glyph="&#xE995;" FontSize="27" Foreground="White" />
+                            <TextBlock Text="最近错误" FontSize="16" FontWeight="SemiBold" Foreground="{StaticResource DiagTextBrush}" />
+                            <StackPanel Grid.Row="1" HorizontalAlignment="Center" VerticalAlignment="Center" Spacing="12">
+                                <Border Width="58" Height="58" CornerRadius="29" BorderBrush="{StaticResource DiagGreenBrush}" BorderThickness="3">
+                                    <FontIcon Glyph="&#xE73E;" FontSize="29" Foreground="{StaticResource DiagGreenBrush}" />
                                 </Border>
-                                <TextBlock Grid.Column="1" Text="音频桥接" VerticalAlignment="Center" FontSize="16" FontWeight="SemiBold" Foreground="{StaticResource DiagTextBrush}" />
-                                <ToggleSwitch Grid.Column="2" IsOn="True" VerticalAlignment="Center" />
-                            </Grid>
-                            <Grid Grid.Row="1" RowSpacing="8" ColumnSpacing="12">
-                                <Grid.RowDefinitions>
-                                    <RowDefinition Height="Auto" />
-                                    <RowDefinition Height="Auto" />
-                                    <RowDefinition Height="Auto" />
-                                </Grid.RowDefinitions>
-                                <Grid.ColumnDefinitions>
-                                    <ColumnDefinition Width="76" />
-                                    <ColumnDefinition Width="*" />
-                                </Grid.ColumnDefinitions>
-                                <TextBlock Text="状态" FontSize="13" Foreground="#30363D" />
-                                <TextBlock Grid.Column="1" Text="等待 Android 设备" HorizontalAlignment="Right" FontSize="13" Foreground="#66717D" />
-                                <TextBlock Grid.Row="1" Text="模式" FontSize="13" Foreground="#30363D" />
-                                <Grid Grid.Row="1" Grid.Column="1">
-                                    <Grid.ColumnDefinitions>
-                                        <ColumnDefinition Width="*" />
-                                        <ColumnDefinition Width="*" />
-                                    </Grid.ColumnDefinitions>
-                                    <Border Height="34" CornerRadius="6,0,0,6" Background="{StaticResource DiagPrimaryBrush}">
-                                        <TextBlock Text="立体声" HorizontalAlignment="Center" VerticalAlignment="Center" FontSize="13" FontWeight="SemiBold" Foreground="White" />
-                                    </Border>
-                                    <Border Grid.Column="1" Height="34" CornerRadius="0,6,6,0" Background="#F3F6FA" BorderBrush="{StaticResource DiagStrokeBrush}" BorderThickness="1">
-                                        <TextBlock Text="环绕声" HorizontalAlignment="Center" VerticalAlignment="Center" FontSize="13" Foreground="#A2ABB5" />
-                                    </Border>
-                                </Grid>
-                                <TextBlock Grid.Row="2" Text="采样率" FontSize="13" Foreground="#30363D" />
-                                <Grid Grid.Row="2" Grid.Column="1">
-                                    <Grid.ColumnDefinitions>
-                                        <ColumnDefinition Width="*" />
-                                        <ColumnDefinition Width="*" />
-                                    </Grid.ColumnDefinitions>
-                                    <Border Height="34" CornerRadius="6,0,0,6" Background="{StaticResource DiagPrimaryBrush}">
-                                        <TextBlock Text="48 kHz" HorizontalAlignment="Center" VerticalAlignment="Center" FontSize="13" FontWeight="SemiBold" Foreground="White" />
-                                    </Border>
-                                    <Border Grid.Column="1" Height="34" CornerRadius="0,6,6,0" Background="#F3F6FA" BorderBrush="{StaticResource DiagStrokeBrush}" BorderThickness="1">
-                                        <TextBlock Text="96 kHz" HorizontalAlignment="Center" VerticalAlignment="Center" FontSize="13" Foreground="#A2ABB5" />
-                                    </Border>
-                                </Grid>
-                            </Grid>
-                            <Button Grid.Row="2" Height="34" Padding="10,0" HorizontalAlignment="Left" Background="#FFFFFF" BorderBrush="{StaticResource DiagStrokeBrush}">
-                                <StackPanel Orientation="Horizontal" Spacing="8">
-                                    <FontIcon Glyph="&#xE713;" FontSize="15" />
-                                    <TextBlock Text="音频设置" FontSize="13" />
-                                    <FontIcon Glyph="&#xE72A;" FontSize="11" />
-                                </StackPanel>
-                            </Button>
-                        </Grid>
-                    </Border>
-
-                    <Border Grid.Column="3" Style="{StaticResource DiagCardStyle}" Padding="16">
-                        <Grid RowSpacing="10">
-                            <Grid.RowDefinitions>
-                                <RowDefinition Height="Auto" />
-                                <RowDefinition Height="*" />
-                                <RowDefinition Height="Auto" />
-                            </Grid.RowDefinitions>
-                            <Grid ColumnSpacing="14">
-                                <Grid.ColumnDefinitions>
-                                    <ColumnDefinition Width="54" />
-                                    <ColumnDefinition Width="*" />
-                                    <ColumnDefinition Width="Auto" />
-                                </Grid.ColumnDefinitions>
-                                <Border Width="52" Height="52" CornerRadius="26" Background="#55B9C2">
-                                    <FontIcon Glyph="&#xE9D9;" FontSize="27" Foreground="White" />
-                                </Border>
-                                <TextBlock Grid.Column="1" Text="运行诊断" VerticalAlignment="Center" FontSize="16" FontWeight="SemiBold" Foreground="{StaticResource DiagTextBrush}" />
-                                <FontIcon Grid.Column="2" Glyph="&#xE72A;" FontSize="18" Foreground="#30363D" />
-                            </Grid>
-                            <Grid Grid.Row="1" RowSpacing="7" ColumnSpacing="12">
-                                <Grid.RowDefinitions>
-                                    <RowDefinition Height="Auto" />
-                                    <RowDefinition Height="Auto" />
-                                    <RowDefinition Height="Auto" />
-                                    <RowDefinition Height="Auto" />
-                                    <RowDefinition Height="Auto" />
-                                </Grid.RowDefinitions>
-                                <Grid.ColumnDefinitions>
-                                    <ColumnDefinition Width="44" />
-                                    <ColumnDefinition Width="64" />
-                                    <ColumnDefinition Width="*" />
-                                </Grid.ColumnDefinitions>
-                                <TextBlock Text="CPU" FontSize="13" Foreground="#30363D" />
-                                <TextBlock Grid.Column="1" Text="未运行" FontSize="13" Foreground="#66717D" />
-                                <TextBlock Grid.Column="2" Text="▪▪▪▪▪▪▪▪▪▪" FontSize="15" Foreground="#D8DEE4" />
-                                <TextBlock Grid.Row="1" Text="内存" FontSize="13" Foreground="#30363D" />
-                                <TextBlock Grid.Row="1" Grid.Column="1" Text="未运行" FontSize="13" Foreground="#66717D" />
-                                <TextBlock Grid.Row="1" Grid.Column="2" Text="▪▪▪▪▪▪▪▪" FontSize="15" Foreground="#D8DEE4" />
-                                <TextBlock Grid.Row="2" Text="网络" FontSize="13" Foreground="#30363D" />
-                                <TextBlock Grid.Row="2" Grid.Column="1" Text="" FontSize="13" />
-                                <StackPanel Grid.Row="2" Grid.Column="2" Orientation="Horizontal" Spacing="8">
-                                    <FontIcon Glyph="&#xEC3F;" FontSize="17" Foreground="{StaticResource DiagPrimaryBrush}" />
-                                    <TextBlock Text="链路 325 Mbps" FontSize="13" Foreground="{StaticResource DiagPrimaryBrush}" />
-                                </StackPanel>
-                                <TextBlock Grid.Row="3" Grid.ColumnSpan="3" Text="丢包/丢帧无数据" FontSize="13" Foreground="#30363D" />
-                            </Grid>
+                                <TextBlock Text="无严重错误" HorizontalAlignment="Center" FontSize="16" FontWeight="SemiBold" Foreground="{StaticResource DiagGreenBrush}" />
+                                <TextBlock Text="最近 24 小时内未检测到严重错误。" HorizontalAlignment="Center" FontSize="12" Foreground="{StaticResource DiagBodyBrush}" />
+                            </StackPanel>
                             <Grid Grid.Row="2">
-                                <TextBlock Text="查看详细诊断" FontSize="13" Foreground="#30363D" />
-                                <FontIcon Glyph="&#xE72A;" FontSize="14" Foreground="#30363D" HorizontalAlignment="Right" />
+                                <Border Height="1" Background="{StaticResource DiagSoftStrokeBrush}" VerticalAlignment="Top" />
+                                <TextBlock Text="查看错误历史" FontSize="13" Foreground="{StaticResource DiagPrimaryBrush}" VerticalAlignment="Bottom" />
+                                <FontIcon Glyph="&#xE72A;" FontSize="14" Foreground="{StaticResource DiagBodyBrush}" HorizontalAlignment="Right" VerticalAlignment="Bottom" />
                             </Grid>
                         </Grid>
                     </Border>
