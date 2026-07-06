@@ -2,6 +2,8 @@ using System.Diagnostics;
 using System.IO.Compression;
 using System.IO.MemoryMappedFiles;
 using System.Globalization;
+using System.Net;
+using System.Net.Sockets;
 using System.Reflection;
 using System.Runtime.InteropServices;
 using System.Runtime.InteropServices.WindowsRuntime;
@@ -35,6 +37,9 @@ public sealed partial class MainWindow : Window
     private const string VirtualAudioCablePayloadZip = "VirtualAudioCablePayload.zip";
     private const int DefaultAudioPort = 27185;
     private const int DefaultCameraPort = 27186;
+    private const int DefaultCameraCommandPort = 27187;
+    private const int DesiredWindowWidth = 1080;
+    private const int DesiredWindowHeight = 760;
     private const string AdbExe = "adb.exe";
     private const int SwHide = 0;
     private const int SwShow = 5;
@@ -45,6 +50,7 @@ public sealed partial class MainWindow : Window
     private const uint WmApp = 0x8000;
     private const uint WmTrayIcon = WmApp + 1;
     private const uint WmContextMenu = 0x007B;
+    private const uint WmDpiChanged = 0x02E0;
     private const uint WmLButtonUp = 0x0202;
     private const uint WmLButtonDoubleClick = 0x0203;
     private const uint WmRButtonUp = 0x0205;
@@ -69,6 +75,7 @@ public sealed partial class MainWindow : Window
     private const int TrayMenuExit = 1002;
     private const int MaxRecentAudioLogLines = 80;
     private const int MaxRecentCameraLogLines = 80;
+    private const int CameraPreviewIntervalMs = 33;
     private const string AudioPreferencesFileName = "audio-preferences.json";
     private static readonly string DeviceToolProcessName = Path.GetFileNameWithoutExtension(DeviceToolExe);
     private static readonly UIntPtr WindowSubclassId = new(1);
@@ -122,6 +129,9 @@ public sealed partial class MainWindow : Window
     private string? _lastCameraStatusLine;
     private string? _lastCameraErrorLine;
     private string? _lastCameraErrorMessage;
+    private bool _uiReady;
+    private bool _restartingForCameraFacing;
+    private bool _cameraPreviewEnabled = true;
     private bool _loadingAudioEndpointChoices;
     private string? _boundMicrophoneRenderEndpointId;
     private string? _boundMicrophoneRenderEndpointName;
@@ -138,11 +148,13 @@ public sealed partial class MainWindow : Window
     public MainWindow()
     {
         InitializeComponent();
+        _uiReady = true;
 
         _windowHandle = WindowNative.GetWindowHandle(this);
+        UpdateDpiDiagnosticTitle();
         ExtendsContentIntoTitleBar = true;
         SetTitleBar(null);
-        AppWindow.Resize(new Windows.Graphics.SizeInt32(1080, 760));
+        ResizeWindowForCurrentDpi();
         if (AppWindow.Presenter is OverlappedPresenter presenter)
         {
             presenter.IsResizable = false;
@@ -174,9 +186,10 @@ public sealed partial class MainWindow : Window
         _displayStatusTimer.Tick += (_, _) => RefreshVirtualDisplayState();
         _displayStatusTimer.Start();
 
-        _cameraPreviewTimer.Interval = TimeSpan.FromMilliseconds(200);
+        _cameraPreviewTimer.Interval = TimeSpan.FromMilliseconds(CameraPreviewIntervalMs);
         _cameraPreviewTimer.Tick += (_, _) => UpdateCameraPreview();
         _cameraPreviewTimer.Start();
+        UpdateCameraPreviewToggleView();
 
         _virtualCameraStatusTimer.Interval = TimeSpan.FromSeconds(2);
         _virtualCameraStatusTimer.Tick += (_, _) => RefreshVirtualCameraStatusFromFiles();
@@ -335,7 +348,51 @@ public sealed partial class MainWindow : Window
             return IntPtr.Zero;
         }
 
+        if (message == WmDpiChanged)
+        {
+            DispatcherQueue.TryEnqueue(() =>
+            {
+                UpdateDpiDiagnosticTitle();
+                ResizeWindowForCurrentDpi();
+            });
+        }
+
         return DefSubclassProc(hWnd, message, wParam, lParam);
+    }
+
+    private void ResizeWindowForCurrentDpi()
+    {
+        var scale = CurrentDpiScale();
+        var width = (int)Math.Round(DesiredWindowWidth * scale);
+        var height = (int)Math.Round(DesiredWindowHeight * scale);
+
+        var displayArea = DisplayArea.GetFromWindowId(
+            Win32Interop.GetWindowIdFromWindow(_windowHandle),
+            DisplayAreaFallback.Nearest);
+        var workArea = displayArea.WorkArea;
+        width = Math.Min(width, Math.Max(DesiredWindowWidth, workArea.Width));
+        height = Math.Min(height, Math.Max(DesiredWindowHeight, workArea.Height));
+
+        AppWindow.Resize(new Windows.Graphics.SizeInt32(width, height));
+    }
+
+    private double CurrentDpiScale()
+    {
+        var dpi = GetDpiForWindow(_windowHandle);
+        return dpi > 0 ? dpi / 96.0 : 1.0;
+    }
+
+    private void UpdateDpiDiagnosticTitle()
+    {
+        var dpi = GetDpiForWindow(_windowHandle);
+        if (dpi == 0)
+        {
+            Title = "SideDock Host - DPI unknown";
+            return;
+        }
+
+        var scalePercent = (int)Math.Round(dpi / 96.0 * 100);
+        Title = $"SideDock Host - DPI {dpi} ({scalePercent}%)";
     }
 
     private void HandleTrayIconMessage(uint message)
@@ -452,9 +509,45 @@ public sealed partial class MainWindow : Window
         await RefreshAdbDevicesAsync(showErrors: true);
     }
 
+    private async void RestartAdbButton_Click(object sender, RoutedEventArgs e)
+    {
+        await RestartAdbAsync(showErrors: true);
+    }
+
     private void AdbDeviceCombo_SelectionChanged(object sender, SelectionChangedEventArgs e)
     {
         UpdateAudioState();
+    }
+
+    private async void CameraFacingCombo_SelectionChanged(object sender, SelectionChangedEventArgs e)
+    {
+        if (!_uiReady)
+        {
+            return;
+        }
+
+        _cameraDiagnostics.Facing = NormalizeCameraFacing(Selected(CameraFacingCombo));
+        UpdateCameraStatusView();
+
+        if (_restartingForCameraFacing || _hostProcess is not { HasExited: false })
+        {
+            return;
+        }
+
+        _restartingForCameraFacing = true;
+        CameraFacingCombo.IsEnabled = false;
+        CameraStatusText.Text = $"Server: restarting  Android: {_cameraDiagnostics.ClientState}  权限: {_cameraDiagnostics.PermissionText}";
+        try
+        {
+            StopHost();
+            await StartHostAsync();
+        }
+        finally
+        {
+            _restartingForCameraFacing = false;
+            CameraFacingCombo.IsEnabled = true;
+            UpdateCameraStatusView();
+        }
     }
 
     private void AudioSwitch_Toggled(object sender, RoutedEventArgs e)
@@ -526,14 +619,19 @@ public sealed partial class MainWindow : Window
         }
     }
 
+    private void ToggleCameraPreviewButton_Click(object sender, RoutedEventArgs e)
+    {
+        SetCameraPreviewEnabled(!_cameraPreviewEnabled);
+    }
+
     private async void StartVirtualCameraButton_Click(object sender, RoutedEventArgs e)
     {
-        await RunVirtualCameraCommandAsync("ensure-start");
+        await StartCameraPipelineAsync();
     }
 
     private async void StopVirtualCameraButton_Click(object sender, RoutedEventArgs e)
     {
-        await RunVirtualCameraCommandAsync("stop");
+        await StopCameraPipelineAsync();
     }
 
     private async void RefreshVirtualCameraButton_Click(object sender, RoutedEventArgs e)
@@ -584,6 +682,8 @@ public sealed partial class MainWindow : Window
             StopHostButton.IsEnabled = false;
             AdbDeviceCombo.IsEnabled = false;
             RefreshAdbDevicesButton.IsEnabled = false;
+            RestartAdbButton.IsEnabled = false;
+            CameraFacingCombo.IsEnabled = false;
             OverallStatusText.Text = "启动中";
             OverallStatusText.Foreground = _secondaryBrush;
             SetAdbStatus("正在检查 ADB reverse...", _secondaryBrush);
@@ -705,6 +805,7 @@ public sealed partial class MainWindow : Window
             "--video-port", Port(VideoPortBox, "video"),
             "--audio-port", DefaultAudioPort.ToString(CultureInfo.InvariantCulture),
             "--camera-port", DefaultCameraPort.ToString(CultureInfo.InvariantCulture),
+            "--camera-facing", Selected(CameraFacingCombo),
             "--audio-backend", "wasapi-virtual-cable"
         };
 
@@ -993,6 +1094,7 @@ public sealed partial class MainWindow : Window
     {
         var selectedSerial = SelectedAdbSerial();
         RefreshAdbDevicesButton.IsEnabled = false;
+        RestartAdbButton.IsEnabled = false;
 
         try
         {
@@ -1057,8 +1159,92 @@ public sealed partial class MainWindow : Window
         }
         finally
         {
-            RefreshAdbDevicesButton.IsEnabled = StartHostButton.IsEnabled && _hostProcess is not { HasExited: false };
+            var controlsEnabled = CanUseAdbControls();
+            RefreshAdbDevicesButton.IsEnabled = controlsEnabled;
+            RestartAdbButton.IsEnabled = controlsEnabled;
         }
+    }
+
+    private async Task RestartAdbAsync(bool showErrors)
+    {
+        if (!CanUseAdbControls())
+        {
+            return;
+        }
+
+        var selectedSerial = SelectedAdbSerial();
+        AdbDeviceCombo.IsEnabled = false;
+        RefreshAdbDevicesButton.IsEnabled = false;
+        RestartAdbButton.IsEnabled = false;
+
+        try
+        {
+            var adbPath = ResolveAdbPath(AdbPathBox.Text.Trim());
+            SetAdbDeviceChoices(Array.Empty<AdbDeviceRow>(), selectedSerial);
+            SetAdbStatus("正在重启 ADB...", _secondaryBrush);
+
+            var killResult = await RunAdbAsync(adbPath, "kill-server", TimeSpan.FromSeconds(8));
+            if (killResult.TimedOut || killResult.ExitCode != 0)
+            {
+                var killedCount = TryKillAdbProcesses();
+                var reason = killResult.TimedOut
+                    ? "kill-server 超时"
+                    : $"kill-server 退出码 {killResult.ExitCode}";
+                SetAdbStatus($"{reason}，已强制结束 {killedCount} 个 adb.exe，正在启动 ADB...", _warningBrush);
+            }
+
+            await Task.Delay(500);
+
+            var startResult = await RunAdbAsync(adbPath, "start-server", TimeSpan.FromSeconds(12));
+            if (startResult.TimedOut)
+            {
+                SetAdbStatus("ADB start-server 超时。", _dangerBrush);
+                if (showErrors)
+                {
+                    ShowError("无法重启 ADB", "ADB start-server 超时。");
+                }
+
+                return;
+            }
+
+            if (startResult.ExitCode != 0)
+            {
+                var message = string.IsNullOrWhiteSpace(startResult.Stderr)
+                    ? $"ADB start-server 执行失败（退出码 {startResult.ExitCode}）。"
+                    : startResult.Stderr;
+                SetAdbStatus(message, _dangerBrush);
+                if (showErrors)
+                {
+                    ShowError("无法重启 ADB", message);
+                }
+
+                return;
+            }
+
+            SetAdbStatus("ADB 已重启，正在刷新 Android 设备...", _successBrush);
+            await RefreshAdbDevicesAsync(showErrors, adbPath);
+        }
+        catch (Exception ex)
+        {
+            SetAdbDeviceChoices(Array.Empty<AdbDeviceRow>(), selectedSerial);
+            SetAdbStatus($"重启 ADB 失败：{ex.Message}", _dangerBrush);
+            if (showErrors)
+            {
+                ShowError("无法重启 ADB", ex.Message);
+            }
+        }
+        finally
+        {
+            var controlsEnabled = CanUseAdbControls();
+            AdbDeviceCombo.IsEnabled = controlsEnabled;
+            RefreshAdbDevicesButton.IsEnabled = controlsEnabled;
+            RestartAdbButton.IsEnabled = controlsEnabled;
+        }
+    }
+
+    private bool CanUseAdbControls()
+    {
+        return StartHostButton.IsEnabled && _hostProcess is not { HasExited: false };
     }
 
     private void SetAdbDeviceChoices(IReadOnlyList<AdbDeviceRow> rows, string? selectedSerial)
@@ -1141,7 +1327,12 @@ public sealed partial class MainWindow : Window
 
     private static string Selected(ComboBox comboBox)
     {
-        return (comboBox.SelectedItem as ComboBoxItem)?.Content?.ToString() ?? string.Empty;
+        if (comboBox.SelectedItem is not ComboBoxItem item)
+        {
+            return string.Empty;
+        }
+
+        return item.Tag?.ToString() ?? item.Content?.ToString() ?? string.Empty;
     }
 
     private static string Port(NumberBox numberBox, string name)
@@ -1405,6 +1596,42 @@ public sealed partial class MainWindow : Window
         {
             // Best effort cleanup after an adb timeout.
         }
+    }
+
+    private static int TryKillAdbProcesses()
+    {
+        var killedCount = 0;
+        Process[] processes;
+        try
+        {
+            processes = Process.GetProcessesByName("adb");
+        }
+        catch
+        {
+            return killedCount;
+        }
+
+        foreach (var process in processes)
+        {
+            try
+            {
+                if (!process.HasExited)
+                {
+                    process.Kill(entireProcessTree: true);
+                    killedCount++;
+                }
+            }
+            catch
+            {
+                // Best effort cleanup when adb server is wedged.
+            }
+            finally
+            {
+                process.Dispose();
+            }
+        }
+
+        return killedCount;
     }
 
     private static IEnumerable<AdbDeviceRow> ParseAdbDevices(string stdout)
@@ -2484,6 +2711,8 @@ public sealed partial class MainWindow : Window
         StopHostButton.IsEnabled = running;
         AdbDeviceCombo.IsEnabled = !running;
         RefreshAdbDevicesButton.IsEnabled = !running;
+        RestartAdbButton.IsEnabled = !running;
+        CameraFacingCombo.IsEnabled = !_restartingForCameraFacing;
         OverallStatusText.Text = running ? "运行中" : "未启动";
         OverallStatusText.Foreground = running ? _successBrush : _dangerBrush;
         if (running)
@@ -2509,6 +2738,11 @@ public sealed partial class MainWindow : Window
 
     private void UpdateCameraPreview()
     {
+        if (!_cameraPreviewEnabled)
+        {
+            return;
+        }
+
         try
         {
             _cameraPreviewReader ??= CameraPreviewFrameReader.TryOpen();
@@ -2519,14 +2753,8 @@ public sealed partial class MainWindow : Window
                 return;
             }
 
-            var frame = _cameraPreviewReader.TryReadLatest();
+            var frame = _cameraPreviewReader.TryReadLatest(_lastCameraPreviewSequence);
             if (frame is null)
-            {
-                UpdateCameraPreviewStaleness();
-                return;
-            }
-
-            if (frame.Sequence <= _lastCameraPreviewSequence)
             {
                 UpdateCameraPreviewStaleness();
                 return;
@@ -2582,6 +2810,55 @@ public sealed partial class MainWindow : Window
         UpdateCameraStatusView();
     }
 
+    private void SetCameraPreviewEnabled(bool enabled)
+    {
+        if (_cameraPreviewEnabled == enabled)
+        {
+            UpdateCameraPreviewToggleView();
+            return;
+        }
+
+        _cameraPreviewEnabled = enabled;
+        if (enabled)
+        {
+            CameraPreviewPlaceholderText.Text = "等待摄像头解码帧";
+            CameraPreviewPlaceholderText.Visibility = CameraPreviewImage.Source is null ? Visibility.Visible : Visibility.Collapsed;
+            _cameraPreviewTimer.Start();
+            UpdateCameraPreview();
+        }
+        else
+        {
+            _cameraPreviewTimer.Stop();
+            _cameraPreviewReader?.Dispose();
+            _cameraPreviewReader = null;
+            _cameraPreviewBitmap = null;
+            CameraPreviewImage.Source = null;
+            CameraPreviewPlaceholderText.Text = "Windows 预览已关闭";
+            CameraPreviewPlaceholderText.Visibility = Visibility.Visible;
+        }
+
+        UpdateCameraPreviewToggleView();
+        UpdateCameraStatusView();
+    }
+
+    private void UpdateCameraPreviewToggleView()
+    {
+        if (ToggleCameraPreviewButtonText is null || ToggleCameraPreviewIcon is null)
+        {
+            return;
+        }
+
+        ToggleCameraPreviewButtonText.Text = _cameraPreviewEnabled ? "关闭预览" : "打开预览";
+        ToggleCameraPreviewIcon.Glyph = _cameraPreviewEnabled ? "\uE890" : "\uE7B3";
+    }
+
+    private string FormatCameraPreviewState()
+    {
+        return _cameraPreviewEnabled
+            ? FormatCameraAge(_lastCameraPreviewAt?.ToString("O") ?? string.Empty)
+            : "已关闭";
+    }
+
     private void UpdateCameraStatusView()
     {
         if (CameraStatusText is null)
@@ -2591,9 +2868,10 @@ public sealed partial class MainWindow : Window
 
         var camera = _cameraDiagnostics;
         CameraStatusText.Text = $"Server: {camera.ServerState}  Android: {camera.ClientState}  权限: {camera.PermissionText}";
-        CameraConfigText.Text = $"port {camera.Port} · {camera.Width}x{camera.Height}@{camera.Fps} · {camera.Codec}";
+        CameraConfigText.Text = $"port {camera.Port} · {camera.Width}x{camera.Height}@{camera.Fps} · {camera.Codec} · {camera.Facing}";
         CameraMetricsText.Text =
-            $"{camera.ApproxFps:F1} fps · {camera.ApproxKbps:F0} kbps · packets {camera.Packets} · frames {camera.Frames} · decoded {camera.DecodedFrames} · last {FormatCameraAge(camera.LastFrameAt)}";
+            $"{camera.ApproxFps:F1} fps · {camera.ApproxKbps:F0} kbps · packets {camera.Packets} · frames {camera.Frames} · decoded {camera.DecodedFrames} · "
+            + $"decode {camera.DecodeLagMs:F0}ms · preview {FormatCameraPreviewState()} · last {FormatCameraAge(camera.LastFrameAt)}";
         var errorText = string.IsNullOrWhiteSpace(camera.LastError) ? "无" : camera.LastError;
         CameraErrorText.Text = errorText;
         CameraErrorText.Foreground = string.IsNullOrWhiteSpace(camera.LastError) ? _secondaryBrush : _warningBrush;
@@ -2647,6 +2925,79 @@ public sealed partial class MainWindow : Window
         finally
         {
             SetVirtualCameraButtonsEnabled(true);
+        }
+    }
+
+    private async Task StartCameraPipelineAsync()
+    {
+        SetCameraPreviewEnabled(true);
+        await SendHostCameraConfigCommandAsync(enabled: true);
+        await RunVirtualCameraCommandAsync("ensure-start");
+    }
+
+    private async Task StopCameraPipelineAsync()
+    {
+        SetCameraPreviewEnabled(false);
+        await SendHostCameraConfigCommandAsync(enabled: false);
+        await RunVirtualCameraCommandAsync("stop");
+    }
+
+    private async Task SendHostCameraConfigCommandAsync(bool enabled)
+    {
+        if (_hostProcess is not { HasExited: false })
+        {
+            return;
+        }
+
+        try
+        {
+            using var client = new TcpClient();
+            await client.ConnectAsync(IPAddress.Loopback, DefaultCameraCommandPort);
+            await using var stream = client.GetStream();
+            using var writer = new StreamWriter(stream, new UTF8Encoding(encoderShouldEmitUTF8Identifier: false), bufferSize: 4096, leaveOpen: true)
+            {
+                AutoFlush = true,
+                NewLine = "\n"
+            };
+            using var reader = new StreamReader(stream, Encoding.UTF8, detectEncodingFromByteOrderMarks: false, bufferSize: 4096, leaveOpen: true);
+
+            var request = JsonSerializer.Serialize(new
+            {
+                v = 1,
+                type = "host_camera_config",
+                seq = 1,
+                ts = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds(),
+                payload = new { enabled }
+            });
+            await writer.WriteLineAsync(request);
+
+            var response = await reader.ReadLineAsync().WaitAsync(TimeSpan.FromSeconds(3));
+            if (string.IsNullOrWhiteSpace(response))
+            {
+                throw new IOException("摄像头控制通道没有返回响应。");
+            }
+
+            using var document = JsonDocument.Parse(response);
+            var root = document.RootElement;
+            var ok = root.TryGetProperty("ok", out var okProperty)
+                && okProperty.ValueKind is JsonValueKind.True or JsonValueKind.False
+                && okProperty.GetBoolean();
+            if (!ok)
+            {
+                var message = root.TryGetProperty("message", out var messageProperty)
+                    ? messageProperty.GetString()
+                    : "摄像头控制命令失败。";
+                throw new IOException(string.IsNullOrWhiteSpace(message) ? "摄像头控制命令失败。" : message);
+            }
+
+            _cameraDiagnostics.ClientState = enabled ? "preparing" : "disabled";
+            _cameraDiagnostics.LastError = "";
+            UpdateCameraStatusView();
+        }
+        catch (Exception ex) when (ex is IOException or SocketException or TimeoutException or JsonException)
+        {
+            _cameraDiagnostics.LastError = ex.Message;
+            UpdateCameraStatusView();
         }
     }
 
@@ -3228,6 +3579,7 @@ public sealed partial class MainWindow : Window
         report.AppendLine($"Android 麦克风写入端点名称: {FormatOptional(_boundMicrophoneRenderEndpointName)}");
         report.AppendLine($"音频端口: {DefaultAudioPort}");
         report.AppendLine($"摄像头端口: {DefaultCameraPort}");
+        report.AppendLine($"摄像头方向: {Selected(CameraFacingCombo)}");
         report.AppendLine($"摄像头 reverse: tcp:{DefaultCameraPort} -> tcp:{DefaultCameraPort}");
         report.AppendLine($"控制端口: {FormatNumberBox(ControlPortBox)}");
         report.AppendLine($"视频端口: {FormatNumberBox(VideoPortBox)}");
@@ -3356,6 +3708,8 @@ public sealed partial class MainWindow : Window
         report.AppendLine($"实际接收 fps: {camera.ApproxFps:F1}");
         report.AppendLine($"码率 kbps: {camera.ApproxKbps:F0}");
         report.AppendLine($"解码帧/错误: {camera.DecodedFrames}/{camera.DecodeErrors}");
+        report.AppendLine($"最近解码滞后: {camera.DecodeLagMs:F1} ms");
+        report.AppendLine($"Windows 预览: {(_cameraPreviewEnabled ? "启用" : "关闭")}");
         report.AppendLine($"共享预览帧序号: {_lastCameraPreviewSequence}");
         report.AppendLine($"共享预览最近时间: {FormatOptional(_lastCameraPreviewAt?.ToString("O"))}");
         report.AppendLine($"最近接收帧时间: {FormatOptional(camera.LastFrameAt)}");
@@ -3450,6 +3804,7 @@ public sealed partial class MainWindow : Window
         _lastCameraErrorLine = null;
         _lastCameraErrorMessage = null;
         _cameraDiagnostics.Reset();
+        _cameraDiagnostics.Facing = NormalizeCameraFacing(Selected(CameraFacingCombo));
 
         if (CopyAudioLogButtonText is not null)
         {
@@ -3601,6 +3956,7 @@ public sealed partial class MainWindow : Window
             ApplyCameraSize(ExtractLogValue(line, "size="));
             _cameraDiagnostics.Fps = ExtractLogInt(line, "fps=", _cameraDiagnostics.Fps);
             _cameraDiagnostics.Codec = NonEmpty(ExtractLogValue(line, "codec="), _cameraDiagnostics.Codec);
+            _cameraDiagnostics.Facing = NormalizeCameraFacing(NonEmpty(ExtractLogValue(line, "facing="), _cameraDiagnostics.Facing));
             _cameraDiagnostics.ClientPackets = ExtractLogLong(line, "packets=", _cameraDiagnostics.ClientPackets);
             _cameraDiagnostics.ClientBytes = ExtractLogLong(line, "bytes=", _cameraDiagnostics.ClientBytes);
             _cameraDiagnostics.ClientKeyFrames = ExtractLogLong(line, "keyFrames=", _cameraDiagnostics.ClientKeyFrames);
@@ -3612,6 +3968,7 @@ public sealed partial class MainWindow : Window
             _cameraDiagnostics.Port = ExtractLogInt(line, "port=", _cameraDiagnostics.Port);
             ApplyCameraConfig(ExtractLogValue(line, "config="));
             _cameraDiagnostics.Codec = NonEmpty(ExtractLogValue(line, "codec="), _cameraDiagnostics.Codec);
+            _cameraDiagnostics.Facing = NormalizeCameraFacing(NonEmpty(ExtractLogValue(line, "facing="), _cameraDiagnostics.Facing));
             _cameraDiagnostics.Packets = ExtractLogLong(line, "packets=", _cameraDiagnostics.Packets);
             _cameraDiagnostics.Frames = ExtractLogLong(line, "frames=", _cameraDiagnostics.Frames);
             _cameraDiagnostics.Bytes = ExtractLogLong(line, "bytes=", _cameraDiagnostics.Bytes);
@@ -3620,6 +3977,7 @@ public sealed partial class MainWindow : Window
             _cameraDiagnostics.DecodedFrames = ExtractLogLong(line, "decodedFrames=", _cameraDiagnostics.DecodedFrames);
             _cameraDiagnostics.DecodeErrors = ExtractLogLong(line, "decodeErrors=", _cameraDiagnostics.DecodeErrors);
             _cameraDiagnostics.PreviewFrameSequence = ExtractLogLong(line, "previewSeq=", _cameraDiagnostics.PreviewFrameSequence);
+            _cameraDiagnostics.DecodeLagMs = ExtractLogDouble(line, "decodeLagMs=", _cameraDiagnostics.DecodeLagMs);
             _cameraDiagnostics.ApproxFps = ExtractLogDouble(line, "approxFps=", _cameraDiagnostics.ApproxFps);
             _cameraDiagnostics.ApproxKbps = ExtractLogDouble(line, "approxKbps=", _cameraDiagnostics.ApproxKbps);
             _cameraDiagnostics.LastFrameAt = NonEmpty(ExtractLogValue(line, "lastFrameAt="), _cameraDiagnostics.LastFrameAt);
@@ -3740,6 +4098,11 @@ public sealed partial class MainWindow : Window
     private static string NonEmpty(string value, string fallback)
     {
         return string.IsNullOrWhiteSpace(value) ? fallback : value;
+    }
+
+    private static string NormalizeCameraFacing(string value)
+    {
+        return value.Trim().Equals("front", StringComparison.OrdinalIgnoreCase) ? "front" : "back";
     }
 
     private static string AudioStateHint(AudioDirection direction, AudioCapabilityStatus status)
@@ -4297,6 +4660,9 @@ public sealed partial class MainWindow : Window
     [DllImport("user32.dll")]
     private static extern bool SetForegroundWindow(IntPtr hWnd);
 
+    [DllImport("user32.dll")]
+    private static extern uint GetDpiForWindow(IntPtr hWnd);
+
     [DllImport("shell32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
     private static extern bool Shell_NotifyIcon(uint dwMessage, ref NotifyIconData lpData);
 
@@ -4453,6 +4819,8 @@ public sealed partial class MainWindow : Window
 
         public string Codec { get; set; } = "video/avc";
 
+        public string Facing { get; set; } = "back";
+
         public long Packets { get; set; }
 
         public long Frames { get; set; }
@@ -4468,6 +4836,8 @@ public sealed partial class MainWindow : Window
         public long DecodeErrors { get; set; }
 
         public long PreviewFrameSequence { get; set; }
+
+        public double DecodeLagMs { get; set; }
 
         public double ApproxFps { get; set; }
 
@@ -4499,6 +4869,7 @@ public sealed partial class MainWindow : Window
             Height = 720;
             Fps = 30;
             Codec = "video/avc";
+            Facing = "back";
             Packets = 0;
             Frames = 0;
             Bytes = 0;
@@ -4507,6 +4878,7 @@ public sealed partial class MainWindow : Window
             DecodedFrames = 0;
             DecodeErrors = 0;
             PreviewFrameSequence = 0;
+            DecodeLagMs = 0;
             ApproxFps = 0;
             ApproxKbps = 0;
             LastFrameAt = "";
@@ -4551,10 +4923,16 @@ public sealed partial class MainWindow : Window
             }
         }
 
-        public CameraPreviewFrame? TryReadLatest()
+        public CameraPreviewFrame? TryReadLatest(long lastSeenSequence)
         {
             var sequenceBefore = _view.ReadInt64(32);
             if (sequenceBefore <= 0 || (sequenceBefore & 1) != 0)
+            {
+                return null;
+            }
+
+            var frameSequence = sequenceBefore / 2;
+            if (frameSequence <= lastSeenSequence)
             {
                 return null;
             }
@@ -4594,7 +4972,7 @@ public sealed partial class MainWindow : Window
             var bgra = stride == width * 4
                 ? raw
                 : CompactRows(raw, width, height, stride);
-            return new CameraPreviewFrame(sequenceAfter / 2, width, height, writtenAtUnixMs, bgra);
+            return new CameraPreviewFrame(frameSequence, width, height, writtenAtUnixMs, bgra);
         }
 
         public void Dispose()

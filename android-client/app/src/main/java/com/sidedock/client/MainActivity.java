@@ -188,6 +188,7 @@ public final class MainActivity extends Activity implements ControlClient.Listen
     private int cameraHeight = DEFAULT_CAMERA_HEIGHT;
     private int cameraFps = DEFAULT_CAMERA_FPS;
     private String cameraCodec = VIDEO_CODEC_AVC;
+    private String cameraFacing = "back";
     private int audioSampleRate = DEFAULT_AUDIO_SAMPLE_RATE;
     private int audioChannels = DEFAULT_AUDIO_CHANNELS;
     private int audioSpeakerChannels = 2;
@@ -440,6 +441,7 @@ public final class MainActivity extends Activity implements ControlClient.Listen
         cameraHeight = config.height > 0 ? config.height : DEFAULT_CAMERA_HEIGHT;
         cameraFps = config.fps > 0 ? config.fps : DEFAULT_CAMERA_FPS;
         cameraCodec = config.codec == null || config.codec.length() == 0 ? VIDEO_CODEC_AVC : config.codec;
+        cameraFacing = normalizeCameraFacing(config.facing);
         cameraPacketsSent = 0L;
         cameraBytesSent = 0L;
         cameraKeyFramesSent = 0L;
@@ -447,7 +449,7 @@ public final class MainActivity extends Activity implements ControlClient.Listen
         lastCameraHint = hostCameraEnabled
             ? "Camera uplink configured."
             : "Host camera uplink is disabled.";
-        addLog("camera_config " + cameraWidth + "x" + cameraHeight + "@" + cameraFps + " port=" + cameraPort);
+        addLog("camera_config " + cameraFacing + " " + cameraWidth + "x" + cameraHeight + "@" + cameraFps + " port=" + cameraPort);
         applyCameraCaptureIntent(lastCameraHint);
         updateOverlay();
     }
@@ -1643,7 +1645,16 @@ public final class MainActivity extends Activity implements ControlClient.Listen
 
         cameraRuntimeState = cameraCaptureClient.isRunning() ? "capturing" : "preparing";
         publishCameraStatus(cameraRuntimeState, message);
-        cameraCaptureClient.start(cameraPort, cameraWidth, cameraHeight, cameraFps, cameraCodec);
+        cameraCaptureClient.start(cameraPort, cameraWidth, cameraHeight, cameraFps, cameraCodec, cameraFacing);
+    }
+
+    private static String normalizeCameraFacing(String value) {
+        if (value == null) {
+            return "back";
+        }
+
+        String normalized = value.trim().toLowerCase(Locale.ROOT);
+        return "front".equals(normalized) ? "front" : "back";
     }
 
     private void requestCameraPermissionIfNeeded() {
@@ -1674,6 +1685,7 @@ public final class MainActivity extends Activity implements ControlClient.Listen
             cameraHeight,
             cameraFps,
             cameraCodec,
+            cameraFacing,
             cameraPacketsSent,
             cameraBytesSent,
             cameraKeyFramesSent,

@@ -47,7 +47,7 @@ internal static partial class Program
                 Log(
                     "CAMERA",
                     $"camera-state=listening address={address} port={options.CameraPort} "
-                    + $"config={options.CameraWidth}x{options.CameraHeight}@{options.CameraFps} codec={options.CameraCodec}");
+                    + $"config={options.CameraWidth}x{options.CameraHeight}@{options.CameraFps} codec={options.CameraCodec} facing={options.CameraFacing}");
                 await PublishServerStatusAsync("listening", "waiting for Android camera stream", cancellationToken);
 
                 while (!cancellationToken.IsCancellationRequested)
@@ -179,8 +179,10 @@ internal static partial class Program
             byte[]? codecConfig = null;
             byte[]? payloadBuffer = null;
             var needsKeyFrame = true;
+            var debugDumpPath = Environment.GetEnvironmentVariable("SIDEDOCK_CAMERA_DUMP");
 
             using var decoder = CreateDecoder(connectionId);
+            await using var debugDump = OpenCameraDebugDump(debugDumpPath);
 
             try
             {
@@ -191,14 +193,29 @@ internal static partial class Program
                     payloadBuffer = EnsurePayloadBuffer(payloadBuffer, packet.PayloadLength);
                     await stream.ReadExactlyAsync(payloadBuffer.AsMemory(0, packet.PayloadLength), cancellationToken);
                     stats.Record(packet);
+                    if (debugDump is not null)
+                    {
+                        await debugDump.WriteAsync(payloadBuffer.AsMemory(0, packet.PayloadLength), cancellationToken);
+                        if (stats.PacketCount <= 8)
+                        {
+                            Log(
+                                $"CAMERA {connectionId}",
+                                $"debug-dump packet={stats.PacketCount} seq={packet.Sequence} flags={FormatFlags(packet.Flags)} "
+                                + $"payload={packet.PayloadLength} nalTypes={FormatH264NalTypes(payloadBuffer, packet.PayloadLength)}");
+                        }
+                    }
 
-                    if ((packet.Flags & FlagCodecConfig) != 0)
+                    var containsPicture = H264PayloadContainsPicture(payloadBuffer, packet.PayloadLength);
+                    var isCodecConfigPacket = (packet.Flags & FlagCodecConfig) != 0;
+                    var isKeyFramePacket = (packet.Flags & FlagKeyFrame) != 0 || H264PayloadContainsNalType(payloadBuffer, packet.PayloadLength, 5);
+
+                    if (isCodecConfigPacket && !containsPicture)
                     {
                         codecConfig = payloadBuffer.AsSpan(0, packet.PayloadLength).ToArray();
                         needsKeyFrame = true;
                         needsKeyFrame = DecodePacket(decoder, stats, payloadBuffer, packet.PayloadLength, packet, isCodecConfig: true, needsKeyFrame, codecConfig);
                     }
-                    else if ((packet.Flags & FlagKeyFrame) != 0)
+                    else if (isKeyFramePacket)
                     {
                         needsKeyFrame = DecodePacket(decoder, stats, payloadBuffer, packet.PayloadLength, packet, isCodecConfig: false, needsKeyFrame, codecConfig);
                     }
@@ -228,7 +245,7 @@ internal static partial class Program
                             + $"lastSeq={packet.Sequence} flags={FormatFlags(packet.Flags)} payload={packet.PayloadLength} "
                             + $"keyFrames={stats.KeyFrameCount} codecConfigPackets={stats.CodecConfigPacketCount} "
                             + $"decodedFrames={stats.DecodedFrameCount} decodeErrors={stats.DecodeErrorCount} "
-                            + $"previewSeq={_latestFrameCache.PublishedFrameSequence} "
+                            + $"previewSeq={_latestFrameCache.PublishedFrameSequence} decodeLagMs={stats.LastDecodeLagMs:F1} "
                             + $"lastFrameAt={FormatTimestamp(stats.LastFrameAt)} lastDecodedFrameAt={FormatTimestamp(stats.LastDecodedFrameAt)}"
                             + (string.IsNullOrWhiteSpace(stats.LastDecodeError) ? string.Empty : $" lastError={stats.LastDecodeError}"));
                         await PublishServerStatusAsync(
@@ -253,6 +270,32 @@ internal static partial class Program
                 {
                     ArrayPool<byte>.Shared.Return(payloadBuffer);
                 }
+            }
+        }
+
+        private static FileStream? OpenCameraDebugDump(string? path)
+        {
+            if (string.IsNullOrWhiteSpace(path))
+            {
+                return null;
+            }
+
+            try
+            {
+                var fullPath = Path.GetFullPath(path);
+                var directory = Path.GetDirectoryName(fullPath);
+                if (!string.IsNullOrWhiteSpace(directory))
+                {
+                    Directory.CreateDirectory(directory);
+                }
+
+                Log("CAMERA", $"camera-debug-dump path={fullPath}");
+                return new FileStream(fullPath, FileMode.Create, FileAccess.Write, FileShare.Read);
+            }
+            catch (Exception ex) when (ex is IOException or UnauthorizedAccessException or ArgumentException)
+            {
+                Log("CAMERA", $"camera-debug-dump unavailable: {ex.Message}");
+                return null;
             }
         }
 
@@ -395,6 +438,197 @@ internal static partial class Program
                 : string.Join("|", parts);
         }
 
+        private static bool H264PayloadContainsPicture(byte[] payload, int payloadLength)
+        {
+            return H264PayloadContainsPicture(payload.AsSpan(0, payloadLength));
+        }
+
+        private static bool H264PayloadContainsNalType(byte[] payload, int payloadLength, int nalType)
+        {
+            return H264PayloadContainsNalType(payload.AsSpan(0, payloadLength), nalType);
+        }
+
+        private static bool H264PayloadContainsPicture(ReadOnlySpan<byte> payload)
+        {
+            return H264PayloadContainsNalType(payload, 1, 5);
+        }
+
+        private static bool H264PayloadContainsNalType(ReadOnlySpan<byte> payload, int nalType)
+        {
+            return H264PayloadContainsNalType(payload, nalType, nalType);
+        }
+
+        private static bool H264PayloadContainsNalType(ReadOnlySpan<byte> payload, int minNalType, int maxNalType)
+        {
+            if (payload.IsEmpty)
+            {
+                return false;
+            }
+
+            var startCode = FindStartCode(payload, 0);
+            if (startCode >= 0)
+            {
+                while (startCode >= 0)
+                {
+                    var nalOffset = NalOffsetAfterStartCode(payload, startCode);
+                    if (nalOffset < payload.Length)
+                    {
+                        var nalType = payload[nalOffset] & 0x1F;
+                        if (nalType >= minNalType && nalType <= maxNalType)
+                        {
+                            return true;
+                        }
+                    }
+
+                    startCode = FindStartCode(payload, Math.Max(nalOffset + 1, startCode + 3));
+                }
+
+                return false;
+            }
+
+            if (TryLengthPrefixedPayloadContainsNalType(payload, minNalType, maxNalType, out var containsNalType))
+            {
+                return containsNalType;
+            }
+
+            var rawNalType = payload[0] & 0x1F;
+            return rawNalType >= minNalType && rawNalType <= maxNalType;
+        }
+
+        private static string FormatH264NalTypes(byte[] payload, int payloadLength)
+        {
+            var types = EnumerateH264NalTypes(payload.AsSpan(0, payloadLength)).Take(16).ToArray();
+            return types.Length == 0 ? "none" : string.Join(",", types);
+        }
+
+        private static IReadOnlyList<int> EnumerateH264NalTypes(ReadOnlySpan<byte> payload)
+        {
+            var types = new List<int>();
+            if (payload.IsEmpty)
+            {
+                return types;
+            }
+
+            var startCode = FindStartCode(payload, 0);
+            if (startCode >= 0)
+            {
+                while (startCode >= 0)
+                {
+                    var nalOffset = NalOffsetAfterStartCode(payload, startCode);
+                    if (nalOffset < payload.Length)
+                    {
+                        types.Add(payload[nalOffset] & 0x1F);
+                    }
+
+                    startCode = FindStartCode(payload, Math.Max(nalOffset + 1, startCode + 3));
+                }
+
+                return types;
+            }
+
+            if (TryEnumerateLengthPrefixedNalTypes(payload, out var lengthPrefixedTypes))
+            {
+                return lengthPrefixedTypes;
+            }
+
+            types.Add(payload[0] & 0x1F);
+            return types;
+        }
+
+        private static bool TryEnumerateLengthPrefixedNalTypes(ReadOnlySpan<byte> payload, out int[] nalTypes)
+        {
+            var types = new List<int>();
+            var offset = 0;
+            while (offset + 4 <= payload.Length)
+            {
+                var nalLength = BinaryPrimitives.ReadInt32BigEndian(payload.Slice(offset, 4));
+                offset += 4;
+                if (nalLength <= 0 || offset + nalLength > payload.Length)
+                {
+                    nalTypes = Array.Empty<int>();
+                    return false;
+                }
+
+                types.Add(payload[offset] & 0x1F);
+                offset += nalLength;
+            }
+
+            if (offset != payload.Length || types.Count == 0)
+            {
+                nalTypes = Array.Empty<int>();
+                return false;
+            }
+
+            nalTypes = types.ToArray();
+            return true;
+        }
+
+        private static bool TryLengthPrefixedPayloadContainsNalType(
+            ReadOnlySpan<byte> payload,
+            int minNalType,
+            int maxNalType,
+            out bool containsNalType)
+        {
+            containsNalType = false;
+            var offset = 0;
+            var nalCount = 0;
+            while (offset + 4 <= payload.Length)
+            {
+                var nalLength = BinaryPrimitives.ReadInt32BigEndian(payload.Slice(offset, 4));
+                offset += 4;
+                if (nalLength <= 0 || offset + nalLength > payload.Length)
+                {
+                    containsNalType = false;
+                    return false;
+                }
+
+                nalCount++;
+                var nalType = payload[offset] & 0x1F;
+                if (nalType >= minNalType && nalType <= maxNalType)
+                {
+                    containsNalType = true;
+                }
+
+                offset += nalLength;
+            }
+
+            if (offset != payload.Length || nalCount == 0)
+            {
+                containsNalType = false;
+                return false;
+            }
+
+            return true;
+        }
+
+        private static int FindStartCode(ReadOnlySpan<byte> payload, int start)
+        {
+            for (var index = Math.Max(0, start); index + 3 <= payload.Length; index++)
+            {
+                if (payload[index] != 0 || payload[index + 1] != 0)
+                {
+                    continue;
+                }
+
+                if (payload[index + 2] == 1)
+                {
+                    return index;
+                }
+
+                if (index + 4 <= payload.Length && payload[index + 2] == 0 && payload[index + 3] == 1)
+                {
+                    return index;
+                }
+            }
+
+            return -1;
+        }
+
+        private static int NalOffsetAfterStartCode(ReadOnlySpan<byte> payload, int startCodeOffset)
+        {
+            return startCodeOffset + (startCodeOffset + 2 < payload.Length && payload[startCodeOffset + 2] == 1 ? 3 : 4);
+        }
+
         private ValueTask PublishServerStatusAsync(
             string state,
             string message,
@@ -421,6 +655,7 @@ internal static partial class Program
                 ["decodeErrors"] = stats?.DecodeErrorCount ?? 0,
                 ["approxFps"] = approxFps,
                 ["approxKbps"] = approxKbps,
+                ["decodeLagMs"] = stats?.LastDecodeLagMs ?? 0.0,
                 ["lastFrameAt"] = FormatTimestamp(stats?.LastFrameAt),
                 ["lastDecodedFrameAt"] = FormatTimestamp(stats?.LastDecodedFrameAt),
                 ["lastError"] = stats?.LastDecodeError ?? "",
@@ -544,6 +779,8 @@ internal static partial class Program
 
             public DateTimeOffset LastDecodedFrameAt { get; private set; }
 
+            public double LastDecodeLagMs { get; private set; }
+
             public string LastDecodeError { get; private set; } = string.Empty;
 
             public void Record(CameraPacketHeader packet)
@@ -570,7 +807,12 @@ internal static partial class Program
             public void RecordDecodedFrame()
             {
                 DecodedFrameCount += 1;
-                LastDecodedFrameAt = DateTimeOffset.UtcNow;
+                var now = DateTimeOffset.UtcNow;
+                LastDecodedFrameAt = now;
+                if (LastFrameAt != default)
+                {
+                    LastDecodeLagMs = Math.Max(0.0, (now - LastFrameAt).TotalMilliseconds);
+                }
             }
 
             public void RecordDecodeError(string message)
@@ -1305,12 +1547,12 @@ internal static partial class Program
                 using var inputType = CreateInputMediaType();
                 ThrowIfFailed(GetTransform().SetInputType(0, inputType.MediaType, 0), "Unable to set Media Foundation H.264 camera input type.");
 
-                if (TrySetOutputMediaType(Native.MFVideoFormat_RGB32, OutputFormatRgb32))
+                if (TrySetOutputMediaType(Native.MFVideoFormat_NV12, OutputFormatNv12))
                 {
                     return;
                 }
 
-                if (TrySetOutputMediaType(Native.MFVideoFormat_NV12, OutputFormatNv12))
+                if (TrySetOutputMediaType(Native.MFVideoFormat_RGB32, OutputFormatRgb32))
                 {
                     return;
                 }

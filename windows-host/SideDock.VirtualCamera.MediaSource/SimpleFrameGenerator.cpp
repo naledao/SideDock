@@ -373,7 +373,8 @@ HRESULT SimpleFrameGenerator::_CreateRGB32Frame(
 {
     RETURN_HR_IF_NULL(E_INVALIDARG, pBuf);
     const auto absPitch = static_cast<DWORD>(abs(pitch));
-    if (len < (absPitch * height))
+    const DWORD rowBytes = width * 4;
+    if (absPitch < rowBytes || len < (absPitch * height))
     {
         return HRESULT_FROM_WIN32(ERROR_INSUFFICIENT_BUFFER);
     }
@@ -384,6 +385,24 @@ HRESULT SimpleFrameGenerator::_CreateRGB32Frame(
     {
         std::lock_guard<std::mutex> lock(g_frameReaderLock);
         hasFrame = g_frameReader.TryRead(frame, error);
+    }
+
+    if (hasFrame
+        && frame.Width == static_cast<int>(width)
+        && frame.Height == static_cast<int>(height))
+    {
+        for (DWORD y = 0; y < height; y++)
+        {
+            BYTE* dst = pitch >= 0
+                ? pBuf + (y * pitch)
+                : pBuf + ((height - 1 - y) * absPitch);
+            const BYTE* src = frame.Bgra.data() + y * frame.Stride;
+            CopyMemory(dst, src, rowBytes);
+        }
+
+        const auto servedFrames = ++g_servedFrames;
+        WriteStatus("shared", servedFrames, &frame, error);
+        return S_OK;
     }
 
     for (DWORD y = 0; y < height; y++)

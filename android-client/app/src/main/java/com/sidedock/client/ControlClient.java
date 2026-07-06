@@ -80,6 +80,7 @@ public final class ControlClient {
         public final int height;
         public final int fps;
         public final String codec;
+        public final String facing;
 
         public CameraConfig(
             boolean enabled,
@@ -87,7 +88,8 @@ public final class ControlClient {
             int width,
             int height,
             int fps,
-            String codec
+            String codec,
+            String facing
         ) {
             this.enabled = enabled;
             this.port = port;
@@ -95,6 +97,7 @@ public final class ControlClient {
             this.height = height;
             this.fps = fps;
             this.codec = codec;
+            this.facing = facing;
         }
     }
 
@@ -662,6 +665,7 @@ public final class ControlClient {
         int height,
         int fps,
         String codec,
+        String facing,
         long packets,
         long bytes,
         long keyFrames,
@@ -676,6 +680,7 @@ public final class ControlClient {
             "height", height,
             "fps", fps,
             "codec", codec == null ? "" : codec,
+            "facing", facing == null ? "back" : facing,
             "packets", packets,
             "bytes", bytes,
             "keyFrames", keyFrames,
@@ -1233,7 +1238,8 @@ public final class ControlClient {
             payload.optInt("cameraWidth", 1280),
             payload.optInt("cameraHeight", 720),
             payload.optInt("cameraFps", 30),
-            payload.optString("cameraCodec", "video/avc")
+            payload.optString("cameraCodec", "video/avc"),
+            payload.optString("cameraFacing", "back")
         );
     }
 
@@ -1244,7 +1250,8 @@ public final class ControlClient {
             payload.optInt("width", 1280),
             payload.optInt("height", 720),
             payload.optInt("fps", 30),
-            payload.optString("codec", "video/avc")
+            payload.optString("codec", "video/avc"),
+            payload.optString("facing", "back")
         );
     }
 

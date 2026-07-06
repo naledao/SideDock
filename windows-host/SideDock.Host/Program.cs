@@ -1,6 +1,7 @@
 ﻿using System.Buffers.Binary;
 using System.Buffers;
 using System.Collections.Concurrent;
+using System.ComponentModel;
 using System.Diagnostics;
 using System.Globalization;
 using System.IO.MemoryMappedFiles;
@@ -26,16 +27,19 @@ internal static partial class Program
     private const int DefaultVideoPort = 27184;
     private const int DefaultAudioPort = 27185;
     private const int DefaultCameraPort = 27186;
+    private const int DefaultCameraCommandPort = 27187;
     private const int DefaultVideoWidth = 1280;
     private const int DefaultVideoHeight = 720;
     private const int DefaultVideoFps = 120;
     private const int DefaultCameraWidth = 1280;
     private const int DefaultCameraHeight = 720;
     private const int DefaultCameraFps = 30;
+    private const string DefaultCameraFacing = "back";
     private const int DefaultVideoBitrate = 4_000_000;
     private const int DefaultVideoGop = 30;
     private const int DefaultMaxVideoQueue = 2;
     private const int DefaultNv12PoolSize = 4;
+    private static readonly TimeSpan AdbCommandTimeout = TimeSpan.FromSeconds(6);
     private const VideoSourceKind DefaultVideoSource = VideoSourceKind.IddGpu;
     private const string DefaultVideoFile = "artifacts/test-videos/sidedock-720p30.h264";
     private const string DefaultResolutionPreset = "720p";
@@ -88,15 +92,25 @@ internal static partial class Program
             Log("ADB", $"目标设备: {adbSerial}");
         }
 
-        foreach (var port in options.ReversePorts)
+        var skipAdbReverse = IsTruthy(Environment.GetEnvironmentVariable("SIDEDOCK_SKIP_ADB_REVERSE"));
+        if (skipAdbReverse)
         {
-            await ConfigureAdbReverseAsync(adbPath, adbSerial, port, appCts.Token);
+            Log("ADB", "跳过自动配置 reverse: SIDEDOCK_SKIP_ADB_REVERSE 已启用");
+        }
+        else
+        {
+            foreach (var port in options.ReversePorts)
+            {
+                await ConfigureAdbReverseAsync(adbPath, adbSerial, port, appCts.Token);
+            }
+
+            _ = Task.Run(() => KeepAdbReverseAliveAsync(adbPath, adbSerial, options.ReversePorts, appCts.Token), appCts.Token);
         }
 
-        _ = Task.Run(() => KeepAdbReverseAliveAsync(adbPath, adbSerial, options.ReversePorts, appCts.Token), appCts.Token);
-
         var controlPublisher = new ControlMessagePublisher();
-        var controlServer = new ControlServer(IPAddress.Loopback, options, videoModeState, controlPublisher, displayLayoutProvider);
+        var cameraRuntimeState = new CameraRuntimeState(options.CameraEnabled);
+        var controlServer = new ControlServer(IPAddress.Loopback, options, videoModeState, controlPublisher, displayLayoutProvider, cameraRuntimeState);
+        var cameraCommandServer = new CameraCommandServer(IPAddress.Loopback, DefaultCameraCommandPort, options, controlPublisher, cameraRuntimeState);
         var videoServer = new VideoServer(IPAddress.Loopback, options, videoModeState, controlPublisher);
         var audioServer = new AudioServer(IPAddress.Loopback, options, controlPublisher);
         var cameraServer = new CameraServer(IPAddress.Loopback, options, controlPublisher);
@@ -109,6 +123,7 @@ internal static partial class Program
 
         await Task.WhenAll(
             controlServer.RunAsync(appCts.Token),
+            cameraCommandServer.RunAsync(appCts.Token),
             videoServer.RunAsync(appCts.Token),
             audioServer.RunAsync(appCts.Token),
             cameraServer.RunAsync(appCts.Token));
@@ -143,7 +158,7 @@ internal static partial class Program
         Console.WriteLine($"编码调优: {FormatEncoderTuningForLog(options)}");
         Console.WriteLine($"链路容量: nv12Pool={options.Nv12PoolSize} encodedPacketQueue={options.EncodedPacketQueue}");
         Console.WriteLine($"音频能力: microphone={(options.AudioDeviceEnabled && options.MicrophoneEnabled ? "enabled" : "disabled")} speaker={(options.AudioDeviceEnabled && options.SpeakerEnabled ? "enabled" : "disabled")}");
-        Console.WriteLine($"摄像头能力: {(options.CameraEnabled ? "enabled" : "disabled")} {options.CameraWidth}x{options.CameraHeight}@{options.CameraFps} {options.CameraCodec}");
+        Console.WriteLine($"摄像头能力: {(options.CameraEnabled ? "enabled" : "disabled")} {options.CameraWidth}x{options.CameraHeight}@{options.CameraFps} {options.CameraCodec} facing={options.CameraFacing}");
         if (!string.IsNullOrWhiteSpace(options.CameraReplayFilePath))
         {
             Console.WriteLine($"摄像头回放输入: {options.CameraReplayFilePath}");
@@ -200,6 +215,15 @@ internal static partial class Program
     private static bool IsIddVideoSource(VideoSourceKind value)
     {
         return value is VideoSourceKind.Idd or VideoSourceKind.IddGpu;
+    }
+
+    private static bool IsTruthy(string? value)
+    {
+        return value is not null
+            && (value.Equals("1", StringComparison.OrdinalIgnoreCase)
+                || value.Equals("true", StringComparison.OrdinalIgnoreCase)
+                || value.Equals("yes", StringComparison.OrdinalIgnoreCase)
+                || value.Equals("on", StringComparison.OrdinalIgnoreCase));
     }
 
     private static async Task KeepAdbReverseAliveAsync(
@@ -309,8 +333,45 @@ internal static partial class Program
 
         var stdoutTask = process.StandardOutput.ReadToEndAsync(cancellationToken);
         var stderrTask = process.StandardError.ReadToEndAsync(cancellationToken);
-        await process.WaitForExitAsync(cancellationToken);
+        using var adbTimeoutCts = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
+        adbTimeoutCts.CancelAfter(AdbCommandTimeout);
+
+        try
+        {
+            await process.WaitForExitAsync(adbTimeoutCts.Token);
+        }
+        catch (OperationCanceledException) when (!cancellationToken.IsCancellationRequested)
+        {
+            try
+            {
+                if (!process.HasExited)
+                {
+                    process.Kill(entireProcessTree: true);
+                }
+            }
+            catch (Exception ex) when (ex is InvalidOperationException or Win32Exception)
+            {
+            }
+
+            return new ProcessResult(
+                -1,
+                await ReadProcessOutputAsync(stdoutTask),
+                $"adb command timed out after {AdbCommandTimeout.TotalSeconds:F0}s: adb {arguments}");
+        }
+
         return new ProcessResult(process.ExitCode, (await stdoutTask).Trim(), (await stderrTask).Trim());
+    }
+
+    private static async Task<string> ReadProcessOutputAsync(Task<string> outputTask)
+    {
+        try
+        {
+            return await outputTask.WaitAsync(TimeSpan.FromMilliseconds(500));
+        }
+        catch (Exception ex) when (ex is OperationCanceledException or TimeoutException or IOException or ObjectDisposedException)
+        {
+            return string.Empty;
+        }
     }
 
     private static string ResolveAdbPath()
@@ -636,6 +697,150 @@ internal static partial class Program
         }
     }
 
+    private sealed class CameraRuntimeState(bool initialEnabled)
+    {
+        private readonly object _lock = new();
+        private bool _requestedEnabled = initialEnabled;
+
+        public bool IsEnabled(HostOptions options)
+        {
+            lock (_lock)
+            {
+                return options.CameraEnabled && _requestedEnabled;
+            }
+        }
+
+        public bool SetRequestedEnabled(bool enabled, HostOptions options)
+        {
+            lock (_lock)
+            {
+                _requestedEnabled = enabled;
+                return options.CameraEnabled && _requestedEnabled;
+            }
+        }
+    }
+
+    private sealed class CameraCommandServer(
+        IPAddress address,
+        int port,
+        HostOptions options,
+        ControlMessagePublisher publisher,
+        CameraRuntimeState cameraRuntimeState)
+    {
+        private readonly TcpListener _listener = new(address, port);
+
+        public async Task RunAsync(CancellationToken cancellationToken)
+        {
+            try
+            {
+                _listener.Start();
+                Log("CAMERA CMD", $"listening address={address} port={port}");
+
+                while (!cancellationToken.IsCancellationRequested)
+                {
+                    var client = await _listener.AcceptTcpClientAsync(cancellationToken);
+                    _ = Task.Run(() => HandleClientAsync(client, cancellationToken), cancellationToken);
+                }
+            }
+            catch (OperationCanceledException)
+            {
+                Log("CAMERA CMD", "正在关闭。");
+            }
+            catch (SocketException ex)
+            {
+                Log("CAMERA CMD", $"listen_failed message={ex.Message}");
+            }
+            finally
+            {
+                _listener.Stop();
+            }
+        }
+
+        private async Task HandleClientAsync(TcpClient client, CancellationToken cancellationToken)
+        {
+            using (client)
+            await using (var stream = client.GetStream())
+            using (var reader = new StreamReader(stream, Encoding.UTF8, detectEncodingFromByteOrderMarks: false, bufferSize: 4096, leaveOpen: true))
+            await using (var writer = new StreamWriter(stream, new UTF8Encoding(encoderShouldEmitUTF8Identifier: false), bufferSize: 4096, leaveOpen: true)
+            {
+                AutoFlush = true,
+                NewLine = "\n"
+            })
+            {
+                client.NoDelay = true;
+                var line = await reader.ReadLineAsync(cancellationToken);
+                if (string.IsNullOrWhiteSpace(line))
+                {
+                    await WriteCommandResponseAsync(writer, ok: false, "empty command", cancellationToken);
+                    return;
+                }
+
+                ProtocolMessage? message;
+                try
+                {
+                    message = JsonSerializer.Deserialize<ProtocolMessage>(line, JsonOptions);
+                }
+                catch (JsonException ex)
+                {
+                    await WriteCommandResponseAsync(writer, ok: false, $"invalid json: {ex.Message}", cancellationToken);
+                    return;
+                }
+
+                if (message?.Type != "host_camera_config" || message.Payload is not JsonObject payload)
+                {
+                    await WriteCommandResponseAsync(writer, ok: false, "unsupported command", cancellationToken);
+                    return;
+                }
+
+                var requestedEnabled = ReadCommandBool(payload, "enabled");
+                var effectiveEnabled = cameraRuntimeState.SetRequestedEnabled(requestedEnabled, options);
+                await publisher.PublishAsync(
+                    "camera_config",
+                    CreateCameraConfigPayload(options, effectiveEnabled),
+                    cancellationToken);
+
+                Log("CAMERA CMD", $"host_camera_config requestedEnabled={requestedEnabled} effectiveEnabled={effectiveEnabled}");
+                await WriteCommandResponseAsync(writer, ok: true, effectiveEnabled ? "camera enabled" : "camera disabled", cancellationToken);
+            }
+        }
+
+        private static async Task WriteCommandResponseAsync(
+            StreamWriter writer,
+            bool ok,
+            string message,
+            CancellationToken cancellationToken)
+        {
+            var response = JsonSerializer.Serialize(new JsonObject
+            {
+                ["ok"] = ok,
+                ["message"] = message
+            }, JsonOptions);
+            await writer.WriteLineAsync(response.AsMemory(), cancellationToken);
+        }
+
+        private static bool ReadCommandBool(JsonObject payload, string name)
+        {
+            return payload.TryGetPropertyValue(name, out var node)
+                && node is not null
+                && node.GetValueKind() is JsonValueKind.True or JsonValueKind.False
+                && node.GetValue<bool>();
+        }
+    }
+
+    private static JsonObject CreateCameraConfigPayload(HostOptions options, bool enabled)
+    {
+        return new JsonObject
+        {
+            ["enabled"] = enabled,
+            ["port"] = options.CameraPort,
+            ["width"] = options.CameraWidth,
+            ["height"] = options.CameraHeight,
+            ["fps"] = options.CameraFps,
+            ["codec"] = options.CameraCodec,
+            ["facing"] = options.CameraFacing
+        };
+    }
+
     private sealed class ControlConnection
     {
         private readonly int _connectionId;
@@ -686,13 +891,15 @@ internal static partial class Program
         HostOptions options,
         VideoModeState videoModeState,
         ControlMessagePublisher publisher,
-        DisplayLayoutProvider displayLayoutProvider)
+        DisplayLayoutProvider displayLayoutProvider,
+        CameraRuntimeState cameraRuntimeState)
     {
         private readonly TcpListener _listener = new(address, options.ControlPort);
         private readonly HostOptions _options = options;
         private readonly VideoModeState _videoModeState = videoModeState;
         private readonly ControlMessagePublisher _publisher = publisher;
         private readonly DisplayLayoutProvider _displayLayoutProvider = displayLayoutProvider;
+        private readonly CameraRuntimeState _cameraRuntimeState = cameraRuntimeState;
         private readonly object _connectionLock = new();
         private CancellationTokenSource? _activeConnectionCts;
         private int _connectionSerial;
@@ -750,7 +957,7 @@ internal static partial class Program
             using (connectionCts)
             {
                 var remote = client.Client.RemoteEndPoint?.ToString() ?? "unknown";
-                var session = new ControlSession(connectionId, client, connectionCts, _options, _videoModeState, _publisher, _displayLayoutProvider);
+                var session = new ControlSession(connectionId, client, connectionCts, _options, _videoModeState, _publisher, _displayLayoutProvider, _cameraRuntimeState);
                 Log($"CONN {connectionId}", $"控制通道已连接: {remote}");
 
                 try
@@ -790,6 +997,7 @@ internal static partial class Program
         private readonly VideoModeState _videoModeState;
         private readonly ControlMessagePublisher _publisher;
         private readonly DisplayLayoutProvider _displayLayoutProvider;
+        private readonly CameraRuntimeState _cameraRuntimeState;
         private readonly HostInputController _inputController;
         private readonly PeriodicTimer _heartbeatTimer = new(TimeSpan.FromSeconds(2));
         private readonly PeriodicTimer _inputStatsTimer = new(TimeSpan.FromSeconds(1));
@@ -809,7 +1017,8 @@ internal static partial class Program
             HostOptions options,
             VideoModeState videoModeState,
             ControlMessagePublisher publisher,
-            DisplayLayoutProvider displayLayoutProvider)
+            DisplayLayoutProvider displayLayoutProvider,
+            CameraRuntimeState cameraRuntimeState)
         {
             _connectionId = connectionId;
             _client = client;
@@ -818,6 +1027,7 @@ internal static partial class Program
             _videoModeState = videoModeState;
             _publisher = publisher;
             _displayLayoutProvider = displayLayoutProvider;
+            _cameraRuntimeState = cameraRuntimeState;
             _client.NoDelay = true;
             _inputController = new HostInputController(
                 options.EnableInputInjection,
@@ -908,6 +1118,7 @@ internal static partial class Program
             {
                 case "hello":
                     var helloVideoMode = _videoModeState.Current;
+                    var cameraEnabled = _cameraRuntimeState.IsEnabled(_options);
                     await connection.SendAsync("hello_ack", new JsonObject
                     {
                         ["server"] = "SideDock.Host",
@@ -930,14 +1141,15 @@ internal static partial class Program
                         ["microphoneChannels"] = AudioDefaults.MicChannels,
                         ["speakerChannels"] = AudioDefaults.SpeakerChannels,
                         ["audioBitsPerSample"] = AudioDefaults.BitsPerSample,
-                        ["cameraEnabled"] = _options.CameraEnabled,
+                        ["cameraEnabled"] = cameraEnabled,
                         ["cameraPort"] = _options.CameraPort,
                         ["cameraWidth"] = _options.CameraWidth,
                         ["cameraHeight"] = _options.CameraHeight,
                         ["cameraFps"] = _options.CameraFps,
-                        ["cameraCodec"] = _options.CameraCodec
+                        ["cameraCodec"] = _options.CameraCodec,
+                        ["cameraFacing"] = _options.CameraFacing
                     }, cancellationToken);
-                    await connection.SendAsync("camera_config", CameraConfigPayload(_options), cancellationToken);
+                    await connection.SendAsync("camera_config", CreateCameraConfigPayload(_options, cameraEnabled), cancellationToken);
                     await PublishDisplayMetricsIfChangedAsync(connection, force: true, cancellationToken);
                     break;
 
@@ -1124,19 +1336,6 @@ internal static partial class Program
                 + (string.IsNullOrWhiteSpace(message) ? string.Empty : $" message={message}"));
         }
 
-        private static JsonObject CameraConfigPayload(HostOptions options)
-        {
-            return new JsonObject
-            {
-                ["enabled"] = options.CameraEnabled,
-                ["port"] = options.CameraPort,
-                ["width"] = options.CameraWidth,
-                ["height"] = options.CameraHeight,
-                ["fps"] = options.CameraFps,
-                ["codec"] = options.CameraCodec
-            };
-        }
-
         private void LogCameraStatus(JsonNode payloadNode)
         {
             if (payloadNode is not JsonObject payload)
@@ -1157,6 +1356,7 @@ internal static partial class Program
                 + $" size={ReadLong(payload, "width")}x{ReadLong(payload, "height")}"
                 + $" fps={ReadLong(payload, "fps")}"
                 + $" codec={ReadString(payload, "codec")}"
+                + $" facing={ReadString(payload, "facing")}"
                 + $" packets={ReadLong(payload, "packets")}"
                 + $" bytes={ReadLong(payload, "bytes")}"
                 + $" keyFrames={ReadLong(payload, "keyFrames")}"
@@ -13422,6 +13622,7 @@ internal static partial class Program
         int CameraHeight,
         int CameraFps,
         string CameraCodec,
+        string CameraFacing,
         AudioBackendKind AudioBackend,
         string? AudioOutputLoopbackEndpointId,
         string? AudioMicrophoneRenderEndpointId,
@@ -13454,6 +13655,7 @@ internal static partial class Program
             var cameraHeight = DefaultCameraHeight;
             var cameraFps = DefaultCameraFps;
             var cameraCodec = "video/avc";
+            var cameraFacing = DefaultCameraFacing;
             var resolutionPreset = DefaultResolutionPreset;
             var videoSource = DefaultVideoSource;
             var encoder = H264EncoderKind.MediaFoundation;
@@ -13578,6 +13780,11 @@ internal static partial class Program
                             cameraCodec = args[index + 1].Trim();
                         }
 
+                        break;
+
+                    case "--camera-facing":
+                    case "--camera-lens-facing":
+                        cameraFacing = NormalizeCameraFacing(args[index + 1]);
                         break;
 
                     case "--camera-replay":
@@ -13805,6 +14012,7 @@ internal static partial class Program
                 cameraHeight,
                 cameraFps,
                 cameraCodec,
+                cameraFacing,
                 audioBackend,
                 NormalizeOptionalAudioEndpointId(audioOutputLoopbackEndpointId),
                 NormalizeOptionalAudioEndpointId(audioMicrophoneRenderEndpointId),
@@ -13814,6 +14022,16 @@ internal static partial class Program
         private static string? NormalizeOptionalAudioEndpointId(string? value)
         {
             return string.IsNullOrWhiteSpace(value) ? null : value.Trim();
+        }
+
+        private static string NormalizeCameraFacing(string? value)
+        {
+            if (string.IsNullOrWhiteSpace(value))
+            {
+                return DefaultCameraFacing;
+            }
+
+            return value.Trim().Equals("front", StringComparison.OrdinalIgnoreCase) ? "front" : "back";
         }
 
         private static string? NormalizeOptionalPath(string? value)

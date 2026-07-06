@@ -169,6 +169,7 @@
                                         <Grid.ColumnDefinitions>
                                             <ColumnDefinition Width="*" />
                                             <ColumnDefinition Width="Auto" />
+                                            <ColumnDefinition Width="Auto" />
                                         </Grid.ColumnDefinitions>
                                         <ComboBox
                                             x:Name="AdbDeviceCombo"
@@ -182,6 +183,16 @@
                                             <StackPanel Orientation="Horizontal" Spacing="6">
                                                 <FontIcon Glyph="&#xE72C;" FontSize="14" />
                                                 <TextBlock Text="刷新" />
+                                            </StackPanel>
+                                        </Button>
+                                        <Button
+                                            Grid.Column="2"
+                                            x:Name="RestartAdbButton"
+                                            Click="RestartAdbButton_Click"
+                                            Padding="10,6">
+                                            <StackPanel Orientation="Horizontal" Spacing="6">
+                                                <FontIcon Glyph="&#xE72C;" FontSize="14" />
+                                                <TextBlock Text="重启 ADB" />
                                             </StackPanel>
                                         </Button>
                                     </Grid>
@@ -218,6 +229,8 @@
                                     <Grid.ColumnDefinitions>
                                         <ColumnDefinition Width="*" />
                                         <ColumnDefinition Width="Auto" />
+                                        <ColumnDefinition Width="Auto" />
+                                        <ColumnDefinition Width="Auto" />
                                     </Grid.ColumnDefinitions>
                                     <StackPanel Spacing="3">
                                         <TextBlock
@@ -230,8 +243,41 @@
                                             Foreground="{ThemeResource TextFillColorSecondaryBrush}"
                                             TextWrapping="Wrap" />
                                     </StackPanel>
-                                    <Button
+                                    <StackPanel
                                         Grid.Column="1"
+                                        Spacing="4"
+                                        MinWidth="96"
+                                        VerticalAlignment="Top">
+                                        <TextBlock
+                                            Text="镜头"
+                                            Foreground="{ThemeResource TextFillColorSecondaryBrush}" />
+                                        <ComboBox
+                                            x:Name="CameraFacingCombo"
+                                            SelectedIndex="0"
+                                            SelectionChanged="CameraFacingCombo_SelectionChanged"
+                                            HorizontalAlignment="Stretch">
+                                            <ComboBoxItem Content="后置" Tag="back" />
+                                            <ComboBoxItem Content="前置" Tag="front" />
+                                        </ComboBox>
+                                    </StackPanel>
+                                    <Button
+                                        Grid.Column="2"
+                                        x:Name="ToggleCameraPreviewButton"
+                                        Click="ToggleCameraPreviewButton_Click"
+                                        Padding="8,6"
+                                        VerticalAlignment="Top">
+                                        <StackPanel Orientation="Horizontal" Spacing="6">
+                                            <FontIcon
+                                                x:Name="ToggleCameraPreviewIcon"
+                                                Glyph="&#xE890;"
+                                                FontSize="14" />
+                                            <TextBlock
+                                                x:Name="ToggleCameraPreviewButtonText"
+                                                Text="关闭预览" />
+                                        </StackPanel>
+                                    </Button>
+                                    <Button
+                                        Grid.Column="3"
                                         x:Name="CopyCameraDiagnosticsButton"
                                         Click="CopyCameraDiagnosticsButton_Click"
                                         Padding="8,6"
