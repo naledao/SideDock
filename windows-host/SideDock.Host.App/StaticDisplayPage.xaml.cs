@@ -34,6 +34,8 @@ public sealed partial class StaticDisplayPage : UserControl
     private string _selectedResolution = "1080p";
     private string _selectedRefreshRate = "120";
     private bool _displayOptionsEnabled = true;
+    private bool _displayOptionsAvailable = true;
+    private bool _displayModeApplyInProgress;
     private bool _statusBannerDismissed;
     private string? _lastLoggedStatus;
     private DisplayLayoutSnapshot _displayLayoutSnapshot = new(Array.Empty<DisplayLayoutMonitor>());
@@ -58,9 +60,7 @@ public sealed partial class StaticDisplayPage : UserControl
 
     public event EventHandler? ShowLogsRequested;
 
-    public event EventHandler<StaticDisplayOptionChangedEventArgs>? ResolutionChanged;
-
-    public event EventHandler<StaticDisplayOptionChangedEventArgs>? RefreshRateChanged;
+    internal event Func<object, StaticDisplayModeApplyRequestedEventArgs, Task<StaticDisplayModeApplyResult>>? DisplayModeApplyRequested;
 
     internal void UpdateVirtualDisplayState(StaticDisplayPageState state)
     {
@@ -174,7 +174,7 @@ public sealed partial class StaticDisplayPage : UserControl
         StatusBanner.Visibility = Visibility.Collapsed;
     }
 
-    private void ResolutionOption_Tapped(object sender, TappedRoutedEventArgs e)
+    private async void ResolutionOption_Tapped(object sender, TappedRoutedEventArgs e)
     {
         if (!_displayOptionsEnabled || sender is not FrameworkElement { Tag: string value })
         {
@@ -187,12 +187,10 @@ public sealed partial class StaticDisplayPage : UserControl
             return;
         }
 
-        SetSelectedResolution(normalized);
-        AddActivityLog($"分辨率已选择为 {ResolutionLabel(normalized)}。", StaticDisplayActivityKind.Info);
-        ResolutionChanged?.Invoke(this, new StaticDisplayOptionChangedEventArgs(normalized));
+        await RequestDisplayModeApplyAsync(normalized, _selectedRefreshRate);
     }
 
-    private void RefreshRateOption_Tapped(object sender, TappedRoutedEventArgs e)
+    private async void RefreshRateOption_Tapped(object sender, TappedRoutedEventArgs e)
     {
         if (!_displayOptionsEnabled || sender is not FrameworkElement { Tag: string value })
         {
@@ -205,9 +203,45 @@ public sealed partial class StaticDisplayPage : UserControl
             return;
         }
 
-        SetSelectedRefreshRate(normalized);
-        AddActivityLog($"刷新率已选择为 {normalized} Hz。", StaticDisplayActivityKind.Info);
-        RefreshRateChanged?.Invoke(this, new StaticDisplayOptionChangedEventArgs(normalized));
+        await RequestDisplayModeApplyAsync(_selectedResolution, normalized);
+    }
+
+    private async Task RequestDisplayModeApplyAsync(string resolution, string refreshRate)
+    {
+        var handler = DisplayModeApplyRequested;
+        if (handler is null)
+        {
+            AddActivityLog("无法应用显示模式：页面尚未连接到主窗口。", StaticDisplayActivityKind.Failure);
+            return;
+        }
+
+        var requestText = BuildDisplayModeText(resolution, refreshRate);
+        SetDisplayOptionsApplying(true);
+        AddActivityLog($"正在应用显示模式：{requestText}。", StaticDisplayActivityKind.Info);
+
+        try
+        {
+            var result = await handler(this, new StaticDisplayModeApplyRequestedEventArgs(resolution, refreshRate));
+            if (!string.IsNullOrWhiteSpace(result.DisplayedResolution)
+                && !string.IsNullOrWhiteSpace(result.DisplayedRefreshRate))
+            {
+                SetSelectedDisplayOptions(result.DisplayedResolution, result.DisplayedRefreshRate);
+            }
+
+            AddActivityLog(
+                result.Success
+                    ? $"显示模式已应用：{result.CurrentModeText ?? requestText}。"
+                    : $"显示模式应用失败：{result.Message}",
+                result.Success ? StaticDisplayActivityKind.Success : StaticDisplayActivityKind.Failure);
+        }
+        catch (Exception ex)
+        {
+            AddActivityLog($"显示模式应用失败：{ex.Message}", StaticDisplayActivityKind.Failure);
+        }
+        finally
+        {
+            SetDisplayOptionsApplying(false);
+        }
     }
 
     private void SetSelectedDisplayOptions(string resolution, string refreshRate)
@@ -236,8 +270,20 @@ public sealed partial class StaticDisplayPage : UserControl
 
     private void SetDisplayOptionsEnabled(bool enabled)
     {
-        _displayOptionsEnabled = enabled;
-        var opacity = enabled ? 1 : 0.56;
+        _displayOptionsAvailable = enabled;
+        UpdateDisplayOptionsAvailability();
+    }
+
+    private void SetDisplayOptionsApplying(bool applying)
+    {
+        _displayModeApplyInProgress = applying;
+        UpdateDisplayOptionsAvailability();
+    }
+
+    private void UpdateDisplayOptionsAvailability()
+    {
+        _displayOptionsEnabled = _displayOptionsAvailable && !_displayModeApplyInProgress;
+        var opacity = _displayOptionsEnabled ? 1 : 0.56;
         Resolution720pOption.Opacity = opacity;
         Resolution1080pOption.Opacity = opacity;
         Resolution2kOption.Opacity = opacity;
@@ -645,29 +691,70 @@ public sealed partial class StaticDisplayPage : UserControl
 
     private static string NormalizeResolution(string? value)
     {
-        return (value ?? string.Empty).Trim().ToLowerInvariant() switch
+        var cleaned = (value ?? string.Empty).Trim();
+        if (string.IsNullOrWhiteSpace(cleaned))
+        {
+            return "1080p";
+        }
+
+        var compact = cleaned
+            .Replace(" ", string.Empty, StringComparison.Ordinal)
+            .Replace("×", "x", StringComparison.Ordinal)
+            .ToLowerInvariant();
+        return compact switch
         {
             "720" or "720p" => "720p",
+            "1280x720" => "720p",
+            "1080" or "1080p" => "1080p",
+            "1920x1080" => "1080p",
             "2k" or "1440p" => "2k",
-            _ => "1080p"
+            "2560x1440" => "2k",
+            _ => cleaned
         };
     }
 
     private static string NormalizeRefreshRate(string? value)
     {
-        return (value ?? string.Empty).Trim() switch
+        var cleaned = (value ?? string.Empty).Trim();
+        if (string.IsNullOrWhiteSpace(cleaned))
         {
-            "30" or "30 Hz" => "30",
-            "60" or "60 Hz" => "60",
-            _ => "120"
+            return "120";
+        }
+
+        var numericText = cleaned
+            .Replace("Hz", string.Empty, StringComparison.OrdinalIgnoreCase)
+            .Trim();
+        return numericText switch
+        {
+            "30" => "30",
+            "60" => "60",
+            "120" => "120",
+            _ => int.TryParse(numericText, out var refreshRate) && refreshRate > 0
+                ? refreshRate.ToString()
+                : cleaned
         };
     }
 
     private static string ResolutionLabel(string resolution)
     {
-        return NormalizeResolution(resolution) == "2k"
-            ? "2K"
-            : NormalizeResolution(resolution);
+        var normalized = NormalizeResolution(resolution);
+        return normalized == "2k" ? "2K" : normalized;
+    }
+
+    private static string BuildDisplayModeText(string resolution, string refreshRate)
+    {
+        return $"{ResolutionSizeText(resolution)} @ {NormalizeRefreshRate(refreshRate)} Hz";
+    }
+
+    private static string ResolutionSizeText(string resolution)
+    {
+        return NormalizeResolution(resolution) switch
+        {
+            "720p" => "1280 × 720",
+            "1080p" => "1920 × 1080",
+            "2k" => "2560 × 1440",
+            var custom => custom
+        };
     }
 
     private sealed record ActivityLogEntry(
@@ -712,14 +799,30 @@ public sealed partial class StaticDisplayPage : UserControl
     }
 }
 
-public sealed class StaticDisplayOptionChangedEventArgs : EventArgs
+internal sealed class StaticDisplayModeApplyRequestedEventArgs : EventArgs
 {
-    public StaticDisplayOptionChangedEventArgs(string value)
+    public StaticDisplayModeApplyRequestedEventArgs(string resolution, string refreshRate)
     {
-        Value = value;
+        Resolution = resolution;
+        RefreshRate = refreshRate;
     }
 
-    public string Value { get; }
+    public string Resolution { get; }
+
+    public string RefreshRate { get; }
+}
+
+internal sealed class StaticDisplayModeApplyResult
+{
+    public bool Success { get; init; }
+
+    public string Message { get; init; } = string.Empty;
+
+    public string? DisplayedResolution { get; init; }
+
+    public string? DisplayedRefreshRate { get; init; }
+
+    public string? CurrentModeText { get; init; }
 }
 
 internal sealed class StaticDisplayPageState
