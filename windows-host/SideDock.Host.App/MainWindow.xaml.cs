@@ -225,6 +225,7 @@ public sealed partial class MainWindow : Window
     private bool _syncingVirtualDisplayOptions;
     private bool _updatingOverviewVirtualDisplaySwitch;
     private bool _virtualDisplayOperationInProgress;
+    private bool _virtualDisplayModeApplyInProgress;
     private bool _driverInstallInProgress;
     private bool _syncingOverviewCameraOptions;
     private bool _updatingOverviewCameraSwitch;
@@ -411,8 +412,7 @@ public sealed partial class MainWindow : Window
         OverviewDisplayPage.InstallDriverRequested += StaticDisplayPage_InstallDriverRequested;
         OverviewDisplayPage.OpenDisplaySettingsRequested += StaticDisplayPage_OpenDisplaySettingsRequested;
         OverviewDisplayPage.ShowLogsRequested += StaticDisplayPage_ShowLogsRequested;
-        OverviewDisplayPage.ResolutionChanged += StaticDisplayPage_ResolutionChanged;
-        OverviewDisplayPage.RefreshRateChanged += StaticDisplayPage_RefreshRateChanged;
+        OverviewDisplayPage.DisplayModeApplyRequested += StaticDisplayPage_DisplayModeApplyRequested;
     }
 
     private void UpdateOverviewMainContentMinHeight()
@@ -2429,14 +2429,11 @@ public sealed partial class MainWindow : Window
         await ShowOverviewLogsDialogAsync();
     }
 
-    private void StaticDisplayPage_ResolutionChanged(object? sender, StaticDisplayOptionChangedEventArgs e)
+    private Task<StaticDisplayModeApplyResult> StaticDisplayPage_DisplayModeApplyRequested(
+        object sender,
+        StaticDisplayModeApplyRequestedEventArgs e)
     {
-        SyncStaticDisplayOptionToHostCombo(e.Value, OverviewVirtualDisplayResolutionCombo, ResolutionCombo);
-    }
-
-    private void StaticDisplayPage_RefreshRateChanged(object? sender, StaticDisplayOptionChangedEventArgs e)
-    {
-        SyncStaticDisplayOptionToHostCombo(e.Value, OverviewVirtualDisplayRefreshRateCombo, RefreshRateCombo);
+        return ApplyVirtualDisplayModeSelectionAsync(e.Resolution, e.RefreshRate);
     }
 
     private static string BuildDisplayLayoutRefreshSummary(DisplayLayoutSnapshot displayLayout)
@@ -2676,14 +2673,24 @@ public sealed partial class MainWindow : Window
         await SetOverviewVirtualDisplayEnabledAsync(OverviewVirtualDisplaySwitch.IsOn);
     }
 
-    private void OverviewVirtualDisplayResolutionCombo_SelectionChanged(object sender, SelectionChangedEventArgs e)
+    private async void OverviewVirtualDisplayResolutionCombo_SelectionChanged(object sender, SelectionChangedEventArgs e)
     {
-        SyncVirtualDisplayOptionToHostCombo(OverviewVirtualDisplayResolutionCombo, ResolutionCombo);
+        if (_syncingVirtualDisplayOptions || !_uiReady)
+        {
+            return;
+        }
+
+        await ApplyOverviewVirtualDisplayModeSelectionAsync();
     }
 
-    private void OverviewVirtualDisplayRefreshRateCombo_SelectionChanged(object sender, SelectionChangedEventArgs e)
+    private async void OverviewVirtualDisplayRefreshRateCombo_SelectionChanged(object sender, SelectionChangedEventArgs e)
     {
-        SyncVirtualDisplayOptionToHostCombo(OverviewVirtualDisplayRefreshRateCombo, RefreshRateCombo);
+        if (_syncingVirtualDisplayOptions || !_uiReady)
+        {
+            return;
+        }
+
+        await ApplyOverviewVirtualDisplayModeSelectionAsync();
     }
 
     private async void OverviewCameraSwitch_Toggled(object sender, RoutedEventArgs e)
@@ -3401,45 +3408,224 @@ public sealed partial class MainWindow : Window
         }
     }
 
-    private void SyncVirtualDisplayOptionToHostCombo(ComboBox source, ComboBox target)
+    private async Task ApplyOverviewVirtualDisplayModeSelectionAsync()
     {
-        if (_syncingVirtualDisplayOptions || !_uiReady)
-        {
-            return;
-        }
+        var result = await ApplyVirtualDisplayModeSelectionAsync(
+            Selected(OverviewVirtualDisplayResolutionCombo),
+            Selected(OverviewVirtualDisplayRefreshRateCombo));
 
-        _syncingVirtualDisplayOptions = true;
-        try
-        {
-            SelectComboBoxValue(target, Selected(source));
-        }
-        finally
-        {
-            _syncingVirtualDisplayOptions = false;
-        }
+        OverviewDisplayPage.AddActivityLog(
+            result.Success
+                ? $"显示模式已应用：{result.CurrentModeText ?? "当前请求"}。"
+                : $"显示模式应用失败：{result.Message}",
+            result.Success ? StaticDisplayActivityKind.Success : StaticDisplayActivityKind.Failure);
 
-        RefreshVirtualDisplayState();
+        if (!result.Success)
+        {
+            RollBackOverviewVirtualDisplaySelection(result);
+        }
     }
 
-    private void SyncStaticDisplayOptionToHostCombo(string value, ComboBox overviewCombo, ComboBox hostCombo)
+    private async Task<StaticDisplayModeApplyResult> ApplyVirtualDisplayModeSelectionAsync(string resolution, string refreshRate)
     {
-        if (_syncingVirtualDisplayOptions || !_uiReady)
+        if (_virtualDisplayModeApplyInProgress || _virtualDisplayOperationInProgress || _driverInstallInProgress)
         {
-            return;
+            var busyMode = CurrentSideDockModeFromLayout(DisplayLayoutQuery.GetCurrent());
+            return BuildStaticDisplayModeApplyResult(false, "显示器操作正在进行中，请稍后再试。", busyMode, null);
         }
 
+        if (!TryCreateVirtualDisplayModeRequest(resolution, refreshRate, out var request, out var requestError))
+        {
+            var currentMode = CurrentSideDockModeFromLayout(DisplayLayoutQuery.GetCurrent());
+            return BuildStaticDisplayModeApplyResult(false, requestError, currentMode, null);
+        }
+
+        _virtualDisplayModeApplyInProgress = true;
+        RefreshVirtualDisplayState();
+
+        try
+        {
+            var serviceResult = await Task.Run(() => VirtualDisplayModeService.Apply(request));
+            if (serviceResult.Success)
+            {
+                SyncVirtualDisplayModeSelection(request.Resolution, request.RefreshRateValue);
+            }
+
+            return BuildStaticDisplayModeApplyResult(
+                serviceResult.Success,
+                serviceResult.Summary,
+                serviceResult.CurrentMode,
+                serviceResult.Success ? request : null);
+        }
+        catch (Exception ex)
+        {
+            var currentMode = CurrentSideDockModeFromLayout(DisplayLayoutQuery.GetCurrent());
+            return BuildStaticDisplayModeApplyResult(false, ex.Message, currentMode, null);
+        }
+        finally
+        {
+            _virtualDisplayModeApplyInProgress = false;
+            RefreshVirtualDisplayState();
+        }
+    }
+
+    private void SyncVirtualDisplayModeSelection(string resolution, string refreshRate)
+    {
         _syncingVirtualDisplayOptions = true;
         try
         {
-            SelectComboBoxValue(hostCombo, value);
-            SelectComboBoxValue(overviewCombo, value);
+            SelectComboBoxValue(ResolutionCombo, resolution);
+            SelectComboBoxValue(RefreshRateCombo, refreshRate);
+            SelectComboBoxValue(OverviewVirtualDisplayResolutionCombo, resolution);
+            SelectComboBoxValue(OverviewVirtualDisplayRefreshRateCombo, refreshRate);
         }
         finally
         {
             _syncingVirtualDisplayOptions = false;
         }
+    }
 
-        RefreshVirtualDisplayState();
+    private void RollBackOverviewVirtualDisplaySelection(StaticDisplayModeApplyResult result)
+    {
+        _syncingVirtualDisplayOptions = true;
+        try
+        {
+            var resolution = result.DisplayedResolution ?? Selected(ResolutionCombo);
+            if (!SelectComboBoxValue(OverviewVirtualDisplayResolutionCombo, resolution))
+            {
+                OverviewVirtualDisplayResolutionCombo.SelectedIndex = -1;
+            }
+
+            var refreshRate = result.DisplayedRefreshRate ?? Selected(RefreshRateCombo);
+            if (!SelectComboBoxValue(OverviewVirtualDisplayRefreshRateCombo, refreshRate))
+            {
+                OverviewVirtualDisplayRefreshRateCombo.SelectedIndex = -1;
+            }
+        }
+        finally
+        {
+            _syncingVirtualDisplayOptions = false;
+        }
+    }
+
+    private static StaticDisplayModeApplyResult BuildStaticDisplayModeApplyResult(
+        bool success,
+        string message,
+        VirtualDisplayMode? currentMode,
+        VirtualDisplayModeRequest? successfulRequest)
+    {
+        return new StaticDisplayModeApplyResult
+        {
+            Success = success,
+            Message = message,
+            CurrentModeText = currentMode is null ? null : VirtualDisplayModeService.FormatMode(currentMode),
+            DisplayedResolution = successfulRequest?.Resolution ?? DisplayResolutionValueFromMode(currentMode),
+            DisplayedRefreshRate = successfulRequest?.RefreshRateValue ?? DisplayRefreshRateValueFromMode(currentMode)
+        };
+    }
+
+    private bool TryCreateVirtualDisplayModeRequest(
+        string resolution,
+        string refreshRate,
+        out VirtualDisplayModeRequest request,
+        out string error)
+    {
+        var normalizedResolution = NormalizeVirtualDisplayResolutionSelection(resolution)
+            ?? NormalizeVirtualDisplayResolutionSelection(Selected(ResolutionCombo));
+        var normalizedRefreshRate = NormalizeVirtualDisplayRefreshRateSelection(refreshRate)
+            ?? NormalizeVirtualDisplayRefreshRateSelection(Selected(RefreshRateCombo));
+
+        request = new VirtualDisplayModeRequest("1080p", 1920, 1080, "120", 120);
+        if (normalizedResolution is null)
+        {
+            error = "请选择 720p、1080p 或 2K 分辨率。";
+            return false;
+        }
+
+        if (normalizedRefreshRate is null)
+        {
+            error = "请选择 30、60 或 120 Hz 刷新率。";
+            return false;
+        }
+
+        var (width, height) = normalizedResolution switch
+        {
+            "720p" => (1280, 720),
+            "2k" => (2560, 1440),
+            _ => (1920, 1080)
+        };
+        var refreshRateValue = int.Parse(normalizedRefreshRate, NumberStyles.Integer, CultureInfo.InvariantCulture);
+        request = new VirtualDisplayModeRequest(
+            normalizedResolution,
+            width,
+            height,
+            normalizedRefreshRate,
+            refreshRateValue);
+        error = string.Empty;
+        return true;
+    }
+
+    private static string? NormalizeVirtualDisplayResolutionSelection(string? value)
+    {
+        var normalized = (value ?? string.Empty).Trim().ToLowerInvariant();
+        return normalized switch
+        {
+            "720" or "720p" => "720p",
+            "1080" or "1080p" => "1080p",
+            "2k" or "2K" or "1440p" => "2k",
+            _ => null
+        };
+    }
+
+    private static string? NormalizeVirtualDisplayRefreshRateSelection(string? value)
+    {
+        var normalized = (value ?? string.Empty)
+            .Replace("Hz", string.Empty, StringComparison.OrdinalIgnoreCase)
+            .Trim();
+        return normalized switch
+        {
+            "30" => "30",
+            "60" => "60",
+            "120" => "120",
+            _ => null
+        };
+    }
+
+    private static VirtualDisplayMode? CurrentSideDockModeFromLayout(DisplayLayoutSnapshot displayLayout)
+    {
+        var monitor = displayLayout.SideDockMonitor;
+        return monitor is null
+            ? null
+            : new VirtualDisplayMode(monitor.Width, monitor.Height, monitor.RefreshRate);
+    }
+
+    private static string? DisplayResolutionValueFromMode(VirtualDisplayMode? mode)
+    {
+        return mode is null
+            ? null
+            : (mode.Width, mode.Height) switch
+            {
+                (1280, 720) => "720p",
+                (1920, 1080) => "1080p",
+                (2560, 1440) => "2k",
+                _ => $"{mode.Width.ToString(CultureInfo.InvariantCulture)} × {mode.Height.ToString(CultureInfo.InvariantCulture)}"
+            };
+    }
+
+    private static string? DisplayRefreshRateValueFromMode(VirtualDisplayMode? mode)
+    {
+        if (mode is not { RefreshRate: > 0 })
+        {
+            return null;
+        }
+
+        return mode.RefreshRate switch
+        {
+            >= 29 and <= 31 => "30",
+            >= 59 and <= 61 => "60",
+            >= 119 and <= 121 => "120",
+            _ => mode.RefreshRate.ToString(CultureInfo.InvariantCulture)
+        };
     }
 
     private void InitializeOverviewCameraOptions()
@@ -3607,11 +3793,11 @@ public sealed partial class MainWindow : Window
         content.Children.Add(comboBox);
     }
 
-    private static void SelectComboBoxValue(ComboBox comboBox, string value)
+    private static bool SelectComboBoxValue(ComboBox comboBox, string value)
     {
         if (string.IsNullOrWhiteSpace(value))
         {
-            return;
+            return false;
         }
 
         for (var index = 0; index < comboBox.Items.Count; index++)
@@ -3620,9 +3806,11 @@ public sealed partial class MainWindow : Window
                 && string.Equals(ComboBoxItemValue(item), value, StringComparison.OrdinalIgnoreCase))
             {
                 comboBox.SelectedIndex = index;
-                return;
+                return true;
             }
         }
+
+        return false;
     }
 
     private static string ComboBoxItemValue(ComboBoxItem item)
@@ -6537,7 +6725,9 @@ public sealed partial class MainWindow : Window
         var displayLayout = DisplayLayoutQuery.GetCurrent();
         var state = DetermineVirtualDisplayOverviewState(running, out var driverInstalled, out var toolAvailable);
         var (statusText, subtext, statusBrush) = BuildVirtualDisplayStatusView(state, driverInstalled, toolAvailable);
-        var displayOperationEnabled = !_virtualDisplayOperationInProgress && !_driverInstallInProgress;
+        var displayOperationEnabled = !_virtualDisplayOperationInProgress
+            && !_virtualDisplayModeApplyInProgress
+            && !_driverInstallInProgress;
 
         StartDisplayButton.IsEnabled = displayOperationEnabled && !running;
         StopDisplayButton.IsEnabled = displayOperationEnabled && running;
@@ -6562,7 +6752,7 @@ public sealed partial class MainWindow : Window
         OverviewVirtualDisplayStatusText.Foreground = statusBrush;
         OverviewVirtualDisplayHintText.Text = BuildOverviewVirtualDisplayHint(state, subtext, running);
         OverviewInstallDriverButton.IsEnabled = displayOperationEnabled;
-        UpdateOverviewVirtualDisplayOptionsEnabled(running);
+        UpdateOverviewVirtualDisplayOptionsEnabled(running, displayLayout.HasSideDockVirtualDisplay);
         UpdateStaticDisplayPageState(
             state,
             running,
@@ -6593,7 +6783,9 @@ public sealed partial class MainWindow : Window
         var (toolStatusText, toolStatusBrush) = BuildStaticDisplayToolStatus(state, running, toolAvailable);
         var (permissionStatusText, permissionStatusBrush) = BuildStaticDisplayPermissionStatus(state);
         var footer = BuildOverviewFooterSnapshot();
-        var hostRunning = _hostProcess is { HasExited: false };
+        var currentMode = CurrentSideDockModeFromLayout(displayLayout);
+        var canChangeDisplayOptions = displayOperationEnabled
+            && (running || displayLayout.HasSideDockVirtualDisplay);
 
         OverviewDisplayPage.UpdateVirtualDisplayState(new StaticDisplayPageState
         {
@@ -6617,11 +6809,11 @@ public sealed partial class MainWindow : Window
             CanInstallDriver = displayOperationEnabled,
             CanRefresh = !_driverInstallInProgress,
             CanOpenDisplaySettings = true,
-            CanChangeDisplayOptions = displayOperationEnabled && !running && !hostRunning,
+            CanChangeDisplayOptions = canChangeDisplayOptions,
             VirtualDisplayRunning = running,
             DisplayLayout = displayLayout,
-            Resolution = Selected(ResolutionCombo),
-            RefreshRate = Selected(RefreshRateCombo),
+            Resolution = DisplayResolutionValueFromMode(currentMode) ?? Selected(ResolutionCombo),
+            RefreshRate = DisplayRefreshRateValueFromMode(currentMode) ?? Selected(RefreshRateCombo),
             FooterHostText = footer.HostText,
             FooterOsText = footer.OsText,
             FooterNetworkText = footer.NetworkText,
@@ -6808,9 +7000,14 @@ public sealed partial class MainWindow : Window
         string subtext,
         bool running)
     {
-        if (running || _hostProcess is { HasExited: false })
+        if (running)
         {
-            return $"{subtext} 分辨率和帧率停止后可修改，下次启动主机生效。";
+            return $"{subtext} 可实时应用分辨率和刷新率，成功后也会同步下次启动参数。";
+        }
+
+        if (_hostProcess is { HasExited: false })
+        {
+            return $"{subtext} 主机运行中，启动参数会在下次启动主机时生效。";
         }
 
         return state == VirtualDisplayOverviewState.ToolStopped
@@ -6818,13 +7015,12 @@ public sealed partial class MainWindow : Window
             : subtext;
     }
 
-    private void UpdateOverviewVirtualDisplayOptionsEnabled(bool virtualDisplayRunning)
+    private void UpdateOverviewVirtualDisplayOptionsEnabled(bool virtualDisplayRunning, bool hasSideDockDisplay)
     {
-        var hostRunning = _hostProcess is { HasExited: false };
         var enabled = !_virtualDisplayOperationInProgress
+            && !_virtualDisplayModeApplyInProgress
             && !_driverInstallInProgress
-            && !virtualDisplayRunning
-            && !hostRunning;
+            && (virtualDisplayRunning || hasSideDockDisplay);
 
         OverviewVirtualDisplayResolutionCombo.IsEnabled = enabled;
         OverviewVirtualDisplayRefreshRateCombo.IsEnabled = enabled;
