@@ -91,6 +91,11 @@ public sealed partial class MainWindow : Window
     private const int AudioPlaybackTestDurationMs = 1600;
     private const int AudioRecordingTestDurationMs = 2500;
     private const int AudioTestTimeoutMs = 8000;
+    private const int AfInet = 2;
+    private const int AfInet6 = 23;
+    private const int NoError = 0;
+    private const int ErrorInsufficientBuffer = 122;
+    private const int HostPortReleaseWaitMs = 2500;
     private const string AudioPreferencesFileName = "audio-preferences.json";
     private static readonly TimeSpan AudioTelemetryStaleAfter = TimeSpan.FromSeconds(5);
     private static readonly string[] HostSupportedCameraCodecs = { "video/avc" };
@@ -247,6 +252,7 @@ public sealed partial class MainWindow : Window
     private long _lastOverviewPreviewSequence;
     private DateTimeOffset? _lastOverviewPreviewAt;
     private OverviewPreviewState _overviewPreviewState = OverviewPreviewState.HostNotStarted;
+    private bool _overviewPreviewEnabled = true;
     private bool _overviewPreviewFillMode;
     private bool _overviewPreviewOverlayVisible = true;
     private OverviewHostServiceState _overviewHostServiceState = OverviewHostServiceState.NotStarted;
@@ -265,6 +271,7 @@ public sealed partial class MainWindow : Window
     private bool _driverInstallInProgress;
     private bool _virtualDisplayAutoRestoreInProgress;
     private bool _syncingOverviewCameraOptions;
+    private CameraConfigSelection? _deferredCameraCapabilityOptionsRefresh;
     private bool _updatingOverviewCameraSwitch;
     private bool _updatingOverviewAudioSwitch;
     private bool _updatingStaticAudioPage;
@@ -344,6 +351,7 @@ public sealed partial class MainWindow : Window
 
     private enum OverviewPreviewState
     {
+        Disabled,
         HostNotStarted,
         WaitingSource,
         Receiving,
@@ -374,6 +382,7 @@ public sealed partial class MainWindow : Window
         WireStaticAudioPage();
         WireStaticDiagnosticsPage();
         WireStaticSettingsPage();
+        WireOverviewCameraOptionDropDownEvents();
         if (!string.IsNullOrWhiteSpace(settingsLoadError))
         {
             OverviewDisplayPage.AddActivityLog($"Settings load failed: {settingsLoadError}", StaticDisplayActivityKind.Failure);
@@ -385,7 +394,7 @@ public sealed partial class MainWindow : Window
         if (StaticOverviewUi)
         {
             UpdateOverviewSidebarLayout();
-            SetOverviewNavigationItem(OverviewNavigationItem.Connection);
+            SetOverviewNavigationItem(OverviewNavigationItem.Overview);
             OverviewMainScrollViewer.SizeChanged += (_, _) => UpdateOverviewMainContentMinHeight();
         }
 
@@ -413,9 +422,10 @@ public sealed partial class MainWindow : Window
         if (!StaticOverviewUi)
         {
             RegisterCardWheelScrolling();
-            InitializeTrayIcon();
-            AppWindow.Closing += OnAppWindowClosing;
         }
+
+        InitializeTrayIcon();
+        AppWindow.Closing += OnAppWindowClosing;
 
         Closed += (_, _) =>
         {
@@ -462,13 +472,15 @@ public sealed partial class MainWindow : Window
 
         _overviewPreviewTimer.Interval = TimeSpan.FromMilliseconds(OverviewPreviewIntervalMs);
         _overviewPreviewTimer.Tick += (_, _) => UpdateOverviewPreview();
-        if (StaticOverviewUi)
+        if (StaticOverviewUi && _overviewPreviewEnabled)
         {
             _overviewPreviewTimer.Start();
         }
 
         UpdateOverviewPreviewChrome();
-        SetOverviewPreviewState(OverviewPreviewState.HostNotStarted);
+        SetOverviewPreviewState(_overviewPreviewEnabled
+            ? OverviewPreviewState.HostNotStarted
+            : OverviewPreviewState.Disabled);
 
         _virtualCameraStatusTimer.Interval = TimeSpan.FromSeconds(2);
         _virtualCameraStatusTimer.Tick += (_, _) => RefreshVirtualCameraStatusFromFiles();
@@ -2274,6 +2286,306 @@ public sealed partial class MainWindow : Window
         }
     }
 
+    private IReadOnlyList<OverviewPortBinding> GetConfiguredOverviewPortBindings()
+    {
+        return OverviewPortStatusControls()
+            .Select(port => (port.Name, Valid: TryReadPort(port.NumberBox, out var value), Value: value))
+            .Where(port => port.Valid)
+            .Select(port => new OverviewPortBinding(port.Name, port.Value))
+            .ToArray();
+    }
+
+    private async Task<HostPortCleanupResult> ReleaseStaleHostPortOwnersForConfiguredPortsAsync()
+    {
+        var bindings = GetConfiguredOverviewPortBindings();
+        if (bindings.Count == 0)
+        {
+            return HostPortCleanupResult.Empty;
+        }
+
+        var currentHostPid = _hostProcess is { HasExited: false } process
+            ? TryGetProcessId(process)
+            : null;
+        var expectedHostPath = TryResolveHostPathForProcessMatch();
+        return await Task.Run(() => ReleaseStaleHostPortOwners(bindings, currentHostPid, expectedHostPath));
+    }
+
+    private string? TryResolveHostPathForProcessMatch()
+    {
+        try
+        {
+            return Path.GetFullPath(_hostPath ?? ResolveHostPath());
+        }
+        catch
+        {
+            return null;
+        }
+    }
+
+    private static HostPortCleanupResult ReleaseStaleHostPortOwners(
+        IReadOnlyList<OverviewPortBinding> bindings,
+        int? currentHostPid,
+        string? expectedHostPath)
+    {
+        var ports = bindings.Select(binding => binding.Port).Distinct().ToHashSet();
+        var portNames = bindings
+            .GroupBy(binding => binding.Port)
+            .ToDictionary(
+                group => group.Key,
+                group => string.Join("、", group.Select(binding => binding.Name).Distinct()));
+        var initialOwners = GetTcpListenerPortOwners()
+            .Where(owner => ports.Contains(owner.Port))
+            .ToArray();
+        var staleHostPids = initialOwners
+            .Where(owner => currentHostPid != owner.ProcessId)
+            .Select(owner => owner.ProcessId)
+            .Where(processId => processId > 0)
+            .Distinct()
+            .Where(processId => IsSideDockHostProcess(processId, expectedHostPath))
+            .ToArray();
+        var killedPids = new List<int>();
+        var errors = new List<string>();
+
+        foreach (var processId in staleHostPids)
+        {
+            try
+            {
+                using var process = Process.GetProcessById(processId);
+                if (process.HasExited)
+                {
+                    continue;
+                }
+
+                process.Kill(entireProcessTree: true);
+                if (!process.WaitForExit(HostPortReleaseWaitMs))
+                {
+                    errors.Add($"SideDock.Host.exe PID {processId} 未在 {HostPortReleaseWaitMs}ms 内退出。");
+                    continue;
+                }
+
+                killedPids.Add(processId);
+            }
+            catch (Exception ex)
+            {
+                errors.Add($"无法结束 SideDock.Host.exe PID {processId}：{ex.Message}");
+            }
+        }
+
+        var remainingOwners = WaitForRelevantPortOwnersToSettle(ports, killedPids);
+        var blockingOwners = remainingOwners
+            .Where(owner => currentHostPid != owner.ProcessId)
+            .Select(owner => BuildPortOwnerDescription(owner, portNames))
+            .Distinct()
+            .ToList();
+        if (currentHostPid is null)
+        {
+            var describedPorts = remainingOwners.Select(owner => owner.Port).ToHashSet();
+            var unknownOccupiedPorts = GetActiveTcpListenerPorts()
+                .Where(port => ports.Contains(port) && !describedPorts.Contains(port))
+                .OrderBy(port => port)
+                .ToArray();
+            foreach (var port in unknownOccupiedPorts)
+            {
+                var module = portNames.TryGetValue(port, out var name)
+                    ? $"{name} "
+                    : string.Empty;
+                blockingOwners.Add($"{module}{port}：未知进程");
+            }
+        }
+
+        return new HostPortCleanupResult(killedPids, blockingOwners.Distinct().ToArray(), errors);
+    }
+
+    private static IReadOnlyList<TcpListenerPortOwner> WaitForRelevantPortOwnersToSettle(
+        HashSet<int> ports,
+        IReadOnlyCollection<int> releasedProcessIds)
+    {
+        if (releasedProcessIds.Count == 0)
+        {
+            return GetTcpListenerPortOwners()
+                .Where(owner => ports.Contains(owner.Port))
+                .ToArray();
+        }
+
+        var releasedProcessSet = releasedProcessIds.ToHashSet();
+        var deadline = DateTimeOffset.UtcNow.AddMilliseconds(HostPortReleaseWaitMs);
+        IReadOnlyList<TcpListenerPortOwner> owners;
+        do
+        {
+            owners = GetTcpListenerPortOwners()
+                .Where(owner => ports.Contains(owner.Port))
+                .ToArray();
+
+            if (owners.All(owner => !releasedProcessSet.Contains(owner.ProcessId)))
+            {
+                return owners;
+            }
+
+            System.Threading.Thread.Sleep(150);
+        }
+        while (DateTimeOffset.UtcNow < deadline);
+
+        return owners;
+    }
+
+    private static string BuildPortOwnerDescription(
+        TcpListenerPortOwner owner,
+        IReadOnlyDictionary<int, string> portNames)
+    {
+        var module = portNames.TryGetValue(owner.Port, out var name)
+            ? $"{name} "
+            : string.Empty;
+        var processName = TryGetProcessDisplayName(owner.ProcessId);
+        return $"{module}{owner.Port}：PID {owner.ProcessId} {processName}";
+    }
+
+    private static string TryGetProcessDisplayName(int processId)
+    {
+        try
+        {
+            using var process = Process.GetProcessById(processId);
+            var processName = string.IsNullOrWhiteSpace(process.ProcessName)
+                ? "未知进程"
+                : process.ProcessName;
+            var processPath = TryGetProcessPath(process);
+            return string.IsNullOrWhiteSpace(processPath)
+                ? processName
+                : $"{processName} ({processPath})";
+        }
+        catch
+        {
+            return "未知进程";
+        }
+    }
+
+    private static bool IsSideDockHostProcess(int processId, string? expectedHostPath)
+    {
+        try
+        {
+            using var process = Process.GetProcessById(processId);
+            if (!process.ProcessName.Equals(
+                    Path.GetFileNameWithoutExtension(HostExe),
+                    StringComparison.OrdinalIgnoreCase))
+            {
+                return false;
+            }
+
+            var processPath = TryGetProcessPath(process);
+            if (string.IsNullOrWhiteSpace(processPath) || string.IsNullOrWhiteSpace(expectedHostPath))
+            {
+                return true;
+            }
+
+            return PathsEqual(processPath, expectedHostPath)
+                || Path.GetFileName(processPath).Equals(HostExe, StringComparison.OrdinalIgnoreCase);
+        }
+        catch
+        {
+            return false;
+        }
+    }
+
+    private static string? TryGetProcessPath(Process process)
+    {
+        try
+        {
+            return process.MainModule?.FileName;
+        }
+        catch
+        {
+            return null;
+        }
+    }
+
+    private static bool PathsEqual(string left, string right)
+    {
+        try
+        {
+            return Path.GetFullPath(left).Equals(Path.GetFullPath(right), StringComparison.OrdinalIgnoreCase);
+        }
+        catch
+        {
+            return left.Equals(right, StringComparison.OrdinalIgnoreCase);
+        }
+    }
+
+    private static IReadOnlyList<TcpListenerPortOwner> GetTcpListenerPortOwners()
+    {
+        var owners = new List<TcpListenerPortOwner>();
+        AddTcpListenerPortOwners(owners, AfInet, Marshal.SizeOf<MibTcpRowOwnerPid>(), pointer =>
+        {
+            var row = Marshal.PtrToStructure<MibTcpRowOwnerPid>(pointer);
+            return new TcpListenerPortOwner(DecodeTcpPort(row.LocalPort), unchecked((int)row.OwningPid));
+        });
+        AddTcpListenerPortOwners(owners, AfInet6, Marshal.SizeOf<MibTcp6RowOwnerPid>(), pointer =>
+        {
+            var row = Marshal.PtrToStructure<MibTcp6RowOwnerPid>(pointer);
+            return new TcpListenerPortOwner(DecodeTcpPort(row.LocalPort), unchecked((int)row.OwningPid));
+        });
+        return owners;
+    }
+
+    private static void AddTcpListenerPortOwners(
+        List<TcpListenerPortOwner> owners,
+        int addressFamily,
+        int rowSize,
+        Func<IntPtr, TcpListenerPortOwner> readOwner)
+    {
+        var bufferLength = 0;
+        var result = GetExtendedTcpTable(
+            IntPtr.Zero,
+            ref bufferLength,
+            sort: true,
+            addressFamily,
+            TcpTableClass.TcpTableOwnerPidListener,
+            reserved: 0);
+        if ((result != ErrorInsufficientBuffer && result != NoError) || bufferLength <= 0)
+        {
+            return;
+        }
+
+        var buffer = IntPtr.Zero;
+        try
+        {
+            buffer = Marshal.AllocHGlobal(bufferLength);
+            result = GetExtendedTcpTable(
+                buffer,
+                ref bufferLength,
+                sort: true,
+                addressFamily,
+                TcpTableClass.TcpTableOwnerPidListener,
+                reserved: 0);
+            if (result != NoError)
+            {
+                return;
+            }
+
+            var count = Marshal.ReadInt32(buffer);
+            var rowPointer = IntPtr.Add(buffer, sizeof(int));
+            for (var index = 0; index < count; index++)
+            {
+                owners.Add(readOwner(rowPointer));
+                rowPointer = IntPtr.Add(rowPointer, rowSize);
+            }
+        }
+        catch
+        {
+            // Port owner lookup is best-effort; the UI can still show regular port occupancy.
+        }
+        finally
+        {
+            if (buffer != IntPtr.Zero)
+            {
+                Marshal.FreeHGlobal(buffer);
+            }
+        }
+    }
+
+    private static int DecodeTcpPort(uint networkOrderPort)
+    {
+        return (ushort)IPAddress.NetworkToHostOrder(unchecked((short)networkOrderPort));
+    }
+
     private static bool TryReadPort(NumberBox? numberBox, out int port)
     {
         port = 0;
@@ -2515,9 +2827,60 @@ public sealed partial class MainWindow : Window
         OverviewSidebarHostStatusText.Foreground = statusBrush;
         OverviewSidebarHostStatusDot.Fill = dotBrush;
 
+        UpdateOverviewVideoLinkCard();
         UpdateOverviewActionButtons();
         UpdateOverviewConnectionGuide();
         UpdateOverviewEnvironmentBanner();
+    }
+
+    private void UpdateOverviewVideoLinkCard()
+    {
+        if (!StaticOverviewUi
+            || OverviewVideoLinkModeText is null
+            || OverviewVideoLinkDetailText is null
+            || OverviewVideoLinkStatusDot is null)
+        {
+            return;
+        }
+
+        var resolution = NormalizeVirtualDisplayResolutionSelection(FirstNonEmpty(
+            Selected(OverviewVirtualDisplayResolutionCombo),
+            Selected(ResolutionCombo),
+            _appSettings.VirtualDisplayResolution)) ?? "1080p";
+        var refreshRate = NormalizeVirtualDisplayRefreshRateSelection(FirstNonEmpty(
+            Selected(OverviewVirtualDisplayRefreshRateCombo),
+            Selected(RefreshRateCombo),
+            _appSettings.VirtualDisplayRefreshRate)) ?? "120";
+        var running = TryGetRunningHostProcess(out _);
+        var applying = _virtualDisplayModeApplyInProgress || _virtualDisplayOperationInProgress;
+
+        OverviewVideoLinkModeText.Text = $"{FormatOverviewVirtualDisplayResolutionLabel(resolution)} {refreshRate} fps";
+        OverviewVideoLinkModeText.Foreground = running || applying ? _overviewPrimaryBrush : _secondaryBrush;
+        OverviewVideoLinkDetailText.Text = $"H.264 · 推荐 {RecommendedOverviewVideoBitrateMbps(resolution, refreshRate)} Mbps";
+        OverviewVideoLinkStatusDot.Fill = applying
+            ? _overviewPrimaryBrush
+            : running
+                ? _successBrush
+                : _overviewMutedBrush;
+    }
+
+    private static string FormatOverviewVirtualDisplayResolutionLabel(string resolution)
+    {
+        return resolution.Equals("2k", StringComparison.OrdinalIgnoreCase) ? "2K" : resolution;
+    }
+
+    private static int RecommendedOverviewVideoBitrateMbps(string resolution, string refreshRate)
+    {
+        var fps = int.TryParse(refreshRate, NumberStyles.Integer, CultureInfo.InvariantCulture, out var parsedFps)
+            ? parsedFps
+            : 120;
+
+        return resolution.ToLowerInvariant() switch
+        {
+            "720p" => fps >= 90 ? 12 : fps >= 50 ? 6 : 4,
+            "2k" => fps >= 90 ? 56 : fps >= 50 ? 28 : 16,
+            _ => fps >= 90 ? 28 : fps >= 50 ? 14 : 8
+        };
     }
 
     private void UpdateOverviewActionButtons()
@@ -4517,7 +4880,9 @@ public sealed partial class MainWindow : Window
     {
         MarkCameraConfigUserSelection();
         SyncOverviewCameraComboSelection(OverviewCameraResolutionCombo, OverviewCameraPageResolutionCombo);
-        RefreshOverviewCameraCapabilityOptions(SelectedOverviewCameraConfig(_overviewCameraRequestedEnabled));
+        RefreshOverviewCameraCapabilityOptions(
+            SelectedOverviewCameraConfig(_overviewCameraRequestedEnabled),
+            forceWhileDropDownOpen: true);
         await HandleOverviewCameraConfigSelectionChangedAsync();
     }
 
@@ -4525,13 +4890,16 @@ public sealed partial class MainWindow : Window
     {
         MarkCameraConfigUserSelection();
         SyncOverviewCameraComboSelection(OverviewCameraFrameRateCombo, OverviewCameraPageFrameRateCombo);
-        RefreshOverviewCameraCapabilityOptions(SelectedOverviewCameraConfig(_overviewCameraRequestedEnabled));
+        RefreshOverviewCameraCapabilityOptions(
+            SelectedOverviewCameraConfig(_overviewCameraRequestedEnabled),
+            forceWhileDropDownOpen: true);
         await HandleOverviewCameraConfigSelectionChangedAsync();
     }
 
     private async void OverviewCameraPageFacingCombo_SelectionChanged(object sender, SelectionChangedEventArgs e)
     {
         SyncOverviewCameraComboSelection(OverviewCameraPageFacingCombo, CameraFacingCombo);
+        MarkCameraConfigUserSelection();
         await HandleOverviewCameraFacingSelectionChangedAsync();
     }
 
@@ -4539,7 +4907,9 @@ public sealed partial class MainWindow : Window
     {
         MarkCameraConfigUserSelection();
         SyncOverviewCameraComboSelection(OverviewCameraPageResolutionCombo, OverviewCameraResolutionCombo);
-        RefreshOverviewCameraCapabilityOptions(SelectedOverviewCameraConfig(_overviewCameraRequestedEnabled));
+        RefreshOverviewCameraCapabilityOptions(
+            SelectedOverviewCameraConfig(_overviewCameraRequestedEnabled),
+            forceWhileDropDownOpen: true);
         await HandleOverviewCameraConfigSelectionChangedAsync();
     }
 
@@ -4547,14 +4917,18 @@ public sealed partial class MainWindow : Window
     {
         MarkCameraConfigUserSelection();
         SyncOverviewCameraComboSelection(OverviewCameraPageFrameRateCombo, OverviewCameraFrameRateCombo);
-        RefreshOverviewCameraCapabilityOptions(SelectedOverviewCameraConfig(_overviewCameraRequestedEnabled));
+        RefreshOverviewCameraCapabilityOptions(
+            SelectedOverviewCameraConfig(_overviewCameraRequestedEnabled),
+            forceWhileDropDownOpen: true);
         await HandleOverviewCameraConfigSelectionChangedAsync();
     }
 
     private async void OverviewCameraPageCodecCombo_SelectionChanged(object sender, SelectionChangedEventArgs e)
     {
         MarkCameraConfigUserSelection();
-        RefreshOverviewCameraCapabilityOptions(SelectedOverviewCameraConfig(_overviewCameraRequestedEnabled));
+        RefreshOverviewCameraCapabilityOptions(
+            SelectedOverviewCameraConfig(_overviewCameraRequestedEnabled),
+            forceWhileDropDownOpen: true);
         await HandleOverviewCameraConfigSelectionChangedAsync();
     }
 
@@ -4636,6 +5010,11 @@ public sealed partial class MainWindow : Window
     {
         _overviewPreviewFillMode = !_overviewPreviewFillMode;
         UpdateOverviewPreviewChrome();
+    }
+
+    private void OverviewPreviewToggleButton_Click(object sender, RoutedEventArgs e)
+    {
+        SetOverviewPreviewEnabled(!_overviewPreviewEnabled);
     }
 
     private void OverviewPreviewOverlayButton_Click(object sender, RoutedEventArgs e)
@@ -4867,8 +5246,27 @@ public sealed partial class MainWindow : Window
         OverviewActionRepairEndpointsMenuItem.IsEnabled = false;
         try
         {
+            var portCleanup = await ReleaseStaleHostPortOwnersForConfiguredPortsAsync();
+            if (portCleanup.HasChanges)
+            {
+                SetOverviewHostState(
+                    _hostHasStarted ? OverviewHostServiceState.Stopped : OverviewHostServiceState.NotStarted,
+                    portCleanup.Summary);
+            }
+
+            if (!portCleanup.Success)
+            {
+                UpdateOverviewConnectionPage();
+                ShowErrorWithDetails(
+                    "无法修复端口占用",
+                    portCleanup.Summary,
+                    portCleanup.Details);
+                return;
+            }
+
             await RefreshAudioEndpointsAsync(showHint: true);
             await RefreshVirtualCameraStatusAsync();
+            UpdateOverviewConnectionPage();
             UpdateOverviewEnvironmentBanner();
             if (openSettings)
             {
@@ -5170,6 +5568,25 @@ public sealed partial class MainWindow : Window
             SetOverviewHostState(OverviewHostServiceState.Starting, adbStartupStatus);
             UpdateOverviewConnectionPage();
 
+            var portCleanup = await ReleaseStaleHostPortOwnersForConfiguredPortsAsync();
+            if (portCleanup.HasChanges)
+            {
+                SetOverviewHostState(OverviewHostServiceState.Starting, portCleanup.Summary);
+                UpdateOverviewConnectionPage();
+            }
+
+            if (!portCleanup.Success)
+            {
+                SetRunningState(false);
+                SetOverviewHostState(OverviewHostServiceState.Error, portCleanup.Summary);
+                UpdateOverviewConnectionPage();
+                ShowErrorWithDetails(
+                    "无法启动 SideDock 主机",
+                    portCleanup.Summary,
+                    portCleanup.Details);
+                return;
+            }
+
             adbPath = ResolveAdbPath(AdbPathBox.Text.Trim());
             if (configureAdbReverse)
             {
@@ -5453,6 +5870,8 @@ public sealed partial class MainWindow : Window
         {
             _syncingVirtualDisplayOptions = false;
         }
+
+        UpdateOverviewVideoLinkCard();
     }
 
     private async Task ApplyOverviewVirtualDisplayModeSelectionAsync()
@@ -5464,6 +5883,7 @@ public sealed partial class MainWindow : Window
         _appSettings.Normalize();
         TrySaveAppSettings("Virtual display settings saved.");
         OverviewDisplayPage.ApplySettings(_appSettings);
+        UpdateOverviewVideoLinkCard();
 
         if (!_appSettings.StartVirtualDisplayWithHost)
         {
@@ -5486,6 +5906,11 @@ public sealed partial class MainWindow : Window
         if (!result.Success)
         {
             RollBackOverviewVirtualDisplaySelection(result);
+        }
+        else
+        {
+            UpdateOverviewRuntimeDiagnostics();
+            UpdateOverviewVideoLinkCard();
         }
     }
 
@@ -5727,6 +6152,8 @@ public sealed partial class MainWindow : Window
         {
             _syncingVirtualDisplayOptions = false;
         }
+
+        UpdateOverviewVideoLinkCard();
     }
 
     private void SaveLastAppliedVirtualDisplayMode(VirtualDisplayModeRequest request)
@@ -5765,6 +6192,8 @@ public sealed partial class MainWindow : Window
         {
             _syncingVirtualDisplayOptions = false;
         }
+
+        UpdateOverviewVideoLinkCard();
     }
 
     private static StaticDisplayModeApplyResult BuildStaticDisplayModeApplyResult(
@@ -5895,7 +6324,49 @@ public sealed partial class MainWindow : Window
         UpdateOverviewCameraState();
     }
 
-    private void RefreshOverviewCameraCapabilityOptions(CameraConfigSelection preferredConfig)
+    private void WireOverviewCameraOptionDropDownEvents()
+    {
+        foreach (var comboBox in OverviewCameraOptionCombos())
+        {
+            if (comboBox is not null)
+            {
+                comboBox.DropDownClosed += OverviewCameraOptionCombo_DropDownClosed;
+            }
+        }
+    }
+
+    private IEnumerable<ComboBox?> OverviewCameraOptionCombos()
+    {
+        yield return CameraFacingCombo;
+        yield return OverviewCameraPageFacingCombo;
+        yield return OverviewCameraResolutionCombo;
+        yield return OverviewCameraFrameRateCombo;
+        yield return OverviewCameraPageResolutionCombo;
+        yield return OverviewCameraPageFrameRateCombo;
+        yield return OverviewCameraPageCodecCombo;
+    }
+
+    private void OverviewCameraOptionCombo_DropDownClosed(object? sender, object e)
+    {
+        if (IsOverviewCameraOptionDropDownOpen() || _deferredCameraCapabilityOptionsRefresh is not { } deferredConfig)
+        {
+            return;
+        }
+
+        _deferredCameraCapabilityOptionsRefresh = null;
+        DispatcherQueue.TryEnqueue(() => RefreshOverviewCameraCapabilityOptions(
+            deferredConfig,
+            forceWhileDropDownOpen: true));
+    }
+
+    private bool IsOverviewCameraOptionDropDownOpen()
+    {
+        return OverviewCameraOptionCombos().Any(comboBox => comboBox?.IsDropDownOpen == true);
+    }
+
+    private void RefreshOverviewCameraCapabilityOptions(
+        CameraConfigSelection preferredConfig,
+        bool forceWhileDropDownOpen = false)
     {
         if (_syncingOverviewCameraOptions
             || CameraFacingCombo is null
@@ -5906,6 +6377,12 @@ public sealed partial class MainWindow : Window
             || OverviewCameraPageFrameRateCombo is null
             || OverviewCameraPageCodecCombo is null)
         {
+            return;
+        }
+
+        if (!forceWhileDropDownOpen && IsOverviewCameraOptionDropDownOpen())
+        {
+            _deferredCameraCapabilityOptionsRefresh = preferredConfig;
             return;
         }
 
@@ -6032,46 +6509,53 @@ public sealed partial class MainWindow : Window
 
     private static void PopulateCameraFacingCombo(ComboBox comboBox, IReadOnlyList<CameraLensCapability> lenses)
     {
-        comboBox.Items.Clear();
-        foreach (var lens in lenses)
-        {
-            var label = lens.Facing.Equals("front", StringComparison.OrdinalIgnoreCase) ? "前置" : "后置";
-            if (!string.IsNullOrWhiteSpace(lens.CameraId))
+        var options = lenses
+            .Select(lens =>
             {
-                label += $" ({lens.CameraId})";
-            }
+                var label = lens.Facing.Equals("front", StringComparison.OrdinalIgnoreCase) ? "前置" : "后置";
+                if (!string.IsNullOrWhiteSpace(lens.CameraId))
+                {
+                    label += $" ({lens.CameraId})";
+                }
 
-            comboBox.Items.Add(new ComboBoxItem { Content = label, Tag = lens.Facing });
-        }
+                return new CameraComboOption(label, lens.Facing);
+            })
+            .ToArray();
+        ReplaceComboBoxItemsIfChanged(comboBox, options);
     }
 
     private static void PopulateCameraResolutionCombo(ComboBox comboBox, IReadOnlyList<CameraSizeCapability> sizes, bool compact)
     {
-        comboBox.Items.Clear();
-        foreach (var size in sizes)
-        {
-            var value = CameraResolutionValue(size.Width, size.Height);
-            var label = compact
-                ? CameraResolutionCompactLabel(size.Width, size.Height)
-                : $"{size.Width}×{size.Height}";
-            comboBox.Items.Add(new ComboBoxItem { Content = label, Tag = value });
-        }
+        var options = sizes
+            .Select(size =>
+            {
+                var value = CameraResolutionValue(size.Width, size.Height);
+                var label = compact
+                    ? CameraResolutionCompactLabel(size.Width, size.Height)
+                    : $"{size.Width}×{size.Height}";
+                return new CameraComboOption(label, value);
+            })
+            .ToArray();
+        ReplaceComboBoxItemsIfChanged(comboBox, options);
     }
 
     private static void PopulateCameraFrameRateCombo(ComboBox comboBox, IReadOnlyList<int> fpsValues, bool compact)
     {
-        comboBox.Items.Clear();
-        foreach (var fps in fpsValues.OrderBy(value => value))
-        {
-            var value = fps.ToString(CultureInfo.InvariantCulture);
-            comboBox.Items.Add(new ComboBoxItem { Content = compact ? value : $"{value} fps", Tag = value });
-        }
+        var options = fpsValues
+            .OrderBy(value => value)
+            .Select(fps =>
+            {
+                var value = fps.ToString(CultureInfo.InvariantCulture);
+                return new CameraComboOption(compact ? value : $"{value} fps", value);
+            })
+            .ToArray();
+        ReplaceComboBoxItemsIfChanged(comboBox, options);
     }
 
     private static void PopulateCameraCodecCombo(ComboBox comboBox, IReadOnlyList<string> codecs)
     {
-        comboBox.Items.Clear();
         var added = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        var options = new List<CameraComboOption>();
         foreach (var codec in codecs)
         {
             var normalized = NormalizeCameraCodec(codec);
@@ -6080,25 +6564,66 @@ public sealed partial class MainWindow : Window
                 continue;
             }
 
-            comboBox.Items.Add(new ComboBoxItem
-            {
-                Content = IsHostSupportedCameraCodec(normalized)
+            options.Add(new CameraComboOption(
+                IsHostSupportedCameraCodec(normalized)
                     ? FormatCameraCodec(normalized)
                     : $"{FormatCameraCodec(normalized)} (Windows receiver unavailable)",
-                Tag = normalized,
-                IsEnabled = IsHostSupportedCameraCodec(normalized)
-            });
+                normalized,
+                IsHostSupportedCameraCodec(normalized)));
         }
 
         if (!added.Contains("video/avc"))
         {
-            comboBox.Items.Insert(0, new ComboBoxItem
+            options.Insert(0, new CameraComboOption(FormatCameraCodec("video/avc"), "video/avc"));
+        }
+
+        ReplaceComboBoxItemsIfChanged(comboBox, options);
+    }
+
+    private static void ReplaceComboBoxItemsIfChanged(ComboBox comboBox, IReadOnlyList<CameraComboOption> options)
+    {
+        if (ComboBoxItemsMatch(comboBox, options))
+        {
+            return;
+        }
+
+        var selectedValue = Selected(comboBox);
+        comboBox.Items.Clear();
+        foreach (var option in options)
+        {
+            comboBox.Items.Add(new ComboBoxItem
             {
-                Content = FormatCameraCodec("video/avc"),
-                Tag = "video/avc",
-                IsEnabled = true
+                Content = option.Content,
+                Tag = option.Tag,
+                IsEnabled = option.IsEnabled
             });
         }
+
+        if (!SelectComboBoxValue(comboBox, selectedValue) && comboBox.SelectedIndex >= comboBox.Items.Count)
+        {
+            comboBox.SelectedIndex = comboBox.Items.Count > 0 ? 0 : -1;
+        }
+    }
+
+    private static bool ComboBoxItemsMatch(ComboBox comboBox, IReadOnlyList<CameraComboOption> options)
+    {
+        if (comboBox.Items.Count != options.Count)
+        {
+            return false;
+        }
+
+        for (var index = 0; index < options.Count; index++)
+        {
+            if (comboBox.Items[index] is not ComboBoxItem item
+                || !string.Equals(item.Content?.ToString(), options[index].Content, StringComparison.Ordinal)
+                || !string.Equals(ComboBoxItemValue(item), options[index].Tag, StringComparison.OrdinalIgnoreCase)
+                || item.IsEnabled != options[index].IsEnabled)
+            {
+                return false;
+            }
+        }
+
+        return true;
     }
 
     private static string BuildCameraCapabilityHint(
@@ -6593,7 +7118,11 @@ public sealed partial class MainWindow : Window
             if (comboBox.Items[index] is ComboBoxItem item
                 && string.Equals(ComboBoxItemValue(item), value, StringComparison.OrdinalIgnoreCase))
             {
-                comboBox.SelectedIndex = index;
+                if (comboBox.SelectedIndex != index)
+                {
+                    comboBox.SelectedIndex = index;
+                }
+
                 return true;
             }
         }
@@ -10899,7 +11428,12 @@ public sealed partial class MainWindow : Window
         RefreshVirtualDisplayState();
         UpdateOverviewCameraState();
         UpdateOverviewRuntimeDiagnostics();
-        if (running)
+        if (!_overviewPreviewEnabled)
+        {
+            ResetOverviewPreview(clearImage: true);
+            SetOverviewPreviewState(OverviewPreviewState.Disabled);
+        }
+        else if (running)
         {
             UpdateOverviewPreview();
         }
@@ -10931,6 +11465,13 @@ public sealed partial class MainWindow : Window
     {
         if (!StaticOverviewUi)
         {
+            return;
+        }
+
+        if (!_overviewPreviewEnabled)
+        {
+            ResetOverviewPreview(clearImage: true);
+            SetOverviewPreviewState(OverviewPreviewState.Disabled);
             return;
         }
 
@@ -11009,6 +11550,49 @@ public sealed partial class MainWindow : Window
             : OverviewPreviewState.Receiving);
     }
 
+    private void SetOverviewPreviewEnabled(bool enabled)
+    {
+        if (!StaticOverviewUi)
+        {
+            return;
+        }
+
+        if (_overviewPreviewEnabled == enabled)
+        {
+            if (enabled)
+            {
+                _overviewPreviewTimer.Start();
+                UpdateOverviewPreview();
+            }
+            else
+            {
+                ResetOverviewPreview(clearImage: true);
+                SetOverviewPreviewState(OverviewPreviewState.Disabled);
+            }
+
+            UpdateOverviewPreviewChrome();
+            return;
+        }
+
+        _overviewPreviewEnabled = enabled;
+        if (enabled)
+        {
+            SetOverviewPreviewState(IsHostRunningForPreview()
+                ? OverviewPreviewState.WaitingSource
+                : OverviewPreviewState.HostNotStarted);
+            _overviewPreviewTimer.Start();
+            UpdateOverviewPreview();
+        }
+        else
+        {
+            _overviewPreviewTimer.Stop();
+            ResetOverviewPreview(clearImage: true);
+            SetOverviewPreviewState(OverviewPreviewState.Disabled);
+        }
+
+        UpdateOverviewPreviewChrome();
+    }
+
     private void ResetOverviewPreview(bool clearImage, bool keepReader = false)
     {
         if (!keepReader)
@@ -11041,6 +11625,7 @@ public sealed partial class MainWindow : Window
 
         OverviewPreviewStatusText.Text = state switch
         {
+            OverviewPreviewState.Disabled => "预览已关闭",
             OverviewPreviewState.HostNotStarted => "主机未启动",
             OverviewPreviewState.WaitingSource => "等待视频源",
             OverviewPreviewState.Receiving => "正在接收画面",
@@ -11054,17 +11639,19 @@ public sealed partial class MainWindow : Window
         {
             OverviewPreviewState.Receiving => _overviewPreviewReceivingBadgeBrush,
             OverviewPreviewState.Paused => _overviewPreviewPausedBadgeBrush,
+            OverviewPreviewState.Disabled => _overviewPreviewPausedBadgeBrush,
             OverviewPreviewState.Error => _overviewPreviewErrorBadgeBrush,
             OverviewPreviewState.Unavailable => _overviewPreviewErrorBadgeBrush,
             _ => _overviewPreviewNeutralBadgeBrush
         };
 
         var hasImage = OverviewPreviewImage?.Source is not null;
-        var showEmpty = state is OverviewPreviewState.HostNotStarted or OverviewPreviewState.WaitingSource or OverviewPreviewState.Unavailable or OverviewPreviewState.Error
+        var showEmpty = state is OverviewPreviewState.Disabled or OverviewPreviewState.HostNotStarted or OverviewPreviewState.WaitingSource or OverviewPreviewState.Unavailable or OverviewPreviewState.Error
             || !hasImage;
         OverviewPreviewEmptyState.Visibility = showEmpty ? Visibility.Visible : Visibility.Collapsed;
         OverviewPreviewEmptyStateText.Text = detail ?? state switch
         {
+            OverviewPreviewState.Disabled => "预览已关闭，点击右上角播放按钮重新启动",
             OverviewPreviewState.HostNotStarted => "启动主机后显示副屏实时画面",
             OverviewPreviewState.WaitingSource => "等待虚拟显示器或 Android 视频连接",
             OverviewPreviewState.Receiving => "正在显示来自 SideDock Host 的实时帧",
@@ -11089,9 +11676,22 @@ public sealed partial class MainWindow : Window
 
         if (OverviewPreviewFitButton is not null)
         {
+            OverviewPreviewFitButton.IsEnabled = _overviewPreviewEnabled;
             ToolTipService.SetToolTip(
                 OverviewPreviewFitButton,
                 _overviewPreviewFillMode ? "切换为完整适配" : "切换为填充裁切");
+        }
+
+        if (OverviewPreviewToggleIcon is not null)
+        {
+            OverviewPreviewToggleIcon.Glyph = _overviewPreviewEnabled ? "\uE711" : "\uE768";
+        }
+
+        if (OverviewPreviewToggleButton is not null)
+        {
+            ToolTipService.SetToolTip(
+                OverviewPreviewToggleButton,
+                _overviewPreviewEnabled ? "关闭预览" : "启动预览");
         }
 
         if (OverviewPreviewOverlay is not null)
@@ -16116,6 +16716,15 @@ public sealed partial class MainWindow : Window
     [DllImport("user32.dll", SetLastError = true)]
     private static extern bool PostMessage(IntPtr hWnd, uint msg, UIntPtr wParam, IntPtr lParam);
 
+    [DllImport("iphlpapi.dll", SetLastError = true)]
+    private static extern int GetExtendedTcpTable(
+        IntPtr pTcpTable,
+        ref int dwOutBufLen,
+        [MarshalAs(UnmanagedType.Bool)] bool sort,
+        int ipVersion,
+        TcpTableClass tableClass,
+        uint reserved);
+
     private delegate IntPtr SubclassProc(
         IntPtr hWnd,
         uint message,
@@ -16528,6 +17137,8 @@ public sealed partial class MainWindow : Window
             ClientCodecConfigPackets = 0;
         }
     }
+
+    private readonly record struct CameraComboOption(string Content, string Tag, bool IsEnabled = true);
 
     private sealed record CameraConfigSelection(
         bool Enabled,
@@ -17317,6 +17928,35 @@ public sealed partial class MainWindow : Window
         public int Y;
     }
 
+    [StructLayout(LayoutKind.Sequential)]
+    private struct MibTcpRowOwnerPid
+    {
+        public uint State;
+        public uint LocalAddr;
+        public uint LocalPort;
+        public uint RemoteAddr;
+        public uint RemotePort;
+        public uint OwningPid;
+    }
+
+    [StructLayout(LayoutKind.Sequential)]
+    private struct MibTcp6RowOwnerPid
+    {
+        [MarshalAs(UnmanagedType.ByValArray, SizeConst = 16)]
+        public byte[] LocalAddr;
+
+        public uint LocalScopeId;
+        public uint LocalPort;
+
+        [MarshalAs(UnmanagedType.ByValArray, SizeConst = 16)]
+        public byte[] RemoteAddr;
+
+        public uint RemoteScopeId;
+        public uint RemotePort;
+        public uint State;
+        public uint OwningPid;
+    }
+
     [StructLayout(LayoutKind.Sequential, CharSet = CharSet.Unicode)]
     private struct NotifyIconData
     {
@@ -17344,6 +17984,87 @@ public sealed partial class MainWindow : Window
         public uint dwInfoFlags;
         public Guid guidItem;
         public IntPtr hBalloonIcon;
+    }
+
+    private enum TcpTableClass
+    {
+        TcpTableBasicListener = 0,
+        TcpTableOwnerPidListener = 3
+    }
+
+    private sealed record OverviewPortBinding(string Name, int Port);
+
+    private sealed record TcpListenerPortOwner(int Port, int ProcessId);
+
+    private sealed record HostPortCleanupResult(
+        IReadOnlyList<int> KilledProcessIds,
+        IReadOnlyList<string> BlockingOwners,
+        IReadOnlyList<string> Errors)
+    {
+        public static HostPortCleanupResult Empty { get; } =
+            new(Array.Empty<int>(), Array.Empty<string>(), Array.Empty<string>());
+
+        public bool HasChanges => KilledProcessIds.Count > 0;
+
+        public bool Success => BlockingOwners.Count == 0 && Errors.Count == 0;
+
+        public string Summary
+        {
+            get
+            {
+                if (!Success)
+                {
+                    return BlockingOwners.Count > 0
+                        ? $"端口仍被占用：{string.Join("；", BlockingOwners)}"
+                        : $"无法释放残留主机端口：{string.Join("；", Errors)}";
+                }
+
+                return HasChanges
+                    ? $"已清理残留 SideDock.Host.exe（PID {string.Join("、", KilledProcessIds)}），端口已释放。"
+                    : "未发现残留 SideDock.Host.exe 占用端口。";
+            }
+        }
+
+        public string Details
+        {
+            get
+            {
+                var report = new StringBuilder();
+                report.AppendLine("SideDock 端口修复结果");
+                report.AppendLine(Summary);
+                if (KilledProcessIds.Count > 0)
+                {
+                    report.AppendLine();
+                    report.AppendLine("已结束的残留主机进程：");
+                    foreach (var processId in KilledProcessIds)
+                    {
+                        report.AppendLine($"- SideDock.Host.exe PID {processId}");
+                    }
+                }
+
+                if (BlockingOwners.Count > 0)
+                {
+                    report.AppendLine();
+                    report.AppendLine("仍在占用端口的进程：");
+                    foreach (var owner in BlockingOwners)
+                    {
+                        report.AppendLine($"- {owner}");
+                    }
+                }
+
+                if (Errors.Count > 0)
+                {
+                    report.AppendLine();
+                    report.AppendLine("清理错误：");
+                    foreach (var error in Errors)
+                    {
+                        report.AppendLine($"- {error}");
+                    }
+                }
+
+                return report.ToString();
+            }
+        }
     }
 
     private sealed class HostProcessLog(

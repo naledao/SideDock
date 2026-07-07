@@ -683,10 +683,10 @@
                                     </Border>
                                     <StackPanel Grid.Column="1" VerticalAlignment="Center" Spacing="3">
                                         <TextBlock Text="视频链路" FontSize="12" Foreground="#20252B" />
-                                        <TextBlock Text="720p 120 fps" FontSize="20" FontWeight="SemiBold" Foreground="#0B67E3" />
-                                        <TextBlock Text="H.264 · 20 Mbps" FontSize="12" Foreground="#111827" />
+                                        <TextBlock x:Name="OverviewVideoLinkModeText" Text="1080p 120 fps" FontSize="20" FontWeight="SemiBold" Foreground="#0B67E3" />
+                                        <TextBlock x:Name="OverviewVideoLinkDetailText" Text="H.264 · 推荐 28 Mbps" FontSize="12" Foreground="#111827" />
                                     </StackPanel>
-                                    <Ellipse Grid.Column="2" Width="8" Height="8" Fill="#168A29" VerticalAlignment="Top" />
+                                    <Ellipse x:Name="OverviewVideoLinkStatusDot" Grid.Column="2" Width="8" Height="8" Fill="#168A29" VerticalAlignment="Top" />
                                 </Grid>
                             </Border>
 
@@ -806,6 +806,22 @@
                                                     Spacing="8"
                                                     HorizontalAlignment="Right"
                                                     VerticalAlignment="Top">
+                                                    <Button
+                                                        x:Name="OverviewPreviewToggleButton"
+                                                        Width="34"
+                                                        Height="34"
+                                                        Padding="0"
+                                                        CornerRadius="5"
+                                                        Background="#CC111827"
+                                                        BorderBrush="#33FFFFFF"
+                                                        Click="OverviewPreviewToggleButton_Click"
+                                                        ToolTipService.ToolTip="关闭预览">
+                                                        <FontIcon
+                                                            x:Name="OverviewPreviewToggleIcon"
+                                                            Glyph="&#xE711;"
+                                                            FontSize="15"
+                                                            Foreground="White" />
+                                                    </Button>
                                                     <Button
                                                         x:Name="OverviewPreviewFitButton"
                                                         Width="34"
@@ -1104,7 +1120,7 @@
                                 <ColumnDefinition Width="1.2*" />
                             </Grid.ColumnDefinitions>
 
-                            <Border x:Name="OverviewVirtualDisplayCard" Height="184" Padding="12" CornerRadius="7" Background="#FFFFFF" BorderBrush="#D8DEE4" BorderThickness="1">
+                            <Border x:Name="OverviewVirtualDisplayCard" Height="200" Padding="12" CornerRadius="7" Background="#FFFFFF" BorderBrush="#D8DEE4" BorderThickness="1">
                                 <Grid>
                                     <Grid.RowDefinitions>
                                         <RowDefinition Height="Auto" />
@@ -1198,7 +1214,7 @@
                                             MaxLines="2" />
                                         <Rectangle Height="1" Fill="#E5E7EB" VerticalAlignment="Bottom" Margin="0,0,0,9" />
                                     </Grid>
-                                    <Grid Grid.Row="5" ColumnSpacing="8">
+                                    <Grid Grid.Row="5" Margin="0,8,0,0" ColumnSpacing="8">
                                         <Grid.ColumnDefinitions>
                                             <ColumnDefinition Width="*" />
                                             <ColumnDefinition Width="*" />
@@ -1235,7 +1251,7 @@
                                 </Grid>
                             </Border>
 
-                            <Border x:Name="OverviewCameraCard" Grid.Column="1" Height="184" Padding="12" CornerRadius="7" Background="#FFFFFF" BorderBrush="#D8DEE4" BorderThickness="1">
+                            <Border x:Name="OverviewCameraCard" Grid.Column="1" Height="200" Padding="12" CornerRadius="7" Background="#FFFFFF" BorderBrush="#D8DEE4" BorderThickness="1">
                                 <Grid>
                                     <Grid.RowDefinitions>
                                         <RowDefinition Height="Auto" />
@@ -1333,6 +1349,7 @@
                                     <Button
                                         x:Name="OverviewCameraSettingsButton"
                                         Grid.Row="5"
+                                        Margin="0,8,0,0"
                                         MinHeight="28"
                                         Padding="8,0"
                                         CornerRadius="5"
@@ -1353,7 +1370,7 @@
                                 </Grid>
                             </Border>
 
-                            <Border x:Name="OverviewAudioCard" Grid.Column="2" Height="184" Padding="12" CornerRadius="7" Background="#FFFFFF" BorderBrush="#D8DEE4" BorderThickness="1">
+                            <Border x:Name="OverviewAudioCard" Grid.Column="2" Height="200" Padding="12" CornerRadius="7" Background="#FFFFFF" BorderBrush="#D8DEE4" BorderThickness="1">
                                 <Grid>
                                     <Grid.RowDefinitions>
                                         <RowDefinition Height="Auto" />
@@ -1487,6 +1504,7 @@
                                     <Button
                                         x:Name="OverviewAudioSettingsButton"
                                         Grid.Row="5"
+                                        Margin="0,8,0,0"
                                         MinHeight="28"
                                         Padding="8,0"
                                         CornerRadius="5"
@@ -1510,7 +1528,7 @@
                             <Border
                                 x:Name="OverviewDiagnosticsCard"
                                 Grid.Column="3"
-                                Height="184"
+                                Height="200"
                                 Padding="12"
                                 CornerRadius="7"
                                 Background="#FFFFFF"
@@ -1811,18 +1829,22 @@
                                                     <Rectangle Width="8" Height="4" RadiusX="2" RadiusY="2" Fill="#168A29" VerticalAlignment="Bottom" HorizontalAlignment="Center" Margin="0,0,0,5" />
                                                 </Border>
 
-                                                <StackPanel Grid.Column="1" VerticalAlignment="Center" Spacing="8">
-                                                    <StackPanel Orientation="Horizontal" Spacing="12">
+                                                <StackPanel Grid.Column="1" VerticalAlignment="Center" Spacing="8" HorizontalAlignment="Stretch">
+                                                    <StackPanel Spacing="6">
                                                         <TextBlock
                                                             x:Name="OverviewConnectionSelectedDeviceNameText"
                                                             Text="暂无设备"
                                                             VerticalAlignment="Center"
                                                             FontSize="20"
                                                             FontWeight="SemiBold"
+                                                            TextTrimming="CharacterEllipsis"
                                                             Foreground="#111827" />
                                                         <Border
                                                             x:Name="OverviewConnectionSelectedDeviceStatusBadge"
-                                                            Padding="9,3"
+                                                            Width="96"
+                                                            Height="32"
+                                                            HorizontalAlignment="Left"
+                                                            Padding="0"
                                                             CornerRadius="5"
                                                             Background="#F3F4F6"
                                                             BorderBrush="#D8DEE4"
@@ -1830,8 +1852,14 @@
                                                             <TextBlock
                                                                 x:Name="OverviewConnectionSelectedDeviceStatusText"
                                                                 Text="等待刷新"
+                                                                Width="82"
+                                                                HorizontalAlignment="Center"
+                                                                VerticalAlignment="Center"
+                                                                TextAlignment="Center"
                                                                 FontSize="12"
                                                                 FontWeight="SemiBold"
+                                                                TextWrapping="NoWrap"
+                                                                TextTrimming="None"
                                                                 Foreground="#5B6570" />
                                                         </Border>
                                                     </StackPanel>
@@ -1839,6 +1867,9 @@
                                                         x:Name="OverviewConnectionSelectedDeviceDetailText"
                                                         Text="暂无数据"
                                                         FontSize="13"
+                                                        TextWrapping="Wrap"
+                                                        MaxLines="2"
+                                                        TextTrimming="WordEllipsis"
                                                         Foreground="#30363D" />
                                                 </StackPanel>
 
@@ -1868,7 +1899,7 @@
                                                 <ComboBox
                                                     x:Name="OverviewConnectionAdbDeviceCombo"
                                                     Grid.Column="4"
-                                                    MinWidth="220"
+                                                    Width="220"
                                                     Height="36"
                                                     SelectionChanged="OverviewConnectionAdbDeviceCombo_SelectionChanged"
                                                     VerticalAlignment="Center" />

@@ -2075,6 +2075,7 @@ internal static partial class Program
         private readonly PeriodicTimer _cursorStateTimer = new(TimeSpan.FromMilliseconds(16));
         private readonly Stopwatch _uptime = Stopwatch.StartNew();
         private DisplayMetrics? _lastPublishedMetrics;
+        private DisplayModeRequest? _lastObservedDisplayMode;
         private CursorState? _lastPublishedCursorState;
         private long _cursorStateLogCounter;
         private int _missedPongs;
@@ -2831,7 +2832,7 @@ internal static partial class Program
             bool force,
             CancellationToken cancellationToken)
         {
-            if (_options.VideoSource != VideoSourceKind.Idd && _options.InputTarget != InputTargetKind.Idd)
+            if (!IsIddVideoSource(_options.VideoSource) && _options.InputTarget != InputTargetKind.Idd)
             {
                 return;
             }
@@ -2851,7 +2852,14 @@ internal static partial class Program
                 return;
             }
 
-            var videoMode = _videoModeState.Current;
+            var previousObservedMode = _lastObservedDisplayMode;
+            _lastObservedDisplayMode = new DisplayModeRequest(layout.Width, layout.Height, layout.RefreshRate);
+            var videoMode = await SynchronizeVideoModeWithDisplayLayoutAsync(
+                connection,
+                layout,
+                _videoModeState.Current,
+                previousObservedMode,
+                cancellationToken);
             var metrics = layout.ToMetrics(videoMode.Width, videoMode.Height);
             if (!force && _lastPublishedMetrics is not null && metrics.Equals(_lastPublishedMetrics))
             {
@@ -2867,6 +2875,73 @@ internal static partial class Program
                 ["visible"] = false,
                 ["source"] = "local-overlay"
             }, cancellationToken);
+        }
+
+        private async ValueTask<VideoMode> SynchronizeVideoModeWithDisplayLayoutAsync(
+            ControlConnection connection,
+            DisplayLayout layout,
+            VideoMode currentMode,
+            DisplayModeRequest? previousObservedMode,
+            CancellationToken cancellationToken)
+        {
+            if (!IsIddVideoSource(_options.VideoSource))
+            {
+                return currentMode;
+            }
+
+            var displayModeChanged = previousObservedMode is not null
+                && (previousObservedMode.Width != layout.Width
+                    || previousObservedMode.Height != layout.Height
+                    || Math.Abs(previousObservedMode.RefreshHz - layout.RefreshRate) > 1);
+            var sizeMismatch = currentMode.Width != layout.Width || currentMode.Height != layout.Height;
+            var refreshMismatchFromDisplayChange = displayModeChanged
+                && Math.Abs(currentMode.Fps - layout.RefreshRate) > 1;
+            if (!sizeMismatch && !refreshMismatchFromDisplayChange)
+            {
+                return currentMode;
+            }
+
+            var synchronizedMode = _videoModeState.Set(layout.Width, layout.Height, layout.RefreshRate);
+            _lastPublishedMetrics = null;
+            Log(
+                Scope,
+                "display layout mode sync "
+                + $"previous={currentMode.Width}x{currentMode.Height}@{currentMode.Fps} "
+                + $"layout={layout.Width}x{layout.Height}@{layout.RefreshRate} "
+                + $"video={synchronizedMode.Width}x{synchronizedMode.Height}@{synchronizedMode.Fps}");
+
+            await connection.SendAsync("display_mode_changed", new JsonObject
+            {
+                ["width"] = layout.Width,
+                ["height"] = layout.Height,
+                ["refreshHz"] = layout.RefreshRate,
+                ["requestedRefreshHz"] = layout.RefreshRate,
+                ["displayRefreshHz"] = layout.RefreshRate,
+                ["success"] = true,
+                ["code"] = "DISPLAY_MODE_SYNCED",
+                ["message"] = "Display layout changed externally; video mode synchronized.",
+                ["videoWidth"] = synchronizedMode.Width,
+                ["videoHeight"] = synchronizedMode.Height,
+                ["videoFps"] = synchronizedMode.Fps,
+                ["videoBitrate"] = synchronizedMode.Bitrate,
+                ["external"] = true,
+                ["sourceSeq"] = 0
+            }, cancellationToken);
+
+            await connection.SendAsync("video_start", new JsonObject
+            {
+                ["videoPort"] = _options.VideoPort,
+                ["width"] = synchronizedMode.Width,
+                ["height"] = synchronizedMode.Height,
+                ["fps"] = synchronizedMode.Fps,
+                ["codec"] = "video/avc",
+                ["format"] = "annexb",
+                ["displayRefreshHz"] = layout.RefreshRate,
+                ["displayModeChanged"] = true,
+                ["source"] = "display-layout-sync"
+            }, cancellationToken);
+
+            return synchronizedMode;
         }
 
         private async ValueTask PublishCursorStateIfChangedAsync(

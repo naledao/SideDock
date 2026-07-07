@@ -82,6 +82,7 @@ public sealed partial class MainWindow
             return;
         }
 
+        _deferredCameraCapabilityOptionsRefresh = null;
         var selected = SelectedOverviewCameraConfig(_overviewCameraRequestedEnabled);
         SetCameraConfigSource(
             CameraConfigSource.UserManual,
