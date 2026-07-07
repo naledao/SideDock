@@ -414,6 +414,7 @@ public sealed partial class MainWindow : Window
         OverviewDisplayPage.OpenDisplaySettingsRequested += StaticDisplayPage_OpenDisplaySettingsRequested;
         OverviewDisplayPage.ShowLogsRequested += StaticDisplayPage_ShowLogsRequested;
         OverviewDisplayPage.DisplayModeApplyRequested += StaticDisplayPage_DisplayModeApplyRequested;
+        OverviewDisplayPage.PresentationModeApplyRequested += StaticDisplayPage_PresentationModeApplyRequested;
     }
 
     private void UpdateOverviewMainContentMinHeight()
@@ -2449,6 +2450,13 @@ public sealed partial class MainWindow : Window
         return ApplyVirtualDisplayModeSelectionAsync(e.Resolution, e.RefreshRate);
     }
 
+    private Task<StaticDisplayPresentationModeApplyResult> StaticDisplayPage_PresentationModeApplyRequested(
+        object sender,
+        StaticDisplayPresentationModeApplyRequestedEventArgs e)
+    {
+        return ApplyVirtualDisplayPresentationModeSelectionAsync(e.Mode);
+    }
+
     private static string BuildDisplayLayoutRefreshSummary(DisplayLayoutSnapshot displayLayout)
     {
         if (!string.IsNullOrWhiteSpace(displayLayout.QueryError))
@@ -3524,6 +3532,61 @@ public sealed partial class MainWindow : Window
         {
             var currentMode = CurrentSideDockModeFromLayout(DisplayLayoutQuery.GetCurrent());
             return BuildStaticDisplayModeApplyResult(false, ex.Message, currentMode, null);
+        }
+        finally
+        {
+            _virtualDisplayModeApplyInProgress = false;
+            RefreshVirtualDisplayState();
+        }
+    }
+
+    private async Task<StaticDisplayPresentationModeApplyResult> ApplyVirtualDisplayPresentationModeSelectionAsync(
+        VirtualDisplayPresentationMode mode)
+    {
+        if (_virtualDisplayModeApplyInProgress || _virtualDisplayOperationInProgress || _driverInstallInProgress)
+        {
+            var busyState = VirtualDisplayModeService.GetPresentationState();
+            return new StaticDisplayPresentationModeApplyResult
+            {
+                Success = false,
+                Message = "显示器操作正在进行中，请稍后再试。",
+                CurrentMode = busyState.Mode
+            };
+        }
+
+        if (mode is VirtualDisplayPresentationMode.Mirror or VirtualDisplayPresentationMode.SecondaryOnly)
+        {
+            var currentState = VirtualDisplayModeService.GetPresentationState();
+            return new StaticDisplayPresentationModeApplyResult
+            {
+                Success = false,
+                Message = "该显示模式暂未支持，需要后续安全确认流程。",
+                CurrentMode = currentState.Mode
+            };
+        }
+
+        _virtualDisplayModeApplyInProgress = true;
+        RefreshVirtualDisplayState();
+
+        try
+        {
+            var serviceResult = await Task.Run(() => VirtualDisplayModeService.ApplyPresentationMode(mode));
+            return new StaticDisplayPresentationModeApplyResult
+            {
+                Success = serviceResult.Success,
+                Message = serviceResult.Summary,
+                CurrentMode = serviceResult.CurrentMode
+            };
+        }
+        catch (Exception ex)
+        {
+            var currentState = VirtualDisplayModeService.GetPresentationState();
+            return new StaticDisplayPresentationModeApplyResult
+            {
+                Success = false,
+                Message = ex.Message,
+                CurrentMode = currentState.Mode
+            };
         }
         finally
         {
@@ -6897,6 +6960,7 @@ public sealed partial class MainWindow : Window
         var (permissionStatusText, permissionStatusBrush) = BuildStaticDisplayPermissionStatus(state);
         var footer = BuildOverviewFooterSnapshot();
         var currentMode = CurrentSideDockModeFromLayout(displayLayout);
+        var presentationState = VirtualDisplayModeService.GetPresentationState();
         var canChangeDisplayOptions = displayOperationEnabled
             && (running || displayLayout.HasSideDockVirtualDisplay);
 
@@ -6925,6 +6989,8 @@ public sealed partial class MainWindow : Window
             CanChangeDisplayOptions = canChangeDisplayOptions,
             VirtualDisplayRunning = running,
             DisplayLayout = displayLayout,
+            PresentationMode = presentationState.Mode,
+            PresentationModeMessage = presentationState.Summary,
             Resolution = DisplayResolutionValueFromMode(currentMode) ?? Selected(ResolutionCombo),
             RefreshRate = DisplayRefreshRateValueFromMode(currentMode) ?? Selected(RefreshRateCombo),
             FooterHostText = footer.HostText,

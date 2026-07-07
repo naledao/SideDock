@@ -524,30 +524,86 @@
                                                 <RowDefinition Height="64" />
                                                 <RowDefinition Height="40" />
                                             </Grid.RowDefinitions>
-                                            <Border CornerRadius="5" BorderBrush="#D8DEE4" BorderThickness="1" Background="#F8FAFC">
+                                            <Border
+                                                x:Name="DisplayPresentationOptionsPanel"
+                                                CornerRadius="5"
+                                                BorderBrush="#D8DEE4"
+                                                BorderThickness="1"
+                                                Background="#F8FAFC">
                                                 <Grid>
                                                     <Grid.ColumnDefinitions>
                                                         <ColumnDefinition Width="*" />
                                                         <ColumnDefinition Width="*" />
                                                         <ColumnDefinition Width="*" />
                                                     </Grid.ColumnDefinitions>
-                                                    <Border CornerRadius="5" Background="{StaticResource SideDockPrimaryBrush}">
-                                                        <TextBlock Text="扩展" HorizontalAlignment="Center" VerticalAlignment="Center" FontSize="13" FontWeight="SemiBold" Foreground="White" />
+                                                    <Border
+                                                        x:Name="DisplayPresentationExtendOption"
+                                                        CornerRadius="5"
+                                                        Tag="Extend"
+                                                        Tapped="PresentationModeOption_Tapped">
+                                                        <TextBlock
+                                                            x:Name="DisplayPresentationExtendText"
+                                                            Text="扩展"
+                                                            HorizontalAlignment="Center"
+                                                            VerticalAlignment="Center"
+                                                            FontSize="13" />
                                                     </Border>
-                                                    <TextBlock Grid.Column="1" Text="镜像" HorizontalAlignment="Center" VerticalAlignment="Center" FontSize="13" Foreground="#30363D" />
-                                                    <TextBlock Grid.Column="2" Text="仅副屏" HorizontalAlignment="Center" VerticalAlignment="Center" FontSize="13" Foreground="#30363D" />
+                                                    <Border
+                                                        x:Name="DisplayPresentationMirrorOption"
+                                                        Grid.Column="1"
+                                                        BorderBrush="#D8DEE4"
+                                                        BorderThickness="1,0,1,0"
+                                                        Tag="Mirror"
+                                                        Tapped="PresentationModeOption_Tapped">
+                                                        <TextBlock
+                                                            x:Name="DisplayPresentationMirrorText"
+                                                            Text="镜像"
+                                                            HorizontalAlignment="Center"
+                                                            VerticalAlignment="Center"
+                                                            FontSize="13" />
+                                                    </Border>
+                                                    <Border
+                                                        x:Name="DisplayPresentationSecondaryOnlyOption"
+                                                        Grid.Column="2"
+                                                        CornerRadius="5"
+                                                        Tag="SecondaryOnly"
+                                                        Tapped="PresentationModeOption_Tapped">
+                                                        <TextBlock
+                                                            x:Name="DisplayPresentationSecondaryOnlyText"
+                                                            Text="仅副屏"
+                                                            HorizontalAlignment="Center"
+                                                            VerticalAlignment="Center"
+                                                            FontSize="13" />
+                                                    </Border>
                                                 </Grid>
                                             </Border>
-                                            <Border Grid.Row="1" Padding="11,9" CornerRadius="5" Background="#F8FAFC" BorderBrush="#D8DEE4" BorderThickness="1">
+                                            <Border
+                                                x:Name="DisplayPresentationModeDetailCard"
+                                                Grid.Row="1"
+                                                Padding="11,9"
+                                                CornerRadius="5"
+                                                Background="#F8FAFC"
+                                                BorderBrush="#D8DEE4"
+                                                BorderThickness="1">
                                                 <Grid ColumnSpacing="10">
                                                     <Grid.ColumnDefinitions>
                                                         <ColumnDefinition Width="Auto" />
                                                         <ColumnDefinition Width="*" />
                                                     </Grid.ColumnDefinitions>
-                                                    <FontIcon Glyph="&#xE7F4;" FontSize="18" Foreground="#30363D" />
+                                                    <FontIcon
+                                                        x:Name="DisplayPresentationModeIcon"
+                                                        Glyph="&#xE7F4;"
+                                                        FontSize="18"
+                                                        Foreground="#30363D" />
                                                     <StackPanel Grid.Column="1" Spacing="3">
-                                                        <TextBlock Text="扩展模式" FontSize="12" FontWeight="SemiBold" Foreground="#30363D" />
                                                         <TextBlock
+                                                            x:Name="DisplayPresentationModeTitleText"
+                                                            Text="扩展模式"
+                                                            FontSize="12"
+                                                            FontWeight="SemiBold"
+                                                            Foreground="#30363D" />
+                                                        <TextBlock
+                                                            x:Name="DisplayPresentationModeDescriptionText"
                                                             Text="将虚拟显示器作为扩展桌面使用，可独立设置分辨率与刷新率。"
                                                             FontSize="11"
                                                             Foreground="#5B6570"
