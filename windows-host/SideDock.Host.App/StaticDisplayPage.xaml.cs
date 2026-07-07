@@ -36,6 +36,7 @@ public sealed partial class StaticDisplayPage : UserControl
     private bool _displayOptionsEnabled = true;
     private bool _displayOptionsAvailable = true;
     private bool _displayModeApplyInProgress;
+    private VirtualDisplayPresentationMode _currentPresentationMode = VirtualDisplayPresentationMode.Unknown;
     private bool _statusBannerDismissed;
     private string? _lastLoggedStatus;
     private DisplayLayoutSnapshot _displayLayoutSnapshot = new(Array.Empty<DisplayLayoutMonitor>());
@@ -46,6 +47,7 @@ public sealed partial class StaticDisplayPage : UserControl
         InitializeComponent();
         AddActivityLog("等待检测虚拟显示器状态。", StaticDisplayActivityKind.Info);
         SetSelectedDisplayOptions(_selectedResolution, _selectedRefreshRate);
+        SetCurrentPresentationMode(VirtualDisplayPresentationMode.Unknown);
     }
 
     public event EventHandler? StartRequested;
@@ -61,6 +63,8 @@ public sealed partial class StaticDisplayPage : UserControl
     public event EventHandler? ShowLogsRequested;
 
     internal event Func<object, StaticDisplayModeApplyRequestedEventArgs, Task<StaticDisplayModeApplyResult>>? DisplayModeApplyRequested;
+
+    internal event Func<object, StaticDisplayPresentationModeApplyRequestedEventArgs, Task<StaticDisplayPresentationModeApplyResult>>? PresentationModeApplyRequested;
 
     internal void UpdateVirtualDisplayState(StaticDisplayPageState state)
     {
@@ -97,6 +101,7 @@ public sealed partial class StaticDisplayPage : UserControl
 
         SetDisplayOptionsEnabled(state.CanChangeDisplayOptions);
         SetSelectedDisplayOptions(state.Resolution, state.RefreshRate);
+        SetCurrentPresentationMode(state.PresentationMode, state.PresentationModeMessage);
         UpdateFooter(state.FooterHostText, state.FooterOsText, state.FooterNetworkText, state.FooterNetworkBrush);
         _displayLayoutSnapshot = state.DisplayLayout;
         _virtualDisplayRunning = state.VirtualDisplayRunning;
@@ -206,6 +211,34 @@ public sealed partial class StaticDisplayPage : UserControl
         await RequestDisplayModeApplyAsync(_selectedResolution, normalized);
     }
 
+    private async void PresentationModeOption_Tapped(object sender, TappedRoutedEventArgs e)
+    {
+        if (!_displayOptionsEnabled
+            || sender is not FrameworkElement { Tag: string value }
+            || !TryParsePresentationMode(value, out var mode))
+        {
+            return;
+        }
+
+        if (mode is VirtualDisplayPresentationMode.Mirror or VirtualDisplayPresentationMode.SecondaryOnly)
+        {
+            ShowUnsupportedPresentationMode(mode);
+            return;
+        }
+
+        if (mode == VirtualDisplayPresentationMode.Extend
+            && _currentPresentationMode == VirtualDisplayPresentationMode.Extend)
+        {
+            ShowPresentationModeDetail(
+                VirtualDisplayPresentationMode.Extend,
+                "当前已是扩展桌面，不需要重复切换。");
+            AddActivityLog("当前已是扩展模式。", StaticDisplayActivityKind.Info);
+            return;
+        }
+
+        await RequestPresentationModeApplyAsync(mode);
+    }
+
     private async Task RequestDisplayModeApplyAsync(string resolution, string refreshRate)
     {
         var handler = DisplayModeApplyRequested;
@@ -237,6 +270,41 @@ public sealed partial class StaticDisplayPage : UserControl
         catch (Exception ex)
         {
             AddActivityLog($"显示模式应用失败：{ex.Message}", StaticDisplayActivityKind.Failure);
+        }
+        finally
+        {
+            SetDisplayOptionsApplying(false);
+        }
+    }
+
+    private async Task RequestPresentationModeApplyAsync(VirtualDisplayPresentationMode mode)
+    {
+        var handler = PresentationModeApplyRequested;
+        if (handler is null)
+        {
+            AddActivityLog("无法切换显示模式：页面尚未连接到主窗口。", StaticDisplayActivityKind.Failure);
+            return;
+        }
+
+        var label = PresentationModeLabel(mode);
+        SetDisplayOptionsApplying(true);
+        ShowPresentationModeDetail(mode, $"正在切换为{label}。");
+        AddActivityLog($"正在切换为{label}。", StaticDisplayActivityKind.Info);
+
+        try
+        {
+            var result = await handler(this, new StaticDisplayPresentationModeApplyRequestedEventArgs(mode));
+            SetCurrentPresentationMode(
+                result.CurrentMode,
+                result.Success ? result.Message : $"{label}切换失败：{result.Message}");
+            AddActivityLog(
+                result.Success ? result.Message : $"{label}切换失败：{result.Message}",
+                result.Success ? StaticDisplayActivityKind.Success : StaticDisplayActivityKind.Failure);
+        }
+        catch (Exception ex)
+        {
+            ShowPresentationModeDetail(mode, $"{label}切换失败：{ex.Message}");
+            AddActivityLog($"{label}切换失败：{ex.Message}", StaticDisplayActivityKind.Failure);
         }
         finally
         {
@@ -284,12 +352,83 @@ public sealed partial class StaticDisplayPage : UserControl
     {
         _displayOptionsEnabled = _displayOptionsAvailable && !_displayModeApplyInProgress;
         var opacity = _displayOptionsEnabled ? 1 : 0.56;
+        DisplayPresentationOptionsPanel.Opacity = opacity;
+        DisplayPresentationExtendOption.IsHitTestVisible = _displayOptionsEnabled;
+        DisplayPresentationMirrorOption.IsHitTestVisible = _displayOptionsEnabled;
+        DisplayPresentationSecondaryOnlyOption.IsHitTestVisible = _displayOptionsEnabled;
         Resolution720pOption.Opacity = opacity;
         Resolution1080pOption.Opacity = opacity;
         Resolution2kOption.Opacity = opacity;
         RefreshRate30Option.Opacity = opacity;
         RefreshRate60Option.Opacity = opacity;
         RefreshRate120Option.Opacity = opacity;
+    }
+
+    private void SetCurrentPresentationMode(VirtualDisplayPresentationMode mode, string? message = null)
+    {
+        _currentPresentationMode = mode;
+        SetPresentationModeOption(
+            DisplayPresentationExtendOption,
+            DisplayPresentationExtendText,
+            mode == VirtualDisplayPresentationMode.Extend);
+        SetPresentationModeOption(
+            DisplayPresentationMirrorOption,
+            DisplayPresentationMirrorText,
+            mode == VirtualDisplayPresentationMode.Mirror);
+        SetPresentationModeOption(
+            DisplayPresentationSecondaryOnlyOption,
+            DisplayPresentationSecondaryOnlyText,
+            mode == VirtualDisplayPresentationMode.SecondaryOnly);
+        ShowPresentationModeDetail(mode, message);
+    }
+
+    private void SetPresentationModeOption(Border option, TextBlock text, bool selected)
+    {
+        option.Background = selected ? _primaryBrush : _transparentBrush;
+        text.Foreground = selected ? _whiteBrush : _textBrush;
+        text.FontWeight = selected ? FontWeights.SemiBold : FontWeights.Normal;
+    }
+
+    private void ShowUnsupportedPresentationMode(VirtualDisplayPresentationMode mode)
+    {
+        var label = PresentationModeLabel(mode);
+        var message = mode == VirtualDisplayPresentationMode.Mirror
+            ? "镜像模式暂未支持，需要后续安全确认流程。"
+            : "仅副屏模式暂未支持，需要后续安全确认流程。";
+        ShowPresentationModeDetail(mode, message);
+        AddActivityLog($"{label}暂未支持，未修改系统显示拓扑。", StaticDisplayActivityKind.Info);
+    }
+
+    private void ShowPresentationModeDetail(VirtualDisplayPresentationMode mode, string? message = null)
+    {
+        var (title, description, glyph, brush) = mode switch
+        {
+            VirtualDisplayPresentationMode.Extend => (
+                "扩展模式",
+                "将虚拟显示器作为扩展桌面使用，可独立设置分辨率与刷新率。",
+                "\uE7F4",
+                _primaryBrush),
+            VirtualDisplayPresentationMode.Mirror => (
+                "镜像模式",
+                "镜像切换暂未开放，需要后续安全确认流程。",
+                "\uE7F4",
+                _warningBrush),
+            VirtualDisplayPresentationMode.SecondaryOnly => (
+                "仅副屏模式",
+                "仅副屏切换暂未开放，需要后续安全确认流程。",
+                "\uE7F4",
+                _warningBrush),
+            _ => (
+                "显示模式",
+                "未检测到 SideDock 扩展桌面，可在虚拟显示器可用后切换为扩展模式。",
+                "\uE946",
+                _mutedBrush)
+        };
+
+        DisplayPresentationModeTitleText.Text = title;
+        DisplayPresentationModeDescriptionText.Text = string.IsNullOrWhiteSpace(message) ? description : message;
+        DisplayPresentationModeIcon.Glyph = glyph;
+        DisplayPresentationModeIcon.Foreground = brush;
     }
 
     private void SetResolutionOption(
@@ -746,6 +885,24 @@ public sealed partial class StaticDisplayPage : UserControl
         return $"{ResolutionSizeText(resolution)} @ {NormalizeRefreshRate(refreshRate)} Hz";
     }
 
+    private static bool TryParsePresentationMode(string value, out VirtualDisplayPresentationMode mode)
+    {
+        return Enum.TryParse(value, ignoreCase: true, out mode)
+            && mode is VirtualDisplayPresentationMode.Extend
+                or VirtualDisplayPresentationMode.Mirror
+                or VirtualDisplayPresentationMode.SecondaryOnly;
+    }
+
+    private static string PresentationModeLabel(VirtualDisplayPresentationMode mode)
+    {
+        return mode switch
+        {
+            VirtualDisplayPresentationMode.Mirror => "镜像模式",
+            VirtualDisplayPresentationMode.SecondaryOnly => "仅副屏模式",
+            _ => "扩展模式"
+        };
+    }
+
     private static string ResolutionSizeText(string resolution)
     {
         return NormalizeResolution(resolution) switch
@@ -825,6 +982,25 @@ internal sealed class StaticDisplayModeApplyResult
     public string? CurrentModeText { get; init; }
 }
 
+internal sealed class StaticDisplayPresentationModeApplyRequestedEventArgs : EventArgs
+{
+    public StaticDisplayPresentationModeApplyRequestedEventArgs(VirtualDisplayPresentationMode mode)
+    {
+        Mode = mode;
+    }
+
+    public VirtualDisplayPresentationMode Mode { get; }
+}
+
+internal sealed class StaticDisplayPresentationModeApplyResult
+{
+    public bool Success { get; init; }
+
+    public string Message { get; init; } = string.Empty;
+
+    public VirtualDisplayPresentationMode CurrentMode { get; init; } = VirtualDisplayPresentationMode.Unknown;
+}
+
 internal sealed class StaticDisplayPageState
 {
     public string StatusText { get; init; } = string.Empty;
@@ -873,6 +1049,10 @@ internal sealed class StaticDisplayPageState
 
     public DisplayLayoutSnapshot DisplayLayout { get; init; } = new(Array.Empty<DisplayLayoutMonitor>());
 
+    public VirtualDisplayPresentationMode PresentationMode { get; init; } = VirtualDisplayPresentationMode.Unknown;
+
+    public string? PresentationModeMessage { get; init; }
+
     public string Resolution { get; init; } = "1080p";
 
     public string RefreshRate { get; init; } = "120";
@@ -900,4 +1080,12 @@ internal enum StaticDisplayActivityKind
     Info,
     Warning,
     Failure
+}
+
+internal enum VirtualDisplayPresentationMode
+{
+    Unknown,
+    Extend,
+    Mirror,
+    SecondaryOnly
 }
