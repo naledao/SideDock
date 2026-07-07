@@ -224,6 +224,8 @@ public sealed partial class MainWindow : Window
     private bool _adbRefreshInProgress;
     private IReadOnlyList<AdbDeviceRow> _lastAdbDeviceRows = Array.Empty<AdbDeviceRow>();
     private string _lastAdbStatusText = "等待刷新 Android 设备。";
+    private DiagnosticsAdbReverseSnapshot _lastDiagnosticsAdbSnapshot =
+        DiagnosticsAdbReverseSnapshot.NotChecked("尚未检查 ADB reverse。");
     private string _overviewHostDetailText = "等待启动";
     private bool _syncingVirtualDisplayOptions;
     private bool _updatingOverviewVirtualDisplaySwitch;
@@ -423,8 +425,13 @@ public sealed partial class MainWindow : Window
     {
         OverviewDiagnosticsPage.CopyAllRequested += StaticDiagnosticsPage_CopyAllRequested;
         OverviewDiagnosticsPage.ExportLogsRequested += StaticDiagnosticsPage_ExportLogsRequested;
+        OverviewDiagnosticsPage.ExportDiagnosticsPackageRequested += StaticDiagnosticsPage_ExportDiagnosticsPackageRequested;
         OverviewDiagnosticsPage.RefreshRequested += StaticDiagnosticsPage_RefreshRequested;
         OverviewDiagnosticsPage.RecheckRequested += StaticDiagnosticsPage_RecheckRequested;
+        OverviewDiagnosticsPage.RefreshAdbDevicesRequested += StaticDiagnosticsPage_RefreshAdbDevicesRequested;
+        OverviewDiagnosticsPage.ConfigureAdbReverseRequested += StaticDiagnosticsPage_ConfigureAdbReverseRequested;
+        OverviewDiagnosticsPage.OpenLogDirectoryRequested += StaticDiagnosticsPage_OpenLogDirectoryRequested;
+        OverviewDiagnosticsPage.PortDetailsRequested += StaticDiagnosticsPage_PortDetailsRequested;
     }
 
     private void UpdateOverviewMainContentMinHeight()
@@ -1071,6 +1078,7 @@ public sealed partial class MainWindow : Window
         var virtualDisplay = BuildDiagnosticsVirtualDisplayHealth();
         var virtualCamera = BuildDiagnosticsVirtualCameraHealth();
         var audioEndpoint = BuildDiagnosticsAudioEndpointHealth();
+        var ports = BuildDiagnosticsPortStates();
 
         var issues = new (string Label, DiagnosticsStatusKind Status, string Detail)[]
         {
@@ -1106,7 +1114,8 @@ public sealed partial class MainWindow : Window
             AdbReverseHealth = adbReverseHealth,
             VirtualDisplay = virtualDisplay,
             VirtualCamera = virtualCamera,
-            AudioEndpoint = audioEndpoint
+            AudioEndpoint = audioEndpoint,
+            Ports = ports
         };
     }
 
@@ -1324,6 +1333,160 @@ public sealed partial class MainWindow : Window
         {
             Status = DiagnosticsStatusKind.Warning,
             Detail = "主机运行中，暂未检测到配置端口监听"
+        };
+    }
+
+    private IReadOnlyList<DiagnosticsPortState> BuildDiagnosticsPortStates()
+    {
+        var activePorts = GetActiveTcpListenerPorts();
+        var hostRunning = TryGetRunningHostProcess(out _);
+        var ports = GetDiagnosticsPortConfigurations();
+        var duplicatePorts = ports
+            .Where(port => port.ConfiguredPort.HasValue)
+            .GroupBy(port => port.ConfiguredPort!.Value)
+            .Where(group => group.Count() > 1)
+            .Select(group => group.Key)
+            .ToHashSet();
+
+        return ports.Select(port =>
+        {
+            var (localStatus, localText, localDetail, actualLocalPort) = BuildDiagnosticsLocalPortStatus(
+                port,
+                activePorts,
+                hostRunning,
+                duplicatePorts);
+            var (reverseStatus, reverseText, reverseDetail, actualReversePort) = BuildDiagnosticsReversePortStatus(port);
+            var overallStatus = WorstDiagnosticsStatus(new[] { localStatus, reverseStatus });
+            var detailParts = new[] { localDetail, reverseDetail }
+                .Where(part => !string.IsNullOrWhiteSpace(part));
+
+            return new DiagnosticsPortState
+            {
+                Module = port.Module,
+                IsEnabled = port.IsEnabled,
+                ConfiguredPort = port.ConfiguredPort,
+                ActualLocalPort = actualLocalPort,
+                ActualReversePort = actualReversePort,
+                LocalStatus = localStatus,
+                LocalStatusText = localText,
+                ReverseStatus = reverseStatus,
+                ReverseStatusText = reverseText,
+                OverallStatus = overallStatus,
+                Detail = string.Join("；", detailParts)
+            };
+        }).ToArray();
+    }
+
+    private (string Module, int? ConfiguredPort, bool IsEnabled)[] GetDiagnosticsPortConfigurations()
+    {
+        return new[]
+        {
+            ("控制", TryReadPort(OverviewControlPortBox, out var controlPort) ? controlPort : (int?)null, true),
+            ("视频", TryReadPort(OverviewVideoPortBox, out var videoPort) ? videoPort : (int?)null, true),
+            ("音频", TryReadPort(OverviewAudioPortBox, out var audioPort) ? audioPort : (int?)null, AudioDeviceSwitch.IsOn && (MicrophoneSwitch.IsOn || SpeakerSwitch.IsOn)),
+            ("摄像头", TryReadPort(OverviewCameraPortBox, out var cameraPort) ? cameraPort : (int?)null, _overviewCameraRequestedEnabled)
+        };
+    }
+
+    private (
+        DiagnosticsStatusKind Status,
+        string Text,
+        string Detail,
+        int? ActualPort) BuildDiagnosticsLocalPortStatus(
+            (string Module, int? ConfiguredPort, bool IsEnabled) port,
+            HashSet<int> activePorts,
+            bool hostRunning,
+            HashSet<int> duplicatePorts)
+    {
+        if (!port.ConfiguredPort.HasValue)
+        {
+            return (DiagnosticsStatusKind.Error, "无效", "配置端口无效", null);
+        }
+
+        var configuredPort = port.ConfiguredPort.Value;
+        if (duplicatePorts.Contains(configuredPort))
+        {
+            return (DiagnosticsStatusKind.Error, "重复", $"端口 {configuredPort} 与其它模块重复", configuredPort);
+        }
+
+        if (!port.IsEnabled)
+        {
+            return (DiagnosticsStatusKind.Unknown, "未启用", $"{port.Module} 管线当前未启用", configuredPort);
+        }
+
+        var isListening = activePorts.Contains(configuredPort);
+        if (isListening && hostRunning)
+        {
+            return (DiagnosticsStatusKind.Normal, "监听中", $"本地 tcp:{configuredPort} 正在监听", configuredPort);
+        }
+
+        if (isListening)
+        {
+            return (DiagnosticsStatusKind.Error, "被占用", $"Host 未运行，但 tcp:{configuredPort} 已被其它进程占用", configuredPort);
+        }
+
+        if (hostRunning)
+        {
+            return (DiagnosticsStatusKind.Error, "未监听", $"Host 正在运行，但未检测到 tcp:{configuredPort} 监听", null);
+        }
+
+        return (DiagnosticsStatusKind.Unknown, "未监听", "Host 未运行，端口尚未监听", null);
+    }
+
+    private (
+        DiagnosticsStatusKind Status,
+        string Text,
+        string Detail,
+        int? ActualPort) BuildDiagnosticsReversePortStatus((string Module, int? ConfiguredPort, bool IsEnabled) port)
+    {
+        if (!port.ConfiguredPort.HasValue)
+        {
+            return (DiagnosticsStatusKind.Error, "无效", "配置端口无效，无法检查 reverse", null);
+        }
+
+        var configuredPort = port.ConfiguredPort.Value;
+        if (!port.IsEnabled)
+        {
+            return (DiagnosticsStatusKind.Unknown, "未启用", $"{port.Module} 管线当前未启用，未要求 reverse", null);
+        }
+
+        var snapshot = _lastDiagnosticsAdbSnapshot;
+        if (snapshot.Status == DiagnosticsAdbReverseProbeStatus.NotChecked)
+        {
+            return (DiagnosticsStatusKind.Unknown, "待检查", snapshot.Summary, null);
+        }
+
+        if (snapshot.Status == DiagnosticsAdbReverseProbeStatus.Ready)
+        {
+            if (snapshot.MappedPorts.Contains(configuredPort))
+            {
+                return (DiagnosticsStatusKind.Normal, "已映射", $"ADB reverse tcp:{configuredPort} 已映射到设备 {FormatOptional(snapshot.Serial)}", configuredPort);
+            }
+
+            return (DiagnosticsStatusKind.Error, "未映射", $"ADB reverse 列表中未找到 tcp:{configuredPort}", null);
+        }
+
+        var status = snapshot.Status is DiagnosticsAdbReverseProbeStatus.Unauthorized
+            or DiagnosticsAdbReverseProbeStatus.Offline
+            or DiagnosticsAdbReverseProbeStatus.NoAuthorizedDevice
+            ? DiagnosticsStatusKind.Warning
+            : DiagnosticsStatusKind.Error;
+
+        return (status, ReverseProbeStatusText(snapshot.Status), snapshot.Summary, null);
+    }
+
+    private static string ReverseProbeStatusText(DiagnosticsAdbReverseProbeStatus status)
+    {
+        return status switch
+        {
+            DiagnosticsAdbReverseProbeStatus.AdbUnavailable => "ADB 不可用",
+            DiagnosticsAdbReverseProbeStatus.TimedOut => "检查超时",
+            DiagnosticsAdbReverseProbeStatus.Unauthorized => "未授权",
+            DiagnosticsAdbReverseProbeStatus.Offline => "设备离线",
+            DiagnosticsAdbReverseProbeStatus.NoAuthorizedDevice => "未连接",
+            DiagnosticsAdbReverseProbeStatus.SelectedUnavailable => "设备不可用",
+            DiagnosticsAdbReverseProbeStatus.ReverseListFailed => "读取失败",
+            _ => "异常"
         };
     }
 
@@ -2880,14 +3043,91 @@ public sealed partial class MainWindow : Window
         await ExportOverviewLogsAsync();
     }
 
+    private async void StaticDiagnosticsPage_ExportDiagnosticsPackageRequested(object? sender, EventArgs e)
+    {
+        await RunStaticDiagnosticsActionAsync(
+            DiagnosticsOperationKind.ExportPackage,
+            () => ExportOverviewDiagnosticsPackageAsync());
+    }
+
     private async void StaticDiagnosticsPage_RefreshRequested(object? sender, EventArgs e)
     {
-        await RefreshOverviewAsync(showErrors: true);
+        await RunStaticDiagnosticsActionAsync(
+            DiagnosticsOperationKind.Refresh,
+            async () =>
+            {
+                await RefreshOverviewAsync(showErrors: true);
+                await RefreshDiagnosticsAdbReverseSnapshotAsync(showErrors: true);
+            });
     }
 
     private async void StaticDiagnosticsPage_RecheckRequested(object? sender, EventArgs e)
     {
-        await RefreshOverviewAsync(showErrors: true);
+        await RunStaticDiagnosticsActionAsync(
+            DiagnosticsOperationKind.Recheck,
+            async () =>
+            {
+                await RefreshOverviewAsync(showErrors: true);
+                await RefreshDiagnosticsAdbReverseSnapshotAsync(showErrors: true);
+            });
+    }
+
+    private async void StaticDiagnosticsPage_RefreshAdbDevicesRequested(object? sender, EventArgs e)
+    {
+        await RunStaticDiagnosticsActionAsync(
+            DiagnosticsOperationKind.RefreshAdb,
+            async () =>
+            {
+                await RefreshAdbDevicesAsync(showErrors: true);
+                await RefreshDiagnosticsAdbReverseSnapshotAsync(showErrors: true);
+            });
+    }
+
+    private async void StaticDiagnosticsPage_ConfigureAdbReverseRequested(object? sender, EventArgs e)
+    {
+        await RunStaticDiagnosticsActionAsync(
+            DiagnosticsOperationKind.ConfigureReverse,
+            () => ReconfigureDiagnosticsAdbReverseAsync(showErrors: true));
+    }
+
+    private async void StaticDiagnosticsPage_OpenLogDirectoryRequested(object? sender, EventArgs e)
+    {
+        await OpenOverviewLogDirectoryAsync();
+    }
+
+    private async void StaticDiagnosticsPage_PortDetailsRequested(object? sender, EventArgs e)
+    {
+        await RunStaticDiagnosticsActionAsync(
+            DiagnosticsOperationKind.Recheck,
+            () => RefreshDiagnosticsAdbReverseSnapshotAsync(showErrors: true));
+        if (OverviewDiagnosticsPage is not null)
+        {
+            await OverviewDiagnosticsPage.ShowPortDetailsDialogAsync();
+        }
+    }
+
+    private async Task RunStaticDiagnosticsActionAsync(DiagnosticsOperationKind operation, Func<Task> action)
+    {
+        if (OverviewDiagnosticsPage is not null)
+        {
+            OverviewDiagnosticsPage.SetOperationBusy(operation, isBusy: true);
+        }
+
+        try
+        {
+            await action();
+        }
+        catch (Exception ex)
+        {
+            ShowError("诊断操作失败", ex.Message);
+        }
+        finally
+        {
+            if (OverviewDiagnosticsPage is not null)
+            {
+                OverviewDiagnosticsPage.SetOperationBusy(operation, isBusy: false);
+            }
+        }
     }
 
     private void AppendStaticDiagnosticsLog(
@@ -2976,6 +3216,14 @@ public sealed partial class MainWindow : Window
             return DiagnosticsLogSource.Camera;
         }
 
+        if (line.Contains("[DISPLAY", StringComparison.OrdinalIgnoreCase)
+            || line.Contains("[IDD", StringComparison.OrdinalIgnoreCase)
+            || line.Contains("virtual display", StringComparison.OrdinalIgnoreCase)
+            || line.Contains("DeviceTool", StringComparison.OrdinalIgnoreCase))
+        {
+            return DiagnosticsLogSource.Display;
+        }
+
         return line.Contains("[ADB", StringComparison.OrdinalIgnoreCase)
             || line.Contains(" adb ", StringComparison.OrdinalIgnoreCase)
             ? DiagnosticsLogSource.Adb
@@ -2987,6 +3235,9 @@ public sealed partial class MainWindow : Window
         if (line.Contains("[ERROR", StringComparison.OrdinalIgnoreCase)
             || line.Contains(" error", StringComparison.OrdinalIgnoreCase)
             || line.Contains("failed", StringComparison.OrdinalIgnoreCase)
+            || line.Contains("exception", StringComparison.OrdinalIgnoreCase)
+            || line.Contains("denied", StringComparison.OrdinalIgnoreCase)
+            || line.Contains("timeout", StringComparison.OrdinalIgnoreCase)
             || line.Contains("失败", StringComparison.OrdinalIgnoreCase))
         {
             return DiagnosticsLogSeverity.Error;
@@ -2994,6 +3245,8 @@ public sealed partial class MainWindow : Window
 
         if (line.Contains("[WARN", StringComparison.OrdinalIgnoreCase)
             || line.Contains(" warning", StringComparison.OrdinalIgnoreCase)
+            || line.Contains("unauthorized", StringComparison.OrdinalIgnoreCase)
+            || line.Contains("offline", StringComparison.OrdinalIgnoreCase)
             || line.Contains("超时", StringComparison.OrdinalIgnoreCase))
         {
             return DiagnosticsLogSeverity.Warning;
@@ -3498,6 +3751,7 @@ public sealed partial class MainWindow : Window
         }
 
         _lastAdbReverseConfigured = null;
+        _lastDiagnosticsAdbSnapshot = DiagnosticsAdbReverseSnapshot.NotChecked("端口配置已变更，尚未重新检查 ADB reverse。");
         SyncOverviewConnectionControlsToLegacy();
         UpdateOverviewConnectionPage();
     }
@@ -3511,6 +3765,7 @@ public sealed partial class MainWindow : Window
 
         AdbPathBox.Text = OverviewAdbPathBox.Text;
         _lastAdbReverseConfigured = null;
+        _lastDiagnosticsAdbSnapshot = DiagnosticsAdbReverseSnapshot.NotChecked("ADB 路径已变更，尚未重新检查 ADB reverse。");
         UpdateOverviewConnectionPage();
     }
 
@@ -3542,6 +3797,7 @@ public sealed partial class MainWindow : Window
         }
 
         _lastAdbReverseConfigured = null;
+        _lastDiagnosticsAdbSnapshot = DiagnosticsAdbReverseSnapshot.NotChecked("端口配置已恢复默认，尚未重新检查 ADB reverse。");
         SyncOverviewConnectionControlsToLegacy();
         UpdateOverviewConnectionPage();
     }
@@ -3673,7 +3929,7 @@ public sealed partial class MainWindow : Window
         {
             UpdateOverviewRuntimeDiagnostics();
             var package = new DataPackage { RequestedOperation = DataPackageOperation.Copy };
-            package.SetText(BuildOverviewDiagnosticsReport());
+            package.SetText(BuildOverviewDiagnosticsPackageReport());
             Clipboard.SetContent(package);
             Clipboard.Flush();
         }
@@ -3875,6 +4131,7 @@ public sealed partial class MainWindow : Window
             _lastAdbReverseSerial = adbPreflight.Serial;
             _lastAdbReverseDetail = adbPreflight.Summary;
             SetAdbStatus(adbPreflight.Summary, _successBrush);
+            await RefreshDiagnosticsAdbReverseSnapshotAsync(showErrors: false);
             UpdateOverviewConnectionPage();
 
             if (ShouldManageVirtualDisplayWithHost())
@@ -5202,6 +5459,60 @@ public sealed partial class MainWindow : Window
         }
     }
 
+    private async Task ExportOverviewDiagnosticsPackageAsync()
+    {
+        try
+        {
+            await RefreshDiagnosticsAdbReverseSnapshotAsync(showErrors: false);
+            UpdateOverviewRuntimeDiagnostics();
+
+            var directory = Path.Combine(
+                Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
+                "SideDock",
+                "logs");
+            Directory.CreateDirectory(directory);
+
+            var exportPath = Path.Combine(
+                directory,
+                $"sidedock-diagnostics-{DateTimeOffset.Now:yyyyMMdd-HHmmss}.txt");
+            await File.WriteAllTextAsync(exportPath, BuildOverviewDiagnosticsPackageReport(), Encoding.UTF8);
+
+            Process.Start(new ProcessStartInfo
+            {
+                FileName = "explorer.exe",
+                Arguments = $"/select,\"{exportPath}\"",
+                UseShellExecute = true
+            });
+        }
+        catch (Exception ex)
+        {
+            ShowError("无法导出诊断包", ex.Message);
+        }
+    }
+
+    private Task OpenOverviewLogDirectoryAsync()
+    {
+        try
+        {
+            var directory = Path.Combine(
+                Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
+                "SideDock",
+                "logs");
+            Directory.CreateDirectory(directory);
+            Process.Start(new ProcessStartInfo
+            {
+                FileName = directory,
+                UseShellExecute = true
+            });
+        }
+        catch (Exception ex)
+        {
+            ShowError("无法打开日志目录", ex.Message);
+        }
+
+        return Task.CompletedTask;
+    }
+
     private async Task ShowOverviewAdbPathHelpDialogAsync(string reason)
     {
         var content = new TextBlock
@@ -5327,6 +5638,108 @@ public sealed partial class MainWindow : Window
         report.AppendLine("---- 音频诊断报告 ----");
         report.Append(BuildAudioDiagnosticsReport());
 
+        return report.ToString();
+    }
+
+    private string BuildOverviewDiagnosticsPackageReport()
+    {
+        var report = new StringBuilder();
+        report.AppendLine("SideDock 完整诊断包");
+        report.AppendLine($"当前时间: {DateTimeOffset.Now:yyyy-MM-dd HH:mm:ss zzz}");
+        report.AppendLine();
+        AppendVersionAndSystemInfo(report);
+        report.AppendLine();
+
+        report.AppendLine("==== 综合诊断报告 ====");
+        report.AppendLine(BuildOverviewDiagnosticsReport());
+        report.AppendLine();
+
+        report.AppendLine("==== 最近错误 ====");
+        report.AppendLine(OverviewDiagnosticsPage?.BuildErrorSummary() ?? "最近错误：诊断页尚未初始化。");
+        report.AppendLine();
+
+        report.AppendLine("==== 端口状态 ====");
+        report.AppendLine(BuildDiagnosticsPortReport());
+        report.AppendLine();
+
+        report.AppendLine("==== ADB 状态 ====");
+        report.AppendLine(BuildDiagnosticsAdbStatusReport());
+        report.AppendLine();
+
+        report.AppendLine("==== Host 日志摘要 ====");
+        report.AppendLine(BuildHostLogReport());
+        return report.ToString();
+    }
+
+    private void AppendVersionAndSystemInfo(StringBuilder report)
+    {
+        var assembly = Assembly.GetExecutingAssembly();
+        report.AppendLine("---- 版本/系统信息 ----");
+        report.AppendLine($"App 版本: {assembly.GetName().Version}");
+        report.AppendLine($"进程路径: {FormatOptional(Environment.ProcessPath)}");
+        report.AppendLine($"OS: {RuntimeInformation.OSDescription}");
+        report.AppendLine($"架构: {RuntimeInformation.ProcessArchitecture}");
+        report.AppendLine($".NET: {RuntimeInformation.FrameworkDescription}");
+        report.AppendLine($"机器名: {Environment.MachineName}");
+        report.AppendLine($"用户: {Environment.UserName}");
+    }
+
+    private string BuildDiagnosticsPortReport()
+    {
+        var report = new StringBuilder();
+        report.AppendLine("SideDock 端口诊断");
+        report.AppendLine($"Host 进程: {FormatHostProcessState()}");
+        report.AppendLine($"ADB reverse 快照: {_lastDiagnosticsAdbSnapshot.Summary}");
+        report.AppendLine();
+
+        foreach (var port in BuildDiagnosticsPortStates())
+        {
+            report.AppendLine($"{port.Module}");
+            report.AppendLine($"  启用: {(port.IsEnabled ? "是" : "否")}");
+            report.AppendLine($"  配置端口: {FormatOptional(port.ConfiguredPort?.ToString(CultureInfo.InvariantCulture))}");
+            report.AppendLine($"  实际本地端口: {FormatOptional(port.ActualLocalPort?.ToString(CultureInfo.InvariantCulture))}");
+            report.AppendLine($"  实际 reverse 端口: {FormatOptional(port.ActualReversePort?.ToString(CultureInfo.InvariantCulture))}");
+            report.AppendLine($"  本地状态: {port.LocalStatus} / {port.LocalStatusText}");
+            report.AppendLine($"  reverse 状态: {port.ReverseStatus} / {port.ReverseStatusText}");
+            report.AppendLine($"  详情: {port.Detail}");
+            report.AppendLine();
+        }
+
+        return report.ToString();
+    }
+
+    private string BuildDiagnosticsAdbStatusReport()
+    {
+        var snapshot = _lastDiagnosticsAdbSnapshot;
+        var report = new StringBuilder();
+        report.AppendLine($"ADB 状态: {_lastAdbStatusText}");
+        report.AppendLine($"ADB 路径输入: {FormatOptional(AdbPathBox.Text.Trim())}");
+        report.AppendLine($"ADB 选择设备: {FormatOptional(SelectedAdbSerial())}");
+        report.AppendLine($"ADB reverse 配置状态: {(_lastAdbReverseConfigured.HasValue ? _lastAdbReverseDetail : "待检查")}");
+        report.AppendLine($"ADB reverse probe: {snapshot.Status}");
+        report.AppendLine($"ADB reverse probe 摘要: {snapshot.Summary}");
+        report.AppendLine($"ADB reverse probe 设备: {FormatOptional(snapshot.Serial)}");
+        report.AppendLine($"ADB reverse 已映射端口: {(snapshot.MappedPorts.Count > 0 ? string.Join(", ", snapshot.MappedPorts.OrderBy(port => port)) : "暂无数据")}");
+        report.AppendLine();
+        report.AppendLine("---- ADB 设备 ----");
+        if (_lastAdbDeviceRows.Count == 0)
+        {
+            report.AppendLine("暂无数据。");
+        }
+        else
+        {
+            foreach (var row in _lastAdbDeviceRows)
+            {
+                report.AppendLine(row.RawLine);
+            }
+        }
+
+        report.AppendLine();
+        report.AppendLine("---- adb reverse --list ----");
+        report.AppendLine(string.IsNullOrWhiteSpace(snapshot.RawReverseList) ? "暂无数据。" : snapshot.RawReverseList);
+        report.AppendLine();
+        report.AppendLine("---- ADB probe 详情 ----");
+        report.AppendLine(string.IsNullOrWhiteSpace(snapshot.Details) ? "暂无数据。" : snapshot.Details);
         return report.ToString();
     }
 
@@ -5750,6 +6163,13 @@ public sealed partial class MainWindow : Window
             if (devices.TimedOut)
             {
                 SetAdbDeviceChoices(Array.Empty<AdbDeviceRow>(), selectedSerial);
+                _lastDiagnosticsAdbSnapshot = new DiagnosticsAdbReverseSnapshot(
+                    DiagnosticsAdbReverseProbeStatus.TimedOut,
+                    "ADB devices 检查超时，无法确认 reverse 映射。",
+                    selectedSerial,
+                    Array.Empty<int>(),
+                    string.Empty,
+                    string.Empty);
                 SetAdbStatus("ADB devices 检查超时。", _dangerBrush);
                 if (showErrors)
                 {
@@ -5765,6 +6185,13 @@ public sealed partial class MainWindow : Window
                 var message = string.IsNullOrWhiteSpace(devices.Stderr)
                     ? $"ADB devices 执行失败（退出码 {devices.ExitCode}）。"
                     : devices.Stderr;
+                _lastDiagnosticsAdbSnapshot = new DiagnosticsAdbReverseSnapshot(
+                    DiagnosticsAdbReverseProbeStatus.AdbUnavailable,
+                    message,
+                    selectedSerial,
+                    Array.Empty<int>(),
+                    string.Empty,
+                    string.Empty);
                 SetAdbStatus(message, _dangerBrush);
                 if (showErrors)
                 {
@@ -5777,6 +6204,7 @@ public sealed partial class MainWindow : Window
             var rows = ParseAdbDevices(devices.Stdout).ToArray();
             _lastAdbRefreshCompletedAt = DateTimeOffset.Now;
             _lastAdbReverseConfigured = null;
+            _lastDiagnosticsAdbSnapshot = DiagnosticsAdbReverseSnapshot.NotChecked("ADB 设备已刷新，尚未重新检查 ADB reverse。");
             SetAdbDeviceChoices(rows, selectedSerial);
             var authorizedCount = rows.Count(row => row.State.Equals("device", StringComparison.OrdinalIgnoreCase));
             var unauthorizedDevice = rows.FirstOrDefault(row =>
@@ -5806,6 +6234,13 @@ public sealed partial class MainWindow : Window
         catch (Exception ex)
         {
             SetAdbDeviceChoices(Array.Empty<AdbDeviceRow>(), selectedSerial);
+            _lastDiagnosticsAdbSnapshot = new DiagnosticsAdbReverseSnapshot(
+                DiagnosticsAdbReverseProbeStatus.AdbUnavailable,
+                $"刷新 Android 设备失败：{ex.Message}",
+                selectedSerial,
+                Array.Empty<int>(),
+                string.Empty,
+                string.Empty);
             SetAdbStatus($"刷新 Android 设备失败：{ex.Message}", _dangerBrush);
             if (showErrors)
             {
@@ -6017,6 +6452,7 @@ public sealed partial class MainWindow : Window
         }
 
         _lastAdbReverseConfigured = null;
+        _lastDiagnosticsAdbSnapshot = DiagnosticsAdbReverseSnapshot.NotChecked("ADB 设备选择已变更，尚未重新检查 ADB reverse。");
         UpdateAudioState();
         UpdateOverviewAndroidDeviceState();
         UpdateOverviewConnectionPage();
@@ -6300,6 +6736,352 @@ public sealed partial class MainWindow : Window
 
         var summaryPorts = string.Join("/", ports.Distinct().Select(port => $"tcp:{port}"));
         return new AdbReversePreflight(true, $"ADB reverse 已配置：{serial} {summaryPorts}", report.ToString(), serial);
+    }
+
+    private async Task RefreshDiagnosticsAdbReverseSnapshotAsync(bool showErrors)
+    {
+        var report = new StringBuilder();
+        report.AppendLine("SideDock ADB reverse 状态检查");
+        report.AppendLine($"时间: {DateTimeOffset.Now:yyyy-MM-dd HH:mm:ss zzz}");
+        report.AppendLine();
+
+        string adbPath;
+        try
+        {
+            adbPath = ResolveAdbPath(AdbPathBox.Text.Trim());
+        }
+        catch (Exception ex)
+        {
+            _lastDiagnosticsAdbSnapshot = new DiagnosticsAdbReverseSnapshot(
+                DiagnosticsAdbReverseProbeStatus.AdbUnavailable,
+                $"ADB 不可用：{ex.Message}",
+                null,
+                Array.Empty<int>(),
+                report.ToString(),
+                string.Empty);
+            SetAdbStatus(_lastDiagnosticsAdbSnapshot.Summary, _dangerBrush);
+            UpdateStaticDiagnosticsPage();
+            if (showErrors)
+            {
+                ShowError("ADB 不可用", ex.Message);
+            }
+
+            return;
+        }
+
+        var selectedSerial = SelectedAdbSerial();
+        report.AppendLine($"ADB 路径: {adbPath}");
+        report.AppendLine($"选择设备: {FormatOptional(selectedSerial)}");
+
+        var devices = await RunAdbAsync(adbPath, "devices -l", TimeSpan.FromSeconds(8));
+        AppendAdbCommand(report, adbPath, "devices -l", devices);
+        AppendAdbCommandDiagnosticsLog("devices -l", devices);
+        if (devices.TimedOut)
+        {
+            SetDiagnosticsAdbSnapshot(
+                DiagnosticsAdbReverseProbeStatus.TimedOut,
+                "ADB devices 检查超时，无法确认 reverse 映射。",
+                null,
+                Array.Empty<int>(),
+                report,
+                string.Empty,
+                showErrors);
+            return;
+        }
+
+        if (devices.ExitCode != 0)
+        {
+            SetDiagnosticsAdbSnapshot(
+                DiagnosticsAdbReverseProbeStatus.AdbUnavailable,
+                $"ADB devices 执行失败（退出码 {devices.ExitCode}）。",
+                null,
+                Array.Empty<int>(),
+                report,
+                string.Empty,
+                showErrors);
+            return;
+        }
+
+        var rows = ParseAdbDevices(devices.Stdout).ToArray();
+        _lastAdbRefreshCompletedAt = DateTimeOffset.Now;
+        SetAdbDeviceChoices(rows, selectedSerial);
+
+        if (!TrySelectDiagnosticsAdbDevice(rows, selectedSerial, out var selectedDevice, out var failureStatus, out var failureSummary))
+        {
+            SetDiagnosticsAdbSnapshot(
+                failureStatus,
+                failureSummary,
+                selectedSerial,
+                Array.Empty<int>(),
+                report,
+                string.Empty,
+                showErrors);
+            return;
+        }
+
+        var serial = selectedDevice.Serial;
+        var reverseArguments = $"-s {QuoteArgument(serial)} reverse --list";
+        var reverseList = await RunAdbAsync(adbPath, reverseArguments, TimeSpan.FromSeconds(8));
+        AppendAdbCommand(report, adbPath, reverseArguments, reverseList);
+        AppendAdbCommandDiagnosticsLog(reverseArguments, reverseList);
+        if (reverseList.TimedOut)
+        {
+            SetDiagnosticsAdbSnapshot(
+                DiagnosticsAdbReverseProbeStatus.TimedOut,
+                $"ADB reverse --list 检查超时：{serial}",
+                serial,
+                Array.Empty<int>(),
+                report,
+                reverseList.Stdout,
+                showErrors);
+            return;
+        }
+
+        if (reverseList.ExitCode != 0)
+        {
+            SetDiagnosticsAdbSnapshot(
+                DiagnosticsAdbReverseProbeStatus.ReverseListFailed,
+                $"读取 ADB reverse 列表失败（退出码 {reverseList.ExitCode}）：{serial}",
+                serial,
+                Array.Empty<int>(),
+                report,
+                reverseList.Stdout,
+                showErrors);
+            return;
+        }
+
+        var mappedPorts = ParseAdbReverseMappedPorts(reverseList.Stdout).ToArray();
+        SetDiagnosticsAdbSnapshot(
+            DiagnosticsAdbReverseProbeStatus.Ready,
+            $"ADB reverse 列表已读取：{serial}，映射 {mappedPorts.Length} 个端口。",
+            serial,
+            mappedPorts,
+            report,
+            reverseList.Stdout,
+            showErrors: false);
+    }
+
+    private async Task ReconfigureDiagnosticsAdbReverseAsync(bool showErrors)
+    {
+        var ports = GetDiagnosticsReversePorts();
+        if (ports.Count == 0)
+        {
+            ShowError("无法配置 ADB reverse", "当前端口配置无效，请先修正端口。");
+            return;
+        }
+
+        var adbPath = ResolveAdbPath(AdbPathBox.Text.Trim());
+        await RefreshAdbDevicesAsync(showErrors: false, resolvedAdbPath: adbPath);
+        var selectedSerial = SelectedAdbSerial();
+        var preflight = await ConfigureAdbReverseBeforeHostStartAsync(adbPath, ports, selectedSerial);
+        _lastAdbReverseConfigured = preflight.Success;
+        _lastAdbReverseSerial = preflight.Serial;
+        _lastAdbReverseDetail = preflight.Summary;
+        SetAdbStatus(preflight.Summary, preflight.Success ? _successBrush : _dangerBrush);
+
+        await RefreshDiagnosticsAdbReverseSnapshotAsync(showErrors: false);
+        if (!preflight.Success && showErrors)
+        {
+            ShowErrorWithDetails("无法重新配置 ADB reverse", preflight.Summary, preflight.Details);
+        }
+    }
+
+    private void SetDiagnosticsAdbSnapshot(
+        DiagnosticsAdbReverseProbeStatus status,
+        string summary,
+        string? serial,
+        IReadOnlyCollection<int> mappedPorts,
+        StringBuilder report,
+        string rawReverseList,
+        bool showErrors)
+    {
+        _lastDiagnosticsAdbSnapshot = new DiagnosticsAdbReverseSnapshot(
+            status,
+            summary,
+            serial,
+            mappedPorts.ToArray(),
+            report.ToString(),
+            rawReverseList);
+
+        UpdateAdbReverseStateFromDiagnosticsSnapshot();
+        var brush = status == DiagnosticsAdbReverseProbeStatus.Ready ? _successBrush :
+            status is DiagnosticsAdbReverseProbeStatus.Unauthorized
+                or DiagnosticsAdbReverseProbeStatus.Offline
+                or DiagnosticsAdbReverseProbeStatus.NoAuthorizedDevice
+                ? _warningBrush
+                : _dangerBrush;
+        SetAdbStatus(summary, brush);
+        UpdateStaticDiagnosticsPage();
+
+        if (showErrors && status is DiagnosticsAdbReverseProbeStatus.AdbUnavailable
+            or DiagnosticsAdbReverseProbeStatus.TimedOut
+            or DiagnosticsAdbReverseProbeStatus.ReverseListFailed)
+        {
+            ShowError("ADB reverse 检查失败", summary);
+        }
+    }
+
+    private void UpdateAdbReverseStateFromDiagnosticsSnapshot()
+    {
+        var snapshot = _lastDiagnosticsAdbSnapshot;
+        if (snapshot.Status == DiagnosticsAdbReverseProbeStatus.NotChecked)
+        {
+            return;
+        }
+
+        var requiredPorts = GetDiagnosticsReversePorts();
+        if (snapshot.Status != DiagnosticsAdbReverseProbeStatus.Ready)
+        {
+            _lastAdbReverseConfigured = false;
+            _lastAdbReverseSerial = snapshot.Serial;
+            _lastAdbReverseDetail = snapshot.Summary;
+            return;
+        }
+
+        var missingPorts = requiredPorts
+            .Where(port => !snapshot.MappedPorts.Contains(port))
+            .ToArray();
+        _lastAdbReverseSerial = snapshot.Serial;
+        if (missingPorts.Length == 0)
+        {
+            _lastAdbReverseConfigured = true;
+            _lastAdbReverseDetail = $"ADB reverse 已映射：{FormatOptional(snapshot.Serial)} {string.Join("/", requiredPorts.Select(port => $"tcp:{port}"))}";
+        }
+        else
+        {
+            _lastAdbReverseConfigured = false;
+            _lastAdbReverseDetail = $"ADB reverse 缺少映射：{string.Join("、", missingPorts.Select(port => $"tcp:{port}"))}";
+        }
+    }
+
+    private IReadOnlyList<int> GetDiagnosticsReversePorts()
+    {
+        var ports = new List<int>();
+        if (TryReadPort(OverviewControlPortBox, out var controlPort))
+        {
+            ports.Add(controlPort);
+        }
+
+        if (TryReadPort(OverviewVideoPortBox, out var videoPort))
+        {
+            ports.Add(videoPort);
+        }
+
+        if (TryReadPort(OverviewAudioPortBox, out var audioPort))
+        {
+            ports.Add(audioPort);
+        }
+
+        if (TryReadPort(OverviewCameraPortBox, out var cameraPort))
+        {
+            ports.Add(cameraPort);
+        }
+
+        return ports.Distinct().ToArray();
+    }
+
+    private static bool TrySelectDiagnosticsAdbDevice(
+        IReadOnlyList<AdbDeviceRow> rows,
+        string? selectedSerial,
+        out AdbDeviceRow selectedDevice,
+        out DiagnosticsAdbReverseProbeStatus failureStatus,
+        out string failureSummary)
+    {
+        selectedDevice = default!;
+        failureStatus = DiagnosticsAdbReverseProbeStatus.NoAuthorizedDevice;
+        failureSummary = "未检测到已授权 Android 设备，无法检查 ADB reverse。";
+
+        var authorizedRows = rows
+            .Where(row => row.State.Equals("device", StringComparison.OrdinalIgnoreCase))
+            .ToArray();
+        if (!string.IsNullOrWhiteSpace(selectedSerial))
+        {
+            var selectedRows = rows
+                .Where(row => row.Serial.Equals(selectedSerial, StringComparison.OrdinalIgnoreCase))
+                .ToArray();
+            if (selectedRows.Length == 0)
+            {
+                failureStatus = DiagnosticsAdbReverseProbeStatus.SelectedUnavailable;
+                failureSummary = $"未检测到已选择的 ADB 设备 {selectedSerial}。";
+                return false;
+            }
+
+            var row = selectedRows[0];
+            if (row.State.Equals("device", StringComparison.OrdinalIgnoreCase))
+            {
+                selectedDevice = row;
+                return true;
+            }
+
+            failureStatus = row.State.Equals("unauthorized", StringComparison.OrdinalIgnoreCase)
+                ? DiagnosticsAdbReverseProbeStatus.Unauthorized
+                : row.State.Equals("offline", StringComparison.OrdinalIgnoreCase)
+                    ? DiagnosticsAdbReverseProbeStatus.Offline
+                    : DiagnosticsAdbReverseProbeStatus.SelectedUnavailable;
+            failureSummary = $"已选择的 ADB 设备 {selectedSerial} 当前状态为 {row.State}，无法检查 reverse。";
+            return false;
+        }
+
+        if (authorizedRows.Length == 1)
+        {
+            selectedDevice = authorizedRows[0];
+            return true;
+        }
+
+        if (authorizedRows.Length > 1)
+        {
+            failureStatus = DiagnosticsAdbReverseProbeStatus.SelectedUnavailable;
+            failureSummary = "检测到多个已授权 ADB 设备，请选择目标设备后重新检查。";
+            return false;
+        }
+
+        if (rows.Any(row => row.State.Equals("unauthorized", StringComparison.OrdinalIgnoreCase)))
+        {
+            failureStatus = DiagnosticsAdbReverseProbeStatus.Unauthorized;
+            failureSummary = "Android 设备未授权 USB 调试，无法检查 ADB reverse。";
+            return false;
+        }
+
+        if (rows.Any(row => row.State.Equals("offline", StringComparison.OrdinalIgnoreCase)))
+        {
+            failureStatus = DiagnosticsAdbReverseProbeStatus.Offline;
+            failureSummary = "Android 设备处于 offline 状态，无法检查 ADB reverse。";
+            return false;
+        }
+
+        return false;
+    }
+
+    private static HashSet<int> ParseAdbReverseMappedPorts(string stdout)
+    {
+        var ports = new HashSet<int>();
+        foreach (var rawLine in stdout.Split(new[] { "\r\n", "\n" }, StringSplitOptions.None))
+        {
+            var parts = rawLine.Split(new[] { ' ', '\t' }, StringSplitOptions.RemoveEmptyEntries);
+            for (var index = 0; index < parts.Length - 1; index++)
+            {
+                if (TryParseAdbTcpPort(parts[index], out var leftPort)
+                    && TryParseAdbTcpPort(parts[index + 1], out var rightPort)
+                    && leftPort == rightPort)
+                {
+                    ports.Add(leftPort);
+                }
+            }
+        }
+
+        return ports;
+    }
+
+    private static bool TryParseAdbTcpPort(string value, out int port)
+    {
+        port = 0;
+        const string prefix = "tcp:";
+        if (!value.StartsWith(prefix, StringComparison.OrdinalIgnoreCase))
+        {
+            return false;
+        }
+
+        return int.TryParse(value[prefix.Length..], NumberStyles.Integer, CultureInfo.InvariantCulture, out port);
     }
 
     private static async Task<AdbCommandResult> RunAdbAsync(string adbPath, string arguments, TimeSpan timeout)
@@ -11474,6 +12256,39 @@ public sealed partial class MainWindow : Window
                     : string.Empty;
                 return prefix + _buffer;
             }
+        }
+    }
+
+    private enum DiagnosticsAdbReverseProbeStatus
+    {
+        NotChecked,
+        Ready,
+        AdbUnavailable,
+        TimedOut,
+        NoAuthorizedDevice,
+        Unauthorized,
+        Offline,
+        SelectedUnavailable,
+        ReverseListFailed
+    }
+
+    private sealed record DiagnosticsAdbReverseSnapshot(
+        DiagnosticsAdbReverseProbeStatus Status,
+        string Summary,
+        string? Serial,
+        IReadOnlyCollection<int> MappedPorts,
+        string Details,
+        string RawReverseList)
+    {
+        public static DiagnosticsAdbReverseSnapshot NotChecked(string summary)
+        {
+            return new DiagnosticsAdbReverseSnapshot(
+                DiagnosticsAdbReverseProbeStatus.NotChecked,
+                summary,
+                null,
+                Array.Empty<int>(),
+                string.Empty,
+                string.Empty);
         }
     }
 
