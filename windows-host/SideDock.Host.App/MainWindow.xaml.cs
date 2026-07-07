@@ -233,8 +233,13 @@ public sealed partial class MainWindow : Window
     private bool _updatingOverviewAudioSwitch;
     private bool _updatingStaticAudioPage;
     private bool _overviewCameraOperationInProgress;
+    private bool _cameraRuntimeConfigApplyInProgress;
     private bool _overviewCameraRequestedEnabled = true;
     private bool _overviewCameraBannerDismissed;
+    private CameraRuntimeApplyState _cameraRuntimeApplyState = CameraRuntimeApplyState.None;
+    private CameraConfigSelection? _pendingCameraRuntimeConfig;
+    private string _cameraRuntimeApplyMessage = "";
+    private DateTimeOffset? _cameraRuntimeApplyCompletedAt;
     private bool _virtualAudioCableInstallInProgress;
     private VirtualDisplayOverviewState? _virtualDisplayTransientState;
     private string? _virtualDisplayLastError;
@@ -300,6 +305,15 @@ public sealed partial class MainWindow : Window
         Paused,
         Unavailable,
         Error
+    }
+
+    private enum CameraRuntimeApplyState
+    {
+        None,
+        Applying,
+        Restarting,
+        Succeeded,
+        Failed
     }
 
     public MainWindow()
@@ -3444,34 +3458,34 @@ public sealed partial class MainWindow : Window
         await SetOverviewCameraEnabledAsync(OverviewCameraSwitch.IsOn);
     }
 
-    private void OverviewCameraResolutionCombo_SelectionChanged(object sender, SelectionChangedEventArgs e)
+    private async void OverviewCameraResolutionCombo_SelectionChanged(object sender, SelectionChangedEventArgs e)
     {
         SyncOverviewCameraComboSelection(OverviewCameraResolutionCombo, OverviewCameraPageResolutionCombo);
-        SyncOverviewCameraOptionsToDiagnostics();
+        await HandleOverviewCameraConfigSelectionChangedAsync();
     }
 
-    private void OverviewCameraFrameRateCombo_SelectionChanged(object sender, SelectionChangedEventArgs e)
+    private async void OverviewCameraFrameRateCombo_SelectionChanged(object sender, SelectionChangedEventArgs e)
     {
         SyncOverviewCameraComboSelection(OverviewCameraFrameRateCombo, OverviewCameraPageFrameRateCombo);
-        SyncOverviewCameraOptionsToDiagnostics();
+        await HandleOverviewCameraConfigSelectionChangedAsync();
     }
 
-    private void OverviewCameraPageFacingCombo_SelectionChanged(object sender, SelectionChangedEventArgs e)
+    private async void OverviewCameraPageFacingCombo_SelectionChanged(object sender, SelectionChangedEventArgs e)
     {
         SyncOverviewCameraComboSelection(OverviewCameraPageFacingCombo, CameraFacingCombo);
-        SyncOverviewCameraOptionsToDiagnostics();
+        await HandleOverviewCameraConfigSelectionChangedAsync();
     }
 
-    private void OverviewCameraPageResolutionCombo_SelectionChanged(object sender, SelectionChangedEventArgs e)
+    private async void OverviewCameraPageResolutionCombo_SelectionChanged(object sender, SelectionChangedEventArgs e)
     {
         SyncOverviewCameraComboSelection(OverviewCameraPageResolutionCombo, OverviewCameraResolutionCombo);
-        SyncOverviewCameraOptionsToDiagnostics();
+        await HandleOverviewCameraConfigSelectionChangedAsync();
     }
 
-    private void OverviewCameraPageFrameRateCombo_SelectionChanged(object sender, SelectionChangedEventArgs e)
+    private async void OverviewCameraPageFrameRateCombo_SelectionChanged(object sender, SelectionChangedEventArgs e)
     {
         SyncOverviewCameraComboSelection(OverviewCameraPageFrameRateCombo, OverviewCameraFrameRateCombo);
-        SyncOverviewCameraOptionsToDiagnostics();
+        await HandleOverviewCameraConfigSelectionChangedAsync();
     }
 
     private void OverviewCameraPagePortBox_ValueChanged(NumberBox sender, NumberBoxValueChangedEventArgs args)
@@ -4592,6 +4606,80 @@ public sealed partial class MainWindow : Window
         UpdateCameraStatusView();
     }
 
+    private async Task HandleOverviewCameraConfigSelectionChangedAsync()
+    {
+        if (_syncingOverviewCameraOptions || !_uiReady)
+        {
+            return;
+        }
+
+        if (_hostProcess is { HasExited: false })
+        {
+            await ApplyOverviewCameraRuntimeConfigSelectionAsync();
+            return;
+        }
+
+        ClearCameraRuntimeApplyState();
+        SyncOverviewCameraOptionsToDiagnostics();
+    }
+
+    private async Task ApplyOverviewCameraRuntimeConfigSelectionAsync()
+    {
+        if (_cameraRuntimeConfigApplyInProgress)
+        {
+            UpdateOverviewCameraState();
+            return;
+        }
+
+        if (_hostProcess is not { HasExited: false })
+        {
+            SyncOverviewCameraOptionsToDiagnostics();
+            return;
+        }
+
+        var requested = SelectedOverviewCameraConfig(_overviewCameraRequestedEnabled);
+        _pendingCameraRuntimeConfig = _overviewCameraRequestedEnabled ? requested : null;
+        _cameraRuntimeConfigApplyInProgress = true;
+        SetCameraRuntimeApplyState(
+            CameraRuntimeApplyState.Applying,
+            _overviewCameraRequestedEnabled
+                ? $"正在应用摄像头配置：{requested.Summary}。"
+                : $"已记录运行中配置，下次开启摄像头流时使用：{requested.Summary}。");
+
+        try
+        {
+            var result = await SendHostCameraConfigCommandAsync(requested);
+            if (!result.Ok)
+            {
+                _pendingCameraRuntimeConfig = null;
+                SetCameraRuntimeApplyState(CameraRuntimeApplyState.Failed, result.Message);
+                _cameraDiagnostics.LastError = result.Message;
+                SyncOverviewCameraSelectionsFromConfig(result.EffectiveConfig);
+                UpdateCameraStatusView();
+                return;
+            }
+
+            _cameraDiagnostics.LastError = "";
+            ApplyCameraConfigSelectionToDiagnostics(result.EffectiveConfig);
+            if (!_overviewCameraRequestedEnabled)
+            {
+                _pendingCameraRuntimeConfig = null;
+                SetCameraRuntimeApplyState(CameraRuntimeApplyState.Succeeded, "配置已保存到运行中主机，开启摄像头流后生效。");
+            }
+            else
+            {
+                SetCameraRuntimeApplyState(CameraRuntimeApplyState.Restarting, $"配置已下发，正在等待 Android 重启摄像头：{requested.Summary}。");
+            }
+
+            UpdateCameraStatusView();
+        }
+        finally
+        {
+            _cameraRuntimeConfigApplyInProgress = false;
+            UpdateOverviewCameraState();
+        }
+    }
+
     private void SyncOverviewCameraComboSelection(ComboBox source, ComboBox target)
     {
         if (_syncingOverviewCameraOptions || !_uiReady)
@@ -4645,6 +4733,86 @@ public sealed partial class MainWindow : Window
             : 30;
     }
 
+    private string SelectedOverviewCameraCodec()
+    {
+        var codec = Selected(OverviewCameraPageCodecCombo);
+        return string.IsNullOrWhiteSpace(codec) ? _cameraDiagnostics.Codec : codec;
+    }
+
+    private CameraConfigSelection SelectedOverviewCameraConfig(bool enabled)
+    {
+        var (width, height) = SelectedOverviewCameraResolution();
+        var port = TryReadPort(OverviewCameraPortBox, out var configuredPort)
+            ? configuredPort
+            : _cameraDiagnostics.Port;
+        return new CameraConfigSelection(
+            enabled,
+            port,
+            width,
+            height,
+            SelectedOverviewCameraFps(),
+            SelectedOverviewCameraCodec(),
+            NormalizeCameraFacing(Selected(CameraFacingCombo)));
+    }
+
+    private static bool CameraConfigMatches(CameraConfigSelection left, CameraConfigSelection right)
+    {
+        return left.Enabled == right.Enabled
+            && left.Width == right.Width
+            && left.Height == right.Height
+            && left.Fps == right.Fps
+            && string.Equals(left.Codec, right.Codec, StringComparison.OrdinalIgnoreCase)
+            && string.Equals(left.Facing, right.Facing, StringComparison.OrdinalIgnoreCase);
+    }
+
+    private void ApplyCameraConfigSelectionToDiagnostics(CameraConfigSelection config)
+    {
+        _overviewCameraRequestedEnabled = config.Enabled;
+        _cameraDiagnostics.Port = config.Port;
+        _cameraDiagnostics.Width = config.Width;
+        _cameraDiagnostics.Height = config.Height;
+        _cameraDiagnostics.Fps = config.Fps;
+        _cameraDiagnostics.Codec = config.Codec;
+        _cameraDiagnostics.Facing = NormalizeCameraFacing(config.Facing);
+    }
+
+    private void SyncOverviewCameraSelectionsFromConfig(CameraConfigSelection config)
+    {
+        _syncingOverviewCameraOptions = true;
+        try
+        {
+            SelectComboBoxValue(CameraFacingCombo, config.Facing);
+            SelectComboBoxValue(OverviewCameraPageFacingCombo, config.Facing);
+            SelectComboBoxValue(OverviewCameraResolutionCombo, CameraResolutionValue(config.Width, config.Height));
+            SelectComboBoxValue(OverviewCameraPageResolutionCombo, CameraResolutionValue(config.Width, config.Height));
+            SelectComboBoxValue(OverviewCameraFrameRateCombo, config.Fps.ToString(CultureInfo.InvariantCulture));
+            SelectComboBoxValue(OverviewCameraPageFrameRateCombo, config.Fps.ToString(CultureInfo.InvariantCulture));
+            SelectComboBoxValue(OverviewCameraPageCodecCombo, config.Codec);
+        }
+        finally
+        {
+            _syncingOverviewCameraOptions = false;
+        }
+    }
+
+    private void SetCameraRuntimeApplyState(CameraRuntimeApplyState state, string message)
+    {
+        _cameraRuntimeApplyState = state;
+        _cameraRuntimeApplyMessage = message;
+        _cameraRuntimeApplyCompletedAt = state is CameraRuntimeApplyState.Succeeded or CameraRuntimeApplyState.Failed
+            ? DateTimeOffset.Now
+            : null;
+        UpdateOverviewCameraState();
+    }
+
+    private void ClearCameraRuntimeApplyState()
+    {
+        _cameraRuntimeApplyState = CameraRuntimeApplyState.None;
+        _cameraRuntimeApplyMessage = "";
+        _cameraRuntimeApplyCompletedAt = null;
+        _pendingCameraRuntimeConfig = null;
+    }
+
     private static string CameraResolutionValue(int width, int height)
     {
         return (width, height) switch
@@ -4674,9 +4842,9 @@ public sealed partial class MainWindow : Window
         SelectComboBoxValue(resolutionCombo, Selected(OverviewCameraResolutionCombo));
         SelectComboBoxValue(frameRateCombo, Selected(OverviewCameraFrameRateCombo));
 
-        facingCombo.IsEnabled = !hostRunning;
-        resolutionCombo.IsEnabled = !hostRunning;
-        frameRateCombo.IsEnabled = !hostRunning;
+        facingCombo.IsEnabled = true;
+        resolutionCombo.IsEnabled = true;
+        frameRateCombo.IsEnabled = true;
 
         var content = new StackPanel { Spacing = 10, MinWidth = 280 };
         AddCameraDialogField(content, "镜头", facingCombo);
@@ -4686,7 +4854,7 @@ public sealed partial class MainWindow : Window
         {
             content.Children.Add(new TextBlock
             {
-                Text = "主机运行中，摄像头配置会在下次启动时生效。",
+                Text = "主机运行中会立即应用镜头、分辨率和帧率，端口仍在下次启动时生效。",
                 TextWrapping = TextWrapping.Wrap,
                 Foreground = _secondaryBrush
             });
@@ -4696,19 +4864,16 @@ public sealed partial class MainWindow : Window
         {
             XamlRoot = StaticOverviewShell.XamlRoot,
             Title = "摄像头设置",
-            CloseButtonText = hostRunning ? "关闭" : "取消",
+            CloseButtonText = "取消",
+            PrimaryButtonText = "保存",
+            DefaultButton = ContentDialogButton.Primary,
             Content = content
         };
-        if (!hostRunning)
-        {
-            dialog.PrimaryButtonText = "保存";
-            dialog.DefaultButton = ContentDialogButton.Primary;
-        }
 
         try
         {
             var result = await dialog.ShowAsync();
-            if (hostRunning || result != ContentDialogResult.Primary)
+            if (result != ContentDialogResult.Primary)
             {
                 return;
             }
@@ -4729,7 +4894,7 @@ public sealed partial class MainWindow : Window
             }
 
             _cameraDiagnostics.Facing = NormalizeCameraFacing(Selected(CameraFacingCombo));
-            SyncOverviewCameraOptionsToDiagnostics();
+            await HandleOverviewCameraConfigSelectionChangedAsync();
         }
         catch (Exception ex)
         {
@@ -9120,6 +9285,28 @@ public sealed partial class MainWindow : Window
                 : ("停止中", "正在停止摄像头管线和虚拟摄像头。", _overviewPrimaryBrush);
         }
 
+        if (_cameraRuntimeApplyState is CameraRuntimeApplyState.Applying)
+        {
+            return ("应用中", _cameraRuntimeApplyMessage, _overviewPrimaryBrush);
+        }
+
+        if (_cameraRuntimeApplyState is CameraRuntimeApplyState.Restarting)
+        {
+            return ("重启摄像头中", _cameraRuntimeApplyMessage, _overviewPrimaryBrush);
+        }
+
+        if (_cameraRuntimeApplyState is CameraRuntimeApplyState.Succeeded
+            && _cameraRuntimeApplyCompletedAt is not null
+            && DateTimeOffset.Now - _cameraRuntimeApplyCompletedAt.Value < TimeSpan.FromSeconds(8))
+        {
+            return ("已生效", _cameraRuntimeApplyMessage, _successBrush);
+        }
+
+        if (_cameraRuntimeApplyState is CameraRuntimeApplyState.Failed)
+        {
+            return ("应用失败", _cameraRuntimeApplyMessage, _dangerBrush);
+        }
+
         if (hostRunning
             && _overviewCameraRequestedEnabled
             && (IsCameraErrorState(camera.ServerState)
@@ -9173,7 +9360,8 @@ public sealed partial class MainWindow : Window
 
     private void UpdateOverviewCameraOptionsEnabled(bool hostRunning)
     {
-        var enabled = !hostRunning && !_overviewCameraOperationInProgress;
+        var enabled = !_overviewCameraOperationInProgress && !_cameraRuntimeConfigApplyInProgress;
+        var portEnabled = !hostRunning && enabled;
         SyncOverviewCameraPagePortFromConnection();
         OverviewCameraResolutionCombo.IsEnabled = enabled;
         OverviewCameraFrameRateCombo.IsEnabled = enabled;
@@ -9181,11 +9369,11 @@ public sealed partial class MainWindow : Window
         OverviewCameraPageResolutionCombo.IsEnabled = enabled;
         OverviewCameraPageFrameRateCombo.IsEnabled = enabled;
         OverviewCameraPageCodecCombo.IsEnabled = false;
-        OverviewCameraPagePortBox.IsEnabled = enabled;
-        OverviewCameraSettingsButton.IsEnabled = !_overviewCameraOperationInProgress;
+        OverviewCameraPagePortBox.IsEnabled = portEnabled;
+        OverviewCameraSettingsButton.IsEnabled = enabled;
         OverviewCameraPageConfigHintText.Text = hostRunning
-            ? "主机运行中，镜头、分辨率、帧率和端口会在下次启动摄像头管线时生效。"
-            : "镜头、分辨率、帧率和端口会在下次启动摄像头管线时生效。编码格式由当前链路上报。";
+            ? "主机运行中可动态应用镜头、分辨率和帧率；端口会在下次启动生效。当前链路仅支持 video/avc。"
+            : "镜头、分辨率、帧率和端口会在下次启动摄像头管线时生效。当前链路仅支持 video/avc。";
     }
 
     private bool HasCameraError()
@@ -9213,6 +9401,7 @@ public sealed partial class MainWindow : Window
             || StateEquals(state, "connected")
             || StateEquals(state, "disconnected")
             || StateEquals(state, "preparing")
+            || StateEquals(state, "restarting")
             || StateEquals(state, "unknown");
     }
 
@@ -9285,14 +9474,14 @@ public sealed partial class MainWindow : Window
     private async Task StartCameraPipelineAsync()
     {
         SetCameraPreviewEnabled(true);
-        await SendHostCameraConfigCommandAsync(enabled: true);
+        await SendHostCameraConfigCommandAsync(SelectedOverviewCameraConfig(enabled: true));
         await RunVirtualCameraCommandAsync("ensure-start");
     }
 
     private async Task StopCameraPipelineAsync()
     {
         SetCameraPreviewEnabled(false);
-        await SendHostCameraConfigCommandAsync(enabled: false);
+        await SendHostCameraConfigCommandAsync(SelectedOverviewCameraConfig(enabled: false));
         await RunVirtualCameraCommandAsync("stop");
     }
 
@@ -9321,11 +9510,14 @@ public sealed partial class MainWindow : Window
         }
     }
 
-    private async Task SendHostCameraConfigCommandAsync(bool enabled)
+    private async Task<HostCameraConfigCommandResult> SendHostCameraConfigCommandAsync(CameraConfigSelection config)
     {
         if (_hostProcess is not { HasExited: false })
         {
-            return;
+            return new HostCameraConfigCommandResult(
+                Ok: false,
+                Message: "SideDock Host is not running; camera config will apply on next start.",
+                EffectiveConfig: config);
         }
 
         try
@@ -9346,7 +9538,15 @@ public sealed partial class MainWindow : Window
                 type = "host_camera_config",
                 seq = 1,
                 ts = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds(),
-                payload = new { enabled }
+                payload = new
+                {
+                    enabled = config.Enabled,
+                    width = config.Width,
+                    height = config.Height,
+                    fps = config.Fps,
+                    codec = config.Codec,
+                    facing = config.Facing
+                }
             });
             await writer.WriteLineAsync(request);
 
@@ -9361,6 +9561,12 @@ public sealed partial class MainWindow : Window
             var ok = root.TryGetProperty("ok", out var okProperty)
                 && okProperty.ValueKind is JsonValueKind.True or JsonValueKind.False
                 && okProperty.GetBoolean();
+            var responseMessage = root.TryGetProperty("message", out var responseMessageProperty)
+                ? responseMessageProperty.GetString()
+                : null;
+            var effectiveConfig = root.TryGetProperty("effective", out var effectiveProperty)
+                ? ReadCameraConfigSelection(effectiveProperty, config)
+                : config;
             if (!ok)
             {
                 var message = root.TryGetProperty("message", out var messageProperty)
@@ -9369,15 +9575,71 @@ public sealed partial class MainWindow : Window
                 throw new IOException(string.IsNullOrWhiteSpace(message) ? "摄像头控制命令失败。" : message);
             }
 
-            _cameraDiagnostics.ClientState = enabled ? "preparing" : "disabled";
+            _cameraDiagnostics.ClientState = effectiveConfig.Enabled ? "restarting" : "disabled";
             _cameraDiagnostics.LastError = "";
+            ApplyCameraConfigSelectionToDiagnostics(effectiveConfig);
             UpdateCameraStatusView();
+            return new HostCameraConfigCommandResult(
+                Ok: true,
+                Message: string.IsNullOrWhiteSpace(responseMessage) ? "camera config accepted" : responseMessage!,
+                EffectiveConfig: effectiveConfig);
         }
         catch (Exception ex) when (ex is IOException or SocketException or TimeoutException or JsonException)
         {
             _cameraDiagnostics.LastError = ex.Message;
             UpdateCameraStatusView();
+            return new HostCameraConfigCommandResult(
+                Ok: false,
+                Message: ex.Message,
+                EffectiveConfig: config);
         }
+    }
+
+    private static CameraConfigSelection ReadCameraConfigSelection(JsonElement element, CameraConfigSelection fallback)
+    {
+        if (element.ValueKind != JsonValueKind.Object)
+        {
+            return fallback;
+        }
+
+        var enabled = element.TryGetProperty("enabled", out var enabledProperty)
+            && enabledProperty.ValueKind is JsonValueKind.True or JsonValueKind.False
+            ? enabledProperty.GetBoolean()
+            : fallback.Enabled;
+        var port = ReadJsonInt(element, "port", fallback.Port);
+        var width = ReadJsonInt(element, "width", fallback.Width);
+        var height = ReadJsonInt(element, "height", fallback.Height);
+        var fps = ReadJsonInt(element, "fps", fallback.Fps);
+        var codec = element.TryGetProperty("codec", out var codecProperty)
+            ? codecProperty.GetString()
+            : fallback.Codec;
+        var facing = element.TryGetProperty("facing", out var facingProperty)
+            ? facingProperty.GetString()
+            : fallback.Facing;
+
+        return new CameraConfigSelection(
+            enabled,
+            port,
+            Math.Max(1, width),
+            Math.Max(1, height),
+            Math.Max(1, fps),
+            string.IsNullOrWhiteSpace(codec) ? fallback.Codec : codec!,
+            NormalizeCameraFacing(string.IsNullOrWhiteSpace(facing) ? fallback.Facing : facing!));
+    }
+
+    private static int ReadJsonInt(JsonElement element, string propertyName, int fallback)
+    {
+        if (!element.TryGetProperty(propertyName, out var property))
+        {
+            return fallback;
+        }
+
+        return property.ValueKind switch
+        {
+            JsonValueKind.Number when property.TryGetInt32(out var value) => value,
+            JsonValueKind.String when int.TryParse(property.GetString(), NumberStyles.Integer, CultureInfo.InvariantCulture, out var value) => value,
+            _ => fallback
+        };
     }
 
     private async Task RefreshVirtualCameraStatusAsync()
@@ -10410,6 +10672,12 @@ public sealed partial class MainWindow : Window
     {
         AppendRecentCameraLogLine(line);
 
+        if (line.Contains("camera-config-change", StringComparison.OrdinalIgnoreCase))
+        {
+            HandleCameraConfigChangeHostOutputLine(line);
+            return;
+        }
+
         if (!line.Contains("camera-state=", StringComparison.OrdinalIgnoreCase)
             && !line.Contains("camera-client-state=", StringComparison.OrdinalIgnoreCase))
         {
@@ -10473,7 +10741,78 @@ public sealed partial class MainWindow : Window
             _cameraDiagnostics.LastError = string.IsNullOrWhiteSpace(errorMessage) ? state : errorMessage;
         }
 
+        if (isClient)
+        {
+            ResolvePendingCameraRuntimeConfig(state);
+        }
+
         UpdateCameraStatusView();
+    }
+
+    private void HandleCameraConfigChangeHostOutputLine(string line)
+    {
+        _lastCameraStatusLine = line;
+        var ok = ExtractLogValue(line, "ok=");
+        ApplyCameraConfig(ExtractLogValue(line, "config="));
+        _cameraDiagnostics.Codec = NonEmpty(ExtractLogValue(line, "codec="), _cameraDiagnostics.Codec);
+        _cameraDiagnostics.Facing = NormalizeCameraFacing(NonEmpty(ExtractLogValue(line, "facing="), _cameraDiagnostics.Facing));
+        _overviewCameraRequestedEnabled = ExtractLogValue(line, "enabled=").Equals("true", StringComparison.OrdinalIgnoreCase);
+        if (ok.Equals("false", StringComparison.OrdinalIgnoreCase))
+        {
+            var message = ExtractLogTail(line, " message=");
+            _cameraDiagnostics.LastError = string.IsNullOrWhiteSpace(message) ? "camera config command failed" : message;
+            SetCameraRuntimeApplyState(CameraRuntimeApplyState.Failed, _cameraDiagnostics.LastError);
+        }
+        else if (_overviewCameraRequestedEnabled)
+        {
+            SetCameraRuntimeApplyState(CameraRuntimeApplyState.Restarting, $"配置已下发，等待 Android 重启摄像头：{_cameraDiagnostics.Width}x{_cameraDiagnostics.Height}@{_cameraDiagnostics.Fps}。");
+        }
+
+        UpdateCameraStatusView();
+    }
+
+    private void ResolvePendingCameraRuntimeConfig(string state)
+    {
+        if (_pendingCameraRuntimeConfig is null)
+        {
+            return;
+        }
+
+        if (IsCameraErrorState(state))
+        {
+            var error = FirstNonEmpty(_cameraDiagnostics.LastError, _lastCameraErrorMessage, "Android camera config apply failed.");
+            _pendingCameraRuntimeConfig = null;
+            SetCameraRuntimeApplyState(CameraRuntimeApplyState.Failed, error);
+            return;
+        }
+
+        if (!StateEquals(state, "capturing"))
+        {
+            if (StateEquals(state, "preparing") || StateEquals(state, "restarting"))
+            {
+                SetCameraRuntimeApplyState(CameraRuntimeApplyState.Restarting, _cameraRuntimeApplyMessage);
+            }
+
+            return;
+        }
+
+        var effectiveConfig = new CameraConfigSelection(
+            true,
+            _cameraDiagnostics.Port,
+            _cameraDiagnostics.Width,
+            _cameraDiagnostics.Height,
+            _cameraDiagnostics.Fps,
+            _cameraDiagnostics.Codec,
+            _cameraDiagnostics.Facing);
+        var requestedConfig = _pendingCameraRuntimeConfig;
+        _pendingCameraRuntimeConfig = null;
+        ApplyCameraConfigSelectionToDiagnostics(effectiveConfig);
+        SyncOverviewCameraSelectionsFromConfig(effectiveConfig);
+        SetCameraRuntimeApplyState(
+            CameraRuntimeApplyState.Succeeded,
+            CameraConfigMatches(requestedConfig, effectiveConfig)
+                ? $"摄像头配置已生效：{effectiveConfig.Summary}。"
+                : $"Android 已回退到实际可用配置：{effectiveConfig.Summary}。");
     }
 
     private static string ExtractLogValue(string line, string key)
@@ -11900,6 +12239,20 @@ public sealed partial class MainWindow : Window
             ClientCodecConfigPackets = 0;
         }
     }
+
+    private sealed record CameraConfigSelection(
+        bool Enabled,
+        int Port,
+        int Width,
+        int Height,
+        int Fps,
+        string Codec,
+        string Facing)
+    {
+        public string Summary => $"{Width}x{Height}@{Fps} {Codec} {Facing}";
+    }
+
+    private sealed record HostCameraConfigCommandResult(bool Ok, string Message, CameraConfigSelection EffectiveConfig);
 
     private sealed class OverviewPreviewFrameReader : IDisposable
     {

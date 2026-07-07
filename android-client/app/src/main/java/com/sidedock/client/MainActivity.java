@@ -447,9 +447,13 @@ public final class MainActivity extends Activity implements ControlClient.Listen
         cameraKeyFramesSent = 0L;
         cameraCodecConfigPacketsSent = 0L;
         lastCameraHint = hostCameraEnabled
-            ? "Camera uplink configured."
+            ? "Camera uplink configured; restarting capture."
             : "Host camera uplink is disabled.";
         addLog("camera_config " + cameraFacing + " " + cameraWidth + "x" + cameraHeight + "@" + cameraFps + " port=" + cameraPort);
+        if (hostCameraEnabled && controlConnectionState == ConnectionState.CONNECTED && cameraCaptureClient.isRunning()) {
+            cameraRuntimeState = "restarting";
+            publishCameraStatus(cameraRuntimeState, lastCameraHint);
+        }
         applyCameraCaptureIntent(lastCameraHint);
         updateOverlay();
     }
@@ -521,6 +525,32 @@ public final class MainActivity extends Activity implements ControlClient.Listen
                 if (message != null && !message.isEmpty()) {
                     lastCameraHint = message;
                 }
+                publishCameraStatus(cameraRuntimeState, lastCameraHint);
+                updateOverlay();
+            }
+        });
+    }
+
+    @Override
+    public void onCameraCaptureConfigApplied(
+        int effectivePort,
+        int effectiveWidth,
+        int effectiveHeight,
+        int effectiveFps,
+        String effectiveCodec,
+        String effectiveFacing
+    ) {
+        mainHandler.post(new Runnable() {
+            @Override
+            public void run() {
+                cameraPort = effectivePort > 0 ? effectivePort : cameraPort;
+                cameraWidth = effectiveWidth > 0 ? effectiveWidth : cameraWidth;
+                cameraHeight = effectiveHeight > 0 ? effectiveHeight : cameraHeight;
+                cameraFps = effectiveFps > 0 ? effectiveFps : cameraFps;
+                cameraCodec = effectiveCodec == null || effectiveCodec.length() == 0 ? cameraCodec : effectiveCodec;
+                cameraFacing = normalizeCameraFacing(effectiveFacing);
+                lastCameraHint = "Camera capture config applied.";
+                addLog("camera_effective_config " + cameraFacing + " " + cameraWidth + "x" + cameraHeight + "@" + cameraFps + " port=" + cameraPort);
                 publishCameraStatus(cameraRuntimeState, lastCameraHint);
                 updateOverlay();
             }

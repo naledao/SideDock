@@ -15,7 +15,11 @@ namespace SideDock.Host;
 
 internal static partial class Program
 {
-    private sealed class CameraServer(IPAddress address, HostOptions options, ControlMessagePublisher controlPublisher)
+    private sealed class CameraServer(
+        IPAddress address,
+        HostOptions options,
+        ControlMessagePublisher controlPublisher,
+        CameraRuntimeState cameraRuntimeState)
     {
         private const int HeaderSize = 40;
         private const int Version = 1;
@@ -25,7 +29,7 @@ internal static partial class Program
         private static readonly byte[] Magic = "SDCM"u8.ToArray();
 
         private readonly TcpListener _listener = new(address, options.CameraPort);
-        private readonly CameraLatestFrameCache _latestFrameCache = new(options.CameraWidth, options.CameraHeight);
+        private readonly CameraLatestFrameCache _latestFrameCache = new(cameraRuntimeState.Current.Width, cameraRuntimeState.Current.Height);
         private readonly object _connectionLock = new();
         private CancellationTokenSource? _activeConnectionCts;
         private Task? _activeConnectionTask;
@@ -47,7 +51,7 @@ internal static partial class Program
                 Log(
                     "CAMERA",
                     $"camera-state=listening address={address} port={options.CameraPort} "
-                    + $"config={options.CameraWidth}x{options.CameraHeight}@{options.CameraFps} codec={options.CameraCodec} facing={options.CameraFacing}");
+                    + $"config={FormatCameraConfig(cameraRuntimeState.Current.WithEffectiveEnabled(options))}");
                 await PublishServerStatusAsync("listening", "waiting for Android camera stream", cancellationToken);
 
                 while (!cancellationToken.IsCancellationRequested)
@@ -355,9 +359,13 @@ internal static partial class Program
 
             try
             {
-                var decoder = new CameraH264Decoder(options.CameraWidth, options.CameraHeight, options.CameraFps);
+                var config = cameraRuntimeState.Current;
+                var decoder = new CameraH264Decoder(config.Width, config.Height, config.Fps);
                 decoder.Start();
-                Log("CAMERA", $"camera-decode-state=ready connection={connectionId} decoder={decoder.SelectedMftName}");
+                Log(
+                    "CAMERA",
+                    $"camera-decode-state=ready connection={connectionId} decoder={decoder.SelectedMftName} "
+                    + $"config={config.Width}x{config.Height}@{config.Fps} codec={config.Codec} facing={config.Facing}");
                 return decoder;
             }
             catch (Exception ex)
@@ -637,15 +645,17 @@ internal static partial class Program
             double approxFps = 0.0,
             double approxKbps = 0.0)
         {
+            var config = cameraRuntimeState.Current.WithEffectiveEnabled(options);
             return controlPublisher.PublishAsync("camera_server_status", new JsonObject
             {
                 ["state"] = state,
                 ["message"] = message,
-                ["port"] = options.CameraPort,
-                ["width"] = options.CameraWidth,
-                ["height"] = options.CameraHeight,
-                ["fps"] = options.CameraFps,
-                ["codec"] = options.CameraCodec,
+                ["port"] = config.Port,
+                ["width"] = config.Width,
+                ["height"] = config.Height,
+                ["fps"] = config.Fps,
+                ["codec"] = config.Codec,
+                ["facing"] = config.Facing,
                 ["packets"] = stats?.PacketCount ?? 0,
                 ["frames"] = stats?.FrameCount ?? 0,
                 ["bytes"] = stats?.ByteCount ?? 0,
@@ -662,6 +672,11 @@ internal static partial class Program
                 ["previewFrameSequence"] = _latestFrameCache.PublishedFrameSequence,
                 ["previewMapName"] = CameraLatestFrameCache.MapName
             }, cancellationToken);
+        }
+
+        private static string FormatCameraConfig(EffectiveCameraRuntimeConfig config)
+        {
+            return $"{config.Width}x{config.Height}@{config.Fps} codec={config.Codec} facing={config.Facing} enabled={config.Enabled}";
         }
 
         private static string FormatTimestamp(DateTimeOffset? value)

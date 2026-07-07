@@ -108,12 +108,12 @@ internal static partial class Program
         }
 
         var controlPublisher = new ControlMessagePublisher();
-        var cameraRuntimeState = new CameraRuntimeState(options.CameraEnabled);
+        var cameraRuntimeState = new CameraRuntimeState(CameraRuntimeConfig.FromOptions(options));
         var controlServer = new ControlServer(IPAddress.Loopback, options, videoModeState, controlPublisher, displayLayoutProvider, cameraRuntimeState);
         var cameraCommandServer = new CameraCommandServer(IPAddress.Loopback, DefaultCameraCommandPort, options, controlPublisher, cameraRuntimeState);
         var videoServer = new VideoServer(IPAddress.Loopback, options, videoModeState, controlPublisher);
         var audioServer = new AudioServer(IPAddress.Loopback, options, controlPublisher);
-        var cameraServer = new CameraServer(IPAddress.Loopback, options, controlPublisher);
+        var cameraServer = new CameraServer(IPAddress.Loopback, options, controlPublisher, cameraRuntimeState);
         if (!string.IsNullOrWhiteSpace(options.CameraReplayFilePath))
         {
             _ = Task.Run(
@@ -697,27 +697,182 @@ internal static partial class Program
         }
     }
 
-    private sealed class CameraRuntimeState(bool initialEnabled)
+    private sealed class CameraRuntimeState(CameraRuntimeConfig initialConfig)
     {
         private readonly object _lock = new();
-        private bool _requestedEnabled = initialEnabled;
+        private CameraRuntimeConfig _current = initialConfig;
+
+        public CameraRuntimeConfig Current
+        {
+            get
+            {
+                lock (_lock)
+                {
+                    return _current;
+                }
+            }
+        }
 
         public bool IsEnabled(HostOptions options)
         {
             lock (_lock)
             {
-                return options.CameraEnabled && _requestedEnabled;
+                return _current.IsEffectivelyEnabled(options);
             }
         }
 
-        public bool SetRequestedEnabled(bool enabled, HostOptions options)
+        public CameraConfigApplyResult Apply(JsonObject payload, HostOptions options)
         {
             lock (_lock)
             {
-                _requestedEnabled = enabled;
-                return options.CameraEnabled && _requestedEnabled;
+                if (!TryCreateRequestedConfig(payload, _current, out var requested, out var error))
+                {
+                    return new CameraConfigApplyResult(
+                        Ok: false,
+                        Message: error,
+                        EffectiveConfig: _current.WithEffectiveEnabled(options));
+                }
+
+                _current = requested;
+                var effective = _current.WithEffectiveEnabled(options);
+                if (requested.RequestedEnabled && !options.CameraEnabled)
+                {
+                    return new CameraConfigApplyResult(
+                        Ok: false,
+                        Message: "camera is disabled by startup options",
+                        EffectiveConfig: effective);
+                }
+
+                return new CameraConfigApplyResult(
+                    Ok: true,
+                    Message: effective.Enabled ? "camera config applied; Android will restart capture" : "camera disabled",
+                    EffectiveConfig: effective);
             }
         }
+
+        private static bool TryCreateRequestedConfig(
+            JsonObject payload,
+            CameraRuntimeConfig current,
+            out CameraRuntimeConfig config,
+            out string error)
+        {
+            config = current;
+            error = string.Empty;
+
+            var requestedEnabled = current.RequestedEnabled;
+            if (payload.ContainsKey("enabled") && !TryReadCommandBool(payload, "enabled", out requestedEnabled))
+            {
+                error = "enabled must be true or false";
+                return false;
+            }
+
+            var width = current.Width;
+            if (payload.ContainsKey("width") && !TryReadCommandInt(payload, "width", minValue: 1, out width))
+            {
+                error = "width must be a positive integer";
+                return false;
+            }
+
+            var height = current.Height;
+            if (payload.ContainsKey("height") && !TryReadCommandInt(payload, "height", minValue: 1, out height))
+            {
+                error = "height must be a positive integer";
+                return false;
+            }
+
+            var fps = current.Fps;
+            if (payload.ContainsKey("fps") && !TryReadCommandInt(payload, "fps", minValue: 1, out fps))
+            {
+                error = "fps must be a positive integer";
+                return false;
+            }
+
+            var codec = current.Codec;
+            if (payload.ContainsKey("codec"))
+            {
+                codec = NormalizeCameraCodec(ReadCommandString(payload, "codec"));
+                if (!string.Equals(codec, "video/avc", StringComparison.OrdinalIgnoreCase))
+                {
+                    error = $"unsupported camera codec: {codec}";
+                    return false;
+                }
+            }
+
+            var facing = current.Facing;
+            if (payload.ContainsKey("facing"))
+            {
+                var requestedFacing = ReadCommandString(payload, "facing");
+                if (!TryNormalizeCameraFacing(requestedFacing, out facing))
+                {
+                    error = $"unsupported camera facing: {requestedFacing}";
+                    return false;
+                }
+            }
+
+            config = current with
+            {
+                RequestedEnabled = requestedEnabled,
+                Width = width,
+                Height = height,
+                Fps = fps,
+                Codec = codec,
+                Facing = facing
+            };
+            return true;
+        }
+    }
+
+    private sealed record CameraConfigApplyResult(bool Ok, string Message, EffectiveCameraRuntimeConfig EffectiveConfig);
+
+    private sealed record CameraRuntimeConfig(
+        bool RequestedEnabled,
+        int Port,
+        int Width,
+        int Height,
+        int Fps,
+        string Codec,
+        string Facing)
+    {
+        public static CameraRuntimeConfig FromOptions(HostOptions options)
+        {
+            return new CameraRuntimeConfig(
+                options.CameraEnabled,
+                options.CameraPort,
+                options.CameraWidth,
+                options.CameraHeight,
+                options.CameraFps,
+                NormalizeCameraCodec(options.CameraCodec),
+                options.CameraFacing);
+        }
+
+        public bool IsEffectivelyEnabled(HostOptions options)
+        {
+            return options.CameraEnabled && RequestedEnabled;
+        }
+
+        public EffectiveCameraRuntimeConfig WithEffectiveEnabled(HostOptions options)
+        {
+            return new EffectiveCameraRuntimeConfig(
+                IsEffectivelyEnabled(options),
+                Port,
+                Width,
+                Height,
+                Fps,
+                Codec,
+                Facing);
+        }
+    }
+
+    private sealed record EffectiveCameraRuntimeConfig(
+        bool Enabled,
+        int Port,
+        int Width,
+        int Height,
+        int Fps,
+        string Codec,
+        string Facing)
+    {
+        public string Summary => $"{Width}x{Height}@{Fps} codec={Codec} facing={Facing} enabled={Enabled}";
     }
 
     private sealed class CameraCommandServer(
@@ -792,15 +947,17 @@ internal static partial class Program
                     return;
                 }
 
-                var requestedEnabled = ReadCommandBool(payload, "enabled");
-                var effectiveEnabled = cameraRuntimeState.SetRequestedEnabled(requestedEnabled, options);
+                var result = cameraRuntimeState.Apply(payload, options);
                 await publisher.PublishAsync(
                     "camera_config",
-                    CreateCameraConfigPayload(options, effectiveEnabled),
+                    CreateCameraConfigPayload(result.EffectiveConfig),
                     cancellationToken);
 
-                Log("CAMERA CMD", $"host_camera_config requestedEnabled={requestedEnabled} effectiveEnabled={effectiveEnabled}");
-                await WriteCommandResponseAsync(writer, ok: true, effectiveEnabled ? "camera enabled" : "camera disabled", cancellationToken);
+                Log(
+                    "CAMERA CMD",
+                    $"camera-config-change ok={result.Ok} config={result.EffectiveConfig.Width}x{result.EffectiveConfig.Height}@{result.EffectiveConfig.Fps} "
+                    + $"codec={result.EffectiveConfig.Codec} facing={result.EffectiveConfig.Facing} enabled={result.EffectiveConfig.Enabled} message={result.Message}");
+                await WriteCommandResponseAsync(writer, result, cancellationToken);
             }
         }
 
@@ -810,35 +967,151 @@ internal static partial class Program
             string message,
             CancellationToken cancellationToken)
         {
-            var response = JsonSerializer.Serialize(new JsonObject
-            {
-                ["ok"] = ok,
-                ["message"] = message
-            }, JsonOptions);
+            var response = JsonSerializer.Serialize(CreateCommandResponsePayload(ok, message, effectiveConfig: null), JsonOptions);
             await writer.WriteLineAsync(response.AsMemory(), cancellationToken);
         }
 
-        private static bool ReadCommandBool(JsonObject payload, string name)
+        private static async Task WriteCommandResponseAsync(
+            StreamWriter writer,
+            CameraConfigApplyResult result,
+            CancellationToken cancellationToken)
         {
-            return payload.TryGetPropertyValue(name, out var node)
-                && node is not null
-                && node.GetValueKind() is JsonValueKind.True or JsonValueKind.False
-                && node.GetValue<bool>();
+            var response = JsonSerializer.Serialize(
+                CreateCommandResponsePayload(result.Ok, result.Message, result.EffectiveConfig),
+                JsonOptions);
+            await writer.WriteLineAsync(response.AsMemory(), cancellationToken);
         }
     }
 
-    private static JsonObject CreateCameraConfigPayload(HostOptions options, bool enabled)
+    private static JsonObject CreateCommandResponsePayload(bool ok, string message, EffectiveCameraRuntimeConfig? effectiveConfig)
+    {
+        var response = new JsonObject
+        {
+            ["ok"] = ok,
+            ["message"] = message
+        };
+
+        if (effectiveConfig is not null)
+        {
+            response["effective"] = CreateCameraConfigPayload(effectiveConfig);
+        }
+
+        return response;
+    }
+
+    private static JsonObject CreateCameraConfigPayload(EffectiveCameraRuntimeConfig config)
     {
         return new JsonObject
         {
-            ["enabled"] = enabled,
-            ["port"] = options.CameraPort,
-            ["width"] = options.CameraWidth,
-            ["height"] = options.CameraHeight,
-            ["fps"] = options.CameraFps,
-            ["codec"] = options.CameraCodec,
-            ["facing"] = options.CameraFacing
+            ["enabled"] = config.Enabled,
+            ["port"] = config.Port,
+            ["width"] = config.Width,
+            ["height"] = config.Height,
+            ["fps"] = config.Fps,
+            ["codec"] = config.Codec,
+            ["facing"] = config.Facing
         };
+    }
+
+    private static bool TryReadCommandBool(JsonObject payload, string name, out bool value)
+    {
+        value = false;
+        if (!payload.TryGetPropertyValue(name, out var node) || node is null)
+        {
+            return false;
+        }
+
+        try
+        {
+            value = node.GetValue<bool>();
+            return true;
+        }
+        catch (Exception ex) when (ex is InvalidOperationException or FormatException)
+        {
+            return false;
+        }
+    }
+
+    private static bool TryReadCommandInt(JsonObject payload, string name, int minValue, out int value)
+    {
+        value = 0;
+        if (!payload.TryGetPropertyValue(name, out var node) || node is null)
+        {
+            return false;
+        }
+
+        try
+        {
+            value = node.GetValue<int>();
+        }
+        catch (Exception ex) when (ex is InvalidOperationException or FormatException)
+        {
+            try
+            {
+                value = (int)Math.Round(node.GetValue<double>());
+            }
+            catch (Exception innerEx) when (innerEx is InvalidOperationException or FormatException)
+            {
+                return false;
+            }
+        }
+
+        return value >= minValue;
+    }
+
+    private static string ReadCommandString(JsonObject payload, string name)
+    {
+        if (!payload.TryGetPropertyValue(name, out var node) || node is null)
+        {
+            return string.Empty;
+        }
+
+        try
+        {
+            return node.GetValue<string>() ?? string.Empty;
+        }
+        catch (Exception ex) when (ex is InvalidOperationException or FormatException)
+        {
+            return string.Empty;
+        }
+    }
+
+    private static string NormalizeCameraCodec(string? value)
+    {
+        if (string.IsNullOrWhiteSpace(value))
+        {
+            return "video/avc";
+        }
+
+        return value.Trim().ToLowerInvariant() switch
+        {
+            "avc" or "h264" or "h.264" or "video/h264" => "video/avc",
+            var codec => codec
+        };
+    }
+
+    private static bool TryNormalizeCameraFacing(string? value, out string facing)
+    {
+        facing = "back";
+        if (string.IsNullOrWhiteSpace(value))
+        {
+            return true;
+        }
+
+        var normalized = value.Trim().ToLowerInvariant();
+        if (normalized is "back" or "rear")
+        {
+            facing = "back";
+            return true;
+        }
+
+        if (normalized is "front")
+        {
+            facing = "front";
+            return true;
+        }
+
+        return false;
     }
 
     private sealed class ControlConnection
@@ -1118,7 +1391,7 @@ internal static partial class Program
             {
                 case "hello":
                     var helloVideoMode = _videoModeState.Current;
-                    var cameraEnabled = _cameraRuntimeState.IsEnabled(_options);
+                    var cameraConfig = _cameraRuntimeState.Current.WithEffectiveEnabled(_options);
                     await connection.SendAsync("hello_ack", new JsonObject
                     {
                         ["server"] = "SideDock.Host",
@@ -1141,15 +1414,15 @@ internal static partial class Program
                         ["microphoneChannels"] = AudioDefaults.MicChannels,
                         ["speakerChannels"] = AudioDefaults.SpeakerChannels,
                         ["audioBitsPerSample"] = AudioDefaults.BitsPerSample,
-                        ["cameraEnabled"] = cameraEnabled,
-                        ["cameraPort"] = _options.CameraPort,
-                        ["cameraWidth"] = _options.CameraWidth,
-                        ["cameraHeight"] = _options.CameraHeight,
-                        ["cameraFps"] = _options.CameraFps,
-                        ["cameraCodec"] = _options.CameraCodec,
-                        ["cameraFacing"] = _options.CameraFacing
+                        ["cameraEnabled"] = cameraConfig.Enabled,
+                        ["cameraPort"] = cameraConfig.Port,
+                        ["cameraWidth"] = cameraConfig.Width,
+                        ["cameraHeight"] = cameraConfig.Height,
+                        ["cameraFps"] = cameraConfig.Fps,
+                        ["cameraCodec"] = cameraConfig.Codec,
+                        ["cameraFacing"] = cameraConfig.Facing
                     }, cancellationToken);
-                    await connection.SendAsync("camera_config", CreateCameraConfigPayload(_options, cameraEnabled), cancellationToken);
+                    await connection.SendAsync("camera_config", CreateCameraConfigPayload(cameraConfig), cancellationToken);
                     await PublishDisplayMetricsIfChangedAsync(connection, force: true, cancellationToken);
                     break;
 
@@ -1345,9 +1618,7 @@ internal static partial class Program
 
             var state = ReadString(payload, "state");
             var message = ReadString(payload, "message");
-            var logKey = state is "capturing" or "preparing"
-                ? "camera-client-state"
-                : "camera-state";
+            var logKey = "camera-client-state";
             Log(
                 "CAMERA",
                 logKey + "=" + (string.IsNullOrWhiteSpace(state) ? "unknown" : state)

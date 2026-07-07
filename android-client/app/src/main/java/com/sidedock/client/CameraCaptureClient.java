@@ -41,6 +41,7 @@ import java.util.concurrent.atomic.AtomicReference;
 public final class CameraCaptureClient {
     public interface Listener {
         void onCameraCaptureState(String state, String message);
+        void onCameraCaptureConfigApplied(int port, int width, int height, int fps, String codec, String facing);
         void onCameraCaptureStats(long packetsSent, long bytesSent, long keyFrames, long codecConfigPackets);
     }
 
@@ -60,6 +61,7 @@ public final class CameraCaptureClient {
 
     private ExecutorService executor;
     private Socket socket;
+    private CountDownLatch stopLatch;
     private volatile boolean running;
     private long generation;
     private int port = 27186;
@@ -75,6 +77,7 @@ public final class CameraCaptureClient {
     }
 
     public void start(int nextPort, int nextWidth, int nextHeight, int nextFps, String nextCodec, String nextFacing) {
+        StopToken previousStop;
         synchronized (lifecycleLock) {
             int normalizedWidth = nextWidth > 0 ? nextWidth : 1280;
             int normalizedHeight = nextHeight > 0 ? nextHeight : 720;
@@ -91,36 +94,48 @@ public final class CameraCaptureClient {
                 return;
             }
 
-            stopLocked();
+            emitState("restarting", "Restarting camera capture with new config.");
+            previousStop = stopLocked();
             port = nextPort;
             width = normalizedWidth;
             height = normalizedHeight;
             fps = normalizedFps;
             codec = normalizedCodec;
             facing = normalizedFacing;
+        }
+
+        waitForStop(previousStop);
+
+        synchronized (lifecycleLock) {
             running = true;
             final long runGeneration = ++generation;
+            final CountDownLatch runStopLatch = new CountDownLatch(1);
+            stopLatch = runStopLatch;
             executor = Executors.newSingleThreadExecutor(new NamedThreadFactory("SideDock-Camera"));
             executor.execute(new Runnable() {
                 @Override
                 public void run() {
-                    cameraLoop(runGeneration);
+                    cameraLoop(runGeneration, runStopLatch);
                 }
             });
         }
     }
 
     public void stop() {
+        StopToken previousStop;
         synchronized (lifecycleLock) {
-            stopLocked();
+            previousStop = stopLocked();
         }
+        waitForStop(previousStop);
     }
 
     public boolean isRunning() {
         return running;
     }
 
-    private void stopLocked() {
+    private StopToken stopLocked() {
+        ExecutorService previousExecutor = executor;
+        CountDownLatch previousStopLatch = stopLatch;
         running = false;
         generation += 1;
         closeSocket();
@@ -128,82 +143,107 @@ public final class CameraCaptureClient {
             executor.shutdownNow();
             executor = null;
         }
+        stopLatch = null;
+        return new StopToken(previousExecutor, previousStopLatch);
     }
 
-    private void cameraLoop(long runGeneration) {
-        long reconnectDelayMs = 300L;
-        while (running && isCurrentGeneration(runGeneration)) {
-            if (!hasCameraPermission()) {
-                emitState("waiting_permission", "Camera permission is required.");
-                return;
-            }
-
-            Socket nextSocket = null;
-            HandlerThread cameraThread = null;
-            MediaCodec encoder = null;
-            Surface encoderSurface = null;
-            CameraDevice cameraDevice = null;
-            CameraCaptureSession captureSession = null;
-
-            try {
-                emitState("preparing", "Preparing camera uplink.");
-
-                nextSocket = new Socket();
-                nextSocket.setTcpNoDelay(true);
-                nextSocket.setSendBufferSize(512 * 1024);
-                nextSocket.connect(new InetSocketAddress("127.0.0.1", port), 3000);
-                synchronized (lifecycleLock) {
-                    if (!running || generation != runGeneration) {
-                        closeQuietly(nextSocket);
-                        return;
-                    }
-
-                    socket = nextSocket;
-                }
-
-                CameraManager cameraManager = (CameraManager) context.getSystemService(Context.CAMERA_SERVICE);
-                if (cameraManager == null) {
-                    throw new IllegalStateException("CameraManager is unavailable.");
-                }
-
-                String cameraId = findCameraId(cameraManager, facing);
-                CameraCharacteristics characteristics = cameraManager.getCameraCharacteristics(cameraId);
-                Size captureSize = chooseCaptureSize(characteristics, width, height);
-
-                encoder = createEncoder(codec, captureSize.getWidth(), captureSize.getHeight(), fps);
-                encoderSurface = encoder.createInputSurface();
-                encoder.start();
-
-                cameraThread = new HandlerThread("SideDock-Camera2");
-                cameraThread.start();
-                Handler cameraHandler = new Handler(cameraThread.getLooper());
-
-                cameraDevice = openCamera(cameraManager, cameraId, cameraHandler);
-                captureSession = createCaptureSession(cameraDevice, encoderSurface, cameraHandler);
-                startRepeatingCapture(cameraDevice, captureSession, encoderSurface, characteristics, fps);
-
-                emitState("capturing", "Camera capture started (" + facing + ").");
-                reconnectDelayMs = 300L;
-                drainEncoder(encoder, nextSocket.getOutputStream(), runGeneration);
-            } catch (Exception ex) {
-                if (running && isCurrentGeneration(runGeneration)) {
-                    String state = isNetworkException(ex) ? "disconnected" : "unavailable";
-                    emitState(state, exceptionSummary(ex));
-                    sleepQuietly(reconnectDelayMs);
-                    reconnectDelayMs = Math.min(reconnectDelayMs * 2L, 3000L);
-                }
-            } finally {
-                closeCaptureSession(captureSession);
-                closeCamera(cameraDevice);
-                releaseSurface(encoderSurface);
-                releaseEncoder(encoder);
-                stopCameraThread(cameraThread);
-                closeSocket(nextSocket);
-            }
+    private void waitForStop(StopToken stopToken) {
+        if (stopToken.executor == null) {
+            return;
         }
 
-        if (isCurrentGeneration(runGeneration)) {
-            emitState("disconnected", "Camera capture stopped.");
+        try {
+            if (stopToken.stopLatch != null) {
+                stopToken.stopLatch.await(2500L, TimeUnit.MILLISECONDS);
+            }
+            stopToken.executor.awaitTermination(500L, TimeUnit.MILLISECONDS);
+        } catch (InterruptedException ex) {
+            Thread.currentThread().interrupt();
+        }
+    }
+
+    private void cameraLoop(long runGeneration, CountDownLatch runStopLatch) {
+        try {
+            long reconnectDelayMs = 300L;
+            while (running && isCurrentGeneration(runGeneration)) {
+                if (!hasCameraPermission()) {
+                    emitState("waiting_permission", "Camera permission is required.");
+                    return;
+                }
+
+                Socket nextSocket = null;
+                HandlerThread cameraThread = null;
+                MediaCodec encoder = null;
+                Surface encoderSurface = null;
+                CameraDevice cameraDevice = null;
+                CameraCaptureSession captureSession = null;
+
+                try {
+                    emitState("preparing", "Preparing camera uplink.");
+
+                    nextSocket = new Socket();
+                    nextSocket.setTcpNoDelay(true);
+                    nextSocket.setSendBufferSize(512 * 1024);
+                    nextSocket.connect(new InetSocketAddress("127.0.0.1", port), 3000);
+                    synchronized (lifecycleLock) {
+                        if (!running || generation != runGeneration) {
+                            closeQuietly(nextSocket);
+                            return;
+                        }
+
+                        socket = nextSocket;
+                    }
+
+                    CameraManager cameraManager = (CameraManager) context.getSystemService(Context.CAMERA_SERVICE);
+                    if (cameraManager == null) {
+                        throw new IllegalStateException("CameraManager is unavailable.");
+                    }
+
+                    String cameraId = findCameraId(cameraManager, facing);
+                    CameraCharacteristics characteristics = cameraManager.getCameraCharacteristics(cameraId);
+                    Size captureSize = chooseCaptureSize(characteristics, width, height);
+                    Range<Integer> fpsRange = chooseFpsRange(characteristics, fps);
+                    int effectiveFps = effectiveFpsForRange(fpsRange, fps);
+                    String effectiveFacing = cameraFacingName(characteristics, facing);
+
+                    encoder = createEncoder(codec, captureSize.getWidth(), captureSize.getHeight(), effectiveFps);
+                    encoderSurface = encoder.createInputSurface();
+                    encoder.start();
+
+                    cameraThread = new HandlerThread("SideDock-Camera2");
+                    cameraThread.start();
+                    Handler cameraHandler = new Handler(cameraThread.getLooper());
+
+                    cameraDevice = openCamera(cameraManager, cameraId, cameraHandler);
+                    captureSession = createCaptureSession(cameraDevice, encoderSurface, cameraHandler);
+                    startRepeatingCapture(cameraDevice, captureSession, encoderSurface, characteristics, fpsRange);
+
+                    emitConfigApplied(port, captureSize.getWidth(), captureSize.getHeight(), effectiveFps, codec, effectiveFacing);
+                    emitState("capturing", "Camera capture started (" + effectiveFacing + ").");
+                    reconnectDelayMs = 300L;
+                    drainEncoder(encoder, nextSocket.getOutputStream(), runGeneration);
+                } catch (Exception ex) {
+                    if (running && isCurrentGeneration(runGeneration)) {
+                        String state = isNetworkException(ex) ? "disconnected" : "unavailable";
+                        emitState(state, exceptionSummary(ex));
+                        sleepQuietly(reconnectDelayMs);
+                        reconnectDelayMs = Math.min(reconnectDelayMs * 2L, 3000L);
+                    }
+                } finally {
+                    closeCaptureSession(captureSession);
+                    closeCamera(cameraDevice);
+                    releaseSurface(encoderSurface);
+                    releaseEncoder(encoder);
+                    stopCameraThread(cameraThread);
+                    closeSocket(nextSocket);
+                }
+            }
+
+            if (isCurrentGeneration(runGeneration)) {
+                emitState("disconnected", "Camera capture stopped.");
+            }
+        } finally {
+            runStopLatch.countDown();
         }
     }
 
@@ -551,13 +591,12 @@ public final class CameraCaptureClient {
         CameraCaptureSession session,
         Surface encoderSurface,
         CameraCharacteristics characteristics,
-        int targetFps
+        Range<Integer> fpsRange
     ) throws CameraAccessException {
         CaptureRequest.Builder builder = cameraDevice.createCaptureRequest(CameraDevice.TEMPLATE_RECORD);
         builder.addTarget(encoderSurface);
         builder.set(CaptureRequest.CONTROL_MODE, CaptureRequest.CONTROL_MODE_AUTO);
         configureLowLatencyCaptureRequest(builder, characteristics);
-        Range<Integer> fpsRange = chooseFpsRange(characteristics, targetFps);
         if (fpsRange != null) {
             builder.set(CaptureRequest.CONTROL_AE_TARGET_FPS_RANGE, fpsRange);
         }
@@ -756,6 +795,35 @@ public final class CameraCaptureClient {
         }
 
         return best;
+    }
+
+    private static int effectiveFpsForRange(Range<Integer> range, int requestedFps) {
+        if (range == null) {
+            return Math.max(1, requestedFps);
+        }
+
+        int lower = range.getLower();
+        int upper = range.getUpper();
+        if (requestedFps >= lower && requestedFps <= upper) {
+            return requestedFps;
+        }
+
+        return Math.max(1, upper);
+    }
+
+    private static String cameraFacingName(CameraCharacteristics characteristics, String fallback) {
+        Integer cameraFacing = characteristics.get(CameraCharacteristics.LENS_FACING);
+        if (cameraFacing != null) {
+            if (cameraFacing == CameraCharacteristics.LENS_FACING_FRONT) {
+                return "front";
+            }
+
+            if (cameraFacing == CameraCharacteristics.LENS_FACING_BACK) {
+                return "back";
+            }
+        }
+
+        return normalizeFacing(fallback);
     }
 
     private static int recommendedBitrate(int encodeWidth, int encodeHeight, int encodeFps) {
@@ -1448,8 +1516,22 @@ public final class CameraCaptureClient {
         listener.onCameraCaptureState(state, message);
     }
 
+    private void emitConfigApplied(int port, int width, int height, int fps, String codec, String facing) {
+        listener.onCameraCaptureConfigApplied(port, width, height, fps, codec, facing);
+    }
+
     private void emitStats(long packetsSent, long bytesSent, long keyFrames, long codecConfigPackets) {
         listener.onCameraCaptureStats(packetsSent, bytesSent, keyFrames, codecConfigPackets);
+    }
+
+    private static final class StopToken {
+        final ExecutorService executor;
+        final CountDownLatch stopLatch;
+
+        StopToken(ExecutorService executor, CountDownLatch stopLatch) {
+            this.executor = executor;
+            this.stopLatch = stopLatch;
+        }
     }
 
     private static final class NamedThreadFactory implements ThreadFactory {
