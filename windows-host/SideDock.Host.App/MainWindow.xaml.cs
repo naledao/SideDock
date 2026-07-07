@@ -303,6 +303,7 @@ public sealed partial class MainWindow : Window
         InitializeComponent();
         _uiReady = true;
         WireStaticDisplayPage();
+        WireStaticDiagnosticsPage();
         StaticOverviewShell.Visibility = StaticOverviewUi ? Visibility.Visible : Visibility.Collapsed;
         LegacyShell.Visibility = StaticOverviewUi ? Visibility.Collapsed : Visibility.Visible;
         if (StaticOverviewUi)
@@ -413,6 +414,14 @@ public sealed partial class MainWindow : Window
         OverviewDisplayPage.OpenDisplaySettingsRequested += StaticDisplayPage_OpenDisplaySettingsRequested;
         OverviewDisplayPage.ShowLogsRequested += StaticDisplayPage_ShowLogsRequested;
         OverviewDisplayPage.DisplayModeApplyRequested += StaticDisplayPage_DisplayModeApplyRequested;
+    }
+
+    private void WireStaticDiagnosticsPage()
+    {
+        OverviewDiagnosticsPage.CopyAllRequested += StaticDiagnosticsPage_CopyAllRequested;
+        OverviewDiagnosticsPage.ExportLogsRequested += StaticDiagnosticsPage_ExportLogsRequested;
+        OverviewDiagnosticsPage.RefreshRequested += StaticDiagnosticsPage_RefreshRequested;
+        OverviewDiagnosticsPage.RecheckRequested += StaticDiagnosticsPage_RecheckRequested;
     }
 
     private void UpdateOverviewMainContentMinHeight()
@@ -590,6 +599,13 @@ public sealed partial class MainWindow : Window
             return;
         }
 
+        if (item == OverviewNavigationItem.Diagnostics)
+        {
+            OverviewNavigationDetailPanel.Visibility = Visibility.Collapsed;
+            UpdateStaticDiagnosticsPage();
+            return;
+        }
+
         SetOverviewNavigationDetail(item);
         OverviewNavigationDetailPanel.Visibility = Visibility.Visible;
         OverviewNavigationDetailPanel.StartBringIntoView(new BringIntoViewOptions
@@ -699,6 +715,7 @@ public sealed partial class MainWindow : Window
         UpdateOverviewConnectionPortStatus();
         UpdateOverviewConnectionChecklist();
         UpdateOverviewFooterMachineInfo();
+        UpdateStaticDiagnosticsPage();
     }
 
     private void UpdateOverviewConnectionButtons()
@@ -1021,6 +1038,519 @@ public sealed partial class MainWindow : Window
             _ when authState == OverviewStepState.Complete => (OverviewStepState.Complete, "可以启动会话"),
             _ when authState == OverviewStepState.Warning => (OverviewStepState.Warning, "请先处理设备选择或授权"),
             _ => (OverviewStepState.Waiting, "等待设备和端口检查")
+        };
+    }
+
+    private void UpdateStaticDiagnosticsPage()
+    {
+        if (!StaticOverviewUi || !_uiReady || OverviewDiagnosticsPage is null)
+        {
+            return;
+        }
+
+        OverviewDiagnosticsPage.UpdateState(BuildStaticDiagnosticsPageState());
+    }
+
+    private DiagnosticsPageState BuildStaticDiagnosticsPageState()
+    {
+        var host = BuildDiagnosticsHostCard();
+        var adbReverse = BuildDiagnosticsAdbReverseCard();
+        var packetLoss = BuildDiagnosticsPacketLossCard();
+        var latency = BuildDiagnosticsLatencyCard();
+
+        var (authState, authDetail) = BuildOverviewConnectionAuthStep();
+        var androidAuthorization = ToDiagnosticsHealthCheck(authState, authDetail);
+        var portListening = BuildDiagnosticsPortListeningHealth();
+
+        var (reverseState, reverseDetail) = BuildOverviewConnectionReverseStep(authState);
+        var adbReverseHealth = ToDiagnosticsHealthCheck(reverseState, reverseDetail);
+
+        var virtualDisplay = BuildDiagnosticsVirtualDisplayHealth();
+        var virtualCamera = BuildDiagnosticsVirtualCameraHealth();
+        var audioEndpoint = BuildDiagnosticsAudioEndpointHealth();
+
+        var issues = new (string Label, DiagnosticsStatusKind Status, string Detail)[]
+        {
+            ("Host", host.Status, host.Detail),
+            ("Android 授权", androidAuthorization.Status, androidAuthorization.Detail),
+            ("端口监听", portListening.Status, portListening.Detail),
+            ("ADB reverse", adbReverseHealth.Status, adbReverseHealth.Detail),
+            ("虚拟显示器", virtualDisplay.Status, virtualDisplay.Detail),
+            ("虚拟相机", virtualCamera.Status, virtualCamera.Detail),
+            ("音频端点", audioEndpoint.Status, audioEndpoint.Detail),
+            ("丢帧/丢包率", packetLoss.Status, packetLoss.Detail),
+            ("延迟", latency.Status, latency.Detail)
+        };
+        var overallStatus = WorstDiagnosticsStatus(issues.Select(issue => issue.Status));
+        var firstIssue = issues.FirstOrDefault(issue => issue.Status == overallStatus && issue.Status != DiagnosticsStatusKind.Normal);
+
+        return new DiagnosticsPageState
+        {
+            OverallStatus = overallStatus,
+            OverallTitle = DiagnosticsOverallTitle(overallStatus),
+            OverallDetail = overallStatus == DiagnosticsStatusKind.Normal
+                ? "所有关键服务运行正常，系统性能良好。"
+                : string.IsNullOrWhiteSpace(firstIssue.Label)
+                    ? "请点击刷新或启动主机后查看实时诊断。"
+                    : $"{firstIssue.Label}：{firstIssue.Detail}",
+            Host = host,
+            AdbReverse = adbReverse,
+            PacketLoss = packetLoss,
+            Latency = latency,
+            AndroidAuthorization = androidAuthorization,
+            PortListening = portListening,
+            AdbReverseHealth = adbReverseHealth,
+            VirtualDisplay = virtualDisplay,
+            VirtualCamera = virtualCamera,
+            AudioEndpoint = audioEndpoint
+        };
+    }
+
+    private DiagnosticsStatusCardState BuildDiagnosticsHostCard()
+    {
+        if (TryGetRunningHostProcess(out _))
+        {
+            return new DiagnosticsStatusCardState
+            {
+                Status = DiagnosticsStatusKind.Normal,
+                Value = "运行中",
+                Detail = $"{FormatHostProcessState()} · CPU {_lastOverviewCpuText} · 内存 {_lastOverviewMemoryText}"
+            };
+        }
+
+        return _overviewHostServiceState switch
+        {
+            OverviewHostServiceState.Starting => new DiagnosticsStatusCardState
+            {
+                Status = DiagnosticsStatusKind.Unknown,
+                Value = "启动中",
+                Detail = _overviewHostDetailText
+            },
+            OverviewHostServiceState.Error => new DiagnosticsStatusCardState
+            {
+                Status = DiagnosticsStatusKind.Error,
+                Value = "错误",
+                Detail = _overviewHostDetailText
+            },
+            OverviewHostServiceState.Stopped => new DiagnosticsStatusCardState
+            {
+                Status = DiagnosticsStatusKind.Warning,
+                Value = "已停止",
+                Detail = "主机已停止"
+            },
+            _ => new DiagnosticsStatusCardState
+            {
+                Status = DiagnosticsStatusKind.Warning,
+                Value = "未启动",
+                Detail = "等待启动"
+            }
+        };
+    }
+
+    private DiagnosticsStatusCardState BuildDiagnosticsAdbReverseCard()
+    {
+        if (_lastAdbReverseConfigured == true)
+        {
+            return new DiagnosticsStatusCardState
+            {
+                Status = DiagnosticsStatusKind.Normal,
+                Value = "正常",
+                Detail = _lastAdbReverseDetail
+            };
+        }
+
+        if (_lastAdbReverseConfigured == false)
+        {
+            return new DiagnosticsStatusCardState
+            {
+                Status = DiagnosticsStatusKind.Error,
+                Value = "错误",
+                Detail = _lastAdbReverseDetail
+            };
+        }
+
+        return new DiagnosticsStatusCardState
+        {
+            Status = DiagnosticsStatusKind.Unknown,
+            Value = "暂无数据",
+            Detail = "启动主机时自动配置 ADB reverse"
+        };
+    }
+
+    private DiagnosticsStatusCardState BuildDiagnosticsPacketLossCard()
+    {
+        if (!TryGetRunningHostProcess(out _))
+        {
+            return new DiagnosticsStatusCardState
+            {
+                Status = DiagnosticsStatusKind.Unknown,
+                Value = "暂无数据",
+                Detail = "主机未运行"
+            };
+        }
+
+        if (_videoDiagnostics.TryGetDroppedFrameRate(out var droppedFrameRate))
+        {
+            return new DiagnosticsStatusCardState
+            {
+                Status = droppedFrameRate >= 20
+                    ? DiagnosticsStatusKind.Error
+                    : droppedFrameRate >= 5
+                        ? DiagnosticsStatusKind.Warning
+                        : DiagnosticsStatusKind.Normal,
+                Value = _lastOverviewPacketLossText,
+                Detail = droppedFrameRate >= 5 ? "丢帧偏高" : "良好"
+            };
+        }
+
+        return new DiagnosticsStatusCardState
+        {
+            Status = DiagnosticsStatusKind.Unknown,
+            Value = _lastOverviewPacketLossText,
+            Detail = "等待视频统计"
+        };
+    }
+
+    private DiagnosticsStatusCardState BuildDiagnosticsLatencyCard()
+    {
+        if (!TryGetRunningHostProcess(out _))
+        {
+            return new DiagnosticsStatusCardState
+            {
+                Status = DiagnosticsStatusKind.Unknown,
+                Value = "暂无数据",
+                Detail = "主机未运行"
+            };
+        }
+
+        if (TryGetOverviewLatencyMilliseconds(out var latencyMs))
+        {
+            return new DiagnosticsStatusCardState
+            {
+                Status = latencyMs > 100
+                    ? DiagnosticsStatusKind.Error
+                    : latencyMs > 50
+                        ? DiagnosticsStatusKind.Warning
+                        : DiagnosticsStatusKind.Normal,
+                Value = _lastOverviewLatencyText,
+                Detail = _lastOverviewLatencyDetailText
+            };
+        }
+
+        return new DiagnosticsStatusCardState
+        {
+            Status = DiagnosticsStatusKind.Unknown,
+            Value = _lastOverviewLatencyText,
+            Detail = _lastOverviewLatencyDetailText
+        };
+    }
+
+    private bool TryGetOverviewLatencyMilliseconds(out double latencyMs)
+    {
+        if (_videoDiagnostics.HasRecentVideoStats && _videoDiagnostics.RoughLatencyMs > 0)
+        {
+            latencyMs = _videoDiagnostics.RoughLatencyMs;
+            return true;
+        }
+
+        if (_videoDiagnostics.HasRecentVideoStats && _videoDiagnostics.LocalPipelineLatencyMs > 0)
+        {
+            latencyMs = _videoDiagnostics.LocalPipelineLatencyMs;
+            return true;
+        }
+
+        if (IsCameraReceiving(_cameraDiagnostics) && _cameraDiagnostics.DecodeLagMs > 0)
+        {
+            latencyMs = _cameraDiagnostics.DecodeLagMs;
+            return true;
+        }
+
+        latencyMs = 0;
+        return false;
+    }
+
+    private DiagnosticsHealthCheckState BuildDiagnosticsPortListeningHealth()
+    {
+        var (portState, portDetail) = BuildOverviewConnectionPortSummary();
+        if (portState == OverviewStepState.Error)
+        {
+            return ToDiagnosticsHealthCheck(portState, portDetail);
+        }
+
+        var portValues = OverviewPortStatusControls()
+            .Select(port => (port.Name, Valid: TryReadPort(port.NumberBox, out var value), Value: value))
+            .ToArray();
+        if (portValues.Any(port => !port.Valid))
+        {
+            return ToDiagnosticsHealthCheck(OverviewStepState.Error, portDetail);
+        }
+
+        if (!TryGetRunningHostProcess(out _))
+        {
+            return new DiagnosticsHealthCheckState
+            {
+                Status = DiagnosticsStatusKind.Unknown,
+                Detail = $"主机未运行，端口尚未监听。{portDetail}"
+            };
+        }
+
+        var activePorts = GetActiveTcpListenerPorts();
+        var listeningPorts = portValues
+            .Where(port => activePorts.Contains(port.Value))
+            .ToArray();
+        if (listeningPorts.Length == portValues.Length)
+        {
+            return new DiagnosticsHealthCheckState
+            {
+                Status = DiagnosticsStatusKind.Normal,
+                Detail = $"{listeningPorts.Length}/{portValues.Length} 端口正在监听"
+            };
+        }
+
+        if (listeningPorts.Length > 0)
+        {
+            return new DiagnosticsHealthCheckState
+            {
+                Status = DiagnosticsStatusKind.Warning,
+                Detail = $"{listeningPorts.Length}/{portValues.Length} 端口正在监听：{string.Join("、", listeningPorts.Select(port => port.Value))}"
+            };
+        }
+
+        return new DiagnosticsHealthCheckState
+        {
+            Status = DiagnosticsStatusKind.Warning,
+            Detail = "主机运行中，暂未检测到配置端口监听"
+        };
+    }
+
+    private DiagnosticsHealthCheckState BuildDiagnosticsVirtualDisplayHealth()
+    {
+        var running = IsVirtualDisplayToolRunning();
+        var state = DetermineVirtualDisplayOverviewState(running, out var driverInstalled, out var toolAvailable);
+        var (statusText, detail, _) = BuildVirtualDisplayStatusView(state, driverInstalled, toolAvailable);
+
+        var status = state switch
+        {
+            VirtualDisplayOverviewState.Running => DiagnosticsStatusKind.Normal,
+            VirtualDisplayOverviewState.Error => DiagnosticsStatusKind.Error,
+            VirtualDisplayOverviewState.DriverMissing => DiagnosticsStatusKind.Warning,
+            VirtualDisplayOverviewState.ToolStopped => DiagnosticsStatusKind.Warning,
+            _ => DiagnosticsStatusKind.Unknown
+        };
+
+        return new DiagnosticsHealthCheckState
+        {
+            Status = status,
+            Detail = $"{statusText}：{detail}"
+        };
+    }
+
+    private DiagnosticsHealthCheckState BuildDiagnosticsVirtualCameraHealth()
+    {
+        var (statusText, hintText, _) = BuildOverviewCameraStatusView();
+        if (_overviewCameraOperationInProgress)
+        {
+            return new DiagnosticsHealthCheckState
+            {
+                Status = DiagnosticsStatusKind.Unknown,
+                Detail = $"{statusText}：{hintText}"
+            };
+        }
+
+        if (!_overviewCameraRequestedEnabled)
+        {
+            return new DiagnosticsHealthCheckState
+            {
+                Status = DiagnosticsStatusKind.Warning,
+                Detail = "摄像头管线未启用"
+            };
+        }
+
+        if (HasCameraError())
+        {
+            return new DiagnosticsHealthCheckState
+            {
+                Status = _hostProcess is { HasExited: false } ? DiagnosticsStatusKind.Error : DiagnosticsStatusKind.Warning,
+                Detail = FirstNonEmpty(_cameraDiagnostics.LastError, _virtualCameraDiagnostics.LastError, hintText)
+            };
+        }
+
+        if (_virtualCameraDiagnostics.Running && _virtualCameraDiagnostics.Registered)
+        {
+            return new DiagnosticsHealthCheckState
+            {
+                Status = DiagnosticsStatusKind.Normal,
+                Detail = $"已注册并运行，设备数 {_virtualCameraDiagnostics.DeviceCount}，供帧 {FormatVirtualCameraServedAt(_virtualCameraDiagnostics.LastServedAt)}"
+            };
+        }
+
+        if (_virtualCameraDiagnostics.Running)
+        {
+            return new DiagnosticsHealthCheckState
+            {
+                Status = DiagnosticsStatusKind.Warning,
+                Detail = $"虚拟相机运行中，注册状态：{_virtualCameraDiagnostics.RegistrationText}"
+            };
+        }
+
+        if (!_virtualCameraDiagnostics.Registered)
+        {
+            return new DiagnosticsHealthCheckState
+            {
+                Status = DiagnosticsStatusKind.Warning,
+                Detail = "虚拟相机未注册"
+            };
+        }
+
+        return new DiagnosticsHealthCheckState
+        {
+            Status = DiagnosticsStatusKind.Unknown,
+            Detail = $"{statusText}：{hintText}"
+        };
+    }
+
+    private DiagnosticsHealthCheckState BuildDiagnosticsAudioEndpointHealth()
+    {
+        if (AudioDeviceSwitch is null || MicrophoneSwitch is null || SpeakerSwitch is null)
+        {
+            return new DiagnosticsHealthCheckState
+            {
+                Status = DiagnosticsStatusKind.Unknown,
+                Detail = "音频控件尚未初始化"
+            };
+        }
+
+        if (!AudioDeviceSwitch.IsOn)
+        {
+            return new DiagnosticsHealthCheckState
+            {
+                Status = DiagnosticsStatusKind.Warning,
+                Detail = "音频桥接未启用"
+            };
+        }
+
+        var microphoneIntent = MicrophoneSwitch.IsOn;
+        var speakerIntent = SpeakerSwitch.IsOn;
+        if (!microphoneIntent && !speakerIntent)
+        {
+            return new DiagnosticsHealthCheckState
+            {
+                Status = DiagnosticsStatusKind.Warning,
+                Detail = "麦克风和音响均未启用"
+            };
+        }
+
+        var endpointIssue = BuildAudioEndpointIssueHint(microphoneIntent, speakerIntent);
+        if (!string.IsNullOrWhiteSpace(endpointIssue))
+        {
+            return new DiagnosticsHealthCheckState
+            {
+                Status = HasHardAudioEndpointFailure(microphoneIntent, speakerIntent)
+                    ? DiagnosticsStatusKind.Error
+                    : DiagnosticsStatusKind.Warning,
+                Detail = endpointIssue
+            };
+        }
+
+        if ((microphoneIntent && _microphoneRenderEndpointDiagnostics.Health == AudioEndpointBindingHealth.Unknown)
+            || (speakerIntent && _speakerCaptureEndpointDiagnostics.Health == AudioEndpointBindingHealth.Unknown))
+        {
+            return new DiagnosticsHealthCheckState
+            {
+                Status = DiagnosticsStatusKind.Unknown,
+                Detail = "正在枚举音频端点"
+            };
+        }
+
+        if (_audioOverrideStatus == AudioCapabilityStatus.Error
+            || _microphoneRuntimeStatus == AudioCapabilityStatus.Error
+            || _speakerRuntimeStatus == AudioCapabilityStatus.Error)
+        {
+            return new DiagnosticsHealthCheckState
+            {
+                Status = DiagnosticsStatusKind.Error,
+                Detail = _lastAudioHint
+            };
+        }
+
+        return new DiagnosticsHealthCheckState
+        {
+            Status = DiagnosticsStatusKind.Normal,
+            Detail = BuildAudioEndpointReadyDetail(microphoneIntent, speakerIntent)
+        };
+    }
+
+    private bool HasHardAudioEndpointFailure(bool microphoneIntent, bool speakerIntent)
+    {
+        return (microphoneIntent && IsHardAudioEndpointFailure(_microphoneRenderEndpointDiagnostics.Health))
+            || (speakerIntent && IsHardAudioEndpointFailure(_speakerCaptureEndpointDiagnostics.Health));
+    }
+
+    private static bool IsHardAudioEndpointFailure(AudioEndpointBindingHealth health)
+    {
+        return health is AudioEndpointBindingHealth.Unsupported or AudioEndpointBindingHealth.EnumerationFailed;
+    }
+
+    private static string BuildAudioEndpointReadyDetail(bool microphoneIntent, bool speakerIntent)
+    {
+        if (microphoneIntent && speakerIntent)
+        {
+            return "电脑声音和 Android 麦克风端点已就绪";
+        }
+
+        return microphoneIntent
+            ? "Android 麦克风写入端点已就绪"
+            : "电脑声音 loopback 输出端点已就绪";
+    }
+
+    private static DiagnosticsHealthCheckState ToDiagnosticsHealthCheck(OverviewStepState state, string detail)
+    {
+        return new DiagnosticsHealthCheckState
+        {
+            Status = ToDiagnosticsStatus(state),
+            Detail = detail
+        };
+    }
+
+    private static DiagnosticsStatusKind ToDiagnosticsStatus(OverviewStepState state)
+    {
+        return state switch
+        {
+            OverviewStepState.Complete => DiagnosticsStatusKind.Normal,
+            OverviewStepState.Warning => DiagnosticsStatusKind.Warning,
+            OverviewStepState.Error => DiagnosticsStatusKind.Error,
+            _ => DiagnosticsStatusKind.Unknown
+        };
+    }
+
+    private static DiagnosticsStatusKind WorstDiagnosticsStatus(IEnumerable<DiagnosticsStatusKind> statuses)
+    {
+        if (statuses.Contains(DiagnosticsStatusKind.Error))
+        {
+            return DiagnosticsStatusKind.Error;
+        }
+
+        if (statuses.Contains(DiagnosticsStatusKind.Warning))
+        {
+            return DiagnosticsStatusKind.Warning;
+        }
+
+        if (statuses.Contains(DiagnosticsStatusKind.Unknown))
+        {
+            return DiagnosticsStatusKind.Unknown;
+        }
+
+        return DiagnosticsStatusKind.Normal;
+    }
+
+    private static string DiagnosticsOverallTitle(DiagnosticsStatusKind status)
+    {
+        return status switch
+        {
+            DiagnosticsStatusKind.Normal => "运行诊断正常",
+            DiagnosticsStatusKind.Warning => "运行诊断需要检查",
+            DiagnosticsStatusKind.Error => "运行诊断发现错误",
+            _ => "等待诊断数据"
         };
     }
 
@@ -2336,6 +2866,26 @@ public sealed partial class MainWindow : Window
         await ShowOverviewLogsDialogAsync();
     }
 
+    private void StaticDiagnosticsPage_CopyAllRequested(object? sender, EventArgs e)
+    {
+        CopyOverviewDiagnosticsToClipboard();
+    }
+
+    private async void StaticDiagnosticsPage_ExportLogsRequested(object? sender, EventArgs e)
+    {
+        await ExportOverviewLogsAsync();
+    }
+
+    private async void StaticDiagnosticsPage_RefreshRequested(object? sender, EventArgs e)
+    {
+        await RefreshOverviewAsync(showErrors: true);
+    }
+
+    private async void StaticDiagnosticsPage_RecheckRequested(object? sender, EventArgs e)
+    {
+        await RefreshOverviewAsync(showErrors: true);
+    }
+
     private void OverviewSettingsSaveButton_Click(object sender, RoutedEventArgs e)
     {
         OverviewSettingsPage.SaveChanges();
@@ -2930,6 +3480,7 @@ public sealed partial class MainWindow : Window
             _overviewRefreshInProgress = false;
             UpdateOverviewActionButtons();
             UpdateOverviewEnvironmentBanner();
+            UpdateStaticDiagnosticsPage();
         }
     }
 
@@ -4029,6 +4580,7 @@ public sealed partial class MainWindow : Window
         UpdateOverviewNetworkDiagnostics();
         UpdateOverviewPacketLossDiagnostics(hostRunning);
         UpdateOverviewLatencyDiagnostics(hostRunning);
+        UpdateStaticDiagnosticsPage();
     }
 
     private bool TryGetRunningHostProcess(out Process? process)
@@ -4455,6 +5007,34 @@ public sealed partial class MainWindow : Window
             hasHostLog ? "当前或最近一次 Host stdout/stderr 日志。" : "暂无主机日志。",
             details,
             "复制日志");
+    }
+
+    private async Task ExportOverviewLogsAsync()
+    {
+        try
+        {
+            var directory = Path.Combine(
+                Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
+                "SideDock",
+                "logs");
+            Directory.CreateDirectory(directory);
+
+            var exportPath = Path.Combine(
+                directory,
+                $"sidedock-host-log-{DateTimeOffset.Now:yyyyMMdd-HHmmss}.txt");
+            await File.WriteAllTextAsync(exportPath, BuildHostLogReport(), Encoding.UTF8);
+
+            Process.Start(new ProcessStartInfo
+            {
+                FileName = "explorer.exe",
+                Arguments = $"/select,\"{exportPath}\"",
+                UseShellExecute = true
+            });
+        }
+        catch (Exception ex)
+        {
+            ShowError("无法导出日志", ex.Message);
+        }
     }
 
     private async Task ShowOverviewAdbPathHelpDialogAsync(string reason)
@@ -6763,6 +7343,7 @@ public sealed partial class MainWindow : Window
             statusBrush,
             displayOperationEnabled,
             displayLayout);
+        UpdateStaticDiagnosticsPage();
 
         return displayLayout;
     }
@@ -7582,6 +8163,7 @@ public sealed partial class MainWindow : Window
         OverviewCameraStatusText.Foreground = statusBrush;
         OverviewCameraHintText.Text = hintText;
         UpdateOverviewCameraOptionsEnabled(hostRunning);
+        UpdateStaticDiagnosticsPage();
     }
 
     private (string StatusText, string HintText, Brush StatusBrush) BuildOverviewCameraStatusView()
@@ -9342,6 +9924,7 @@ public sealed partial class MainWindow : Window
             microphoneStatus,
             speakerStatus,
             audioHint);
+        UpdateStaticDiagnosticsPage();
     }
 
     private void UpdateOverviewAudioState(

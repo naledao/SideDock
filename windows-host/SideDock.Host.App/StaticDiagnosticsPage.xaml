@@ -69,19 +69,29 @@
                 FontWeight="SemiBold"
                 Foreground="{StaticResource DiagTextBrush}" />
             <StackPanel Grid.Column="1" Orientation="Horizontal" Spacing="18" VerticalAlignment="Center">
-                <Button Style="{StaticResource DiagHeaderButtonStyle}">
+                <Button
+                    x:Name="CopyAllDiagnosticsButton"
+                    Style="{StaticResource DiagHeaderButtonStyle}"
+                    Click="CopyAllDiagnosticsButton_Click">
                     <StackPanel Orientation="Horizontal" Spacing="10">
                         <FontIcon Glyph="&#xE8C8;" FontSize="17" Foreground="#30363D" />
                         <TextBlock Text="复制全部" VerticalAlignment="Center" FontSize="14" Foreground="{StaticResource DiagBodyBrush}" />
                     </StackPanel>
                 </Button>
-                <Button Style="{StaticResource DiagHeaderButtonStyle}" MinWidth="126">
+                <Button
+                    x:Name="ExportLogsButton"
+                    Style="{StaticResource DiagHeaderButtonStyle}"
+                    MinWidth="126"
+                    Click="ExportLogsButton_Click">
                     <StackPanel Orientation="Horizontal" Spacing="10">
                         <FontIcon Glyph="&#xE898;" FontSize="17" Foreground="#30363D" />
                         <TextBlock Text="导出日志" VerticalAlignment="Center" FontSize="14" Foreground="{StaticResource DiagBodyBrush}" />
                     </StackPanel>
                 </Button>
-                <Button Style="{StaticResource DiagHeaderButtonStyle}">
+                <Button
+                    x:Name="RefreshDiagnosticsButton"
+                    Style="{StaticResource DiagHeaderButtonStyle}"
+                    Click="RefreshDiagnosticsButton_Click">
                     <StackPanel Orientation="Horizontal" Spacing="10">
                         <FontIcon Glyph="&#xE72C;" FontSize="18" Foreground="#30363D" />
                         <TextBlock Text="刷新" VerticalAlignment="Center" FontSize="14" Foreground="{StaticResource DiagBodyBrush}" />
@@ -104,6 +114,7 @@
                 </Grid.RowDefinitions>
 
                 <Border
+                    x:Name="OverallStatusBanner"
                     Style="{StaticResource DiagCardStyle}"
                     Padding="16,0"
                     Background="{StaticResource DiagGreenSoftBrush}"
@@ -114,12 +125,17 @@
                             <ColumnDefinition Width="*" />
                             <ColumnDefinition Width="Auto" />
                         </Grid.ColumnDefinitions>
-                        <Border Width="38" Height="38" CornerRadius="19" Background="{StaticResource DiagGreenBrush}">
-                            <FontIcon Glyph="&#xE73E;" FontSize="22" Foreground="#FFFFFF" />
+                        <Border
+                            x:Name="OverallStatusIconBackground"
+                            Width="38"
+                            Height="38"
+                            CornerRadius="19"
+                            Background="{StaticResource DiagGreenBrush}">
+                            <FontIcon x:Name="OverallStatusIcon" Glyph="&#xE73E;" FontSize="22" Foreground="#FFFFFF" />
                         </Border>
                         <StackPanel Grid.Column="1" VerticalAlignment="Center" Spacing="4">
-                            <TextBlock Text="运行诊断正常" FontSize="18" FontWeight="SemiBold" Foreground="{StaticResource DiagGreenBrush}" />
-                            <TextBlock Text="所有关键服务运行正常，系统性能良好。" FontSize="13" Foreground="{StaticResource DiagBodyBrush}" />
+                            <TextBlock x:Name="OverallStatusTitleText" Text="运行诊断正常" FontSize="18" FontWeight="SemiBold" Foreground="{StaticResource DiagGreenBrush}" />
+                            <TextBlock x:Name="OverallStatusDetailText" Text="所有关键服务运行正常，系统性能良好。" FontSize="13" Foreground="{StaticResource DiagBodyBrush}" />
                         </StackPanel>
                         <FontIcon Grid.Column="2" Glyph="&#xE711;" FontSize="14" Foreground="#30363D" VerticalAlignment="Center" />
                     </Grid>
@@ -145,10 +161,10 @@
                             </Border>
                             <StackPanel Grid.Column="1" VerticalAlignment="Center" Spacing="5">
                                 <TextBlock Text="Host" FontSize="13" Foreground="{StaticResource DiagBodyBrush}" TextTrimming="CharacterEllipsis" />
-                                <TextBlock Text="运行中" FontSize="22" FontWeight="SemiBold" Foreground="{StaticResource DiagGreenBrush}" TextTrimming="CharacterEllipsis" />
-                                <TextBlock Text="正常运行 01:24:36" FontSize="12" Foreground="{StaticResource DiagBodyBrush}" TextTrimming="CharacterEllipsis" />
+                                <TextBlock x:Name="HostStatusValueText" Text="运行中" FontSize="22" FontWeight="SemiBold" Foreground="{StaticResource DiagGreenBrush}" TextTrimming="CharacterEllipsis" />
+                                <TextBlock x:Name="HostStatusDetailText" Text="正常运行 01:24:36" FontSize="12" Foreground="{StaticResource DiagBodyBrush}" TextTrimming="CharacterEllipsis" />
                             </StackPanel>
-                            <Ellipse Grid.Column="2" Width="8" Height="8" Fill="{StaticResource DiagGreenBrush}" VerticalAlignment="Top" Margin="0,18,0,0" />
+                            <Ellipse x:Name="HostStatusDot" Grid.Column="2" Width="8" Height="8" Fill="{StaticResource DiagGreenBrush}" VerticalAlignment="Top" Margin="0,18,0,0" />
                         </Grid>
                     </Border>
 
@@ -164,10 +180,10 @@
                             </Border>
                             <StackPanel Grid.Column="1" VerticalAlignment="Center" Spacing="5">
                                 <TextBlock Text="ADB reverse" FontSize="13" Foreground="{StaticResource DiagBodyBrush}" TextTrimming="CharacterEllipsis" />
-                                <TextBlock Text="正常" FontSize="22" FontWeight="SemiBold" Foreground="{StaticResource DiagGreenBrush}" TextTrimming="CharacterEllipsis" />
-                                <TextBlock Text="4 个端口已映射" FontSize="12" Foreground="{StaticResource DiagBodyBrush}" TextTrimming="CharacterEllipsis" />
+                                <TextBlock x:Name="AdbReverseStatusValueText" Text="正常" FontSize="22" FontWeight="SemiBold" Foreground="{StaticResource DiagGreenBrush}" TextTrimming="CharacterEllipsis" />
+                                <TextBlock x:Name="AdbReverseStatusDetailText" Text="4 个端口已映射" FontSize="12" Foreground="{StaticResource DiagBodyBrush}" TextTrimming="CharacterEllipsis" />
                             </StackPanel>
-                            <Ellipse Grid.Column="2" Width="8" Height="8" Fill="{StaticResource DiagGreenBrush}" VerticalAlignment="Top" Margin="0,18,0,0" />
+                            <Ellipse x:Name="AdbReverseStatusDot" Grid.Column="2" Width="8" Height="8" Fill="{StaticResource DiagGreenBrush}" VerticalAlignment="Top" Margin="0,18,0,0" />
                         </Grid>
                     </Border>
 
@@ -182,11 +198,11 @@
                                 <FontIcon Glyph="&#xE9D2;" FontSize="32" Foreground="{StaticResource DiagPurpleBrush}" />
                             </Border>
                             <StackPanel Grid.Column="1" VerticalAlignment="Center" Spacing="5">
-                                <TextBlock Text="丢包率" FontSize="13" Foreground="{StaticResource DiagBodyBrush}" TextTrimming="CharacterEllipsis" />
-                                <TextBlock Text="0.0%" FontSize="22" FontWeight="SemiBold" Foreground="{StaticResource DiagGreenBrush}" TextTrimming="CharacterEllipsis" />
-                                <TextBlock Text="良好" FontSize="12" Foreground="{StaticResource DiagBodyBrush}" TextTrimming="CharacterEllipsis" />
+                                <TextBlock Text="丢帧/丢包率" FontSize="13" Foreground="{StaticResource DiagBodyBrush}" TextTrimming="CharacterEllipsis" />
+                                <TextBlock x:Name="PacketLossValueText" Text="0.0%" FontSize="22" FontWeight="SemiBold" Foreground="{StaticResource DiagGreenBrush}" TextTrimming="CharacterEllipsis" />
+                                <TextBlock x:Name="PacketLossDetailText" Text="良好" FontSize="12" Foreground="{StaticResource DiagBodyBrush}" TextTrimming="CharacterEllipsis" />
                             </StackPanel>
-                            <Ellipse Grid.Column="2" Width="8" Height="8" Fill="{StaticResource DiagGreenBrush}" VerticalAlignment="Top" Margin="0,18,0,0" />
+                            <Ellipse x:Name="PacketLossStatusDot" Grid.Column="2" Width="8" Height="8" Fill="{StaticResource DiagGreenBrush}" VerticalAlignment="Top" Margin="0,18,0,0" />
                         </Grid>
                     </Border>
 
@@ -202,10 +218,10 @@
                             </Border>
                             <StackPanel Grid.Column="1" VerticalAlignment="Center" Spacing="5">
                                 <TextBlock Text="延迟" FontSize="13" Foreground="{StaticResource DiagBodyBrush}" TextTrimming="CharacterEllipsis" />
-                                <TextBlock Text="22 ms" FontSize="22" FontWeight="SemiBold" Foreground="{StaticResource DiagGreenBrush}" TextTrimming="CharacterEllipsis" />
-                                <TextBlock Text="优秀" FontSize="12" Foreground="{StaticResource DiagBodyBrush}" TextTrimming="CharacterEllipsis" />
+                                <TextBlock x:Name="LatencyValueText" Text="22 ms" FontSize="22" FontWeight="SemiBold" Foreground="{StaticResource DiagGreenBrush}" TextTrimming="CharacterEllipsis" />
+                                <TextBlock x:Name="LatencyDetailText" Text="优秀" FontSize="12" Foreground="{StaticResource DiagBodyBrush}" TextTrimming="CharacterEllipsis" />
                             </StackPanel>
-                            <Ellipse Grid.Column="2" Width="8" Height="8" Fill="{StaticResource DiagGreenBrush}" VerticalAlignment="Top" Margin="0,18,0,0" />
+                            <Ellipse x:Name="LatencyStatusDot" Grid.Column="2" Width="8" Height="8" Fill="{StaticResource DiagGreenBrush}" VerticalAlignment="Top" Margin="0,18,0,0" />
                         </Grid>
                     </Border>
                 </Grid>
@@ -366,63 +382,67 @@
                                 <FontIcon Glyph="&#xE83D;" FontSize="21" Foreground="{StaticResource DiagBodyBrush}" VerticalAlignment="Center" />
                                 <StackPanel Grid.Column="1" VerticalAlignment="Center" Spacing="3">
                                     <TextBlock Text="Android 授权" FontSize="13" FontWeight="SemiBold" Foreground="{StaticResource DiagBodyBrush}" TextTrimming="CharacterEllipsis" />
-                                    <TextBlock Text="设备已授权" FontSize="12" Foreground="{StaticResource DiagMutedBrush}" TextTrimming="CharacterEllipsis" />
+                                    <TextBlock x:Name="AndroidAuthDetailText" Text="设备已授权" FontSize="12" Foreground="{StaticResource DiagMutedBrush}" TextTrimming="CharacterEllipsis" />
                                 </StackPanel>
-                                <TextBlock Grid.Column="2" Text="正常" FontSize="13" FontWeight="SemiBold" Foreground="{StaticResource DiagGreenBrush}" VerticalAlignment="Center" />
-                                <FontIcon Grid.Column="3" Glyph="&#xE73E;" FontSize="14" Foreground="{StaticResource DiagGreenBrush}" VerticalAlignment="Center" />
+                                <TextBlock x:Name="AndroidAuthStatusText" Grid.Column="2" Text="正常" FontSize="13" FontWeight="SemiBold" Foreground="{StaticResource DiagGreenBrush}" VerticalAlignment="Center" />
+                                <FontIcon x:Name="AndroidAuthStatusIcon" Grid.Column="3" Glyph="&#xE73E;" FontSize="14" Foreground="{StaticResource DiagGreenBrush}" VerticalAlignment="Center" />
 
                                 <Border Grid.Row="1" Grid.ColumnSpan="4" Height="1" Background="{StaticResource DiagSoftStrokeBrush}" VerticalAlignment="Top" />
                                 <FontIcon Grid.Row="1" Glyph="&#xE7F4;" FontSize="21" Foreground="{StaticResource DiagBodyBrush}" VerticalAlignment="Center" />
                                 <StackPanel Grid.Row="1" Grid.Column="1" VerticalAlignment="Center" Spacing="3">
                                     <TextBlock Text="端口监听" FontSize="13" FontWeight="SemiBold" Foreground="{StaticResource DiagBodyBrush}" TextTrimming="CharacterEllipsis" />
-                                    <TextBlock Text="4/4 端口正常监听" FontSize="12" Foreground="{StaticResource DiagMutedBrush}" TextTrimming="CharacterEllipsis" />
+                                    <TextBlock x:Name="PortListeningDetailText" Text="4/4 端口正常监听" FontSize="12" Foreground="{StaticResource DiagMutedBrush}" TextTrimming="CharacterEllipsis" />
                                 </StackPanel>
-                                <TextBlock Grid.Row="1" Grid.Column="2" Text="正常" FontSize="13" FontWeight="SemiBold" Foreground="{StaticResource DiagGreenBrush}" VerticalAlignment="Center" />
-                                <FontIcon Grid.Row="1" Grid.Column="3" Glyph="&#xE73E;" FontSize="14" Foreground="{StaticResource DiagGreenBrush}" VerticalAlignment="Center" />
+                                <TextBlock x:Name="PortListeningStatusText" Grid.Row="1" Grid.Column="2" Text="正常" FontSize="13" FontWeight="SemiBold" Foreground="{StaticResource DiagGreenBrush}" VerticalAlignment="Center" />
+                                <FontIcon x:Name="PortListeningStatusIcon" Grid.Row="1" Grid.Column="3" Glyph="&#xE73E;" FontSize="14" Foreground="{StaticResource DiagGreenBrush}" VerticalAlignment="Center" />
 
                                 <Border Grid.Row="2" Grid.ColumnSpan="4" Height="1" Background="{StaticResource DiagSoftStrokeBrush}" VerticalAlignment="Top" />
                                 <FontIcon Grid.Row="2" Glyph="&#xE71B;" FontSize="21" Foreground="{StaticResource DiagBodyBrush}" VerticalAlignment="Center" />
                                 <StackPanel Grid.Row="2" Grid.Column="1" VerticalAlignment="Center" Spacing="3">
                                     <TextBlock Text="ADB reverse" FontSize="13" FontWeight="SemiBold" Foreground="{StaticResource DiagBodyBrush}" TextTrimming="CharacterEllipsis" />
-                                    <TextBlock Text="4/4 端口已映射" FontSize="12" Foreground="{StaticResource DiagMutedBrush}" TextTrimming="CharacterEllipsis" />
+                                    <TextBlock x:Name="AdbReverseHealthDetailText" Text="4/4 端口已映射" FontSize="12" Foreground="{StaticResource DiagMutedBrush}" TextTrimming="CharacterEllipsis" />
                                 </StackPanel>
-                                <TextBlock Grid.Row="2" Grid.Column="2" Text="正常" FontSize="13" FontWeight="SemiBold" Foreground="{StaticResource DiagGreenBrush}" VerticalAlignment="Center" />
-                                <FontIcon Grid.Row="2" Grid.Column="3" Glyph="&#xE73E;" FontSize="14" Foreground="{StaticResource DiagGreenBrush}" VerticalAlignment="Center" />
+                                <TextBlock x:Name="AdbReverseHealthStatusText" Grid.Row="2" Grid.Column="2" Text="正常" FontSize="13" FontWeight="SemiBold" Foreground="{StaticResource DiagGreenBrush}" VerticalAlignment="Center" />
+                                <FontIcon x:Name="AdbReverseHealthStatusIcon" Grid.Row="2" Grid.Column="3" Glyph="&#xE73E;" FontSize="14" Foreground="{StaticResource DiagGreenBrush}" VerticalAlignment="Center" />
 
                                 <Border Grid.Row="3" Grid.ColumnSpan="4" Height="1" Background="{StaticResource DiagSoftStrokeBrush}" VerticalAlignment="Top" />
                                 <FontIcon Grid.Row="3" Glyph="&#xE7F4;" FontSize="21" Foreground="{StaticResource DiagBodyBrush}" VerticalAlignment="Center" />
                                 <StackPanel Grid.Row="3" Grid.Column="1" VerticalAlignment="Center" Spacing="3">
                                     <TextBlock Text="虚拟显示器" FontSize="13" FontWeight="SemiBold" Foreground="{StaticResource DiagBodyBrush}" TextTrimming="CharacterEllipsis" />
-                                    <TextBlock Text="1920 x 1080 @ 120 Hz" FontSize="12" Foreground="{StaticResource DiagMutedBrush}" TextTrimming="CharacterEllipsis" />
+                                    <TextBlock x:Name="VirtualDisplayDetailText" Text="1920 x 1080 @ 120 Hz" FontSize="12" Foreground="{StaticResource DiagMutedBrush}" TextTrimming="CharacterEllipsis" />
                                 </StackPanel>
-                                <TextBlock Grid.Row="3" Grid.Column="2" Text="正常" FontSize="13" FontWeight="SemiBold" Foreground="{StaticResource DiagGreenBrush}" VerticalAlignment="Center" />
-                                <FontIcon Grid.Row="3" Grid.Column="3" Glyph="&#xE73E;" FontSize="14" Foreground="{StaticResource DiagGreenBrush}" VerticalAlignment="Center" />
+                                <TextBlock x:Name="VirtualDisplayStatusText" Grid.Row="3" Grid.Column="2" Text="正常" FontSize="13" FontWeight="SemiBold" Foreground="{StaticResource DiagGreenBrush}" VerticalAlignment="Center" />
+                                <FontIcon x:Name="VirtualDisplayStatusIcon" Grid.Row="3" Grid.Column="3" Glyph="&#xE73E;" FontSize="14" Foreground="{StaticResource DiagGreenBrush}" VerticalAlignment="Center" />
 
                                 <Border Grid.Row="4" Grid.ColumnSpan="4" Height="1" Background="{StaticResource DiagSoftStrokeBrush}" VerticalAlignment="Top" />
                                 <FontIcon Grid.Row="4" Glyph="&#xE722;" FontSize="21" Foreground="{StaticResource DiagBodyBrush}" VerticalAlignment="Center" />
                                 <StackPanel Grid.Row="4" Grid.Column="1" VerticalAlignment="Center" Spacing="3">
                                     <TextBlock Text="虚拟相机" FontSize="13" FontWeight="SemiBold" Foreground="{StaticResource DiagBodyBrush}" TextTrimming="CharacterEllipsis" />
-                                    <TextBlock Text="1280 x 720 @ 30 fps" FontSize="12" Foreground="{StaticResource DiagMutedBrush}" TextTrimming="CharacterEllipsis" />
+                                    <TextBlock x:Name="VirtualCameraDetailText" Text="1280 x 720 @ 30 fps" FontSize="12" Foreground="{StaticResource DiagMutedBrush}" TextTrimming="CharacterEllipsis" />
                                 </StackPanel>
-                                <TextBlock Grid.Row="4" Grid.Column="2" Text="正常" FontSize="13" FontWeight="SemiBold" Foreground="{StaticResource DiagGreenBrush}" VerticalAlignment="Center" />
-                                <FontIcon Grid.Row="4" Grid.Column="3" Glyph="&#xE73E;" FontSize="14" Foreground="{StaticResource DiagGreenBrush}" VerticalAlignment="Center" />
+                                <TextBlock x:Name="VirtualCameraStatusText" Grid.Row="4" Grid.Column="2" Text="正常" FontSize="13" FontWeight="SemiBold" Foreground="{StaticResource DiagGreenBrush}" VerticalAlignment="Center" />
+                                <FontIcon x:Name="VirtualCameraStatusIcon" Grid.Row="4" Grid.Column="3" Glyph="&#xE73E;" FontSize="14" Foreground="{StaticResource DiagGreenBrush}" VerticalAlignment="Center" />
 
                                 <Border Grid.Row="5" Grid.ColumnSpan="4" Height="1" Background="{StaticResource DiagSoftStrokeBrush}" VerticalAlignment="Top" />
                                 <FontIcon Grid.Row="5" Glyph="&#xE995;" FontSize="21" Foreground="{StaticResource DiagBodyBrush}" VerticalAlignment="Center" />
                                 <StackPanel Grid.Row="5" Grid.Column="1" VerticalAlignment="Center" Spacing="3">
                                     <TextBlock Text="音频端点" FontSize="13" FontWeight="SemiBold" Foreground="{StaticResource DiagBodyBrush}" TextTrimming="CharacterEllipsis" />
-                                    <TextBlock Text="播放和录音端点检查" FontSize="12" Foreground="{StaticResource DiagMutedBrush}" TextTrimming="CharacterEllipsis" />
+                                    <TextBlock x:Name="AudioEndpointDetailText" Text="播放和录音端点检查" FontSize="12" Foreground="{StaticResource DiagMutedBrush}" TextTrimming="CharacterEllipsis" />
                                 </StackPanel>
-                                <TextBlock Grid.Row="5" Grid.Column="2" Text="警告" FontSize="13" FontWeight="SemiBold" Foreground="{StaticResource DiagOrangeBrush}" VerticalAlignment="Center" />
-                                <FontIcon Grid.Row="5" Grid.Column="3" Glyph="&#xE7BA;" FontSize="15" Foreground="{StaticResource DiagOrangeBrush}" VerticalAlignment="Center" />
+                                <TextBlock x:Name="AudioEndpointStatusText" Grid.Row="5" Grid.Column="2" Text="警告" FontSize="13" FontWeight="SemiBold" Foreground="{StaticResource DiagOrangeBrush}" VerticalAlignment="Center" />
+                                <FontIcon x:Name="AudioEndpointStatusIcon" Grid.Row="5" Grid.Column="3" Glyph="&#xE7BA;" FontSize="15" Foreground="{StaticResource DiagOrangeBrush}" VerticalAlignment="Center" />
                             </Grid>
 
-                            <Border Grid.Row="2" BorderBrush="{StaticResource DiagSoftStrokeBrush}" BorderThickness="1,1,1,0">
+                            <Button
+                                x:Name="RecheckDiagnosticsButton"
+                                Grid.Row="2"
+                                Style="{StaticResource DiagSmallButtonStyle}"
+                                Click="RecheckDiagnosticsButton_Click">
                                 <StackPanel Orientation="Horizontal" HorizontalAlignment="Center" Spacing="8">
                                     <FontIcon Glyph="&#xE72C;" FontSize="14" Foreground="{StaticResource DiagBodyBrush}" />
                                     <TextBlock Text="重新检查" FontSize="13" Foreground="{StaticResource DiagBodyBrush}" VerticalAlignment="Center" />
                                 </StackPanel>
-                            </Border>
+                            </Button>
                         </Grid>
                     </Border>
                 </Grid>
