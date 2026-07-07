@@ -688,6 +688,10 @@ public final class ControlClient {
         ));
     }
 
+    public void sendCameraCapabilities(JSONObject capabilities) {
+        sendFromAnyThread("camera_capabilities", capabilities == null ? new JSONObject() : capabilities);
+    }
+
     public void sendKeyboardInput(
         String action,
         int androidKeyCode,

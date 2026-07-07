@@ -34,6 +34,7 @@ import android.widget.FrameLayout;
 import android.widget.LinearLayout;
 import android.widget.ProgressBar;
 import android.widget.TextView;
+import org.json.JSONObject;
 import java.text.SimpleDateFormat;
 import java.util.ArrayDeque;
 import java.util.Date;
@@ -361,6 +362,7 @@ public final class MainActivity extends Activity implements ControlClient.Listen
         }
         if (state == ConnectionState.CONNECTED) {
             sendVideoReadyIfSurfaceReady();
+            publishCameraCapabilities("control_connected");
             applyAudioCaptureIntent("电脑音频已连接。");
             applyCameraCaptureIntent("Control channel connected.");
         } else {
@@ -450,6 +452,7 @@ public final class MainActivity extends Activity implements ControlClient.Listen
             ? "Camera uplink configured; restarting capture."
             : "Host camera uplink is disabled.";
         addLog("camera_config " + cameraFacing + " " + cameraWidth + "x" + cameraHeight + "@" + cameraFps + " port=" + cameraPort);
+        publishCameraCapabilities("camera_config");
         if (hostCameraEnabled && controlConnectionState == ConnectionState.CONNECTED && cameraCaptureClient.isRunning()) {
             cameraRuntimeState = "restarting";
             publishCameraStatus(cameraRuntimeState, lastCameraHint);
@@ -552,6 +555,7 @@ public final class MainActivity extends Activity implements ControlClient.Listen
                 lastCameraHint = "Camera capture config applied.";
                 addLog("camera_effective_config " + cameraFacing + " " + cameraWidth + "x" + cameraHeight + "@" + cameraFps + " port=" + cameraPort);
                 publishCameraStatus(cameraRuntimeState, lastCameraHint);
+                publishCameraCapabilities("camera_effective_config");
                 updateOverlay();
             }
         });
@@ -1721,6 +1725,25 @@ public final class MainActivity extends Activity implements ControlClient.Listen
             cameraKeyFramesSent,
             cameraCodecConfigPacketsSent
         );
+    }
+
+    private void publishCameraCapabilities(String reason) {
+        if (controlClient == null || cameraCaptureClient == null) {
+            return;
+        }
+
+        JSONObject capabilities = cameraCaptureClient.buildCapabilitiesSnapshot(
+            reason,
+            hostCameraEnabled,
+            cameraRuntimeState,
+            cameraPort,
+            cameraWidth,
+            cameraHeight,
+            cameraFps,
+            cameraCodec,
+            cameraFacing
+        );
+        controlClient.sendCameraCapabilities(capabilities);
     }
 
     private String audioStatusWireState(AudioStatus status) {

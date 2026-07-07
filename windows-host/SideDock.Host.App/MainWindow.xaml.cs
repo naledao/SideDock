@@ -89,6 +89,7 @@ public sealed partial class MainWindow : Window
     private const int OverviewPreviewIntervalMs = 33;
     private const int MaxOverviewDiagnosticsSamples = 11;
     private const string AudioPreferencesFileName = "audio-preferences.json";
+    private static readonly string[] HostSupportedCameraCodecs = { "video/avc" };
     private static readonly TimeSpan OverviewPreviewStaleAfter = TimeSpan.FromMilliseconds(1500);
     private static readonly TimeSpan VirtualDisplayStatusCacheDuration = TimeSpan.FromSeconds(30);
     private static readonly string DeviceToolProcessName = Path.GetFileNameWithoutExtension(DeviceToolExe);
@@ -168,6 +169,8 @@ public sealed partial class MainWindow : Window
     private string? _lastCameraStatusLine;
     private string? _lastCameraErrorLine;
     private string? _lastCameraErrorMessage;
+    private CameraCapabilitiesSnapshot? _cameraCapabilities;
+    private string _cameraCapabilityHint = "Waiting for Android camera capabilities; showing default camera options.";
     private string? _lastVideoStatsLine;
     private string? _lastEncoderStatsLine;
     private int? _lastHostCpuSampleProcessId;
@@ -3965,30 +3968,41 @@ public sealed partial class MainWindow : Window
     private async void OverviewCameraResolutionCombo_SelectionChanged(object sender, SelectionChangedEventArgs e)
     {
         SyncOverviewCameraComboSelection(OverviewCameraResolutionCombo, OverviewCameraPageResolutionCombo);
+        RefreshOverviewCameraCapabilityOptions(SelectedOverviewCameraConfig(_overviewCameraRequestedEnabled));
         await HandleOverviewCameraConfigSelectionChangedAsync();
     }
 
     private async void OverviewCameraFrameRateCombo_SelectionChanged(object sender, SelectionChangedEventArgs e)
     {
         SyncOverviewCameraComboSelection(OverviewCameraFrameRateCombo, OverviewCameraPageFrameRateCombo);
+        RefreshOverviewCameraCapabilityOptions(SelectedOverviewCameraConfig(_overviewCameraRequestedEnabled));
         await HandleOverviewCameraConfigSelectionChangedAsync();
     }
 
     private async void OverviewCameraPageFacingCombo_SelectionChanged(object sender, SelectionChangedEventArgs e)
     {
         SyncOverviewCameraComboSelection(OverviewCameraPageFacingCombo, CameraFacingCombo);
+        RefreshOverviewCameraCapabilityOptions(SelectedOverviewCameraConfig(_overviewCameraRequestedEnabled));
         await HandleOverviewCameraConfigSelectionChangedAsync();
     }
 
     private async void OverviewCameraPageResolutionCombo_SelectionChanged(object sender, SelectionChangedEventArgs e)
     {
         SyncOverviewCameraComboSelection(OverviewCameraPageResolutionCombo, OverviewCameraResolutionCombo);
+        RefreshOverviewCameraCapabilityOptions(SelectedOverviewCameraConfig(_overviewCameraRequestedEnabled));
         await HandleOverviewCameraConfigSelectionChangedAsync();
     }
 
     private async void OverviewCameraPageFrameRateCombo_SelectionChanged(object sender, SelectionChangedEventArgs e)
     {
         SyncOverviewCameraComboSelection(OverviewCameraPageFrameRateCombo, OverviewCameraFrameRateCombo);
+        RefreshOverviewCameraCapabilityOptions(SelectedOverviewCameraConfig(_overviewCameraRequestedEnabled));
+        await HandleOverviewCameraConfigSelectionChangedAsync();
+    }
+
+    private async void OverviewCameraPageCodecCombo_SelectionChanged(object sender, SelectionChangedEventArgs e)
+    {
+        RefreshOverviewCameraCapabilityOptions(SelectedOverviewCameraConfig(_overviewCameraRequestedEnabled));
         await HandleOverviewCameraConfigSelectionChangedAsync();
     }
 
@@ -4753,6 +4767,7 @@ public sealed partial class MainWindow : Window
             "--camera-width", cameraWidth.ToString(CultureInfo.InvariantCulture),
             "--camera-height", cameraHeight.ToString(CultureInfo.InvariantCulture),
             "--camera-fps", cameraFps.ToString(CultureInfo.InvariantCulture),
+            "--camera-codec", SelectedOverviewCameraCodec(),
             "--camera-facing", Selected(CameraFacingCombo),
             "--nv12-pool-size", _appSettings.Nv12PoolSize.ToString(CultureInfo.InvariantCulture),
             "--encoded-packet-queue", _appSettings.EncodedPacketQueue.ToString(CultureInfo.InvariantCulture),
@@ -5190,15 +5205,61 @@ public sealed partial class MainWindow : Window
 
     private void InitializeOverviewCameraOptions()
     {
+        RefreshOverviewCameraCapabilityOptions(CurrentCameraConfigSelection(_overviewCameraRequestedEnabled));
+
+        SyncOverviewCameraOptionsToDiagnostics();
+        UpdateOverviewCameraState();
+    }
+
+    private void RefreshOverviewCameraCapabilityOptions(CameraConfigSelection preferredConfig)
+    {
+        if (_syncingOverviewCameraOptions
+            || CameraFacingCombo is null
+            || OverviewCameraPageFacingCombo is null
+            || OverviewCameraResolutionCombo is null
+            || OverviewCameraFrameRateCombo is null
+            || OverviewCameraPageResolutionCombo is null
+            || OverviewCameraPageFrameRateCombo is null
+            || OverviewCameraPageCodecCombo is null)
+        {
+            return;
+        }
+
+        var capabilities = _cameraCapabilities;
+        var lenses = capabilities?.Lenses.Count > 0
+            ? capabilities.Lenses
+            : CreateDefaultCameraLenses();
+        var usingReportedCapabilities = capabilities?.Lenses.Count > 0;
+
+        var selectedLens = FindCameraLens(lenses, preferredConfig.Facing) ?? lenses[0];
+        var selectedSize = FindCameraSize(selectedLens, preferredConfig.Width, preferredConfig.Height)
+            ?? FindCameraSize(selectedLens, 1280, 720)
+            ?? selectedLens.Sizes[0];
+        var selectedFps = SelectCameraFps(selectedSize.Fps, preferredConfig.Fps);
+        var selectedCodec = SelectCameraCodec(selectedSize.Codecs, preferredConfig.Codec);
+
         _syncingOverviewCameraOptions = true;
         try
         {
-            SelectComboBoxValue(OverviewCameraPageFacingCombo, Selected(CameraFacingCombo));
-            SelectComboBoxValue(OverviewCameraResolutionCombo, CameraResolutionValue(_cameraDiagnostics.Width, _cameraDiagnostics.Height));
-            SelectComboBoxValue(OverviewCameraFrameRateCombo, _cameraDiagnostics.Fps.ToString(CultureInfo.InvariantCulture));
-            SelectComboBoxValue(OverviewCameraPageResolutionCombo, Selected(OverviewCameraResolutionCombo));
-            SelectComboBoxValue(OverviewCameraPageFrameRateCombo, Selected(OverviewCameraFrameRateCombo));
-            SelectComboBoxValue(OverviewCameraPageCodecCombo, _cameraDiagnostics.Codec);
+            PopulateCameraFacingCombo(CameraFacingCombo, lenses);
+            PopulateCameraFacingCombo(OverviewCameraPageFacingCombo, lenses);
+            SelectComboBoxValue(CameraFacingCombo, selectedLens.Facing);
+            SelectComboBoxValue(OverviewCameraPageFacingCombo, selectedLens.Facing);
+
+            PopulateCameraResolutionCombo(OverviewCameraResolutionCombo, selectedLens.Sizes, compact: true);
+            PopulateCameraResolutionCombo(OverviewCameraPageResolutionCombo, selectedLens.Sizes, compact: false);
+            var resolutionValue = CameraResolutionValue(selectedSize.Width, selectedSize.Height);
+            SelectComboBoxValue(OverviewCameraResolutionCombo, resolutionValue);
+            SelectComboBoxValue(OverviewCameraPageResolutionCombo, resolutionValue);
+
+            PopulateCameraFrameRateCombo(OverviewCameraFrameRateCombo, selectedSize.Fps, compact: true);
+            PopulateCameraFrameRateCombo(OverviewCameraPageFrameRateCombo, selectedSize.Fps, compact: false);
+            var fpsValue = selectedFps.ToString(CultureInfo.InvariantCulture);
+            SelectComboBoxValue(OverviewCameraFrameRateCombo, fpsValue);
+            SelectComboBoxValue(OverviewCameraPageFrameRateCombo, fpsValue);
+
+            PopulateCameraCodecCombo(OverviewCameraPageCodecCombo, selectedSize.Codecs);
+            SelectComboBoxValue(OverviewCameraPageCodecCombo, selectedCodec);
             OverviewCameraPagePortBox.Value = OverviewCameraPortBox.Value;
         }
         finally
@@ -5206,8 +5267,182 @@ public sealed partial class MainWindow : Window
             _syncingOverviewCameraOptions = false;
         }
 
-        SyncOverviewCameraOptionsToDiagnostics();
-        UpdateOverviewCameraState();
+        _cameraCapabilityHint = BuildCameraCapabilityHint(
+            usingReportedCapabilities,
+            selectedLens,
+            selectedSize,
+            selectedFps,
+            selectedCodec,
+            preferredConfig);
+    }
+
+    private CameraConfigSelection CurrentCameraConfigSelection(bool enabled)
+    {
+        return new CameraConfigSelection(
+            enabled,
+            _cameraDiagnostics.Port,
+            _cameraDiagnostics.Width,
+            _cameraDiagnostics.Height,
+            _cameraDiagnostics.Fps,
+            _cameraDiagnostics.Codec,
+            _cameraDiagnostics.Facing);
+    }
+
+    private static IReadOnlyList<CameraLensCapability> CreateDefaultCameraLenses()
+    {
+        var defaultSizes = new[]
+        {
+            new CameraSizeCapability(1280, 720, new[] { 30, 60, 120 }, new[] { "video/avc" }),
+            new CameraSizeCapability(1920, 1080, new[] { 30, 60, 120 }, new[] { "video/avc" }),
+            new CameraSizeCapability(2560, 1440, new[] { 30, 60, 120 }, new[] { "video/avc" })
+        };
+
+        return new[]
+        {
+            new CameraLensCapability("back", "", "Back", defaultSizes),
+            new CameraLensCapability("front", "", "Front", defaultSizes)
+        };
+    }
+
+    private static CameraLensCapability? FindCameraLens(IReadOnlyList<CameraLensCapability> lenses, string facing)
+    {
+        return lenses.FirstOrDefault(lens => lens.Facing.Equals(NormalizeCameraFacing(facing), StringComparison.OrdinalIgnoreCase))
+            ?? lenses.FirstOrDefault(lens => lens.Sizes.Count > 0);
+    }
+
+    private static CameraSizeCapability? FindCameraSize(CameraLensCapability lens, int width, int height)
+    {
+        return lens.Sizes.FirstOrDefault(size => size.Width == width && size.Height == height);
+    }
+
+    private static int SelectCameraFps(IReadOnlyList<int> fpsValues, int preferredFps)
+    {
+        if (fpsValues.Count == 0)
+        {
+            return Math.Max(1, preferredFps);
+        }
+
+        if (fpsValues.Contains(preferredFps))
+        {
+            return preferredFps;
+        }
+
+        return fpsValues
+            .OrderBy(fps => fps > preferredFps ? 1 : 0)
+            .ThenBy(fps => Math.Abs(fps - preferredFps))
+            .ThenByDescending(fps => fps)
+            .First();
+    }
+
+    private static string SelectCameraCodec(IReadOnlyList<string> codecs, string preferredCodec)
+    {
+        var normalizedPreferred = NormalizeCameraCodec(preferredCodec);
+        if (codecs.Any(codec => codec.Equals(normalizedPreferred, StringComparison.OrdinalIgnoreCase))
+            && IsHostSupportedCameraCodec(normalizedPreferred))
+        {
+            return normalizedPreferred;
+        }
+
+        return codecs.FirstOrDefault(IsHostSupportedCameraCodec) ?? "video/avc";
+    }
+
+    private static void PopulateCameraFacingCombo(ComboBox comboBox, IReadOnlyList<CameraLensCapability> lenses)
+    {
+        comboBox.Items.Clear();
+        foreach (var lens in lenses)
+        {
+            var label = lens.Facing.Equals("front", StringComparison.OrdinalIgnoreCase) ? "前置" : "后置";
+            if (!string.IsNullOrWhiteSpace(lens.CameraId))
+            {
+                label += $" ({lens.CameraId})";
+            }
+
+            comboBox.Items.Add(new ComboBoxItem { Content = label, Tag = lens.Facing });
+        }
+    }
+
+    private static void PopulateCameraResolutionCombo(ComboBox comboBox, IReadOnlyList<CameraSizeCapability> sizes, bool compact)
+    {
+        comboBox.Items.Clear();
+        foreach (var size in sizes)
+        {
+            var value = CameraResolutionValue(size.Width, size.Height);
+            var label = compact
+                ? CameraResolutionCompactLabel(size.Width, size.Height)
+                : $"{size.Width}×{size.Height}";
+            comboBox.Items.Add(new ComboBoxItem { Content = label, Tag = value });
+        }
+    }
+
+    private static void PopulateCameraFrameRateCombo(ComboBox comboBox, IReadOnlyList<int> fpsValues, bool compact)
+    {
+        comboBox.Items.Clear();
+        foreach (var fps in fpsValues.OrderBy(value => value))
+        {
+            var value = fps.ToString(CultureInfo.InvariantCulture);
+            comboBox.Items.Add(new ComboBoxItem { Content = compact ? value : $"{value} fps", Tag = value });
+        }
+    }
+
+    private static void PopulateCameraCodecCombo(ComboBox comboBox, IReadOnlyList<string> codecs)
+    {
+        comboBox.Items.Clear();
+        var added = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        foreach (var codec in codecs)
+        {
+            var normalized = NormalizeCameraCodec(codec);
+            if (!added.Add(normalized))
+            {
+                continue;
+            }
+
+            comboBox.Items.Add(new ComboBoxItem
+            {
+                Content = IsHostSupportedCameraCodec(normalized)
+                    ? FormatCameraCodec(normalized)
+                    : $"{FormatCameraCodec(normalized)} (Windows receiver unavailable)",
+                Tag = normalized,
+                IsEnabled = IsHostSupportedCameraCodec(normalized)
+            });
+        }
+
+        if (!added.Contains("video/avc"))
+        {
+            comboBox.Items.Insert(0, new ComboBoxItem
+            {
+                Content = FormatCameraCodec("video/avc"),
+                Tag = "video/avc",
+                IsEnabled = true
+            });
+        }
+    }
+
+    private static string BuildCameraCapabilityHint(
+        bool usingReportedCapabilities,
+        CameraLensCapability selectedLens,
+        CameraSizeCapability selectedSize,
+        int selectedFps,
+        string selectedCodec,
+        CameraConfigSelection requestedConfig)
+    {
+        if (!usingReportedCapabilities)
+        {
+            return "Waiting for Android camera capabilities; showing default options.";
+        }
+
+        var selectedChanged = !selectedLens.Facing.Equals(NormalizeCameraFacing(requestedConfig.Facing), StringComparison.OrdinalIgnoreCase)
+            || selectedSize.Width != requestedConfig.Width
+            || selectedSize.Height != requestedConfig.Height
+            || selectedFps != requestedConfig.Fps
+            || !selectedCodec.Equals(NormalizeCameraCodec(requestedConfig.Codec), StringComparison.OrdinalIgnoreCase);
+        var hevcReported = selectedSize.Codecs.Any(codec => NormalizeCameraCodec(codec).Equals("video/hevc", StringComparison.OrdinalIgnoreCase));
+        var suffix = hevcReported
+            ? " Android reports HEVC, but this Windows camera receiver currently falls back to AVC."
+            : string.Empty;
+
+        return selectedChanged
+            ? $"Android capabilities do not include the requested combination; using {selectedSize.Width}x{selectedSize.Height}@{selectedFps} {selectedCodec}.{suffix}"
+            : $"Android capabilities loaded for {selectedLens.Facing} camera.{suffix}";
     }
 
     private void SyncOverviewCameraOptionsToDiagnostics()
@@ -5242,6 +5477,8 @@ public sealed partial class MainWindow : Window
         {
             return;
         }
+
+        RefreshOverviewCameraCapabilityOptions(SelectedOverviewCameraConfig(_overviewCameraRequestedEnabled));
 
         if (_hostProcess is { HasExited: false })
         {
@@ -5348,7 +5585,13 @@ public sealed partial class MainWindow : Window
 
     private (int Width, int Height) SelectedOverviewCameraResolution()
     {
-        return Selected(OverviewCameraResolutionCombo).Trim().ToLowerInvariant() switch
+        var value = Selected(OverviewCameraResolutionCombo).Trim().ToLowerInvariant();
+        if (TryParseCameraResolutionValue(value, out var width, out var height))
+        {
+            return (width, height);
+        }
+
+        return value switch
         {
             "1080p" => (1920, 1080),
             "2k" => (2560, 1440),
@@ -5366,7 +5609,7 @@ public sealed partial class MainWindow : Window
     private string SelectedOverviewCameraCodec()
     {
         var codec = Selected(OverviewCameraPageCodecCombo);
-        return string.IsNullOrWhiteSpace(codec) ? _cameraDiagnostics.Codec : codec;
+        return string.IsNullOrWhiteSpace(codec) ? _cameraDiagnostics.Codec : NormalizeCameraCodec(codec);
     }
 
     private CameraConfigSelection SelectedOverviewCameraConfig(bool enabled)
@@ -5402,12 +5645,13 @@ public sealed partial class MainWindow : Window
         _cameraDiagnostics.Width = config.Width;
         _cameraDiagnostics.Height = config.Height;
         _cameraDiagnostics.Fps = config.Fps;
-        _cameraDiagnostics.Codec = config.Codec;
+        _cameraDiagnostics.Codec = NormalizeCameraCodec(config.Codec);
         _cameraDiagnostics.Facing = NormalizeCameraFacing(config.Facing);
     }
 
     private void SyncOverviewCameraSelectionsFromConfig(CameraConfigSelection config)
     {
+        RefreshOverviewCameraCapabilityOptions(config);
         _syncingOverviewCameraOptions = true;
         try
         {
@@ -5449,7 +5693,31 @@ public sealed partial class MainWindow : Window
         {
             (1920, 1080) => "1080p",
             (2560, 1440) => "2k",
-            _ => "720p"
+            (1280, 720) => "720p",
+            _ => $"{width}x{height}"
+        };
+    }
+
+    private static bool TryParseCameraResolutionValue(string value, out int width, out int height)
+    {
+        width = 0;
+        height = 0;
+        var parts = value.Replace('×', 'x').Split('x', StringSplitOptions.TrimEntries | StringSplitOptions.RemoveEmptyEntries);
+        return parts.Length == 2
+            && int.TryParse(parts[0], NumberStyles.Integer, CultureInfo.InvariantCulture, out width)
+            && int.TryParse(parts[1], NumberStyles.Integer, CultureInfo.InvariantCulture, out height)
+            && width > 0
+            && height > 0;
+    }
+
+    private static string CameraResolutionCompactLabel(int width, int height)
+    {
+        return (width, height) switch
+        {
+            (1280, 720) => "720p",
+            (1920, 1080) => "1080p",
+            (2560, 1440) => "2K",
+            _ => $"{width}×{height}"
         };
     }
 
@@ -9891,7 +10159,17 @@ public sealed partial class MainWindow : Window
     private void UpdateOverviewCameraEncodingStatus()
     {
         var camera = _cameraDiagnostics;
-        SelectComboBoxValue(OverviewCameraPageCodecCombo, camera.Codec);
+        var wasSyncingCameraOptions = _syncingOverviewCameraOptions;
+        _syncingOverviewCameraOptions = true;
+        try
+        {
+            SelectComboBoxValue(OverviewCameraPageCodecCombo, camera.Codec);
+        }
+        finally
+        {
+            _syncingOverviewCameraOptions = wasSyncingCameraOptions;
+        }
+
         OverviewCameraEncodingCodecText.Text = FormatCameraCodec(camera.Codec);
         OverviewCameraEncodingResolutionText.Text = $"{camera.Width}×{camera.Height}";
         OverviewCameraEncodingFpsText.Text = camera.ApproxFps > 0
@@ -10110,9 +10388,13 @@ public sealed partial class MainWindow : Window
 
     private static string FormatCameraCodec(string codec)
     {
-        return codec.Trim().Equals("video/avc", StringComparison.OrdinalIgnoreCase)
-            ? "video/avc (H.264)"
-            : string.IsNullOrWhiteSpace(codec) ? "--" : codec;
+        var normalized = NormalizeCameraCodec(codec);
+        return normalized switch
+        {
+            "video/avc" => "video/avc (H.264)",
+            "video/hevc" => "video/hevc (H.265)",
+            _ => string.IsNullOrWhiteSpace(codec) ? "--" : codec
+        };
     }
 
     private static string FormatCameraBitrate(double kbps)
@@ -10285,12 +10567,13 @@ public sealed partial class MainWindow : Window
         OverviewCameraPageFacingCombo.IsEnabled = enabled;
         OverviewCameraPageResolutionCombo.IsEnabled = enabled;
         OverviewCameraPageFrameRateCombo.IsEnabled = enabled;
-        OverviewCameraPageCodecCombo.IsEnabled = false;
+        OverviewCameraPageCodecCombo.IsEnabled = enabled && OverviewCameraPageCodecCombo.Items.Count > 1;
         OverviewCameraPagePortBox.IsEnabled = portEnabled;
         OverviewCameraSettingsButton.IsEnabled = enabled;
         OverviewCameraPageConfigHintText.Text = hostRunning
             ? "主机运行中可动态应用镜头、分辨率和帧率；端口会在下次启动生效。当前链路仅支持 video/avc。"
             : "镜头、分辨率、帧率和端口会在下次启动摄像头管线时生效。当前链路仅支持 video/avc。";
+        OverviewCameraPageConfigHintText.Text = $"{OverviewCameraPageConfigHintText.Text} {_cameraCapabilityHint}";
     }
 
     private bool HasCameraError()
@@ -10344,7 +10627,7 @@ public sealed partial class MainWindow : Window
     private string FormatSelectedOverviewCameraConfig()
     {
         var (width, height) = SelectedOverviewCameraResolution();
-        return $"{width}x{height}@{SelectedOverviewCameraFps()}";
+        return $"{width}x{height}@{SelectedOverviewCameraFps()} {SelectedOverviewCameraCodec()}";
     }
 
     private async Task RunVirtualCameraCommandAsync(string command)
@@ -11370,6 +11653,8 @@ public sealed partial class MainWindow : Window
         _lastCameraStatusLine = null;
         _lastCameraErrorLine = null;
         _lastCameraErrorMessage = null;
+        _cameraCapabilities = null;
+        _cameraCapabilityHint = "Waiting for Android camera capabilities; showing default camera options.";
         _lastVideoStatsLine = null;
         _lastEncoderStatsLine = null;
         _cameraDiagnostics.Reset();
@@ -11380,6 +11665,8 @@ public sealed partial class MainWindow : Window
         _cameraDiagnostics.Width = cameraWidth;
         _cameraDiagnostics.Height = cameraHeight;
         _cameraDiagnostics.Fps = SelectedOverviewCameraFps();
+        _cameraDiagnostics.Codec = SelectedOverviewCameraCodec();
+        RefreshOverviewCameraCapabilityOptions(CurrentCameraConfigSelection(_overviewCameraRequestedEnabled));
 
         if (CopyAudioLogButtonText is not null)
         {
@@ -11594,6 +11881,12 @@ public sealed partial class MainWindow : Window
             return;
         }
 
+        if (line.Contains("camera-capabilities payload=", StringComparison.OrdinalIgnoreCase))
+        {
+            HandleCameraCapabilitiesHostOutputLine(line);
+            return;
+        }
+
         if (!line.Contains("camera-state=", StringComparison.OrdinalIgnoreCase)
             && !line.Contains("camera-client-state=", StringComparison.OrdinalIgnoreCase))
         {
@@ -11660,9 +11953,44 @@ public sealed partial class MainWindow : Window
         if (isClient)
         {
             ResolvePendingCameraRuntimeConfig(state);
+            if (_pendingCameraRuntimeConfig is null
+                && !_cameraRuntimeConfigApplyInProgress
+                && StateEquals(state, "capturing"))
+            {
+                var effectiveConfig = CurrentCameraConfigSelection(_overviewCameraRequestedEnabled);
+                RefreshOverviewCameraCapabilityOptions(effectiveConfig);
+                SyncOverviewCameraSelectionsFromConfig(effectiveConfig);
+            }
         }
 
         UpdateCameraStatusView();
+    }
+
+    private void HandleCameraCapabilitiesHostOutputLine(string line)
+    {
+        _lastCameraStatusLine = line;
+        var json = ExtractLogTail(line, "camera-capabilities payload=");
+        if (string.IsNullOrWhiteSpace(json))
+        {
+            return;
+        }
+
+        try
+        {
+            _cameraCapabilities = CameraCapabilitiesSnapshot.Parse(json);
+            if (_cameraCapabilities.Current is { } current)
+            {
+                ApplyCameraConfigSelectionToDiagnostics(current);
+            }
+
+            RefreshOverviewCameraCapabilityOptions(CurrentCameraConfigSelection(_overviewCameraRequestedEnabled));
+            UpdateCameraStatusView();
+        }
+        catch (Exception ex) when (ex is JsonException or InvalidOperationException or FormatException)
+        {
+            _cameraDiagnostics.LastError = $"Unable to parse Android camera capabilities: {ex.Message}";
+            UpdateCameraStatusView();
+        }
     }
 
     private void HandleCameraConfigChangeHostOutputLine(string line)
@@ -11870,6 +12198,27 @@ public sealed partial class MainWindow : Window
     private static string NormalizeCameraFacing(string value)
     {
         return value.Trim().Equals("front", StringComparison.OrdinalIgnoreCase) ? "front" : "back";
+    }
+
+    private static string NormalizeCameraCodec(string value)
+    {
+        if (string.IsNullOrWhiteSpace(value))
+        {
+            return "video/avc";
+        }
+
+        return value.Trim().ToLowerInvariant() switch
+        {
+            "avc" or "h264" or "h.264" or "video/h264" => "video/avc",
+            "hevc" or "h265" or "h.265" or "video/h265" => "video/hevc",
+            var codec => codec
+        };
+    }
+
+    private static bool IsHostSupportedCameraCodec(string codec)
+    {
+        var normalized = NormalizeCameraCodec(codec);
+        return HostSupportedCameraCodecs.Any(supported => supported.Equals(normalized, StringComparison.OrdinalIgnoreCase));
     }
 
     private static string AudioStateHint(AudioDirection direction, AudioCapabilityStatus status)
@@ -13298,6 +13647,190 @@ public sealed partial class MainWindow : Window
     {
         public string Summary => $"{Width}x{Height}@{Fps} {Codec} {Facing}";
     }
+
+    private sealed record CameraCapabilitiesSnapshot(
+        IReadOnlyList<CameraLensCapability> Lenses,
+        CameraConfigSelection? Current,
+        string Error)
+    {
+        public static CameraCapabilitiesSnapshot Parse(string json)
+        {
+            using var document = JsonDocument.Parse(json);
+            var root = document.RootElement;
+            var lenses = new List<CameraLensCapability>();
+            if (root.TryGetProperty("lenses", out var lensesElement)
+                && lensesElement.ValueKind == JsonValueKind.Array)
+            {
+                foreach (var lensElement in lensesElement.EnumerateArray())
+                {
+                    var lens = ParseLens(lensElement);
+                    if (lens.Sizes.Count > 0)
+                    {
+                        lenses.Add(lens);
+                    }
+                }
+            }
+
+            var current = root.TryGetProperty("current", out var currentElement)
+                ? ParseCurrent(currentElement)
+                : null;
+            var error = root.TryGetProperty("error", out var errorElement)
+                ? errorElement.GetString() ?? string.Empty
+                : string.Empty;
+
+            if (lenses.Count == 0)
+            {
+                lenses.AddRange(CreateDefaultCameraLenses());
+            }
+
+            return new CameraCapabilitiesSnapshot(
+                lenses
+                    .OrderBy(lens => lens.Facing.Equals("back", StringComparison.OrdinalIgnoreCase) ? 0 : 1)
+                    .ThenBy(lens => lens.CameraId)
+                    .ToArray(),
+                current,
+                error);
+        }
+
+        private static CameraLensCapability ParseLens(JsonElement element)
+        {
+            var facing = NormalizeCameraFacing(ReadJsonString(element, "facing", "back"));
+            var cameraId = ReadJsonString(element, "cameraId", string.Empty);
+            var label = string.IsNullOrWhiteSpace(cameraId)
+                ? facing
+                : $"{facing} ({cameraId})";
+            var sizes = new List<CameraSizeCapability>();
+
+            if (element.TryGetProperty("sizes", out var sizesElement)
+                && sizesElement.ValueKind == JsonValueKind.Array)
+            {
+                foreach (var sizeElement in sizesElement.EnumerateArray())
+                {
+                    var width = ReadJsonInt(sizeElement, "width", 0);
+                    var height = ReadJsonInt(sizeElement, "height", 0);
+                    if (width <= 0 || height <= 0)
+                    {
+                        continue;
+                    }
+
+                    var fps = ReadJsonIntArray(sizeElement, "fps", new[] { 30 });
+                    var codecs = ReadJsonStringArray(sizeElement, "codecs", new[] { "video/avc" })
+                        .Select(NormalizeCameraCodec)
+                        .Distinct(StringComparer.OrdinalIgnoreCase)
+                        .ToArray();
+                    sizes.Add(new CameraSizeCapability(width, height, fps, codecs));
+                }
+            }
+
+            return new CameraLensCapability(
+                facing,
+                cameraId,
+                label,
+                sizes
+                    .GroupBy(size => (size.Width, size.Height))
+                    .Select(group => group.First())
+                    .OrderBy(size => size.Width * size.Height)
+                    .ThenBy(size => size.Width)
+                    .ToArray());
+        }
+
+        private static CameraConfigSelection? ParseCurrent(JsonElement element)
+        {
+            if (element.ValueKind != JsonValueKind.Object)
+            {
+                return null;
+            }
+
+            return new CameraConfigSelection(
+                element.TryGetProperty("enabled", out var enabledProperty)
+                    && enabledProperty.ValueKind is JsonValueKind.True or JsonValueKind.False
+                    && enabledProperty.GetBoolean(),
+                ReadJsonInt(element, "port", DefaultCameraPort),
+                Math.Max(1, ReadJsonInt(element, "width", 1280)),
+                Math.Max(1, ReadJsonInt(element, "height", 720)),
+                Math.Max(1, ReadJsonInt(element, "fps", 30)),
+                NormalizeCameraCodec(ReadJsonString(element, "codec", "video/avc")),
+                NormalizeCameraFacing(ReadJsonString(element, "facing", "back")));
+        }
+
+        private static string ReadJsonString(JsonElement element, string propertyName, string fallback)
+        {
+            if (!element.TryGetProperty(propertyName, out var property))
+            {
+                return fallback;
+            }
+
+            return property.ValueKind == JsonValueKind.String
+                ? property.GetString() ?? fallback
+                : fallback;
+        }
+
+        private static IReadOnlyList<int> ReadJsonIntArray(JsonElement element, string propertyName, IReadOnlyList<int> fallback)
+        {
+            if (!element.TryGetProperty(propertyName, out var property)
+                || property.ValueKind != JsonValueKind.Array)
+            {
+                return fallback;
+            }
+
+            var values = new List<int>();
+            foreach (var item in property.EnumerateArray())
+            {
+                var value = item.ValueKind switch
+                {
+                    JsonValueKind.Number when item.TryGetInt32(out var number) => number,
+                    JsonValueKind.String when int.TryParse(item.GetString(), NumberStyles.Integer, CultureInfo.InvariantCulture, out var number) => number,
+                    _ => 0
+                };
+                if (value > 0)
+                {
+                    values.Add(value);
+                }
+            }
+
+            return values.Count == 0
+                ? fallback
+                : values.Distinct().OrderBy(value => value).ToArray();
+        }
+
+        private static IReadOnlyList<string> ReadJsonStringArray(JsonElement element, string propertyName, IReadOnlyList<string> fallback)
+        {
+            if (!element.TryGetProperty(propertyName, out var property)
+                || property.ValueKind != JsonValueKind.Array)
+            {
+                return fallback;
+            }
+
+            var values = new List<string>();
+            foreach (var item in property.EnumerateArray())
+            {
+                if (item.ValueKind == JsonValueKind.String)
+                {
+                    var value = item.GetString();
+                    if (!string.IsNullOrWhiteSpace(value))
+                    {
+                        values.Add(value!);
+                    }
+                }
+            }
+
+            return values.Count == 0
+                ? fallback
+                : values.Distinct(StringComparer.OrdinalIgnoreCase).ToArray();
+        }
+    }
+
+    private sealed record CameraLensCapability(
+        string Facing,
+        string CameraId,
+        string Label,
+        IReadOnlyList<CameraSizeCapability> Sizes);
+
+    private sealed record CameraSizeCapability(
+        int Width,
+        int Height,
+        IReadOnlyList<int> Fps,
+        IReadOnlyList<string> Codecs);
 
     private sealed record HostCameraConfigCommandResult(bool Ok, string Message, CameraConfigSelection EffectiveConfig);
 

@@ -2736,6 +2736,7 @@
                                                     Grid.Column="1"
                                                     SelectedIndex="0"
                                                     IsEnabled="False"
+                                                    SelectionChanged="OverviewCameraPageCodecCombo_SelectionChanged"
                                                     ToolTipService.ToolTip="编码格式由当前摄像头链路上报，本轮暂不支持手动切换。"
                                                     HorizontalAlignment="Stretch">
                                                     <ComboBoxItem Content="video/avc" Tag="video/avc" />

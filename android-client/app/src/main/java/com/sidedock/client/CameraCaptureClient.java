@@ -13,6 +13,7 @@ import android.hardware.camera2.CaptureRequest;
 import android.hardware.camera2.params.StreamConfigurationMap;
 import android.media.MediaCodec;
 import android.media.MediaCodecInfo;
+import android.media.MediaCodecList;
 import android.media.MediaFormat;
 import android.media.MediaRecorder;
 import android.os.Build;
@@ -22,15 +23,21 @@ import android.os.HandlerThread;
 import android.util.Range;
 import android.util.Size;
 import android.view.Surface;
+import org.json.JSONArray;
+import org.json.JSONObject;
 import java.io.OutputStream;
 import java.net.InetSocketAddress;
 import java.net.Socket;
 import java.nio.ByteBuffer;
 import java.nio.ByteOrder;
+import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Collections;
 import java.util.Comparator;
+import java.util.HashSet;
+import java.util.List;
 import java.util.Locale;
+import java.util.Set;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
@@ -54,6 +61,9 @@ public final class CameraCaptureClient {
     private static final byte[] MAGIC = new byte[] { 'S', 'D', 'C', 'M' };
     private static final byte[] ANNEX_B_START_CODE = new byte[] { 0, 0, 0, 1 };
     private static final String DEFAULT_CODEC = "video/avc";
+    private static final String HEVC_CODEC = "video/hevc";
+    private static final String[] CAMERA_ENCODER_CODECS = new String[] { DEFAULT_CODEC, HEVC_CODEC };
+    private static final int[] PREFERRED_TARGET_FPS = new int[] { 30, 60, 120, 24, 15 };
 
     private final Context context;
     private final Listener listener;
@@ -133,6 +143,72 @@ public final class CameraCaptureClient {
         return running;
     }
 
+    public JSONObject buildCapabilitiesSnapshot(
+        String reason,
+        boolean enabled,
+        String state,
+        int currentPort,
+        int currentWidth,
+        int currentHeight,
+        int currentFps,
+        String currentCodec,
+        String currentFacing
+    ) {
+        JSONObject root = new JSONObject();
+        try {
+            root.put("schema", 1);
+            root.put("reason", reason == null ? "" : reason);
+            root.put("queriedAtMs", System.currentTimeMillis());
+            root.put("manufacturer", Build.MANUFACTURER == null ? "" : Build.MANUFACTURER);
+            root.put("model", Build.MODEL == null ? "" : Build.MODEL);
+            root.put("androidSdk", Build.VERSION.SDK_INT);
+            root.put("streamCodecs", stringArrayJson(availableEncoderCodecsForStream()));
+            root.put("current", currentConfigJson(
+                enabled,
+                state,
+                currentPort,
+                currentWidth,
+                currentHeight,
+                currentFps,
+                currentCodec,
+                currentFacing
+            ));
+
+            JSONArray lenses = new JSONArray();
+            CameraManager cameraManager = (CameraManager) context.getSystemService(Context.CAMERA_SERVICE);
+            if (cameraManager == null) {
+                root.put("error", "CameraManager is unavailable.");
+                root.put("lenses", lenses);
+                return root;
+            }
+
+            String[] cameraIds = cameraManager.getCameraIdList();
+            for (String cameraId : cameraIds) {
+                try {
+                    CameraCharacteristics characteristics = cameraManager.getCameraCharacteristics(cameraId);
+                    lenses.put(cameraCapabilityJson(cameraId, characteristics, currentWidth, currentHeight, currentFps));
+                } catch (Exception ex) {
+                    JSONObject lensError = new JSONObject();
+                    lensError.put("cameraId", cameraId == null ? "" : cameraId);
+                    lensError.put("error", exceptionSummary(ex));
+                    lenses.put(lensError);
+                }
+            }
+
+            root.put("lenses", lenses);
+            if (lenses.length() == 0) {
+                root.put("error", "No camera is available.");
+            }
+        } catch (Exception ex) {
+            try {
+                root.put("error", exceptionSummary(ex));
+            } catch (Exception ignored) {
+            }
+        }
+
+        return root;
+    }
+
     private StopToken stopLocked() {
         ExecutorService previousExecutor = executor;
         CountDownLatch previousStopLatch = stopLatch;
@@ -201,12 +277,13 @@ public final class CameraCaptureClient {
 
                     String cameraId = findCameraId(cameraManager, facing);
                     CameraCharacteristics characteristics = cameraManager.getCameraCharacteristics(cameraId);
-                    Size captureSize = chooseCaptureSize(characteristics, width, height);
-                    Range<Integer> fpsRange = chooseFpsRange(characteristics, fps);
-                    int effectiveFps = effectiveFpsForRange(fpsRange, fps);
+                    String effectiveCodec = selectEffectiveCameraCodec(codec);
+                    Size captureSize = chooseCaptureSize(characteristics, width, height, effectiveCodec);
+                    int effectiveFps = chooseEffectiveFps(characteristics, captureSize, fps, effectiveCodec);
+                    Range<Integer> fpsRange = chooseFpsRange(characteristics, effectiveFps);
                     String effectiveFacing = cameraFacingName(characteristics, facing);
 
-                    encoder = createEncoder(codec, captureSize.getWidth(), captureSize.getHeight(), effectiveFps);
+                    encoder = createEncoder(effectiveCodec, captureSize.getWidth(), captureSize.getHeight(), effectiveFps);
                     encoderSurface = encoder.createInputSurface();
                     encoder.start();
 
@@ -218,7 +295,7 @@ public final class CameraCaptureClient {
                     captureSession = createCaptureSession(cameraDevice, encoderSurface, cameraHandler);
                     startRepeatingCapture(cameraDevice, captureSession, encoderSurface, characteristics, fpsRange);
 
-                    emitConfigApplied(port, captureSize.getWidth(), captureSize.getHeight(), effectiveFps, codec, effectiveFacing);
+                    emitConfigApplied(port, captureSize.getWidth(), captureSize.getHeight(), effectiveFps, effectiveCodec, effectiveFacing);
                     emitState("capturing", "Camera capture started (" + effectiveFacing + ").");
                     reconnectDelayMs = 300L;
                     drainEncoder(encoder, nextSocket.getOutputStream(), runGeneration);
@@ -706,6 +783,361 @@ public final class CameraCaptureClient {
         return false;
     }
 
+    private static JSONObject currentConfigJson(
+        boolean enabled,
+        String state,
+        int currentPort,
+        int currentWidth,
+        int currentHeight,
+        int currentFps,
+        String currentCodec,
+        String currentFacing
+    ) throws Exception {
+        JSONObject current = new JSONObject();
+        current.put("enabled", enabled);
+        current.put("state", state == null ? "" : state);
+        current.put("port", currentPort);
+        current.put("width", currentWidth);
+        current.put("height", currentHeight);
+        current.put("fps", currentFps);
+        current.put("codec", normalizeCodec(currentCodec));
+        current.put("facing", normalizeFacing(currentFacing));
+        return current;
+    }
+
+    private static JSONObject cameraCapabilityJson(
+        String cameraId,
+        CameraCharacteristics characteristics,
+        int fallbackWidth,
+        int fallbackHeight,
+        int fallbackFps
+    ) throws Exception {
+        String facingName = cameraFacingName(characteristics, "back");
+        Range<Integer>[] ranges = characteristics.get(CameraCharacteristics.CONTROL_AE_AVAILABLE_TARGET_FPS_RANGES);
+        List<Integer> targetFps = targetFpsFromRanges(ranges);
+        List<Size> sizes = supportedOutputSizes(characteristics, fallbackWidth, fallbackHeight);
+        JSONArray sizesJson = new JSONArray();
+        Set<String> lensCodecs = new HashSet<>();
+
+        for (Size size : sizes) {
+            List<String> codecs = supportedCodecsForSize(size, targetFps);
+            List<Integer> fpsValues = supportedFpsForSize(size, targetFps, codecs);
+            if (codecs.isEmpty() || fpsValues.isEmpty()) {
+                continue;
+            }
+
+            for (String codec : codecs) {
+                lensCodecs.add(codec);
+            }
+
+            JSONObject sizeJson = new JSONObject();
+            sizeJson.put("width", size.getWidth());
+            sizeJson.put("height", size.getHeight());
+            sizeJson.put("fps", intArrayJson(fpsValues));
+            sizeJson.put("codecs", stringArrayJson(codecs));
+            sizesJson.put(sizeJson);
+        }
+
+        if (sizesJson.length() == 0) {
+            JSONObject fallbackSize = new JSONObject();
+            fallbackSize.put("width", Math.max(1, fallbackWidth));
+            fallbackSize.put("height", Math.max(1, fallbackHeight));
+            fallbackSize.put("fps", intArrayJson(Collections.singletonList(Math.max(1, fallbackFps))));
+            fallbackSize.put("codecs", stringArrayJson(availableEncoderCodecsForStream()));
+            sizesJson.put(fallbackSize);
+            lensCodecs.add(DEFAULT_CODEC);
+        }
+
+        JSONObject lens = new JSONObject();
+        lens.put("facing", facingName);
+        lens.put("cameraId", cameraId == null ? "" : cameraId);
+        lens.put("hardwareLevel", hardwareLevelName(characteristics));
+        lens.put("fpsRanges", fpsRangesJson(ranges));
+        lens.put("targetFps", intArrayJson(targetFps));
+        lens.put("codecs", stringArrayJson(sortedStrings(lensCodecs)));
+        lens.put("sizes", sizesJson);
+        return lens;
+    }
+
+    private static List<Size> supportedOutputSizes(
+        CameraCharacteristics characteristics,
+        int fallbackWidth,
+        int fallbackHeight
+    ) {
+        StreamConfigurationMap map = characteristics.get(CameraCharacteristics.SCALER_STREAM_CONFIGURATION_MAP);
+        Size[] sizes = null;
+        if (map != null) {
+            sizes = map.getOutputSizes(MediaCodec.class);
+            if (sizes == null || sizes.length == 0) {
+                sizes = map.getOutputSizes(MediaRecorder.class);
+            }
+        }
+
+        List<Size> output = new ArrayList<>();
+        Set<String> seen = new HashSet<>();
+        if (sizes != null) {
+            for (Size size : sizes) {
+                if (size == null || size.getWidth() <= 0 || size.getHeight() <= 0) {
+                    continue;
+                }
+
+                String key = size.getWidth() + "x" + size.getHeight();
+                if (seen.add(key)) {
+                    output.add(size);
+                }
+            }
+        }
+
+        if (output.isEmpty()) {
+            output.add(new Size(Math.max(1, fallbackWidth), Math.max(1, fallbackHeight)));
+        }
+
+        Collections.sort(output, new Comparator<Size>() {
+            @Override
+            public int compare(Size left, Size right) {
+                int areaCompare = Integer.compare(left.getWidth() * left.getHeight(), right.getWidth() * right.getHeight());
+                if (areaCompare != 0) {
+                    return areaCompare;
+                }
+
+                return Integer.compare(left.getWidth(), right.getWidth());
+            }
+        });
+        return output;
+    }
+
+    private static List<Integer> targetFpsFromRanges(Range<Integer>[] ranges) {
+        Set<Integer> values = new HashSet<>();
+        if (ranges != null) {
+            for (Range<Integer> range : ranges) {
+                if (range == null) {
+                    continue;
+                }
+
+                int lower = Math.max(1, range.getLower());
+                int upper = Math.max(lower, range.getUpper());
+                values.add(upper);
+                if (lower == upper) {
+                    values.add(lower);
+                }
+
+                for (int preferred : PREFERRED_TARGET_FPS) {
+                    if (preferred >= lower && preferred <= upper) {
+                        values.add(preferred);
+                    }
+                }
+            }
+        }
+
+        if (values.isEmpty()) {
+            values.add(30);
+        }
+
+        List<Integer> output = new ArrayList<>(values);
+        Collections.sort(output);
+        return output;
+    }
+
+    private static List<String> supportedCodecsForSize(Size size, List<Integer> targetFps) {
+        List<String> codecs = new ArrayList<>();
+        for (String codec : CAMERA_ENCODER_CODECS) {
+            if (!isEncoderCodecUsable(codec)) {
+                continue;
+            }
+
+            for (int fpsValue : targetFps) {
+                if (isEncoderSizeRateSupported(codec, size.getWidth(), size.getHeight(), fpsValue)) {
+                    codecs.add(codec);
+                    break;
+                }
+            }
+        }
+
+        return codecs;
+    }
+
+    private static List<Integer> supportedFpsForSize(Size size, List<Integer> targetFps, List<String> codecs) {
+        List<Integer> values = new ArrayList<>();
+        for (int fpsValue : targetFps) {
+            for (String codec : codecs) {
+                if (isEncoderSizeRateSupported(codec, size.getWidth(), size.getHeight(), fpsValue)) {
+                    values.add(fpsValue);
+                    break;
+                }
+            }
+        }
+
+        if (values.isEmpty()) {
+            values.add(30);
+        }
+
+        return values;
+    }
+
+    private static JSONArray fpsRangesJson(Range<Integer>[] ranges) throws Exception {
+        JSONArray output = new JSONArray();
+        if (ranges == null) {
+            return output;
+        }
+
+        for (Range<Integer> range : ranges) {
+            if (range == null) {
+                continue;
+            }
+
+            JSONObject rangeJson = new JSONObject();
+            rangeJson.put("min", range.getLower());
+            rangeJson.put("max", range.getUpper());
+            output.put(rangeJson);
+        }
+
+        return output;
+    }
+
+    private static JSONArray intArrayJson(List<Integer> values) {
+        JSONArray array = new JSONArray();
+        if (values == null) {
+            return array;
+        }
+
+        for (Integer value : values) {
+            if (value != null && value > 0) {
+                array.put(value);
+            }
+        }
+
+        return array;
+    }
+
+    private static JSONArray stringArrayJson(List<String> values) {
+        JSONArray array = new JSONArray();
+        if (values == null) {
+            return array;
+        }
+
+        for (String value : values) {
+            if (value != null && value.length() > 0) {
+                array.put(value);
+            }
+        }
+
+        return array;
+    }
+
+    private static List<String> sortedStrings(Set<String> values) {
+        List<String> output = new ArrayList<>(values);
+        Collections.sort(output);
+        return output;
+    }
+
+    private static List<String> availableEncoderCodecsForStream() {
+        List<String> codecs = new ArrayList<>();
+        for (String codec : CAMERA_ENCODER_CODECS) {
+            if (isEncoderCodecUsable(codec)) {
+                codecs.add(codec);
+            }
+        }
+
+        if (codecs.isEmpty()) {
+            codecs.add(DEFAULT_CODEC);
+        }
+
+        return codecs;
+    }
+
+    private static boolean isEncoderCodecUsable(String mime) {
+        return findEncoderInfo(mime) != null;
+    }
+
+    private static boolean isEncoderSizeRateSupported(String mime, int width, int height, int fpsValue) {
+        MediaCodecInfo codecInfo = findEncoderInfo(mime);
+        if (codecInfo == null) {
+            return false;
+        }
+
+        try {
+            MediaCodecInfo.CodecCapabilities capabilities = codecInfo.getCapabilitiesForType(mime);
+            MediaCodecInfo.VideoCapabilities videoCapabilities = capabilities.getVideoCapabilities();
+            if (videoCapabilities == null) {
+                return true;
+            }
+
+            if (fpsValue > 0) {
+                return videoCapabilities.areSizeAndRateSupported(width, height, fpsValue);
+            }
+
+            return videoCapabilities.isSizeSupported(width, height);
+        } catch (Exception ex) {
+            return false;
+        }
+    }
+
+    private static MediaCodecInfo findEncoderInfo(String mime) {
+        if (mime == null || mime.length() == 0) {
+            return null;
+        }
+
+        try {
+            MediaCodecList codecList = new MediaCodecList(MediaCodecList.REGULAR_CODECS);
+            MediaCodecInfo[] codecInfos = codecList.getCodecInfos();
+            for (MediaCodecInfo codecInfo : codecInfos) {
+                if (codecInfo == null || !codecInfo.isEncoder()) {
+                    continue;
+                }
+
+                String[] supportedTypes = codecInfo.getSupportedTypes();
+                for (String type : supportedTypes) {
+                    if (!mime.equalsIgnoreCase(type)) {
+                        continue;
+                    }
+
+                    if (supportsSurfaceInput(codecInfo, mime)) {
+                        return codecInfo;
+                    }
+                }
+            }
+        } catch (Exception ignored) {
+        }
+
+        return null;
+    }
+
+    private static boolean supportsSurfaceInput(MediaCodecInfo codecInfo, String mime) {
+        try {
+            MediaCodecInfo.CodecCapabilities capabilities = codecInfo.getCapabilitiesForType(mime);
+            for (int colorFormat : capabilities.colorFormats) {
+                if (colorFormat == MediaCodecInfo.CodecCapabilities.COLOR_FormatSurface) {
+                    return true;
+                }
+            }
+        } catch (Exception ignored) {
+        }
+
+        return false;
+    }
+
+    private static String hardwareLevelName(CameraCharacteristics characteristics) {
+        Integer level = characteristics.get(CameraCharacteristics.INFO_SUPPORTED_HARDWARE_LEVEL);
+        if (level == null) {
+            return "";
+        }
+
+        switch (level) {
+            case CameraCharacteristics.INFO_SUPPORTED_HARDWARE_LEVEL_LEGACY:
+                return "legacy";
+            case CameraCharacteristics.INFO_SUPPORTED_HARDWARE_LEVEL_LIMITED:
+                return "limited";
+            case CameraCharacteristics.INFO_SUPPORTED_HARDWARE_LEVEL_FULL:
+                return "full";
+            case CameraCharacteristics.INFO_SUPPORTED_HARDWARE_LEVEL_3:
+                return "level_3";
+            case CameraCharacteristics.INFO_SUPPORTED_HARDWARE_LEVEL_EXTERNAL:
+                return "external";
+            default:
+                return String.valueOf(level);
+        }
+    }
+
     private static String findCameraId(CameraManager cameraManager, String facing) throws CameraAccessException {
         String[] cameraIds = cameraManager.getCameraIdList();
         String fallback = cameraIds.length > 0 ? cameraIds[0] : null;
@@ -736,7 +1168,45 @@ public final class CameraCaptureClient {
         return "front".equals(normalized) ? "front" : "back";
     }
 
-    private static Size chooseCaptureSize(CameraCharacteristics characteristics, int requestedWidth, int requestedHeight) {
+    private static String normalizeCodec(String value) {
+        if (value == null) {
+            return DEFAULT_CODEC;
+        }
+
+        String normalized = value.trim().toLowerCase(Locale.ROOT);
+        if ("avc".equals(normalized)
+            || "h264".equals(normalized)
+            || "h.264".equals(normalized)
+            || "video/h264".equals(normalized)) {
+            return DEFAULT_CODEC;
+        }
+
+        if ("hevc".equals(normalized)
+            || "h265".equals(normalized)
+            || "h.265".equals(normalized)
+            || "video/h265".equals(normalized)) {
+            return HEVC_CODEC;
+        }
+
+        return normalized.length() == 0 ? DEFAULT_CODEC : normalized;
+    }
+
+    private static String selectEffectiveCameraCodec(String requestedCodec) {
+        String normalized = normalizeCodec(requestedCodec);
+        if (DEFAULT_CODEC.equals(normalized) && isEncoderCodecUsable(DEFAULT_CODEC)) {
+            return DEFAULT_CODEC;
+        }
+
+        // The current Windows receiver decodes AVC. HEVC-capable devices still fall back safely.
+        return DEFAULT_CODEC;
+    }
+
+    private static Size chooseCaptureSize(
+        CameraCharacteristics characteristics,
+        int requestedWidth,
+        int requestedHeight,
+        String codec
+    ) {
         StreamConfigurationMap map = characteristics.get(CameraCharacteristics.SCALER_STREAM_CONFIGURATION_MAP);
         if (map == null) {
             return new Size(requestedWidth, requestedHeight);
@@ -751,7 +1221,9 @@ public final class CameraCaptureClient {
         }
 
         for (Size size : sizes) {
-            if (size.getWidth() == requestedWidth && size.getHeight() == requestedHeight) {
+            if (size.getWidth() == requestedWidth
+                && size.getHeight() == requestedHeight
+                && isEncoderSizeSupported(codec, size.getWidth(), size.getHeight())) {
                 return size;
             }
         }
@@ -764,6 +1236,13 @@ public final class CameraCaptureClient {
                 return leftScore - rightScore;
             }
         });
+
+        for (Size size : sizes) {
+            if (isEncoderSizeSupported(codec, size.getWidth(), size.getHeight())) {
+                return size;
+            }
+        }
+
         return sizes[0];
     }
 
@@ -771,6 +1250,21 @@ public final class CameraCaptureClient {
         int areaDelta = Math.abs(size.getWidth() * size.getHeight() - requestedWidth * requestedHeight);
         int ratioDelta = Math.abs(size.getWidth() * requestedHeight - requestedWidth * size.getHeight());
         return areaDelta + ratioDelta;
+    }
+
+    private static boolean isEncoderSizeSupported(String mime, int width, int height) {
+        MediaCodecInfo codecInfo = findEncoderInfo(mime);
+        if (codecInfo == null) {
+            return DEFAULT_CODEC.equals(mime);
+        }
+
+        try {
+            MediaCodecInfo.CodecCapabilities capabilities = codecInfo.getCapabilitiesForType(mime);
+            MediaCodecInfo.VideoCapabilities videoCapabilities = capabilities.getVideoCapabilities();
+            return videoCapabilities == null || videoCapabilities.isSizeSupported(width, height);
+        } catch (Exception ex) {
+            return false;
+        }
     }
 
     private static Range<Integer> chooseFpsRange(CameraCharacteristics characteristics, int targetFps) {
@@ -795,6 +1289,62 @@ public final class CameraCaptureClient {
         }
 
         return best;
+    }
+
+    private static int chooseEffectiveFps(
+        CameraCharacteristics characteristics,
+        Size size,
+        int requestedFps,
+        String codec
+    ) {
+        Range<Integer>[] ranges = characteristics.get(CameraCharacteristics.CONTROL_AE_AVAILABLE_TARGET_FPS_RANGES);
+        if (isCameraFpsSupported(ranges, requestedFps)
+            && isEncoderSizeRateSupported(codec, size.getWidth(), size.getHeight(), requestedFps)) {
+            return Math.max(1, requestedFps);
+        }
+
+        List<Integer> candidates = targetFpsFromRanges(ranges);
+        Collections.sort(candidates, new Comparator<Integer>() {
+            @Override
+            public int compare(Integer left, Integer right) {
+                int leftPenalty = left > requestedFps ? 10000 : 0;
+                int rightPenalty = right > requestedFps ? 10000 : 0;
+                int leftScore = leftPenalty + Math.abs(left - requestedFps);
+                int rightScore = rightPenalty + Math.abs(right - requestedFps);
+                if (leftScore != rightScore) {
+                    return leftScore - rightScore;
+                }
+
+                return right - left;
+            }
+        });
+
+        for (int candidate : candidates) {
+            if (isCameraFpsSupported(ranges, candidate)
+                && isEncoderSizeRateSupported(codec, size.getWidth(), size.getHeight(), candidate)) {
+                return Math.max(1, candidate);
+            }
+        }
+
+        return effectiveFpsForRange(chooseFpsRange(characteristics, requestedFps), requestedFps);
+    }
+
+    private static boolean isCameraFpsSupported(Range<Integer>[] ranges, int fpsValue) {
+        if (fpsValue <= 0) {
+            return false;
+        }
+
+        if (ranges == null || ranges.length == 0) {
+            return true;
+        }
+
+        for (Range<Integer> range : ranges) {
+            if (range != null && fpsValue >= range.getLower() && fpsValue <= range.getUpper()) {
+                return true;
+            }
+        }
+
+        return false;
     }
 
     private static int effectiveFpsForRange(Range<Integer> range, int requestedFps) {

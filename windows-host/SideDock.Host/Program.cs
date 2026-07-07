@@ -725,7 +725,7 @@ internal static partial class Program
         {
             lock (_lock)
             {
-                if (!TryCreateRequestedConfig(payload, _current, out var requested, out var error))
+                if (!TryCreateRequestedConfig(payload, _current, out var requested, out var error, out var warning))
                 {
                     return new CameraConfigApplyResult(
                         Ok: false,
@@ -745,7 +745,9 @@ internal static partial class Program
 
                 return new CameraConfigApplyResult(
                     Ok: true,
-                    Message: effective.Enabled ? "camera config applied; Android will restart capture" : "camera disabled",
+                    Message: !string.IsNullOrWhiteSpace(warning)
+                        ? warning
+                        : effective.Enabled ? "camera config applied; Android will restart capture" : "camera disabled",
                     EffectiveConfig: effective);
             }
         }
@@ -754,10 +756,12 @@ internal static partial class Program
             JsonObject payload,
             CameraRuntimeConfig current,
             out CameraRuntimeConfig config,
-            out string error)
+            out string error,
+            out string warning)
         {
             config = current;
             error = string.Empty;
+            warning = string.Empty;
 
             var requestedEnabled = current.RequestedEnabled;
             if (payload.ContainsKey("enabled") && !TryReadCommandBool(payload, "enabled", out requestedEnabled))
@@ -790,11 +794,15 @@ internal static partial class Program
             var codec = current.Codec;
             if (payload.ContainsKey("codec"))
             {
-                codec = NormalizeCameraCodec(ReadCommandString(payload, "codec"));
-                if (!string.Equals(codec, "video/avc", StringComparison.OrdinalIgnoreCase))
+                var requestedCodec = NormalizeCameraCodec(ReadCommandString(payload, "codec"));
+                if (IsHostSupportedCameraCodec(requestedCodec))
                 {
-                    error = $"unsupported camera codec: {codec}";
-                    return false;
+                    codec = requestedCodec;
+                }
+                else
+                {
+                    codec = "video/avc";
+                    warning = $"camera codec {requestedCodec} is not available on the Windows receiver; falling back to video/avc";
                 }
             }
 
@@ -841,7 +849,7 @@ internal static partial class Program
                 options.CameraWidth,
                 options.CameraHeight,
                 options.CameraFps,
-                NormalizeCameraCodec(options.CameraCodec),
+                NormalizeHostCameraCodec(options.CameraCodec),
                 options.CameraFacing);
         }
 
@@ -1086,8 +1094,20 @@ internal static partial class Program
         return value.Trim().ToLowerInvariant() switch
         {
             "avc" or "h264" or "h.264" or "video/h264" => "video/avc",
+            "hevc" or "h265" or "h.265" or "video/h265" => "video/hevc",
             var codec => codec
         };
+    }
+
+    private static string NormalizeHostCameraCodec(string? value)
+    {
+        var codec = NormalizeCameraCodec(value);
+        return IsHostSupportedCameraCodec(codec) ? codec : "video/avc";
+    }
+
+    private static bool IsHostSupportedCameraCodec(string codec)
+    {
+        return codec.Trim().Equals("video/avc", StringComparison.OrdinalIgnoreCase);
     }
 
     private static bool TryNormalizeCameraFacing(string? value, out string facing)
@@ -1479,6 +1499,14 @@ internal static partial class Program
                     await HandleDisplayModeChangeAsync(message, connection, cancellationToken);
                     break;
 
+                case "camera_capabilities":
+                    if (message.Payload is not null)
+                    {
+                        LogCameraCapabilities(message.Payload);
+                    }
+
+                    break;
+
                 case "input_keyboard":
                 case "input_pointer_abs":
                 case "input_mouse_move":
@@ -1633,6 +1661,17 @@ internal static partial class Program
                 + $" keyFrames={ReadLong(payload, "keyFrames")}"
                 + $" codecConfigPackets={ReadLong(payload, "codecConfigPackets")}"
                 + (string.IsNullOrWhiteSpace(message) ? string.Empty : $" message={message}"));
+        }
+
+        private void LogCameraCapabilities(JsonNode payloadNode)
+        {
+            if (payloadNode is null)
+            {
+                return;
+            }
+
+            var payload = payloadNode.ToJsonString(JsonOptions);
+            Log("CAMERA", $"camera-capabilities payload={payload}");
         }
 
         private ValueTask HandleVideoErrorAsync(
