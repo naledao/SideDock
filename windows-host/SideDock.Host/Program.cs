@@ -108,11 +108,12 @@ internal static partial class Program
         }
 
         var controlPublisher = new ControlMessagePublisher();
+        var audioTestCoordinator = new AudioTestCoordinator(options, controlPublisher);
         var cameraRuntimeState = new CameraRuntimeState(CameraRuntimeConfig.FromOptions(options));
-        var controlServer = new ControlServer(IPAddress.Loopback, options, videoModeState, controlPublisher, displayLayoutProvider, cameraRuntimeState);
-        var cameraCommandServer = new CameraCommandServer(IPAddress.Loopback, DefaultCameraCommandPort, options, controlPublisher, cameraRuntimeState);
+        var controlServer = new ControlServer(IPAddress.Loopback, options, videoModeState, controlPublisher, displayLayoutProvider, cameraRuntimeState, audioTestCoordinator);
+        var cameraCommandServer = new CameraCommandServer(IPAddress.Loopback, DefaultCameraCommandPort, options, controlPublisher, cameraRuntimeState, audioTestCoordinator);
         var videoServer = new VideoServer(IPAddress.Loopback, options, videoModeState, controlPublisher);
-        var audioServer = new AudioServer(IPAddress.Loopback, options, controlPublisher);
+        var audioServer = new AudioServer(IPAddress.Loopback, options, controlPublisher, audioTestCoordinator);
         var cameraServer = new CameraServer(IPAddress.Loopback, options, controlPublisher, cameraRuntimeState);
         if (!string.IsNullOrWhiteSpace(options.CameraReplayFilePath))
         {
@@ -664,6 +665,17 @@ internal static partial class Program
         private readonly object _lock = new();
         private ControlConnection? _activeConnection;
 
+        public bool HasActiveConnection
+        {
+            get
+            {
+                lock (_lock)
+                {
+                    return _activeConnection is not null;
+                }
+            }
+        }
+
         public void SetActive(ControlConnection connection)
         {
             lock (_lock)
@@ -898,7 +910,8 @@ internal static partial class Program
         int port,
         HostOptions options,
         ControlMessagePublisher publisher,
-        CameraRuntimeState cameraRuntimeState)
+        CameraRuntimeState cameraRuntimeState,
+        AudioTestCoordinator audioTestCoordinator)
     {
         private readonly TcpListener _listener = new(address, port);
 
@@ -959,7 +972,20 @@ internal static partial class Program
                     return;
                 }
 
-                if (message?.Type != "host_camera_config" || message.Payload is not JsonObject payload)
+                if (message?.Payload is not JsonObject payload)
+                {
+                    await WriteCommandResponseAsync(writer, ok: false, "unsupported command", cancellationToken);
+                    return;
+                }
+
+                if (message.Type == "host_audio_test")
+                {
+                    var audioTestResult = await audioTestCoordinator.RunCommandAsync(payload, cancellationToken);
+                    await WriteAudioTestCommandResponseAsync(writer, audioTestResult, cancellationToken);
+                    return;
+                }
+
+                if (message.Type != "host_camera_config")
                 {
                     await WriteCommandResponseAsync(writer, ok: false, "unsupported command", cancellationToken);
                     return;
@@ -999,6 +1025,15 @@ internal static partial class Program
                 JsonOptions);
             await writer.WriteLineAsync(response.AsMemory(), cancellationToken);
         }
+
+        private static async Task WriteAudioTestCommandResponseAsync(
+            StreamWriter writer,
+            AudioTestCommandResult result,
+            CancellationToken cancellationToken)
+        {
+            var response = JsonSerializer.Serialize(CreateAudioTestCommandResponsePayload(result), JsonOptions);
+            await writer.WriteLineAsync(response.AsMemory(), cancellationToken);
+        }
     }
 
     private static JsonObject CreateCommandResponsePayload(bool ok, string message, EffectiveCameraRuntimeConfig? effectiveConfig)
@@ -1017,6 +1052,31 @@ internal static partial class Program
         return response;
     }
 
+    private static JsonObject CreateAudioTestCommandResponsePayload(AudioTestCommandResult result)
+    {
+        return new JsonObject
+        {
+            ["ok"] = result.Ok,
+            ["status"] = result.Status,
+            ["kind"] = result.Kind,
+            ["testId"] = result.TestId,
+            ["message"] = result.Message,
+            ["startedAtUnixMs"] = NumberOrNull(result.StartedAtUnixMs),
+            ["completedAtUnixMs"] = NumberOrNull(result.CompletedAtUnixMs),
+            ["stats"] = CloneJsonObject(result.Stats)
+        };
+    }
+
+    private static JsonObject CloneJsonObject(JsonObject value)
+    {
+        return JsonNode.Parse(value.ToJsonString(JsonOptions))?.AsObject() ?? new JsonObject();
+    }
+
+    private static JsonNode? NumberOrNull(long? value)
+    {
+        return value.HasValue ? JsonValue.Create(value.Value) : null;
+    }
+
     private static JsonObject CreateCameraConfigPayload(EffectiveCameraRuntimeConfig config)
     {
         return new JsonObject
@@ -1030,6 +1090,711 @@ internal static partial class Program
             ["facing"] = config.Facing
         };
     }
+
+    private sealed class AudioTestCoordinator(HostOptions options, ControlMessagePublisher publisher)
+    {
+        private const int DefaultPlaybackDurationMs = 1600;
+        private const int DefaultRecordingDurationMs = 2500;
+        private const int DefaultTimeoutMs = 8000;
+        private const int MinUsefulPacketCount = 3;
+        private const int SilentLevelPercentThreshold = 1;
+        private const double TestToneFrequencyHz = 880.0;
+        private const double TestToneAmplitude = 0.24;
+
+        private readonly object _lock = new();
+        private AudioTestSession? _activeSession;
+        private AudioConnectionSnapshot _connection = AudioConnectionSnapshot.Disconnected;
+        private AudioDirectionSnapshot _microphone = AudioDirectionSnapshot.Unknown("microphone");
+        private AudioDirectionSnapshot _speaker = AudioDirectionSnapshot.Unknown("speaker");
+
+        public async Task<AudioTestCommandResult> RunCommandAsync(JsonObject payload, CancellationToken cancellationToken)
+        {
+            var kindText = ReadCommandString(payload, "kind").Trim().ToLowerInvariant();
+            if (!TryParseKind(kindText, out var kind))
+            {
+                return CreateImmediateResult(
+                    ok: false,
+                    status: "failed",
+                    kind: string.IsNullOrWhiteSpace(kindText) ? "unknown" : kindText,
+                    testId: "",
+                    message: "Unsupported audio test kind. Expected playback or recording.");
+            }
+
+            var durationMs = ReadDurationMs(payload, kind);
+            var timeoutMs = ReadTimeoutMs(payload);
+            if (!TryCreateSession(kind, durationMs, timeoutMs, out var session, out var preflightFailure))
+            {
+                return preflightFailure;
+            }
+
+            try
+            {
+                await publisher.PublishAsync(
+                    "audio_test_request",
+                    CreateAudioTestRequestPayload(session),
+                    cancellationToken);
+                Log(
+                    "AUDIO TEST",
+                    $"request kind={session.KindText} testId={session.TestId} durationMs={session.DurationMs} timeoutMs={session.TimeoutMs}");
+
+                try
+                {
+                    return await session.Completion.Task.WaitAsync(TimeSpan.FromMilliseconds(session.TimeoutMs), cancellationToken);
+                }
+                catch (TimeoutException)
+                {
+                    return CompleteTimeout(session);
+                }
+            }
+            finally
+            {
+                ClearActiveSession(session);
+            }
+        }
+
+        public void UpdateAudioConnectionState(int connectionId, bool connected, bool microphoneEnabled, bool speakerEnabled)
+        {
+            lock (_lock)
+            {
+                _connection = connected
+                    ? new AudioConnectionSnapshot(true, connectionId, microphoneEnabled, speakerEnabled)
+                    : AudioConnectionSnapshot.Disconnected;
+            }
+        }
+
+        public void UpdateDirectionSnapshot(AudioTestDirection direction, string state, string message, bool endpointReady)
+        {
+            var snapshot = new AudioDirectionSnapshot(
+                direction == AudioTestDirection.Microphone ? "microphone" : "speaker",
+                string.IsNullOrWhiteSpace(state) ? "unknown" : state,
+                string.IsNullOrWhiteSpace(message) ? "" : message,
+                endpointReady);
+
+            lock (_lock)
+            {
+                if (direction == AudioTestDirection.Microphone)
+                {
+                    _microphone = snapshot;
+                }
+                else
+                {
+                    _speaker = snapshot;
+                }
+            }
+        }
+
+        public bool TryReadPlaybackTone(byte[] destination, int maxByteCount, out int byteCount)
+        {
+            byteCount = 0;
+            AudioTestSession? session;
+            lock (_lock)
+            {
+                session = _activeSession;
+                if (session is null || session.Kind != AudioTestKind.Playback || session.IsHostPlaybackComplete)
+                {
+                    return false;
+                }
+
+                var totalFrames = AudioDefaults.SampleRate * session.DurationMs / 1000;
+                if (session.PlaybackFramesGenerated >= totalFrames)
+                {
+                    session.HostStats.CompletedAtUnixMs ??= DateTimeOffset.UtcNow.ToUnixTimeMilliseconds();
+                    session.IsHostPlaybackComplete = true;
+                    return false;
+                }
+
+                var frameBytes = AudioDefaults.SpeakerFrameBytes;
+                var maxFrames = Math.Max(1, Math.Min(maxByteCount, destination.Length) / frameBytes);
+                var remainingFrames = totalFrames - session.PlaybackFramesGenerated;
+                var frames = (int)Math.Min(maxFrames, remainingFrames);
+                byteCount = frames * frameBytes;
+                session.HostStats.StartedAtUnixMs ??= DateTimeOffset.UtcNow.ToUnixTimeMilliseconds();
+                GeneratePlaybackTone(destination, byteCount, session.PlaybackFramesGenerated);
+                session.PlaybackFramesGenerated += frames;
+                session.HostStats.Packets += 1;
+                session.HostStats.Bytes += byteCount;
+                session.HostStats.PeakLevelPercent = Math.Max(session.HostStats.PeakLevelPercent, 24);
+                if (session.PlaybackFramesGenerated >= totalFrames)
+                {
+                    session.HostStats.CompletedAtUnixMs = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds();
+                    session.IsHostPlaybackComplete = true;
+                }
+
+                return true;
+            }
+        }
+
+        public void RecordMicrophonePacket(int byteCount, int levelPercent, bool endpointReady, string endpointMessage)
+        {
+            lock (_lock)
+            {
+                var session = _activeSession;
+                if (session is null || session.Kind != AudioTestKind.Recording)
+                {
+                    return;
+                }
+
+                session.HostStats.StartedAtUnixMs ??= DateTimeOffset.UtcNow.ToUnixTimeMilliseconds();
+                session.HostStats.Packets += 1;
+                session.HostStats.Bytes += Math.Max(0, byteCount);
+                session.HostStats.PeakLevelPercent = Math.Max(session.HostStats.PeakLevelPercent, Math.Clamp(levelPercent, 0, 100));
+                if (levelPercent <= SilentLevelPercentThreshold)
+                {
+                    session.HostStats.SilentPackets += 1;
+                }
+
+                session.HostStats.EndpointReady = endpointReady;
+                if (!endpointReady)
+                {
+                    session.HostStats.EndpointFailures += 1;
+                    session.HostStats.EndpointMessage = string.IsNullOrWhiteSpace(endpointMessage) ? "Windows endpoint is unavailable." : endpointMessage;
+                }
+                else if (string.IsNullOrWhiteSpace(session.HostStats.EndpointMessage))
+                {
+                    session.HostStats.EndpointMessage = endpointMessage;
+                }
+            }
+        }
+
+        public void HandleAndroidStatus(JsonObject payload)
+        {
+            var testId = ReadString(payload, "testId");
+            if (string.IsNullOrWhiteSpace(testId))
+            {
+                return;
+            }
+
+            AudioTestSession? session;
+            AudioTestCommandResult? result = null;
+            lock (_lock)
+            {
+                session = _activeSession;
+                if (session is null || !string.Equals(session.TestId, testId, StringComparison.OrdinalIgnoreCase))
+                {
+                    return;
+                }
+
+                session.AndroidPayload = CloneJsonObject(payload);
+                session.AndroidUpdatedAtUnixMs = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds();
+                var status = ReadString(payload, "status");
+                if (IsTerminalStatus(status))
+                {
+                    session.HostStats.CompletedAtUnixMs ??= DateTimeOffset.UtcNow.ToUnixTimeMilliseconds();
+                    result = BuildFinalResultLocked(session);
+                    session.Completion.TrySetResult(result);
+                }
+            }
+
+            if (result is not null)
+            {
+                Log(
+                    "AUDIO TEST",
+                    $"complete kind={result.Kind} testId={result.TestId} status={result.Status} ok={result.Ok} message={result.Message}");
+            }
+        }
+
+        private bool TryCreateSession(
+            AudioTestKind kind,
+            int durationMs,
+            int timeoutMs,
+            out AudioTestSession session,
+            out AudioTestCommandResult failure)
+        {
+            session = null!;
+            failure = null!;
+            var kindText = KindText(kind);
+
+            if (!options.AudioDeviceEnabled)
+            {
+                failure = CreateImmediateResult(false, "failed", kindText, "", "Audio is disabled. Enable SideDock audio first.");
+                return false;
+            }
+
+            if (kind == AudioTestKind.Playback && !options.SpeakerEnabled)
+            {
+                failure = CreateImmediateResult(false, "failed", kindText, "", "Playback test requires the computer sound -> Android direction to be enabled.");
+                return false;
+            }
+
+            if (kind == AudioTestKind.Recording && !options.MicrophoneEnabled)
+            {
+                failure = CreateImmediateResult(false, "failed", kindText, "", "Recording test requires the Android microphone -> Windows direction to be enabled.");
+                return false;
+            }
+
+            if (!publisher.HasActiveConnection)
+            {
+                failure = CreateImmediateResult(false, "failed", kindText, "", "Android control channel is not connected.");
+                return false;
+            }
+
+            lock (_lock)
+            {
+                if (_activeSession is not null)
+                {
+                    failure = CreateImmediateResult(false, "failed", kindText, "", "Another audio test is already running.");
+                    return false;
+                }
+
+                if (!_connection.Connected)
+                {
+                    failure = CreateImmediateResult(false, "failed", kindText, "", "Android audio socket is not connected yet.");
+                    return false;
+                }
+
+                if (kind == AudioTestKind.Playback && !_connection.SpeakerEnabled)
+                {
+                    failure = CreateImmediateResult(false, "failed", kindText, "", "Speaker audio stream is not available on the current Android connection.");
+                    return false;
+                }
+
+                if (kind == AudioTestKind.Recording && !_connection.MicrophoneEnabled)
+                {
+                    failure = CreateImmediateResult(false, "failed", kindText, "", "Microphone audio stream is not available on the current Android connection.");
+                    return false;
+                }
+
+                var directionSnapshot = kind == AudioTestKind.Playback ? _speaker : _microphone;
+                if (!directionSnapshot.EndpointReady)
+                {
+                    failure = CreateImmediateResult(
+                        false,
+                        "failed",
+                        kindText,
+                        "",
+                        string.IsNullOrWhiteSpace(directionSnapshot.Message)
+                            ? "Selected Windows audio endpoint is not ready."
+                            : directionSnapshot.Message);
+                    return false;
+                }
+
+                session = new AudioTestSession(Guid.NewGuid().ToString("N"), kind, durationMs, timeoutMs);
+                _activeSession = session;
+                return true;
+            }
+        }
+
+        private AudioTestCommandResult CompleteTimeout(AudioTestSession session)
+        {
+            var result = BuildFailureResult(
+                session,
+                "timeout",
+                $"Audio {session.KindText} test timed out after {session.TimeoutMs} ms.");
+            session.Completion.TrySetResult(result);
+            return result;
+        }
+
+        private void ClearActiveSession(AudioTestSession session)
+        {
+            lock (_lock)
+            {
+                if (ReferenceEquals(_activeSession, session))
+                {
+                    _activeSession = null;
+                }
+            }
+        }
+
+        private AudioTestCommandResult BuildFinalResultLocked(AudioTestSession session)
+        {
+            if (session.AndroidPayload is null)
+            {
+                return BuildFailureResult(session, "failed", "Android did not return an audio test result.");
+            }
+
+            return session.Kind == AudioTestKind.Playback
+                ? BuildPlaybackResultLocked(session, session.AndroidPayload)
+                : BuildRecordingResultLocked(session, session.AndroidPayload);
+        }
+
+        private AudioTestCommandResult BuildPlaybackResultLocked(AudioTestSession session, JsonObject android)
+        {
+            var androidStatus = ReadString(android, "status");
+            var androidOk = ReadBool(android, "ok") || androidStatus.Equals("passed", StringComparison.OrdinalIgnoreCase);
+            var androidMessage = ReadString(android, "message");
+            var packetsReceived = ReadLong(android, "packetsReceived");
+            var bytesReceived = ReadLong(android, "bytesReceived");
+            var writeErrors = ReadLong(android, "writeErrors");
+
+            if (session.HostStats.Packets <= 0 || session.HostStats.Bytes <= 0)
+            {
+                return BuildFailureResult(session, "failed", "Host did not send any playback test packets to Android.");
+            }
+
+            if (!androidOk)
+            {
+                return BuildFailureResult(
+                    session,
+                    "failed",
+                    string.IsNullOrWhiteSpace(androidMessage) ? "Android playback test failed." : androidMessage);
+            }
+
+            if (packetsReceived <= 0 || bytesReceived <= 0)
+            {
+                return BuildFailureResult(session, "failed", "Android did not receive playback test packets.");
+            }
+
+            if (writeErrors > 0)
+            {
+                return BuildFailureResult(session, "failed", "Android AudioTrack reported write errors during playback test.");
+            }
+
+            return BuildResult(
+                session,
+                ok: true,
+                status: "passed",
+                message: $"Playback test passed: Android received {packetsReceived} packets / {bytesReceived} bytes and wrote them to AudioTrack.");
+        }
+
+        private AudioTestCommandResult BuildRecordingResultLocked(AudioTestSession session, JsonObject android)
+        {
+            var androidStatus = ReadString(android, "status");
+            var androidOk = ReadBool(android, "ok") || androidStatus.Equals("passed", StringComparison.OrdinalIgnoreCase);
+            var androidMessage = ReadString(android, "message");
+            var permissionGranted = ReadNullableBool(android, "permissionGranted");
+            var packetsSent = ReadLong(android, "packetsSent");
+            var bytesSent = ReadLong(android, "bytesSent");
+            var androidPeakLevel = ReadLong(android, "peakLevelPercent");
+
+            if (permissionGranted == false)
+            {
+                return BuildFailureResult(session, "failed", "Android microphone permission is missing.");
+            }
+
+            if (!androidOk)
+            {
+                return BuildFailureResult(
+                    session,
+                    "failed",
+                    string.IsNullOrWhiteSpace(androidMessage) ? "Android recording test failed." : androidMessage);
+            }
+
+            if (packetsSent <= 0 || bytesSent <= 0)
+            {
+                return BuildFailureResult(session, "failed", "Android did not send microphone packets during the recording test.");
+            }
+
+            if (session.HostStats.Packets < MinUsefulPacketCount || session.HostStats.Bytes <= 0)
+            {
+                return BuildFailureResult(session, "failed", "Host did not receive enough microphone packets from Android.");
+            }
+
+            if (session.HostStats.EndpointFailures > 0 || session.HostStats.EndpointReady == false)
+            {
+                return BuildFailureResult(
+                    session,
+                    "failed",
+                    string.IsNullOrWhiteSpace(session.HostStats.EndpointMessage)
+                        ? "Host microphone render endpoint is not ready."
+                        : session.HostStats.EndpointMessage);
+            }
+
+            var silentRatio = session.HostStats.Packets <= 0
+                ? 1.0
+                : session.HostStats.SilentPackets / (double)session.HostStats.Packets;
+            var peakLevel = Math.Max(session.HostStats.PeakLevelPercent, (int)Math.Clamp(androidPeakLevel, 0, 100));
+            if (peakLevel <= SilentLevelPercentThreshold || silentRatio >= 0.95)
+            {
+                return BuildResult(
+                    session,
+                    ok: true,
+                    status: "passed_silent",
+                    message: "Recording link passed, but the input level was silent or very low. Speak near the Android microphone and test again if the call app still hears nothing.");
+            }
+
+            return BuildResult(
+                session,
+                ok: true,
+                status: "passed",
+                message: $"Recording test passed: Host received {session.HostStats.Packets} packets / {session.HostStats.Bytes} bytes and wrote them to the Windows endpoint.");
+        }
+
+        private AudioTestCommandResult BuildFailureResult(AudioTestSession session, string status, string message)
+        {
+            return BuildResult(session, ok: false, status, message);
+        }
+
+        private AudioTestCommandResult BuildResult(AudioTestSession session, bool ok, string status, string message)
+        {
+            var completedAt = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds();
+            var stats = new JsonObject
+            {
+                ["host"] = session.HostStats.ToJson(),
+                ["android"] = session.AndroidPayload is null ? null : CloneJsonObject(session.AndroidPayload)
+            };
+
+            return new AudioTestCommandResult(
+                Ok: ok,
+                Status: status,
+                Kind: session.KindText,
+                TestId: session.TestId,
+                Message: message,
+                StartedAtUnixMs: session.StartedAtUnixMs,
+                CompletedAtUnixMs: completedAt,
+                Stats: stats);
+        }
+
+        private static AudioTestCommandResult CreateImmediateResult(
+            bool ok,
+            string status,
+            string kind,
+            string testId,
+            string message)
+        {
+            var now = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds();
+            return new AudioTestCommandResult(
+                ok,
+                status,
+                kind,
+                testId,
+                message,
+                StartedAtUnixMs: now,
+                CompletedAtUnixMs: now,
+                Stats: new JsonObject());
+        }
+
+        private static JsonObject CreateAudioTestRequestPayload(AudioTestSession session)
+        {
+            return new JsonObject
+            {
+                ["testId"] = session.TestId,
+                ["kind"] = session.KindText,
+                ["durationMs"] = session.DurationMs,
+                ["timeoutMs"] = session.TimeoutMs,
+                ["sampleRate"] = AudioDefaults.SampleRate,
+                ["microphoneChannels"] = AudioDefaults.MicChannels,
+                ["speakerChannels"] = AudioDefaults.SpeakerChannels,
+                ["bitsPerSample"] = AudioDefaults.BitsPerSample,
+                ["startedAtUnixMs"] = session.StartedAtUnixMs
+            };
+        }
+
+        private static void GeneratePlaybackTone(byte[] destination, int byteCount, long startFrame)
+        {
+            var frameCount = byteCount / AudioDefaults.SpeakerFrameBytes;
+            for (var frame = 0; frame < frameCount; frame++)
+            {
+                var sample = (short)Math.Round(Math.Sin((startFrame + frame) * Math.Tau * TestToneFrequencyHz / AudioDefaults.SampleRate)
+                    * short.MaxValue
+                    * TestToneAmplitude);
+                var offset = frame * AudioDefaults.SpeakerFrameBytes;
+                BinaryPrimitives.WriteInt16LittleEndian(destination.AsSpan(offset, 2), sample);
+                BinaryPrimitives.WriteInt16LittleEndian(destination.AsSpan(offset + 2, 2), sample);
+            }
+        }
+
+        private static string ReadString(JsonObject payload, string name)
+        {
+            if (!payload.TryGetPropertyValue(name, out var node) || node is null)
+            {
+                return "";
+            }
+
+            try
+            {
+                return node.GetValue<string>() ?? "";
+            }
+            catch (Exception ex) when (ex is InvalidOperationException or FormatException)
+            {
+                return "";
+            }
+        }
+
+        private static long ReadLong(JsonObject payload, string name)
+        {
+            if (!payload.TryGetPropertyValue(name, out var node) || node is null)
+            {
+                return 0;
+            }
+
+            try
+            {
+                return node.GetValue<long>();
+            }
+            catch (Exception ex) when (ex is InvalidOperationException or FormatException)
+            {
+                return 0;
+            }
+        }
+
+        private static bool ReadBool(JsonObject payload, string name)
+        {
+            return ReadNullableBool(payload, name) == true;
+        }
+
+        private static bool? ReadNullableBool(JsonObject payload, string name)
+        {
+            if (!payload.TryGetPropertyValue(name, out var node) || node is null)
+            {
+                return null;
+            }
+
+            try
+            {
+                return node.GetValue<bool>();
+            }
+            catch (Exception ex) when (ex is InvalidOperationException or FormatException)
+            {
+                return null;
+            }
+        }
+
+        private static int ReadDurationMs(JsonObject payload, AudioTestKind kind)
+        {
+            var fallback = kind == AudioTestKind.Playback ? DefaultPlaybackDurationMs : DefaultRecordingDurationMs;
+            return TryReadCommandInt(payload, "durationMs", 1, out var value)
+                ? Math.Clamp(value, 500, 4000)
+                : fallback;
+        }
+
+        private static int ReadTimeoutMs(JsonObject payload)
+        {
+            return TryReadCommandInt(payload, "timeoutMs", 1, out var value)
+                ? Math.Clamp(value, 3000, 12000)
+                : DefaultTimeoutMs;
+        }
+
+        private static bool TryParseKind(string value, out AudioTestKind kind)
+        {
+            if (value.Equals("playback", StringComparison.OrdinalIgnoreCase))
+            {
+                kind = AudioTestKind.Playback;
+                return true;
+            }
+
+            if (value.Equals("recording", StringComparison.OrdinalIgnoreCase))
+            {
+                kind = AudioTestKind.Recording;
+                return true;
+            }
+
+            kind = AudioTestKind.Playback;
+            return false;
+        }
+
+        private static bool IsTerminalStatus(string status)
+        {
+            return status.Equals("passed", StringComparison.OrdinalIgnoreCase)
+                || status.Equals("passed_silent", StringComparison.OrdinalIgnoreCase)
+                || status.Equals("failed", StringComparison.OrdinalIgnoreCase)
+                || status.Equals("completed", StringComparison.OrdinalIgnoreCase);
+        }
+
+        private static string KindText(AudioTestKind kind)
+        {
+            return kind == AudioTestKind.Playback ? "playback" : "recording";
+        }
+
+        private sealed class AudioTestSession(string testId, AudioTestKind kind, int durationMs, int timeoutMs)
+        {
+            public string TestId { get; } = testId;
+
+            public AudioTestKind Kind { get; } = kind;
+
+            public string KindText => AudioTestCoordinator.KindText(Kind);
+
+            public int DurationMs { get; } = durationMs;
+
+            public int TimeoutMs { get; } = timeoutMs;
+
+            public long StartedAtUnixMs { get; } = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds();
+
+            public TaskCompletionSource<AudioTestCommandResult> Completion { get; } =
+                new(TaskCreationOptions.RunContinuationsAsynchronously);
+
+            public AudioTestHostStats HostStats { get; } = new();
+
+            public JsonObject? AndroidPayload { get; set; }
+
+            public long? AndroidUpdatedAtUnixMs { get; set; }
+
+            public long PlaybackFramesGenerated { get; set; }
+
+            public bool IsHostPlaybackComplete { get; set; }
+        }
+
+        private sealed class AudioTestHostStats
+        {
+            public long Packets { get; set; }
+
+            public long Bytes { get; set; }
+
+            public int PeakLevelPercent { get; set; }
+
+            public long SilentPackets { get; set; }
+
+            public bool? EndpointReady { get; set; }
+
+            public long EndpointFailures { get; set; }
+
+            public string EndpointMessage { get; set; } = "";
+
+            public long? StartedAtUnixMs { get; set; }
+
+            public long? CompletedAtUnixMs { get; set; }
+
+            public JsonObject ToJson()
+            {
+                var silentRatio = Packets <= 0 ? 0 : SilentPackets / (double)Packets;
+                return new JsonObject
+                {
+                    ["packets"] = Packets,
+                    ["bytes"] = Bytes,
+                    ["peakLevelPercent"] = PeakLevelPercent,
+                    ["silentPackets"] = SilentPackets,
+                    ["silentRatio"] = Math.Round(silentRatio, 3),
+                    ["endpointReady"] = EndpointReady.HasValue ? JsonValue.Create(EndpointReady.Value) : null,
+                    ["endpointFailures"] = EndpointFailures,
+                    ["endpointMessage"] = string.IsNullOrWhiteSpace(EndpointMessage) ? null : EndpointMessage,
+                    ["startedAtUnixMs"] = NumberOrNull(StartedAtUnixMs),
+                    ["completedAtUnixMs"] = NumberOrNull(CompletedAtUnixMs)
+                };
+            }
+        }
+    }
+
+    private enum AudioTestKind
+    {
+        Playback,
+        Recording
+    }
+
+    private enum AudioTestDirection
+    {
+        Microphone,
+        Speaker
+    }
+
+    private sealed record AudioConnectionSnapshot(
+        bool Connected,
+        int ConnectionId,
+        bool MicrophoneEnabled,
+        bool SpeakerEnabled)
+    {
+        public static AudioConnectionSnapshot Disconnected { get; } = new(false, 0, false, false);
+    }
+
+    private sealed record AudioDirectionSnapshot(
+        string Direction,
+        string State,
+        string Message,
+        bool EndpointReady)
+    {
+        public static AudioDirectionSnapshot Unknown(string direction)
+        {
+            return new AudioDirectionSnapshot(direction, "unknown", "", false);
+        }
+    }
+
+    private sealed record AudioTestCommandResult(
+        bool Ok,
+        string Status,
+        string Kind,
+        string TestId,
+        string Message,
+        long? StartedAtUnixMs,
+        long? CompletedAtUnixMs,
+        JsonObject Stats);
 
     private static bool TryReadCommandBool(JsonObject payload, string name, out bool value)
     {
@@ -1195,7 +1960,8 @@ internal static partial class Program
         VideoModeState videoModeState,
         ControlMessagePublisher publisher,
         DisplayLayoutProvider displayLayoutProvider,
-        CameraRuntimeState cameraRuntimeState)
+        CameraRuntimeState cameraRuntimeState,
+        AudioTestCoordinator audioTestCoordinator)
     {
         private readonly TcpListener _listener = new(address, options.ControlPort);
         private readonly HostOptions _options = options;
@@ -1260,7 +2026,7 @@ internal static partial class Program
             using (connectionCts)
             {
                 var remote = client.Client.RemoteEndPoint?.ToString() ?? "unknown";
-                var session = new ControlSession(connectionId, client, connectionCts, _options, _videoModeState, _publisher, _displayLayoutProvider, _cameraRuntimeState);
+                var session = new ControlSession(connectionId, client, connectionCts, _options, _videoModeState, _publisher, _displayLayoutProvider, _cameraRuntimeState, audioTestCoordinator);
                 Log($"CONN {connectionId}", $"控制通道已连接: {remote}");
 
                 try
@@ -1301,6 +2067,7 @@ internal static partial class Program
         private readonly ControlMessagePublisher _publisher;
         private readonly DisplayLayoutProvider _displayLayoutProvider;
         private readonly CameraRuntimeState _cameraRuntimeState;
+        private readonly AudioTestCoordinator _audioTestCoordinator;
         private readonly HostInputController _inputController;
         private readonly PeriodicTimer _heartbeatTimer = new(TimeSpan.FromSeconds(2));
         private readonly PeriodicTimer _inputStatsTimer = new(TimeSpan.FromSeconds(1));
@@ -1321,7 +2088,8 @@ internal static partial class Program
             VideoModeState videoModeState,
             ControlMessagePublisher publisher,
             DisplayLayoutProvider displayLayoutProvider,
-            CameraRuntimeState cameraRuntimeState)
+            CameraRuntimeState cameraRuntimeState,
+            AudioTestCoordinator audioTestCoordinator)
         {
             _connectionId = connectionId;
             _client = client;
@@ -1331,6 +2099,7 @@ internal static partial class Program
             _publisher = publisher;
             _displayLayoutProvider = displayLayoutProvider;
             _cameraRuntimeState = cameraRuntimeState;
+            _audioTestCoordinator = audioTestCoordinator;
             _client.NoDelay = true;
             _inputController = new HostInputController(
                 options.EnableInputInjection,
@@ -1548,6 +2317,15 @@ internal static partial class Program
                         {
                             LogCameraStatus(message.Payload);
                         }
+                    }
+
+                    break;
+
+                case "audio_test_status":
+                    if (message.Payload is JsonObject audioTestPayload)
+                    {
+                        Log(Scope, $"audio_test_status payload={audioTestPayload}");
+                        _audioTestCoordinator.HandleAndroidStatus(audioTestPayload);
                     }
 
                     break;

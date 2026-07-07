@@ -88,6 +88,9 @@ public sealed partial class MainWindow : Window
     private const int CameraPreviewIntervalMs = 33;
     private const int OverviewPreviewIntervalMs = 33;
     private const int MaxOverviewDiagnosticsSamples = 11;
+    private const int AudioPlaybackTestDurationMs = 1600;
+    private const int AudioRecordingTestDurationMs = 2500;
+    private const int AudioTestTimeoutMs = 8000;
     private const string AudioPreferencesFileName = "audio-preferences.json";
     private static readonly TimeSpan AudioTelemetryStaleAfter = TimeSpan.FromSeconds(5);
     private static readonly string[] HostSupportedCameraCodecs = { "video/avc" };
@@ -225,6 +228,10 @@ public sealed partial class MainWindow : Window
     private AudioRuntimeConfigurationSnapshot? _appliedAudioRuntimeConfiguration;
     private bool _audioRuntimeChangesPending;
     private bool _applyingAudioRuntimeChanges;
+    private bool _audioTestInProgress;
+    private AudioTestKind? _activeAudioTestKind;
+    private AudioTestUiResult _playbackAudioTestResult = AudioTestUiResult.NotRun("尚未测试播放。");
+    private AudioTestUiResult _recordingAudioTestResult = AudioTestUiResult.NotRun("尚未测试录音。");
     private AudioEndpointDiagnostics _microphoneRenderEndpointDiagnostics = AudioEndpointDiagnostics.Unknown(AudioEndpointRole.MicrophoneRender);
     private AudioEndpointDiagnostics _speakerCaptureEndpointDiagnostics = AudioEndpointDiagnostics.Unknown(AudioEndpointRole.SpeakerCapture);
     private CameraPreviewFrameReader? _cameraPreviewReader;
@@ -750,6 +757,8 @@ public sealed partial class MainWindow : Window
         OverviewAudioPage.OpenSoundSettingsRequested += StaticAudioPage_OpenSoundSettingsRequested;
         OverviewAudioPage.AutoBindEndpointsRequested += StaticAudioPage_AutoBindEndpointsRequested;
         OverviewAudioPage.ApplyAudioChangesRequested += StaticAudioPage_ApplyAudioChangesRequested;
+        OverviewAudioPage.TestPlaybackRequested += StaticAudioPage_TestPlaybackRequested;
+        OverviewAudioPage.TestRecordingRequested += StaticAudioPage_TestRecordingRequested;
         OverviewAudioPage.PrimaryRecoveryActionRequested += StaticAudioPage_PrimaryRecoveryActionRequested;
         OverviewAudioPage.SpeakerEndpointChanged += StaticAudioPage_SpeakerEndpointChanged;
         OverviewAudioPage.MicrophoneEndpointChanged += StaticAudioPage_MicrophoneEndpointChanged;
@@ -3866,6 +3875,16 @@ public sealed partial class MainWindow : Window
         await ApplyAudioRuntimeChangesAsync();
     }
 
+    private async void StaticAudioPage_TestPlaybackRequested(object? sender, EventArgs e)
+    {
+        await RunAudioTestFromUiAsync(AudioTestKind.Playback);
+    }
+
+    private async void StaticAudioPage_TestRecordingRequested(object? sender, EventArgs e)
+    {
+        await RunAudioTestFromUiAsync(AudioTestKind.Recording);
+    }
+
     private async void StaticAudioPage_PrimaryRecoveryActionRequested(object? sender, StaticAudioRecoveryActionEventArgs e)
     {
         switch (e.Action)
@@ -3894,6 +3913,113 @@ public sealed partial class MainWindow : Window
                 UpdateAudioState("音频诊断日志已复制。");
                 break;
         }
+    }
+
+    private async Task RunAudioTestFromUiAsync(AudioTestKind kind)
+    {
+        if (_audioTestInProgress)
+        {
+            UpdateAudioState("已有音频测试正在进行。");
+            return;
+        }
+
+        _audioTestInProgress = true;
+        _activeAudioTestKind = kind;
+        SetAudioTestResult(kind, AudioTestUiResult.Running(kind == AudioTestKind.Playback ? "播放测试进行中..." : "录音测试进行中..."));
+        UpdateAudioState(kind == AudioTestKind.Playback ? "正在发送播放测试音。" : "正在采集 Android 麦克风测试音频。");
+
+        AudioTestUiResult result;
+        try
+        {
+            result = await SendHostAudioTestCommandAsync(kind);
+            SetAudioTestResult(kind, result);
+            AppendRecentAudioLogLine($"audio-test kind={AudioTestKindText(kind)} status={result.Status} message={result.Message}");
+        }
+        finally
+        {
+            _audioTestInProgress = false;
+            _activeAudioTestKind = null;
+        }
+
+        UpdateAudioState(result.Message);
+    }
+
+    private void SetAudioTestResult(AudioTestKind kind, AudioTestUiResult result)
+    {
+        if (kind == AudioTestKind.Playback)
+        {
+            _playbackAudioTestResult = result;
+        }
+        else
+        {
+            _recordingAudioTestResult = result;
+        }
+    }
+
+    private async Task<AudioTestUiResult> SendHostAudioTestCommandAsync(AudioTestKind kind)
+    {
+        if (_hostProcess is not { HasExited: false })
+        {
+            return AudioTestUiResult.Failed("Host 未运行，无法发起音频测试。");
+        }
+
+        try
+        {
+            using var client = new TcpClient();
+            await client.ConnectAsync(IPAddress.Loopback, DefaultCameraCommandPort).WaitAsync(TimeSpan.FromSeconds(3));
+            await using var stream = client.GetStream();
+            using var writer = new StreamWriter(stream, new UTF8Encoding(encoderShouldEmitUTF8Identifier: false), bufferSize: 4096, leaveOpen: true)
+            {
+                AutoFlush = true,
+                NewLine = "\n"
+            };
+            using var reader = new StreamReader(stream, Encoding.UTF8, detectEncodingFromByteOrderMarks: false, bufferSize: 4096, leaveOpen: true);
+
+            var request = JsonSerializer.Serialize(new
+            {
+                v = 1,
+                type = "host_audio_test",
+                seq = 1,
+                ts = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds(),
+                payload = new
+                {
+                    kind = AudioTestKindText(kind),
+                    durationMs = kind == AudioTestKind.Playback ? AudioPlaybackTestDurationMs : AudioRecordingTestDurationMs,
+                    timeoutMs = AudioTestTimeoutMs
+                }
+            });
+            await writer.WriteLineAsync(request);
+
+            var response = await reader.ReadLineAsync().WaitAsync(TimeSpan.FromMilliseconds(AudioTestTimeoutMs + 3000));
+            if (string.IsNullOrWhiteSpace(response))
+            {
+                return AudioTestUiResult.Failed("音频测试命令没有返回响应。");
+            }
+
+            using var document = JsonDocument.Parse(response);
+            return ReadAudioTestUiResult(document.RootElement);
+        }
+        catch (Exception ex) when (ex is IOException or SocketException or TimeoutException or JsonException)
+        {
+            return AudioTestUiResult.Failed($"音频测试命令失败：{ex.Message}");
+        }
+    }
+
+    private static AudioTestUiResult ReadAudioTestUiResult(JsonElement root)
+    {
+        var ok = ReadJsonNullableBool(root, "ok") == true;
+        var status = ReadJsonString(root, "status") ?? (ok ? "passed" : "failed");
+        var message = ReadJsonString(root, "message") ?? (ok ? "音频测试通过。" : "音频测试失败。");
+        return status.Equals("passed_silent", StringComparison.OrdinalIgnoreCase)
+            ? AudioTestUiResult.Warning(status, message)
+            : ok
+                ? AudioTestUiResult.Passed(status, message)
+                : AudioTestUiResult.Failed(message, status);
+    }
+
+    private static string AudioTestKindText(AudioTestKind kind)
+    {
+        return kind == AudioTestKind.Playback ? "playback" : "recording";
     }
 
     private void StaticAudioPage_SpeakerEndpointChanged(object? sender, StaticAudioEndpointChangedEventArgs e)
@@ -12813,6 +12939,10 @@ public sealed partial class MainWindow : Window
         _androidMicrophoneTelemetry = null;
         _androidSpeakerTelemetry = null;
         _audioAndroidControlConnected = false;
+        _audioTestInProgress = false;
+        _activeAudioTestKind = null;
+        _playbackAudioTestResult = AudioTestUiResult.NotRun("尚未测试播放。");
+        _recordingAudioTestResult = AudioTestUiResult.NotRun("尚未测试录音。");
         _lastCameraStatusLine = null;
         _lastCameraErrorLine = null;
         _lastCameraErrorMessage = null;
@@ -14218,6 +14348,10 @@ public sealed partial class MainWindow : Window
             AudioDirection.Microphone,
             microphoneStatus,
             audioEnabled && microphoneIntent);
+        var playbackTestView = BuildAudioTestView(_playbackAudioTestResult, recoveryState);
+        var recordingTestView = BuildAudioTestView(_recordingAudioTestResult, recoveryState);
+        var canRunPlaybackTest = CanRunAudioTest(AudioTestKind.Playback, audioEnabled, speakerIntent);
+        var canRunRecordingTest = CanRunAudioTest(AudioTestKind.Recording, audioEnabled, microphoneIntent);
 
         _updatingStaticAudioPage = true;
         try
@@ -14241,6 +14375,16 @@ public sealed partial class MainWindow : Window
                 CanAutoBindEndpoints = CanAutoBindRecommendedAudioEndpoints(),
                 CanApplyAndRestartAudio = CanApplyAndRestartAudio(),
                 CanCopyDiagnostics = true,
+                CanRunPlaybackTest = canRunPlaybackTest,
+                CanRunRecordingTest = canRunRecordingTest,
+                PlaybackTestButtonText = _audioTestInProgress && _activeAudioTestKind == AudioTestKind.Playback ? "测试中..." : "测试播放",
+                RecordingTestButtonText = _audioTestInProgress && _activeAudioTestKind == AudioTestKind.Recording ? "测试中..." : "测试录音",
+                PlaybackTestSummaryText = playbackTestView.Summary,
+                PlaybackTestSummaryBrush = playbackTestView.Brush,
+                RecordingTestSummaryText = recordingTestView.Summary,
+                RecordingTestSummaryBrush = recordingTestView.Brush,
+                PlaybackTestToolTip = BuildAudioTestToolTip(AudioTestKind.Playback, audioEnabled, speakerIntent),
+                RecordingTestToolTip = BuildAudioTestToolTip(AudioTestKind.Recording, audioEnabled, microphoneIntent),
                 PrimaryRecoveryAction = recoveryState.PrimaryAction,
                 PrimaryRecoveryActionText = BuildAudioRecoveryActionText(recoveryState.PrimaryAction, recoveryState.Issue),
                 PrimaryRecoveryActionIconGlyph = AudioRecoveryActionIconGlyph(recoveryState.PrimaryAction, recoveryState.Issue),
@@ -14278,7 +14422,8 @@ public sealed partial class MainWindow : Window
                 RepairHintText = recoveryState.Message,
                 InstallStepState = virtualCableReady ? StaticAudioStepState.Ready : StaticAudioStepState.Warning,
                 SpeakerStepState = AudioEndpointStepState(_speakerCaptureEndpointDiagnostics, audioEnabled && speakerIntent),
-                MicrophoneStepState = AudioEndpointStepState(_microphoneRenderEndpointDiagnostics, audioEnabled && microphoneIntent)
+                MicrophoneStepState = AudioEndpointStepState(_microphoneRenderEndpointDiagnostics, audioEnabled && microphoneIntent),
+                TestStepState = AudioTestStepState()
             });
         }
         finally
@@ -14288,6 +14433,97 @@ public sealed partial class MainWindow : Window
 
         SyncStaticAudioPageEndpointChoices();
         OverviewAudioPage.UpdateRecentLogs(SnapshotRecentAudioLogLines());
+    }
+
+    private bool CanRunAudioTest(AudioTestKind kind, bool audioEnabled, bool directionIntent)
+    {
+        return !_audioTestInProgress
+            && audioEnabled
+            && directionIntent
+            && !_audioRuntimeChangesPending
+            && !_applyingAudioRuntimeChanges
+            && _hostProcess is { HasExited: false };
+    }
+
+    private string BuildAudioTestToolTip(AudioTestKind kind, bool audioEnabled, bool directionIntent)
+    {
+        if (_audioTestInProgress)
+        {
+            return "已有音频测试正在进行。";
+        }
+
+        if (!audioEnabled)
+        {
+            return "先启用 SideDock 音频。";
+        }
+
+        if (!directionIntent)
+        {
+            return kind == AudioTestKind.Playback
+                ? "先启用电脑声音发送到 Android。"
+                : "先启用 Android 麦克风写入 Windows。";
+        }
+
+        if (_audioRuntimeChangesPending)
+        {
+            return "先应用并重启音频，让当前端点配置生效。";
+        }
+
+        if (_hostProcess is not { HasExited: false })
+        {
+            return "先启动 Host。";
+        }
+
+        return kind == AudioTestKind.Playback
+            ? "向 Android 播放短测试音并等待 AudioTrack 回报。"
+            : "采集 2-3 秒 Android 麦克风并确认 Host 写入 Windows 端点。";
+    }
+
+    private AudioTestView BuildAudioTestView(AudioTestUiResult result, AudioRecoveryState recoveryState)
+    {
+        var summary = result.CompletedAt is null
+            ? result.Message
+            : $"{result.CompletedAt:HH:mm:ss} · {result.Message}";
+        if (result.VisualState == AudioTestVisualState.Failed)
+        {
+            summary += $" 下一步：{BuildAudioRecoveryActionText(recoveryState.PrimaryAction, recoveryState.Issue)}。";
+        }
+
+        return new AudioTestView(summary, AudioTestBrush(result.VisualState));
+    }
+
+    private Brush AudioTestBrush(AudioTestVisualState state)
+    {
+        return state switch
+        {
+            AudioTestVisualState.Passed => _successBrush,
+            AudioTestVisualState.Warning => _warningBrush,
+            AudioTestVisualState.Failed => _dangerBrush,
+            AudioTestVisualState.Running => _overviewPrimaryBrush,
+            _ => _secondaryBrush
+        };
+    }
+
+    private StaticAudioStepState AudioTestStepState()
+    {
+        if (_audioTestInProgress)
+        {
+            return StaticAudioStepState.Warning;
+        }
+
+        if (_playbackAudioTestResult.VisualState == AudioTestVisualState.Failed
+            || _recordingAudioTestResult.VisualState == AudioTestVisualState.Failed)
+        {
+            return StaticAudioStepState.Error;
+        }
+
+        if (_playbackAudioTestResult.VisualState is AudioTestVisualState.Passed or AudioTestVisualState.Warning
+            || _recordingAudioTestResult.VisualState is AudioTestVisualState.Passed or AudioTestVisualState.Warning)
+        {
+            return StaticAudioStepState.Ready;
+        }
+
+        return StaticAudioStepState.Unavailable;
     }
 
     private AudioRuntimeDirectionView BuildAudioRuntimeDirectionView(
@@ -15643,6 +15879,40 @@ public sealed partial class MainWindow : Window
         string TimingText,
         double LevelPercent);
 
+    private sealed record AudioTestView(string Summary, Brush Brush);
+
+    private sealed record AudioTestUiResult(
+        AudioTestVisualState VisualState,
+        string Status,
+        string Message,
+        DateTimeOffset? CompletedAt)
+    {
+        public static AudioTestUiResult NotRun(string message)
+        {
+            return new AudioTestUiResult(AudioTestVisualState.NotRun, "not_run", message, null);
+        }
+
+        public static AudioTestUiResult Running(string message)
+        {
+            return new AudioTestUiResult(AudioTestVisualState.Running, "running", message, null);
+        }
+
+        public static AudioTestUiResult Passed(string status, string message)
+        {
+            return new AudioTestUiResult(AudioTestVisualState.Passed, status, message, DateTimeOffset.Now);
+        }
+
+        public static AudioTestUiResult Warning(string status, string message)
+        {
+            return new AudioTestUiResult(AudioTestVisualState.Warning, status, message, DateTimeOffset.Now);
+        }
+
+        public static AudioTestUiResult Failed(string message, string status = "failed")
+        {
+            return new AudioTestUiResult(AudioTestVisualState.Failed, status, message, DateTimeOffset.Now);
+        }
+    }
+
     private sealed record AudioRecoveryState(
         AudioRecoveryIssue Issue,
         AudioRecoveryAction PrimaryAction,
@@ -15654,6 +15924,21 @@ public sealed partial class MainWindow : Window
     {
         Microphone,
         Speaker
+    }
+
+    private enum AudioTestKind
+    {
+        Playback,
+        Recording
+    }
+
+    private enum AudioTestVisualState
+    {
+        NotRun,
+        Running,
+        Passed,
+        Warning,
+        Failed
     }
 
     private enum AudioEndpointRole

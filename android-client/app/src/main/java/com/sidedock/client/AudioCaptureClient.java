@@ -19,7 +19,9 @@ import java.util.Arrays;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.Future;
+import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.ThreadFactory;
+import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicReference;
 
 public final class AudioCaptureClient {
@@ -28,6 +30,58 @@ public final class AudioCaptureClient {
         void onAudioCaptureStats(long packetsSent, long bytesSent, int peakSample, long silentPackets, String audioSourceName);
         void onAudioPlaybackState(String state, String message);
         void onAudioPlaybackStats(long packetsReceived, long bytesReceived, int peakSample, long sourceAgeMs, int playState);
+        void onAudioTestStatus(AudioTestStatus status);
+    }
+
+    public static final class AudioTestStatus {
+        public final String testId;
+        public final String kind;
+        public final String status;
+        public final boolean ok;
+        public final String phase;
+        public final String message;
+        public final long startedAtMs;
+        public final long completedAtMs;
+        public final long packetsSent;
+        public final long bytesSent;
+        public final long packetsReceived;
+        public final long bytesReceived;
+        public final int peakSample;
+        public final int peakLevelPercent;
+        public final long silentPackets;
+        public final double silentRatio;
+        public final boolean permissionGranted;
+        public final boolean muted;
+        public final boolean stopped;
+        public final int playState;
+        public final long writeErrors;
+        public final String error;
+
+        private AudioTestStatus(AudioTestSession session, String status, boolean ok, String phase, String message, String error) {
+            this.testId = session.testId;
+            this.kind = session.kind;
+            this.status = status;
+            this.ok = ok;
+            this.phase = phase;
+            this.message = message;
+            this.startedAtMs = session.startedAtMs;
+            this.completedAtMs = session.completedAtMs > 0L ? session.completedAtMs : System.currentTimeMillis();
+            this.packetsSent = session.packetsSent;
+            this.bytesSent = session.bytesSent;
+            this.packetsReceived = session.packetsReceived;
+            this.bytesReceived = session.bytesReceived;
+            this.peakSample = session.peakSample;
+            this.peakLevelPercent = peakSampleToPercent(session.peakSample);
+            this.silentPackets = session.silentPackets;
+            long packetCount = "recording".equals(session.kind) ? session.packetsSent : session.packetsReceived;
+            this.silentRatio = packetCount <= 0L ? 0.0d : session.silentPackets / (double) packetCount;
+            this.permissionGranted = session.permissionGranted;
+            this.muted = session.muted;
+            this.stopped = session.stopped;
+            this.playState = session.playState;
+            this.writeErrors = session.writeErrors;
+            this.error = error == null ? "" : error;
+        }
     }
 
     private static final int HEADER_SIZE = 36;
@@ -41,6 +95,8 @@ public final class AudioCaptureClient {
     private final Context context;
     private final Listener listener;
     private final Object lifecycleLock = new Object();
+    private final Object testLock = new Object();
+    private final ScheduledExecutorService testExecutor = Executors.newSingleThreadScheduledExecutor(new NamedThreadFactory("SideDock-AudioTest"));
 
     private ExecutorService executor;
     private Socket socket;
@@ -53,6 +109,8 @@ public final class AudioCaptureClient {
     private boolean microphoneActive;
     private boolean speakerEnabled;
     private boolean speakerMuted;
+    private AudioTestSession activePlaybackTest;
+    private AudioTestSession activeRecordingTest;
 
     public AudioCaptureClient(Context context, Listener listener) {
         this.context = context.getApplicationContext();
@@ -107,10 +165,100 @@ public final class AudioCaptureClient {
         synchronized (lifecycleLock) {
             stopLocked();
         }
+        failActiveTests("audio_stopped", "Audio was stopped before the test completed.");
+    }
+
+    public void shutdown() {
+        stop();
+        testExecutor.shutdownNow();
     }
 
     public boolean isRunning() {
         return running;
+    }
+
+    public void startAudioTest(String testId, String kind, int durationMs, int timeoutMs) {
+        String normalizedTestId = testId == null ? "" : testId.trim();
+        String normalizedKind = kind == null ? "" : kind.trim().toLowerCase();
+        if (normalizedTestId.isEmpty()
+            || (!"playback".equals(normalizedKind) && !"recording".equals(normalizedKind))) {
+            emitImmediateTestStatus(
+                normalizedTestId,
+                normalizedKind,
+                "failed",
+                false,
+                "rejected",
+                "Invalid audio test request.",
+                "invalid_request");
+            return;
+        }
+
+        int safeDurationMs = Math.max(500, Math.min(durationMs, 4000));
+        int safeTimeoutMs = Math.max(safeDurationMs + 1000, Math.min(Math.max(timeoutMs, 3000), 12000));
+        AudioTestSession session;
+        synchronized (testLock) {
+            if ("playback".equals(normalizedKind) && activePlaybackTest != null) {
+                emitImmediateTestStatus(normalizedTestId, normalizedKind, "failed", false, "rejected", "A playback test is already running.", "busy");
+                return;
+            }
+            if ("recording".equals(normalizedKind) && activeRecordingTest != null) {
+                emitImmediateTestStatus(normalizedTestId, normalizedKind, "failed", false, "rejected", "A recording test is already running.", "busy");
+                return;
+            }
+
+            boolean permissionGranted = context.checkSelfPermission(Manifest.permission.RECORD_AUDIO) == PackageManager.PERMISSION_GRANTED;
+            if ("recording".equals(normalizedKind) && (!running || !microphoneActive || !permissionGranted)) {
+                emitImmediateTestStatus(
+                    normalizedTestId,
+                    normalizedKind,
+                    "failed",
+                    false,
+                    "preflight",
+                    permissionGranted ? "Android microphone capture is not active." : "Android microphone permission is missing.",
+                    permissionGranted ? "microphone_inactive" : "permission_missing");
+                return;
+            }
+
+            if ("playback".equals(normalizedKind) && (!running || !speakerEnabled || speakerMuted)) {
+                emitImmediateTestStatus(
+                    normalizedTestId,
+                    normalizedKind,
+                    "failed",
+                    false,
+                    "preflight",
+                    speakerMuted ? "Android speaker playback is muted." : "Android speaker playback is not active.",
+                    speakerMuted ? "speaker_muted" : "speaker_inactive");
+                return;
+            }
+
+            session = new AudioTestSession(
+                normalizedTestId,
+                normalizedKind,
+                safeDurationMs,
+                safeTimeoutMs,
+                permissionGranted,
+                "playback".equals(normalizedKind) ? speakerMuted : false,
+                !running);
+            if ("playback".equals(normalizedKind)) {
+                activePlaybackTest = session;
+            } else {
+                activeRecordingTest = session;
+            }
+        }
+
+        emitTestStatus(session, "running", false, "running", "Audio test is running.", "");
+        testExecutor.schedule(new Runnable() {
+            @Override
+            public void run() {
+                finishAudioTest(normalizedTestId, normalizedKind, false);
+            }
+        }, safeDurationMs, TimeUnit.MILLISECONDS);
+        testExecutor.schedule(new Runnable() {
+            @Override
+            public void run() {
+                finishAudioTest(normalizedTestId, normalizedKind, true);
+            }
+        }, safeTimeoutMs, TimeUnit.MILLISECONDS);
     }
 
     private void stopLocked() {
@@ -304,6 +452,7 @@ public final class AudioCaptureClient {
 
             packetsSent += 1L;
             bytesSent += read;
+            recordCaptureTestPacket(read, packetPeakSample, audioSourceName);
             long now = System.currentTimeMillis();
             if (now - lastStatsAtMs >= 1000L) {
                 lastStatsAtMs = now;
@@ -370,7 +519,13 @@ public final class AudioCaptureClient {
                         track.play();
                         playbackStarted = true;
                     }
-                    writeTrack(track, pcm, payloadLength, runGeneration);
+                    try {
+                        writeTrack(track, pcm, payloadLength, runGeneration);
+                        recordPlaybackTestPacket(payloadLength, calculatePeakSample(pcm, payloadLength), track.getPlayState());
+                    } catch (Exception ex) {
+                        failPlaybackTest("audio_track_write_failed", "AudioTrack write failed: " + exceptionSummary(ex));
+                        throw ex;
+                    }
                 } else if (playbackStarted) {
                     track.pause();
                     track.flush();
@@ -437,6 +592,166 @@ public final class AudioCaptureClient {
             lastFailure);
     }
 
+    private void recordCaptureTestPacket(int byteCount, int peakSample, String audioSourceName) {
+        synchronized (testLock) {
+            AudioTestSession session = activeRecordingTest;
+            if (session == null) {
+                return;
+            }
+
+            session.packetsSent += 1L;
+            session.bytesSent += Math.max(0, byteCount);
+            session.peakSample = Math.max(session.peakSample, peakSample);
+            session.audioSourceName = audioSourceName == null ? "" : audioSourceName;
+            if (peakSample <= SILENCE_PEAK_THRESHOLD) {
+                session.silentPackets += 1L;
+            }
+        }
+    }
+
+    private void recordPlaybackTestPacket(int byteCount, int peakSample, int playState) {
+        synchronized (testLock) {
+            AudioTestSession session = activePlaybackTest;
+            if (session == null) {
+                return;
+            }
+
+            session.packetsReceived += 1L;
+            session.bytesReceived += Math.max(0, byteCount);
+            session.peakSample = Math.max(session.peakSample, peakSample);
+            session.playState = playState;
+        }
+    }
+
+    private void finishAudioTest(String testId, String kind, boolean timeout) {
+        AudioTestSession session;
+        synchronized (testLock) {
+            session = "playback".equals(kind) ? activePlaybackTest : activeRecordingTest;
+            if (session == null || !session.testId.equals(testId) || session.completed) {
+                return;
+            }
+
+            if (!timeout && session.completedAtMs > 0L) {
+                return;
+            }
+
+            session.completed = true;
+            session.completedAtMs = System.currentTimeMillis();
+            if ("playback".equals(kind)) {
+                activePlaybackTest = null;
+            } else {
+                activeRecordingTest = null;
+            }
+        }
+
+        AudioTestStatus status = evaluateTestSession(session, timeout);
+        listener.onAudioTestStatus(status);
+    }
+
+    private AudioTestStatus evaluateTestSession(AudioTestSession session, boolean timeout) {
+        if (timeout) {
+            return new AudioTestStatus(session, "failed", false, "timeout", "Audio test timed out on Android.", "timeout");
+        }
+
+        if ("playback".equals(session.kind)) {
+            if (session.muted) {
+                return new AudioTestStatus(session, "failed", false, "preflight", "Android speaker playback is muted.", "speaker_muted");
+            }
+            if (session.writeErrors > 0L) {
+                return new AudioTestStatus(session, "failed", false, "playback", "AudioTrack write failed during playback test.", "audio_track_write_failed");
+            }
+            if (session.packetsReceived <= 0L || session.bytesReceived <= 0L) {
+                return new AudioTestStatus(session, "failed", false, "playback", "Android did not receive playback test packets.", "no_playback_packets");
+            }
+
+            return new AudioTestStatus(session, "passed", true, "playback", "Android received playback packets and wrote them to AudioTrack.", "");
+        }
+
+        if (!session.permissionGranted) {
+            return new AudioTestStatus(session, "failed", false, "preflight", "Android microphone permission is missing.", "permission_missing");
+        }
+        if (session.packetsSent <= 0L || session.bytesSent <= 0L) {
+            return new AudioTestStatus(session, "failed", false, "recording", "Android did not capture microphone packets.", "no_recording_packets");
+        }
+
+        double silentRatio = session.packetsSent <= 0L ? 1.0d : session.silentPackets / (double) session.packetsSent;
+        if (peakSampleToPercent(session.peakSample) <= 1 || silentRatio >= 0.95d) {
+            return new AudioTestStatus(session, "passed_silent", true, "recording", "Microphone link is active, but input level is silent or very low.", "");
+        }
+
+        return new AudioTestStatus(session, "passed", true, "recording", "Android captured and sent microphone packets.", "");
+    }
+
+    private void failPlaybackTest(String error, String message) {
+        AudioTestSession session;
+        synchronized (testLock) {
+            session = activePlaybackTest;
+            if (session == null || session.completed) {
+                return;
+            }
+
+            session.writeErrors += 1L;
+            session.completed = true;
+            session.completedAtMs = System.currentTimeMillis();
+            activePlaybackTest = null;
+        }
+
+        listener.onAudioTestStatus(new AudioTestStatus(session, "failed", false, "playback", message, error));
+    }
+
+    private void failActiveTests(String error, String message) {
+        AudioTestSession playback;
+        AudioTestSession recording;
+        synchronized (testLock) {
+            playback = activePlaybackTest;
+            recording = activeRecordingTest;
+            activePlaybackTest = null;
+            activeRecordingTest = null;
+            long now = System.currentTimeMillis();
+            if (playback != null) {
+                playback.completed = true;
+                playback.completedAtMs = now;
+            }
+            if (recording != null) {
+                recording.completed = true;
+                recording.completedAtMs = now;
+            }
+        }
+
+        if (playback != null) {
+            listener.onAudioTestStatus(new AudioTestStatus(playback, "failed", false, "stopped", message, error));
+        }
+        if (recording != null) {
+            listener.onAudioTestStatus(new AudioTestStatus(recording, "failed", false, "stopped", message, error));
+        }
+    }
+
+    private void emitTestStatus(AudioTestSession session, String status, boolean ok, String phase, String message, String error) {
+        listener.onAudioTestStatus(new AudioTestStatus(session, status, ok, phase, message, error));
+    }
+
+    private void emitImmediateTestStatus(
+        String testId,
+        String kind,
+        String status,
+        boolean ok,
+        String phase,
+        String message,
+        String error
+    ) {
+        AudioTestSession session = new AudioTestSession(
+            testId == null ? "" : testId,
+            kind == null ? "" : kind,
+            0,
+            0,
+            context.checkSelfPermission(Manifest.permission.RECORD_AUDIO) == PackageManager.PERMISSION_GRANTED,
+            speakerMuted,
+            !running);
+        session.completed = true;
+        session.completedAtMs = System.currentTimeMillis();
+        listener.onAudioTestStatus(new AudioTestStatus(session, status, ok, phase, message, error));
+    }
+
     private static int calculatePeakSample(byte[] pcm, int byteCount) {
         int peak = 0;
         int end = byteCount - (byteCount % 2);
@@ -451,6 +766,11 @@ public final class AudioCaptureClient {
         }
 
         return peak;
+    }
+
+    private static int peakSampleToPercent(int peakSample) {
+        int normalized = Math.max(0, Math.min(Short.MAX_VALUE, peakSample));
+        return Math.max(0, Math.min(100, (int) Math.round((normalized * 100.0d) / Short.MAX_VALUE)));
     }
 
     private static String audioSourceName(int audioSource) {
@@ -651,6 +971,47 @@ public final class AudioCaptureClient {
         private WorkerFailure(String worker, Exception exception) {
             this.worker = worker;
             this.exception = exception;
+        }
+    }
+
+    private static final class AudioTestSession {
+        private final String testId;
+        private final String kind;
+        private final int durationMs;
+        private final int timeoutMs;
+        private final long startedAtMs;
+        private final boolean permissionGranted;
+        private final boolean muted;
+        private final boolean stopped;
+        private long completedAtMs;
+        private boolean completed;
+        private long packetsSent;
+        private long bytesSent;
+        private long packetsReceived;
+        private long bytesReceived;
+        private int peakSample;
+        private long silentPackets;
+        private int playState;
+        private long writeErrors;
+        private String audioSourceName = "";
+
+        private AudioTestSession(
+            String testId,
+            String kind,
+            int durationMs,
+            int timeoutMs,
+            boolean permissionGranted,
+            boolean muted,
+            boolean stopped
+        ) {
+            this.testId = testId;
+            this.kind = kind;
+            this.durationMs = durationMs;
+            this.timeoutMs = timeoutMs;
+            this.permissionGranted = permissionGranted;
+            this.muted = muted;
+            this.stopped = stopped;
+            this.startedAtMs = System.currentTimeMillis();
         }
     }
 

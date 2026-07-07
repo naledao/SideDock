@@ -327,7 +327,7 @@ public final class MainActivity extends Activity implements ControlClient.Listen
         stopDisplayFrameSampling();
         clearDisplayTimingHints();
         cameraCaptureClient.stop();
-        audioCaptureClient.stop();
+        audioCaptureClient.shutdown();
         videoClient.stop();
         controlClient.shutdown();
         super.onDestroy();
@@ -451,6 +451,20 @@ public final class MainActivity extends Activity implements ControlClient.Listen
     }
 
     @Override
+    public void onAudioTestRequest(ControlClient.AudioTestRequest request) {
+        if (request == null) {
+            return;
+        }
+
+        addLog("audio_test_request " + request.kind + " testId=" + request.testId);
+        audioCaptureClient.startAudioTest(
+            request.testId,
+            request.kind,
+            request.durationMs,
+            request.timeoutMs);
+    }
+
+    @Override
     public void onCameraConfig(ControlClient.CameraConfig config) {
         hostCameraEnabled = config.enabled;
         cameraPort = config.port > 0 ? config.port : DEFAULT_CAMERA_PORT;
@@ -539,6 +553,38 @@ public final class MainActivity extends Activity implements ControlClient.Listen
                     speakerMuted ? "本机音响已静音。" : "正在播放电脑声音。");
             }
         });
+    }
+
+    @Override
+    public void onAudioTestStatus(AudioCaptureClient.AudioTestStatus status) {
+        if (status == null || controlClient == null) {
+            return;
+        }
+
+        controlClient.sendAudioTestStatus(
+            status.testId,
+            status.kind,
+            status.status,
+            status.ok,
+            status.phase,
+            status.message,
+            status.startedAtMs,
+            status.completedAtMs,
+            status.packetsSent,
+            status.bytesSent,
+            status.packetsReceived,
+            status.bytesReceived,
+            status.peakSample,
+            status.peakLevelPercent,
+            status.silentPackets,
+            status.silentRatio,
+            status.permissionGranted,
+            status.muted,
+            status.stopped,
+            status.playState,
+            status.writeErrors,
+            status.error);
+        addLog("audio_test_status " + status.kind + " " + status.status + " ok=" + status.ok + " " + status.message);
     }
 
     @Override

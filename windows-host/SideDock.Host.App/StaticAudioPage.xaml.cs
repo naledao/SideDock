@@ -57,6 +57,10 @@ public sealed partial class StaticAudioPage : UserControl
 
     public event EventHandler? ApplyAudioChangesRequested;
 
+    public event EventHandler? TestPlaybackRequested;
+
+    public event EventHandler? TestRecordingRequested;
+
     public event EventHandler<StaticAudioRecoveryActionEventArgs>? PrimaryRecoveryActionRequested;
 
     public event EventHandler<StaticAudioEndpointChangedEventArgs>? SpeakerEndpointChanged;
@@ -158,11 +162,21 @@ public sealed partial class StaticAudioPage : UserControl
         ApplyAndRestartAudioActionMenuItem.IsEnabled = state.CanApplyAndRestartAudio;
         OpenSoundSettingsActionMenuItem.IsEnabled = state.CanOpenSoundSettings;
         CopyDiagnosticsActionMenuItem.IsEnabled = state.CanCopyDiagnostics;
+        TestPlaybackButton.IsEnabled = state.CanRunPlaybackTest;
+        TestRecordingButton.IsEnabled = state.CanRunRecordingTest;
+        TestPlaybackButtonText.Text = state.PlaybackTestButtonText;
+        TestRecordingButtonText.Text = state.RecordingTestButtonText;
+        PlaybackTestSummaryText.Text = state.PlaybackTestSummaryText;
+        PlaybackTestSummaryText.Foreground = state.PlaybackTestSummaryBrush;
+        RecordingTestSummaryText.Text = state.RecordingTestSummaryText;
+        RecordingTestSummaryText.Foreground = state.RecordingTestSummaryBrush;
+        ToolTipService.SetToolTip(TestPlaybackButton, state.PlaybackTestToolTip);
+        ToolTipService.SetToolTip(TestRecordingButton, state.RecordingTestToolTip);
 
         SetWizardStep(WizardInstallStepIcon, state.InstallStepState);
         SetWizardStep(WizardSpeakerStepIcon, state.SpeakerStepState);
         SetWizardStep(WizardMicrophoneStepIcon, state.MicrophoneStepState);
-        SetWizardStep(WizardTestStepIcon, StaticAudioStepState.Unavailable);
+        SetWizardStep(WizardTestStepIcon, state.TestStepState);
     }
 
     internal void UpdateEndpointChoices(
@@ -429,6 +443,16 @@ public sealed partial class StaticAudioPage : UserControl
         ApplyAudioChangesRequested?.Invoke(this, EventArgs.Empty);
     }
 
+    private void TestPlaybackButton_Click(object sender, RoutedEventArgs e)
+    {
+        TestPlaybackRequested?.Invoke(this, EventArgs.Empty);
+    }
+
+    private void TestRecordingButton_Click(object sender, RoutedEventArgs e)
+    {
+        TestRecordingRequested?.Invoke(this, EventArgs.Empty);
+    }
+
     private void PrimaryRecoveryActionButton_Click(object sender, RoutedEventArgs e)
     {
         if (_primaryRecoveryAction is AudioRecoveryAction.None
@@ -524,6 +548,26 @@ internal sealed class StaticAudioPageState
 
     public bool CanCopyDiagnostics { get; init; } = true;
 
+    public bool CanRunPlaybackTest { get; init; }
+
+    public bool CanRunRecordingTest { get; init; }
+
+    public string PlaybackTestButtonText { get; init; } = "测试播放";
+
+    public string RecordingTestButtonText { get; init; } = "测试录音";
+
+    public string PlaybackTestSummaryText { get; init; } = "尚未测试播放。";
+
+    public Brush PlaybackTestSummaryBrush { get; init; } = new SolidColorBrush(ColorHelper.FromArgb(255, 91, 101, 112));
+
+    public string RecordingTestSummaryText { get; init; } = "尚未测试录音。";
+
+    public Brush RecordingTestSummaryBrush { get; init; } = new SolidColorBrush(ColorHelper.FromArgb(255, 91, 101, 112));
+
+    public string PlaybackTestToolTip { get; init; } = "向 Android 播放短测试音。";
+
+    public string RecordingTestToolTip { get; init; } = "采集 Android 麦克风并写入 Windows。";
+
     public AudioRecoveryAction PrimaryRecoveryAction { get; init; } = AudioRecoveryAction.NoAction;
 
     public string PrimaryRecoveryActionText { get; init; } = "状态正常";
@@ -591,6 +635,8 @@ internal sealed class StaticAudioPageState
     public StaticAudioStepState SpeakerStepState { get; init; } = StaticAudioStepState.Neutral;
 
     public StaticAudioStepState MicrophoneStepState { get; init; } = StaticAudioStepState.Neutral;
+
+    public StaticAudioStepState TestStepState { get; init; } = StaticAudioStepState.Unavailable;
 }
 
 internal enum StaticAudioBannerSeverity
