@@ -40,6 +40,10 @@ public sealed partial class StaticAudioPage : UserControl
 
     public event EventHandler? OpenSoundSettingsRequested;
 
+    public event EventHandler? AutoBindEndpointsRequested;
+
+    public event EventHandler? ApplyAudioChangesRequested;
+
     public event EventHandler<StaticAudioEndpointChangedEventArgs>? SpeakerEndpointChanged;
 
     public event EventHandler<StaticAudioEndpointChangedEventArgs>? MicrophoneEndpointChanged;
@@ -115,11 +119,15 @@ public sealed partial class StaticAudioPage : UserControl
 
         AudioInlineHintText.Text = state.HintText;
         AudioInlineHintText.Foreground = state.HintBrush;
+        AudioPendingChangesPanel.Visibility = state.ShowPendingChanges ? Visibility.Visible : Visibility.Collapsed;
+        AudioPendingChangesText.Text = state.PendingChangesText;
         WizardRepairHintText.Text = state.RepairHintText;
 
         RefreshEndpointsButton.IsEnabled = state.CanRefreshEndpoints;
         RefreshMicrophoneEndpointsButton.IsEnabled = state.CanRefreshEndpoints;
         RefreshMicrophoneRenderButton.IsEnabled = state.CanRefreshEndpoints;
+        AutoBindEndpointsButton.IsEnabled = state.CanAutoBindEndpoints;
+        ApplyAudioChangesButton.IsEnabled = state.CanApplyPendingChanges;
         RepairEndpointsButton.IsEnabled = state.CanInstallVirtualAudioCable;
         ReloadVirtualCableButton.IsEnabled = state.CanInstallVirtualAudioCable;
         WizardOpenSoundSettingsButton.IsEnabled = state.CanOpenSoundSettings;
@@ -386,6 +394,16 @@ public sealed partial class StaticAudioPage : UserControl
         OpenSoundSettingsRequested?.Invoke(this, EventArgs.Empty);
     }
 
+    private void AutoBindEndpointsButton_Click(object sender, RoutedEventArgs e)
+    {
+        AutoBindEndpointsRequested?.Invoke(this, EventArgs.Empty);
+    }
+
+    private void ApplyAudioChangesButton_Click(object sender, RoutedEventArgs e)
+    {
+        ApplyAudioChangesRequested?.Invoke(this, EventArgs.Empty);
+    }
+
     private void StatusBannerCloseButton_Click(object sender, RoutedEventArgs e)
     {
         _statusBannerDismissed = true;
@@ -447,6 +465,14 @@ internal sealed class StaticAudioPageState
     public bool CanInstallVirtualAudioCable { get; init; } = true;
 
     public bool CanOpenSoundSettings { get; init; } = true;
+
+    public bool CanAutoBindEndpoints { get; init; } = true;
+
+    public bool ShowPendingChanges { get; init; }
+
+    public bool CanApplyPendingChanges { get; init; }
+
+    public string PendingChangesText { get; init; } = "有未应用的音频更改。";
 
     public string CurrentDeviceText { get; init; } = "等待 Android 设备";
 
