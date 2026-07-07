@@ -779,6 +779,10 @@ public final class ControlClient {
         return Math.max(0, Math.min(100, (int) Math.round((normalized * 100.0d) / Short.MAX_VALUE)));
     }
 
+    public void sendCameraCapabilities(JSONObject capabilities) {
+        sendFromAnyThread("camera_capabilities", capabilities == null ? new JSONObject() : capabilities);
+    }
+
     public void sendKeyboardInput(
         String action,
         int androidKeyCode,
