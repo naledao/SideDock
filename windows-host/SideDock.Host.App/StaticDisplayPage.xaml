@@ -522,6 +522,7 @@
                                             <Grid.RowDefinitions>
                                                 <RowDefinition Height="34" />
                                                 <RowDefinition Height="64" />
+                                                <RowDefinition Height="Auto" />
                                                 <RowDefinition Height="40" />
                                             </Grid.RowDefinitions>
                                             <Border
@@ -589,6 +590,7 @@
                                                     <Grid.ColumnDefinitions>
                                                         <ColumnDefinition Width="Auto" />
                                                         <ColumnDefinition Width="*" />
+                                                        <ColumnDefinition Width="Auto" />
                                                     </Grid.ColumnDefinitions>
                                                     <FontIcon
                                                         x:Name="DisplayPresentationModeIcon"
@@ -609,9 +611,76 @@
                                                             Foreground="#5B6570"
                                                             TextWrapping="Wrap" />
                                                     </StackPanel>
+                                                    <Button
+                                                        x:Name="CopyPresentationDiagnosticsButton"
+                                                        Grid.Column="2"
+                                                        Width="32"
+                                                        Height="32"
+                                                        Padding="0"
+                                                        CornerRadius="5"
+                                                        Background="#FFFFFF"
+                                                        BorderBrush="#D8DEE4"
+                                                        Visibility="Collapsed"
+                                                        ToolTipService.ToolTip="复制诊断摘要"
+                                                        Click="CopyPresentationDiagnosticsButton_Click">
+                                                        <FontIcon Glyph="&#xE8C8;" FontSize="14" Foreground="#30363D" />
+                                                    </Button>
                                                 </Grid>
                                             </Border>
                                             <Grid Grid.Row="2" ColumnSpacing="12">
+                                                <Border
+                                                    x:Name="SecondaryOnlyRollbackPanel"
+                                                    Padding="10,8"
+                                                    CornerRadius="5"
+                                                    Background="#FFF8ED"
+                                                    BorderBrush="#F59E0B"
+                                                    BorderThickness="1"
+                                                    Visibility="Collapsed">
+                                                    <Grid ColumnSpacing="10">
+                                                        <Grid.ColumnDefinitions>
+                                                            <ColumnDefinition Width="Auto" />
+                                                            <ColumnDefinition Width="*" />
+                                                            <ColumnDefinition Width="Auto" />
+                                                            <ColumnDefinition Width="Auto" />
+                                                        </Grid.ColumnDefinitions>
+                                                        <FontIcon Glyph="&#xE7BA;" FontSize="17" Foreground="#9D5D00" />
+                                                        <TextBlock
+                                                            x:Name="SecondaryOnlyRollbackText"
+                                                            Grid.Column="1"
+                                                            VerticalAlignment="Center"
+                                                            Text="仅副屏已临时启用，请确认是否保留。"
+                                                            TextWrapping="Wrap"
+                                                            FontSize="11"
+                                                            Foreground="#30363D" />
+                                                        <Button
+                                                            x:Name="KeepSecondaryOnlyButton"
+                                                            Grid.Column="2"
+                                                            Height="28"
+                                                            MinWidth="54"
+                                                            Padding="10,0"
+                                                            CornerRadius="5"
+                                                            Background="{StaticResource SideDockPrimaryBrush}"
+                                                            BorderBrush="{StaticResource SideDockPrimaryBrush}"
+                                                            Foreground="White"
+                                                            Click="KeepSecondaryOnlyButton_Click">
+                                                            <TextBlock Text="保留" FontSize="12" FontWeight="SemiBold" />
+                                                        </Button>
+                                                        <Button
+                                                            x:Name="RestoreSecondaryOnlyButton"
+                                                            Grid.Column="3"
+                                                            Height="28"
+                                                            MinWidth="54"
+                                                            Padding="10,0"
+                                                            CornerRadius="5"
+                                                            Background="#FFFFFF"
+                                                            BorderBrush="#D8DEE4"
+                                                            Click="RestoreSecondaryOnlyButton_Click">
+                                                            <TextBlock Text="恢复" FontSize="12" Foreground="#30363D" />
+                                                        </Button>
+                                                    </Grid>
+                                                </Border>
+                                            </Grid>
+                                            <Grid Grid.Row="3" ColumnSpacing="12">
                                                 <Grid.ColumnDefinitions>
                                                     <ColumnDefinition Width="*" />
                                                     <ColumnDefinition Width="Auto" />

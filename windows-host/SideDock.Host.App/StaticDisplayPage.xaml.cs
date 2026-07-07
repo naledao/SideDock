@@ -5,6 +5,7 @@ using Microsoft.UI.Xaml.Controls;
 using Microsoft.UI.Xaml.Input;
 using Microsoft.UI.Xaml.Media;
 using Microsoft.UI.Xaml.Shapes;
+using Windows.ApplicationModel.DataTransfer;
 
 namespace SideDock.Host.App;
 
@@ -40,6 +41,11 @@ public sealed partial class StaticDisplayPage : UserControl
     private bool _displayOptionsEnabled = true;
     private bool _displayOptionsAvailable = true;
     private bool _displayModeApplyInProgress;
+    private readonly DispatcherTimer _secondaryOnlyRollbackTimer = new();
+    private bool _secondaryOnlyKeepConfirmationActive;
+    private bool _secondaryOnlyPendingActionInProgress;
+    private int _secondaryOnlyRollbackRemainingSeconds;
+    private string? _lastPresentationDiagnostics;
     private VirtualDisplayPresentationMode _currentPresentationMode = VirtualDisplayPresentationMode.Unknown;
     private bool _statusBannerDismissed;
     private string? _lastLoggedStatus;
@@ -49,6 +55,10 @@ public sealed partial class StaticDisplayPage : UserControl
     public StaticDisplayPage()
     {
         InitializeComponent();
+        _secondaryOnlyRollbackTimer.Interval = TimeSpan.FromSeconds(1);
+        _secondaryOnlyRollbackTimer.Tick += SecondaryOnlyRollbackTimer_Tick;
+        UpdatePresentationDiagnostics(null);
+        HideSecondaryOnlyKeepConfirmation();
         AddActivityLog("等待检测虚拟显示器状态。", StaticDisplayActivityKind.Info);
         SetSelectedDisplayOptions(_selectedResolution, _selectedRefreshRate);
         SetCurrentPresentationMode(VirtualDisplayPresentationMode.Unknown);
@@ -69,6 +79,8 @@ public sealed partial class StaticDisplayPage : UserControl
     internal event Func<object, StaticDisplayModeApplyRequestedEventArgs, Task<StaticDisplayModeApplyResult>>? DisplayModeApplyRequested;
 
     internal event Func<object, StaticDisplayPresentationModeApplyRequestedEventArgs, Task<StaticDisplayPresentationModeApplyResult>>? PresentationModeApplyRequested;
+
+    internal event Func<object, StaticDisplayPresentationModePendingActionRequestedEventArgs, Task<StaticDisplayPresentationModePendingActionResult>>? PresentationModePendingActionRequested;
 
     internal event EventHandler<StaticDisplaySettingsChangedEventArgs>? SettingsChanged;
 
@@ -358,18 +370,18 @@ public sealed partial class StaticDisplayPage : UserControl
             return;
         }
 
-        SetCurrentPresentationMode(mode);
-        NotifySettingsChanged(StaticDisplaySettingsChangeKind.Selection);
-
         if (!_autoManageEnabled)
         {
+            SetCurrentPresentationMode(mode);
+            NotifySettingsChanged(StaticDisplaySettingsChangeKind.Selection);
             AddActivityLog($"{PresentationModeLabel(mode)} saved. Auto manage is off, Windows display topology was not changed.", StaticDisplayActivityKind.Info);
             return;
         }
 
-        if (mode is VirtualDisplayPresentationMode.Mirror or VirtualDisplayPresentationMode.SecondaryOnly)
+        if (mode == VirtualDisplayPresentationMode.SecondaryOnly
+            && !await ConfirmSecondaryOnlySwitchAsync())
         {
-            ShowUnsupportedPresentationMode(mode);
+            AddActivityLog("已取消仅副屏模式切换，未修改系统显示拓扑。", StaticDisplayActivityKind.Info);
             return;
         }
 
@@ -431,15 +443,27 @@ public sealed partial class StaticDisplayPage : UserControl
         try
         {
             var result = await handler(this, new StaticDisplayPresentationModeApplyRequestedEventArgs(mode));
+            UpdatePresentationDiagnostics(result.DiagnosticSummary);
             SetCurrentPresentationMode(
                 result.CurrentMode,
                 result.Success ? result.Message : $"{label}切换失败：{result.Message}");
+            if (result.Success && result.RequiresKeepConfirmation)
+            {
+                StartSecondaryOnlyKeepConfirmation(result.KeepConfirmationSeconds, result.Message);
+            }
+            else if (result.Success)
+            {
+                HideSecondaryOnlyKeepConfirmation();
+                NotifySettingsChanged(StaticDisplaySettingsChangeKind.Selection);
+            }
+
             AddActivityLog(
                 result.Success ? result.Message : $"{label}切换失败：{result.Message}",
                 result.Success ? StaticDisplayActivityKind.Success : StaticDisplayActivityKind.Failure);
         }
         catch (Exception ex)
         {
+            UpdatePresentationDiagnostics(null);
             ShowPresentationModeDetail(mode, $"{label}切换失败：{ex.Message}");
             AddActivityLog($"{label}切换失败：{ex.Message}", StaticDisplayActivityKind.Failure);
         }
@@ -447,6 +471,169 @@ public sealed partial class StaticDisplayPage : UserControl
         {
             SetDisplayOptionsApplying(false);
         }
+    }
+
+    private async Task<bool> ConfirmSecondaryOnlySwitchAsync()
+    {
+        var dialog = new ContentDialog
+        {
+            XamlRoot = XamlRoot,
+            Title = "切换为仅副屏？",
+            Content = "这会临时关闭主屏和其它非 SideDock 输出，只保留 SideDock 虚拟显示器。切换成功后需要在倒计时内确认保留，否则会自动恢复切换前拓扑。",
+            PrimaryButtonText = "继续切换",
+            CloseButtonText = "取消",
+            DefaultButton = ContentDialogButton.Close
+        };
+
+        return await dialog.ShowAsync() == ContentDialogResult.Primary;
+    }
+
+    private void StartSecondaryOnlyKeepConfirmation(int seconds, string message)
+    {
+        _secondaryOnlyKeepConfirmationActive = true;
+        _secondaryOnlyPendingActionInProgress = false;
+        _secondaryOnlyRollbackRemainingSeconds = Math.Max(5, seconds);
+        SecondaryOnlyRollbackPanel.Visibility = Visibility.Visible;
+        KeepSecondaryOnlyButton.IsEnabled = true;
+        RestoreSecondaryOnlyButton.IsEnabled = true;
+        UpdateSecondaryOnlyRollbackText(message);
+        UpdateDisplayOptionsAvailability();
+        _secondaryOnlyRollbackTimer.Stop();
+        _secondaryOnlyRollbackTimer.Start();
+    }
+
+    private void HideSecondaryOnlyKeepConfirmation()
+    {
+        _secondaryOnlyRollbackTimer.Stop();
+        _secondaryOnlyKeepConfirmationActive = false;
+        _secondaryOnlyPendingActionInProgress = false;
+        SecondaryOnlyRollbackPanel.Visibility = Visibility.Collapsed;
+        KeepSecondaryOnlyButton.IsEnabled = true;
+        RestoreSecondaryOnlyButton.IsEnabled = true;
+        UpdateDisplayOptionsAvailability();
+    }
+
+    private void UpdateSecondaryOnlyRollbackText(string? message = null)
+    {
+        var prefix = string.IsNullOrWhiteSpace(message)
+            ? "仅副屏已临时启用"
+            : message.TrimEnd('。');
+        SecondaryOnlyRollbackText.Text = $"{prefix}。请在 {_secondaryOnlyRollbackRemainingSeconds} 秒内保留此设置，否则自动恢复。";
+    }
+
+    private async void SecondaryOnlyRollbackTimer_Tick(object? sender, object e)
+    {
+        if (!_secondaryOnlyKeepConfirmationActive || _secondaryOnlyPendingActionInProgress)
+        {
+            return;
+        }
+
+        _secondaryOnlyRollbackRemainingSeconds--;
+        if (_secondaryOnlyRollbackRemainingSeconds <= 0)
+        {
+            _secondaryOnlyRollbackTimer.Stop();
+            await CompleteSecondaryOnlyPendingActionAsync(
+                StaticDisplayPresentationModePendingAction.Restore,
+                "倒计时结束，正在恢复切换前拓扑。");
+            return;
+        }
+
+        UpdateSecondaryOnlyRollbackText();
+    }
+
+    private async void KeepSecondaryOnlyButton_Click(object sender, RoutedEventArgs e)
+    {
+        await CompleteSecondaryOnlyPendingActionAsync(
+            StaticDisplayPresentationModePendingAction.Keep,
+            "正在保留仅副屏模式。");
+    }
+
+    private async void RestoreSecondaryOnlyButton_Click(object sender, RoutedEventArgs e)
+    {
+        await CompleteSecondaryOnlyPendingActionAsync(
+            StaticDisplayPresentationModePendingAction.Restore,
+            "正在恢复切换前显示拓扑。");
+    }
+
+    private async Task CompleteSecondaryOnlyPendingActionAsync(
+        StaticDisplayPresentationModePendingAction action,
+        string activityMessage)
+    {
+        var handler = PresentationModePendingActionRequested;
+        if (handler is null)
+        {
+            AddActivityLog("无法处理仅副屏确认：页面尚未连接到主窗口。", StaticDisplayActivityKind.Failure);
+            return;
+        }
+
+        _secondaryOnlyRollbackTimer.Stop();
+        _secondaryOnlyPendingActionInProgress = true;
+        KeepSecondaryOnlyButton.IsEnabled = false;
+        RestoreSecondaryOnlyButton.IsEnabled = false;
+        AddActivityLog(activityMessage, StaticDisplayActivityKind.Info);
+
+        try
+        {
+            var result = await handler(this, new StaticDisplayPresentationModePendingActionRequestedEventArgs(action));
+            UpdatePresentationDiagnostics(result.DiagnosticSummary);
+            SetCurrentPresentationMode(
+                result.CurrentMode,
+                result.Success ? result.Message : $"仅副屏确认失败：{result.Message}");
+
+            if (result.Success)
+            {
+                HideSecondaryOnlyKeepConfirmation();
+                if (action == StaticDisplayPresentationModePendingAction.Keep)
+                {
+                    NotifySettingsChanged(StaticDisplaySettingsChangeKind.Selection);
+                }
+            }
+            else
+            {
+                _secondaryOnlyPendingActionInProgress = false;
+                KeepSecondaryOnlyButton.IsEnabled = true;
+                RestoreSecondaryOnlyButton.IsEnabled = true;
+                SecondaryOnlyRollbackPanel.Visibility = Visibility.Visible;
+                SecondaryOnlyRollbackText.Text = result.Message;
+            }
+
+            AddActivityLog(
+                result.Success ? result.Message : $"仅副屏确认失败：{result.Message}",
+                result.Success ? StaticDisplayActivityKind.Success : StaticDisplayActivityKind.Failure);
+        }
+        catch (Exception ex)
+        {
+            _secondaryOnlyPendingActionInProgress = false;
+            KeepSecondaryOnlyButton.IsEnabled = true;
+            RestoreSecondaryOnlyButton.IsEnabled = true;
+            SecondaryOnlyRollbackText.Text = $"仅副屏确认失败：{ex.Message}";
+            AddActivityLog($"仅副屏确认失败：{ex.Message}", StaticDisplayActivityKind.Failure);
+        }
+    }
+
+    private void UpdatePresentationDiagnostics(string? diagnostics)
+    {
+        _lastPresentationDiagnostics = string.IsNullOrWhiteSpace(diagnostics) ? null : diagnostics;
+        if (CopyPresentationDiagnosticsButton is not null)
+        {
+            CopyPresentationDiagnosticsButton.Visibility = _lastPresentationDiagnostics is null
+                ? Visibility.Collapsed
+                : Visibility.Visible;
+        }
+    }
+
+    private void CopyPresentationDiagnosticsButton_Click(object sender, RoutedEventArgs e)
+    {
+        if (string.IsNullOrWhiteSpace(_lastPresentationDiagnostics))
+        {
+            return;
+        }
+
+        var package = new DataPackage { RequestedOperation = DataPackageOperation.Copy };
+        package.SetText(_lastPresentationDiagnostics);
+        Clipboard.SetContent(package);
+        Clipboard.Flush();
+        AddActivityLog("显示拓扑诊断摘要已复制。", StaticDisplayActivityKind.Success);
     }
 
     private void SetSelectedDisplayOptions(string resolution, string refreshRate)
@@ -487,7 +674,9 @@ public sealed partial class StaticDisplayPage : UserControl
 
     private void UpdateDisplayOptionsAvailability()
     {
-        _displayOptionsEnabled = _displayOptionsAvailable && !_displayModeApplyInProgress;
+        _displayOptionsEnabled = _displayOptionsAvailable
+            && !_displayModeApplyInProgress
+            && !_secondaryOnlyKeepConfirmationActive;
         var opacity = _displayOptionsEnabled ? 1 : 0.56;
         DisplayPresentationOptionsPanel.Opacity = opacity;
         DisplayPresentationExtendOption.IsHitTestVisible = _displayOptionsEnabled;
@@ -547,12 +736,12 @@ public sealed partial class StaticDisplayPage : UserControl
                 _primaryBrush),
             VirtualDisplayPresentationMode.Mirror => (
                 "镜像模式",
-                "镜像切换暂未开放，需要后续安全确认流程。",
+                "仅将主屏和 SideDock 虚拟显示器组成镜像，其它显示器保持独立。",
                 "\uE7F4",
-                _warningBrush),
+                _primaryBrush),
             VirtualDisplayPresentationMode.SecondaryOnly => (
                 "仅副屏模式",
-                "仅副屏切换暂未开放，需要后续安全确认流程。",
+                "临时关闭非 SideDock 输出，只保留 SideDock 虚拟显示器；未确认会自动恢复。",
                 "\uE7F4",
                 _warningBrush),
             _ => (
@@ -1148,6 +1337,34 @@ internal sealed class StaticDisplayPresentationModeApplyResult
     public string Message { get; init; } = string.Empty;
 
     public VirtualDisplayPresentationMode CurrentMode { get; init; } = VirtualDisplayPresentationMode.Unknown;
+
+    public string? DiagnosticSummary { get; init; }
+
+    public bool RequiresKeepConfirmation { get; init; }
+
+    public int KeepConfirmationSeconds { get; init; } = 20;
+}
+
+internal sealed class StaticDisplayPresentationModePendingActionRequestedEventArgs : EventArgs
+{
+    public StaticDisplayPresentationModePendingActionRequestedEventArgs(
+        StaticDisplayPresentationModePendingAction action)
+    {
+        Action = action;
+    }
+
+    public StaticDisplayPresentationModePendingAction Action { get; }
+}
+
+internal sealed class StaticDisplayPresentationModePendingActionResult
+{
+    public bool Success { get; init; }
+
+    public string Message { get; init; } = string.Empty;
+
+    public VirtualDisplayPresentationMode CurrentMode { get; init; } = VirtualDisplayPresentationMode.Unknown;
+
+    public string? DiagnosticSummary { get; init; }
 }
 
 internal sealed class StaticDisplaySettingsChangedEventArgs : EventArgs
@@ -1292,6 +1509,12 @@ internal enum StaticDisplaySettingsChangeKind
     Selection,
     AutoManage,
     Banner
+}
+
+internal enum StaticDisplayPresentationModePendingAction
+{
+    Keep,
+    Restore
 }
 
 internal enum VirtualDisplayPresentationMode
