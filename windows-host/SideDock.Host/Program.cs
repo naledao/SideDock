@@ -1671,6 +1671,15 @@ internal static partial class Program
                 + $" bytes={ReadLong(payload, "bytes")}"
                 + $" keyFrames={ReadLong(payload, "keyFrames")}"
                 + $" codecConfigPackets={ReadLong(payload, "codecConfigPackets")}"
+                + $" reconnects={ReadLong(payload, "reconnectCount")}"
+                + $" recoveryAttempts={ReadLong(payload, "recoveryAttemptCount")}"
+                + $" consecutiveFailures={ReadLong(payload, "consecutiveFailureCount")}"
+                + $" lastRecoveryDurationMs={ReadLong(payload, "lastRecoveryDurationMs")}"
+                + $" lastDisconnectReason={SanitizeLogValue(ReadString(payload, "lastDisconnectReason"))}"
+                + $" actualFps={ReadDouble(payload, "actualFps"):F1}"
+                + $" actualKbps={ReadDouble(payload, "actualKbps"):F0}"
+                + $" fpsJitter={ReadDouble(payload, "fpsJitter"):F1}"
+                + $" bitrateJitter={ReadDouble(payload, "bitrateJitter"):F1}"
                 + (string.IsNullOrWhiteSpace(message) ? string.Empty : $" message={message}"));
         }
 
@@ -1803,6 +1812,13 @@ internal static partial class Program
             {
                 return string.Empty;
             }
+        }
+
+        private static string SanitizeLogValue(string value)
+        {
+            return string.IsNullOrWhiteSpace(value)
+                ? string.Empty
+                : value.Replace('\r', ' ').Replace('\n', ' ').Replace(' ', '_');
         }
 
         private async ValueTask HandleInputMessageAsync(

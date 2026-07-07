@@ -755,7 +755,16 @@ public final class ControlClient {
         long packets,
         long bytes,
         long keyFrames,
-        long codecConfigPackets
+        long codecConfigPackets,
+        long reconnectCount,
+        long recoveryAttemptCount,
+        long consecutiveFailureCount,
+        long lastRecoveryDurationMs,
+        String lastDisconnectReason,
+        double actualFps,
+        double actualKbps,
+        double fpsJitter,
+        double bitrateJitter
     ) {
         sendFromAnyThread("camera_status", payload(
             "state", state == null ? "" : state,
@@ -770,7 +779,16 @@ public final class ControlClient {
             "packets", packets,
             "bytes", bytes,
             "keyFrames", keyFrames,
-            "codecConfigPackets", codecConfigPackets
+            "codecConfigPackets", codecConfigPackets,
+            "reconnectCount", reconnectCount,
+            "recoveryAttemptCount", recoveryAttemptCount,
+            "consecutiveFailureCount", consecutiveFailureCount,
+            "lastRecoveryDurationMs", lastRecoveryDurationMs,
+            "lastDisconnectReason", lastDisconnectReason == null ? "" : lastDisconnectReason,
+            "actualFps", actualFps,
+            "actualKbps", actualKbps,
+            "fpsJitter", fpsJitter,
+            "bitrateJitter", bitrateJitter
         ));
     }
 

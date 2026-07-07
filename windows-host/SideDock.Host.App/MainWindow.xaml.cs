@@ -259,12 +259,19 @@ public sealed partial class MainWindow : Window
     private bool _updatingStaticAudioPage;
     private bool _overviewCameraOperationInProgress;
     private bool _cameraRuntimeConfigApplyInProgress;
+    private CancellationTokenSource? _cameraRuntimeConfigDebounceCts;
+    private bool _cameraRuntimeConfigApplyQueued;
+    private int _cameraRuntimeConfigRequestSerial;
     private bool _overviewCameraRequestedEnabled = true;
     private bool _overviewCameraBannerDismissed;
     private CameraRuntimeApplyState _cameraRuntimeApplyState = CameraRuntimeApplyState.None;
     private CameraConfigSelection? _pendingCameraRuntimeConfig;
+    private int _pendingCameraRuntimeConfigSerial;
     private string _cameraRuntimeApplyMessage = "";
     private DateTimeOffset? _cameraRuntimeApplyCompletedAt;
+    private bool _virtualCameraAutoRecoveryInProgress;
+    private int _virtualCameraAutoRecoveryFailures;
+    private DateTimeOffset? _lastVirtualCameraAutoRecoveryAt;
     private bool _virtualAudioCableInstallInProgress;
     private VirtualDisplayOverviewState? _virtualDisplayTransientState;
     private string? _virtualDisplayLastError;
@@ -406,6 +413,8 @@ public sealed partial class MainWindow : Window
             _overviewPreviewTimer.Stop();
             _virtualCameraStatusTimer.Stop();
             _audioTelemetryStaleTimer.Stop();
+            _cameraRuntimeConfigDebounceCts?.Cancel();
+            _cameraRuntimeConfigDebounceCts?.Dispose();
             _cameraPreviewReader?.Dispose();
             ResetOverviewPreview(clearImage: true);
             DisposeTrayIcon();
@@ -6002,31 +6011,88 @@ public sealed partial class MainWindow : Window
         UpdateCameraStatusView();
     }
 
-    private async Task HandleOverviewCameraConfigSelectionChangedAsync()
+    private Task HandleOverviewCameraConfigSelectionChangedAsync()
     {
         if (_syncingOverviewCameraOptions || !_uiReady)
         {
-            return;
+            return Task.CompletedTask;
         }
 
         RefreshOverviewCameraCapabilityOptions(SelectedOverviewCameraConfig(_overviewCameraRequestedEnabled));
 
         if (_hostProcess is { HasExited: false })
         {
-            await ApplyOverviewCameraRuntimeConfigSelectionAsync();
-            return;
+            ScheduleOverviewCameraRuntimeConfigSelectionApply();
+            return Task.CompletedTask;
         }
 
         ClearCameraRuntimeApplyState();
         SyncOverviewCameraOptionsToDiagnostics();
+        return Task.CompletedTask;
+    }
+
+    private void ScheduleOverviewCameraRuntimeConfigSelectionApply(
+        CameraConfigSource source = CameraConfigSource.UserManual,
+        bool saveWhenApplied = true)
+    {
+        if (_hostProcess is not { HasExited: false })
+        {
+            SyncOverviewCameraOptionsToDiagnostics();
+            return;
+        }
+
+        var requested = SelectedOverviewCameraConfig(_overviewCameraRequestedEnabled);
+        var serial = System.Threading.Interlocked.Increment(ref _cameraRuntimeConfigRequestSerial);
+        _cameraRuntimeConfigDebounceCts?.Cancel();
+        _cameraRuntimeConfigDebounceCts?.Dispose();
+        var debounceCts = new CancellationTokenSource();
+        _cameraRuntimeConfigDebounceCts = debounceCts;
+        SetCameraConfigSource(source, requested.Summary, logEvent: false);
+        SetCameraRuntimeApplyState(
+            CameraRuntimeApplyState.Applying,
+            _overviewCameraRequestedEnabled
+                ? $"正在应用最新摄像头配置：{requested.Summary}。"
+                : $"已记录最新运行中配置，下一次开启摄像头流时使用：{requested.Summary}。");
+        _ = ApplyOverviewCameraRuntimeConfigSelectionAfterDebounceAsync(
+            requested,
+            source,
+            saveWhenApplied,
+            serial,
+            debounceCts.Token);
+    }
+
+    private async Task ApplyOverviewCameraRuntimeConfigSelectionAfterDebounceAsync(
+        CameraConfigSelection requested,
+        CameraConfigSource source,
+        bool saveWhenApplied,
+        int serial,
+        CancellationToken cancellationToken)
+    {
+        try
+        {
+            await Task.Delay(TimeSpan.FromMilliseconds(300), cancellationToken);
+            if (cancellationToken.IsCancellationRequested)
+            {
+                return;
+            }
+
+            await ApplyOverviewCameraRuntimeConfigSelectionAsync(source, saveWhenApplied, requested, serial);
+        }
+        catch (OperationCanceledException)
+        {
+            // Superseded by a newer UI selection.
+        }
     }
 
     private async Task ApplyOverviewCameraRuntimeConfigSelectionAsync(
         CameraConfigSource source = CameraConfigSource.UserManual,
-        bool saveWhenApplied = true)
+        bool saveWhenApplied = true,
+        CameraConfigSelection? requestedOverride = null,
+        int requestSerial = 0)
     {
         if (_cameraRuntimeConfigApplyInProgress)
         {
+            _cameraRuntimeConfigApplyQueued = true;
             UpdateOverviewCameraState();
             return;
         }
@@ -6037,8 +6103,9 @@ public sealed partial class MainWindow : Window
             return;
         }
 
-        var requested = SelectedOverviewCameraConfig(_overviewCameraRequestedEnabled);
+        var requested = requestedOverride ?? SelectedOverviewCameraConfig(_overviewCameraRequestedEnabled);
         _pendingCameraRuntimeConfig = _overviewCameraRequestedEnabled ? requested : null;
+        _pendingCameraRuntimeConfigSerial = requestSerial;
         _pendingCameraRuntimeConfigSource = source;
         _pendingCameraRuntimeConfigShouldSave = saveWhenApplied;
         _cameraRuntimeConfigApplyInProgress = true;
@@ -6080,6 +6147,12 @@ public sealed partial class MainWindow : Window
         finally
         {
             _cameraRuntimeConfigApplyInProgress = false;
+            if (_cameraRuntimeConfigApplyQueued)
+            {
+                _cameraRuntimeConfigApplyQueued = false;
+                ScheduleOverviewCameraRuntimeConfigSelectionApply(source, saveWhenApplied);
+            }
+
             UpdateOverviewCameraState();
         }
     }
@@ -6218,10 +6291,15 @@ public sealed partial class MainWindow : Window
 
     private void ClearCameraRuntimeApplyState()
     {
+        _cameraRuntimeConfigDebounceCts?.Cancel();
+        _cameraRuntimeConfigDebounceCts?.Dispose();
+        _cameraRuntimeConfigDebounceCts = null;
+        _cameraRuntimeConfigApplyQueued = false;
         _cameraRuntimeApplyState = CameraRuntimeApplyState.None;
         _cameraRuntimeApplyMessage = "";
         _cameraRuntimeApplyCompletedAt = null;
         _pendingCameraRuntimeConfig = null;
+        _pendingCameraRuntimeConfigSerial = 0;
     }
 
     private static string CameraResolutionValue(int width, int height)
@@ -11052,6 +11130,12 @@ public sealed partial class MainWindow : Window
             $"{camera.ApproxFps:F1} fps · {camera.ApproxKbps:F0} kbps · packets {camera.Packets} · frames {camera.Frames} · decoded {camera.DecodedFrames} · "
             + $"decode {camera.DecodeLagMs:F0}ms · preview {FormatCameraPreviewState()} · last {FormatCameraAge(camera.LastFrameAt)}";
         var errorText = string.IsNullOrWhiteSpace(camera.LastError) ? "无" : camera.LastError;
+        CameraMetricsText.Text +=
+            $" · jitter {camera.FpsJitter:F0}%/{camera.BitrateJitter:F0}%"
+            + $" · reconnect {camera.ReconnectCount}"
+            + $" · recovery {camera.RecoveryAttemptCount}"
+            + $" · consecutive {camera.ConsecutiveFailureCount}"
+            + $" · lastRecovery {camera.LastRecoveryDurationMs}ms";
         CameraErrorText.Text = errorText;
         CameraErrorText.Foreground = string.IsNullOrWhiteSpace(camera.LastError) ? _secondaryBrush : _warningBrush;
 
@@ -11190,10 +11274,12 @@ public sealed partial class MainWindow : Window
         OverviewCameraReceiveStatusText.Text = statusText;
         OverviewCameraReceiveStatusText.Foreground = statusBrush;
         OverviewCameraReceiveStatusDot.Fill = statusBrush;
-        OverviewCameraReceiveProtocolText.Text = "TCP";
+        OverviewCameraReceiveProtocolText.Text = $"TCP · reconnect {camera.ReconnectCount} / recovery {camera.RecoveryAttemptCount}";
         OverviewCameraReceiveAddressText.Text = $"127.0.0.1:{FormatConfiguredCameraPortText()}";
         OverviewCameraReceivePacketsText.Text = $"{FormatCompactCount(camera.Packets)} / {FormatByteCount(camera.Bytes)}";
-        OverviewCameraReceiveLastFrameText.Text = FormatCameraAge(camera.LastFrameAt);
+        OverviewCameraReceiveLastFrameText.Text = string.IsNullOrWhiteSpace(camera.LastDisconnectReason)
+            ? FormatCameraAge(camera.LastFrameAt)
+            : $"{FormatCameraAge(camera.LastFrameAt)} · {camera.LastDisconnectReason}";
     }
 
     private (string Text, Brush Brush) BuildCameraReceiveStatus()
@@ -11214,6 +11300,11 @@ public sealed partial class MainWindow : Window
         if (IsCameraPermissionMissing(camera))
         {
             return ("未授权", _warningBrush);
+        }
+
+        if (IsCameraRecoveringState(camera.ServerState) || IsCameraRecoveringState(camera.ClientState))
+        {
+            return ("恢复中", _warningBrush);
         }
 
         if (IsCameraReceiving(camera))
@@ -11244,6 +11335,12 @@ public sealed partial class MainWindow : Window
             ? $"{camera.ApproxFps:F1} fps"
             : $"{camera.Fps} fps 配置";
         OverviewCameraEncodingBitrateText.Text = FormatCameraBitrate(camera.ApproxKbps);
+        var displayFps = camera.ActualFps > 0 ? camera.ActualFps : camera.ApproxFps;
+        OverviewCameraEncodingFpsText.Text = displayFps > 0
+            ? $"{displayFps:F1} fps · jitter {camera.FpsJitter:F0}%"
+            : OverviewCameraEncodingFpsText.Text;
+        var displayKbps = camera.ActualKbps > 0 ? camera.ActualKbps : camera.ApproxKbps;
+        OverviewCameraEncodingBitrateText.Text = $"{FormatCameraBitrate(displayKbps)} · jitter {camera.BitrateJitter:F0}%";
         OverviewCameraEncodingDecodeLagText.Text = camera.DecodeLagMs > 0
             ? $"{camera.DecodeLagMs:F0} ms"
             : "--";
@@ -11262,6 +11359,20 @@ public sealed partial class MainWindow : Window
             OverviewCameraErrorSummaryText.Foreground = _dangerBrush;
             OverviewCameraErrorDetailText.Text = error;
             OverviewCameraErrorDetailText.Foreground = _dangerBrush;
+            return;
+        }
+
+        if (ShouldSuggestRecommendedCameraConfig(camera))
+        {
+            OverviewCameraErrorIconBorder.BorderBrush = _warningBrush;
+            OverviewCameraErrorIcon.Foreground = _warningBrush;
+            OverviewCameraErrorIcon.Glyph = "\uE7BA";
+            OverviewCameraErrorSummaryText.Text = "建议降级";
+            OverviewCameraErrorSummaryText.Foreground = _warningBrush;
+            OverviewCameraErrorDetailText.Text =
+                $"当前 {camera.Width}x{camera.Height}@{camera.Fps} 出现恢复/波动迹象，建议先使用“恢复推荐配置”。"
+                + $" 恢复 {camera.RecoveryAttemptCount} 次，连续失败 {camera.ConsecutiveFailureCount} 次，fps 波动 {camera.FpsJitter:F0}%。";
+            OverviewCameraErrorDetailText.Foreground = _warningBrush;
             return;
         }
 
@@ -11335,6 +11446,11 @@ public sealed partial class MainWindow : Window
                 return (Text: text, Time: time, Brush: CameraEventBrush(text));
             })
             .ToList();
+
+        if (ShouldSuggestRecommendedCameraConfig(_cameraDiagnostics))
+        {
+            events.Add(("suggest_recommended_config: camera link unstable at current resolution/fps", "--", _warningBrush));
+        }
 
         if (events.Count == 0)
         {
@@ -11435,6 +11551,16 @@ public sealed partial class MainWindow : Window
         }
 
         if (ContainsAny(text, "waiting", "preparing", "stopped", "等待", "准备", "停止"))
+        {
+            return _warningBrush;
+        }
+
+        if (ContainsAny(text, "recovery_failed", "config apply failed"))
+        {
+            return _dangerBrush;
+        }
+
+        if (ContainsAny(text, "recovery_start", "recovering", "suggest_recommended"))
         {
             return _warningBrush;
         }
@@ -11652,6 +11778,20 @@ public sealed partial class MainWindow : Window
             || !string.IsNullOrWhiteSpace(_virtualCameraDiagnostics.LastError);
     }
 
+    private static bool ShouldSuggestRecommendedCameraConfig(CameraDiagnosticsState camera)
+    {
+        var highLoad = camera.Width >= 1920 || camera.Height >= 1080 || camera.Fps >= 60;
+        if (!highLoad)
+        {
+            return false;
+        }
+
+        return camera.ConsecutiveFailureCount >= 3
+            || camera.RecoveryAttemptCount >= 3
+            || camera.FpsJitter >= 35.0
+            || camera.BitrateJitter >= 45.0;
+    }
+
     private static bool IsCameraErrorState(string state)
     {
         return StateEquals(state, "unavailable")
@@ -11672,7 +11812,14 @@ public sealed partial class MainWindow : Window
             || StateEquals(state, "disconnected")
             || StateEquals(state, "preparing")
             || StateEquals(state, "restarting")
+            || StateEquals(state, "applying_config")
             || StateEquals(state, "unknown");
+    }
+
+    private static bool IsCameraRecoveringState(string state)
+    {
+        return StateEquals(state, "recovering")
+            || StateEquals(state, "recovered");
     }
 
     private static bool IsCameraPermissionMissing(CameraDiagnosticsState camera)
@@ -12173,7 +12320,69 @@ public sealed partial class MainWindow : Window
     {
         TryApplyVirtualCameraServedStatusFile();
         TryApplyVirtualCameraToolStatusFile();
+        if (IsVirtualCameraServing(_virtualCameraDiagnostics))
+        {
+            _virtualCameraAutoRecoveryFailures = 0;
+        }
+
+        MaybeRecoverVirtualCameraServing();
         UpdateCameraStatusView();
+    }
+
+    private void MaybeRecoverVirtualCameraServing()
+    {
+        if (_virtualCameraAutoRecoveryInProgress
+            || !_overviewCameraRequestedEnabled
+            || _hostProcess is not { HasExited: false }
+            || !IsCameraReceiving(_cameraDiagnostics)
+            || !_virtualCameraDiagnostics.Running
+            || IsVirtualCameraServing(_virtualCameraDiagnostics)
+            || _virtualCameraAutoRecoveryFailures >= 3)
+        {
+            return;
+        }
+
+        if (_lastVirtualCameraAutoRecoveryAt is not null
+            && DateTimeOffset.Now - _lastVirtualCameraAutoRecoveryAt.Value < TimeSpan.FromSeconds(30))
+        {
+            return;
+        }
+
+        _ = RecoverVirtualCameraServingAsync();
+    }
+
+    private async Task RecoverVirtualCameraServingAsync()
+    {
+        _virtualCameraAutoRecoveryInProgress = true;
+        _lastVirtualCameraAutoRecoveryAt = DateTimeOffset.Now;
+        _virtualCameraDiagnostics.LastToolState = "auto-recover-serving";
+        AppendRecentCameraLogLine("camera-recovery-event=virtual_camera_recovery_start reason=serving_stalled");
+        UpdateCameraStatusView();
+
+        try
+        {
+            await RunVirtualCameraCommandAsync("ensure-start");
+            RefreshVirtualCameraStatusFromFiles();
+            if (IsVirtualCameraServing(_virtualCameraDiagnostics))
+            {
+                _virtualCameraAutoRecoveryFailures = 0;
+                AppendRecentCameraLogLine("camera-recovery-event=virtual_camera_recovery_success");
+            }
+            else
+            {
+                _virtualCameraAutoRecoveryFailures++;
+                if (_virtualCameraAutoRecoveryFailures >= 3)
+                {
+                    _virtualCameraDiagnostics.LastError = "Virtual camera serving stalled; automatic recovery failed 3 times. Use restart or check the virtual camera driver.";
+                }
+                AppendRecentCameraLogLine($"camera-recovery-event=virtual_camera_recovery_failed failures={_virtualCameraAutoRecoveryFailures}");
+            }
+        }
+        finally
+        {
+            _virtualCameraAutoRecoveryInProgress = false;
+            UpdateCameraStatusView();
+        }
     }
 
     private void TryApplyVirtualCameraServedStatusFile()
@@ -12710,6 +12919,13 @@ public sealed partial class MainWindow : Window
         report.AppendLine($"Keyframe/config 包: {camera.KeyFrames}/{camera.CodecConfigPackets}");
         report.AppendLine($"实际接收 fps: {camera.ApproxFps:F1}");
         report.AppendLine($"码率 kbps: {camera.ApproxKbps:F0}");
+        report.AppendLine($"Android 实际 fps/kbps: {camera.ActualFps:F1}/{camera.ActualKbps:F0}");
+        report.AppendLine($"fps/bitrate 波动: {camera.FpsJitter:F1}%/{camera.BitrateJitter:F1}%");
+        report.AppendLine($"camera reconnect count: {camera.ReconnectCount}");
+        report.AppendLine($"recovery attempt count: {camera.RecoveryAttemptCount}");
+        report.AppendLine($"consecutive failure count: {camera.ConsecutiveFailureCount}");
+        report.AppendLine($"last recovery duration: {camera.LastRecoveryDurationMs} ms");
+        report.AppendLine($"last disconnect reason: {FormatOptional(camera.LastDisconnectReason)}");
         report.AppendLine($"解码帧/错误: {camera.DecodedFrames}/{camera.DecodeErrors}");
         report.AppendLine($"最近解码滞后: {camera.DecodeLagMs:F1} ms");
         report.AppendLine($"Windows 预览: {(_cameraPreviewEnabled ? "启用" : "关闭")}");
@@ -13519,6 +13735,14 @@ public sealed partial class MainWindow : Window
             _cameraDiagnostics.LastDecodedFrameAt = NonEmpty(ExtractLogValue(line, "lastDecodedFrameAt="), _cameraDiagnostics.LastDecodedFrameAt);
         }
 
+        ApplyCameraStabilityFromLogLine(line);
+
+        if (StateEquals(state, "receiving") || StateEquals(state, "capturing") || StateEquals(state, "recovered"))
+        {
+            _lastCameraErrorMessage = null;
+            _cameraDiagnostics.LastError = "";
+        }
+
         var decodeError = ExtractLogTail(line, " lastError=");
         if (!string.IsNullOrWhiteSpace(decodeError))
         {
@@ -13637,8 +13861,11 @@ public sealed partial class MainWindow : Window
         var requestedConfig = _pendingCameraRuntimeConfig;
         var source = _pendingCameraRuntimeConfigSource;
         var shouldSave = _pendingCameraRuntimeConfigShouldSave;
+        var requestSerial = _pendingCameraRuntimeConfigSerial;
+        var isLatestRequest = requestSerial == 0 || requestSerial == _cameraRuntimeConfigRequestSerial;
         _pendingCameraRuntimeConfig = null;
         _pendingCameraRuntimeConfigShouldSave = false;
+        _pendingCameraRuntimeConfigSerial = 0;
         if (!CameraConfigMatches(requestedConfig, effectiveConfig))
         {
             source = CameraConfigSource.Fallback;
@@ -13646,16 +13873,27 @@ public sealed partial class MainWindow : Window
         }
 
         ApplyCameraConfigSelectionToDiagnostics(effectiveConfig);
-        SyncOverviewCameraSelectionsFromConfig(effectiveConfig);
+        if (isLatestRequest)
+        {
+            SyncOverviewCameraSelectionsFromConfig(effectiveConfig);
+        }
         SetCameraConfigSource(
             source,
             CameraConfigMatches(requestedConfig, effectiveConfig)
                 ? effectiveConfig.Summary
                 : $"Requested {requestedConfig.Summary}; Android applied {effectiveConfig.Summary}.",
             logEvent: source is CameraConfigSource.Fallback);
-        if (shouldSave)
+        if (shouldSave && isLatestRequest)
         {
             SaveEffectiveCameraConfigIfUsable(effectiveConfig, source);
+        }
+
+        if (!isLatestRequest)
+        {
+            SetCameraRuntimeApplyState(
+                CameraRuntimeApplyState.Applying,
+                "较新的摄像头配置正在排队应用，已忽略旧配置的持久化。");
+            return;
         }
 
         SetCameraRuntimeApplyState(
@@ -13663,6 +13901,32 @@ public sealed partial class MainWindow : Window
             CameraConfigMatches(requestedConfig, effectiveConfig)
                 ? $"摄像头配置已生效：{effectiveConfig.Summary}。"
                 : $"Android 已回退到实际可用配置：{effectiveConfig.Summary}。");
+    }
+
+    private void ApplyCameraStabilityFromLogLine(string line)
+    {
+        _cameraDiagnostics.ReconnectCount = ExtractLogLong(
+            line,
+            "reconnects=",
+            ExtractLogLong(line, "reconnectCount=", _cameraDiagnostics.ReconnectCount));
+        _cameraDiagnostics.RecoveryAttemptCount = ExtractLogLong(
+            line,
+            "recoveryAttempts=",
+            ExtractLogLong(line, "recoveryAttemptCount=", _cameraDiagnostics.RecoveryAttemptCount));
+        _cameraDiagnostics.ConsecutiveFailureCount = ExtractLogLong(
+            line,
+            "consecutiveFailures=",
+            ExtractLogLong(line, "consecutiveFailureCount=", _cameraDiagnostics.ConsecutiveFailureCount));
+        _cameraDiagnostics.LastRecoveryDurationMs = ExtractLogLong(line, "lastRecoveryDurationMs=", _cameraDiagnostics.LastRecoveryDurationMs);
+        _cameraDiagnostics.FpsJitter = ExtractLogDouble(line, "fpsJitter=", _cameraDiagnostics.FpsJitter);
+        _cameraDiagnostics.BitrateJitter = ExtractLogDouble(line, "bitrateJitter=", _cameraDiagnostics.BitrateJitter);
+        _cameraDiagnostics.ActualFps = ExtractLogDouble(line, "actualFps=", _cameraDiagnostics.ActualFps);
+        _cameraDiagnostics.ActualKbps = ExtractLogDouble(line, "actualKbps=", _cameraDiagnostics.ActualKbps);
+        var disconnectReason = ExtractLogValue(line, "lastDisconnectReason=");
+        if (!string.IsNullOrWhiteSpace(disconnectReason))
+        {
+            _cameraDiagnostics.LastDisconnectReason = disconnectReason.Replace('_', ' ');
+        }
     }
 
     private static string ExtractLogValue(string line, string key)
@@ -15887,6 +16151,24 @@ public sealed partial class MainWindow : Window
 
         public double ApproxKbps { get; set; }
 
+        public double FpsJitter { get; set; }
+
+        public double BitrateJitter { get; set; }
+
+        public double ActualFps { get; set; }
+
+        public double ActualKbps { get; set; }
+
+        public long ReconnectCount { get; set; }
+
+        public long RecoveryAttemptCount { get; set; }
+
+        public long ConsecutiveFailureCount { get; set; }
+
+        public long LastRecoveryDurationMs { get; set; }
+
+        public string LastDisconnectReason { get; set; } = "";
+
         public string LastFrameAt { get; set; } = "";
 
         public string LastDecodedFrameAt { get; set; } = "";
@@ -15925,6 +16207,15 @@ public sealed partial class MainWindow : Window
             DecodeLagMs = 0;
             ApproxFps = 0;
             ApproxKbps = 0;
+            FpsJitter = 0;
+            BitrateJitter = 0;
+            ActualFps = 0;
+            ActualKbps = 0;
+            ReconnectCount = 0;
+            RecoveryAttemptCount = 0;
+            ConsecutiveFailureCount = 0;
+            LastRecoveryDurationMs = 0;
+            LastDisconnectReason = "";
             LastFrameAt = "";
             LastDecodedFrameAt = "";
             LastError = "";

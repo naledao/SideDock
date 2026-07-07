@@ -48,9 +48,31 @@ import java.util.concurrent.atomic.AtomicReference;
 
 public final class CameraCaptureClient {
     public interface Listener {
-        void onCameraCaptureState(String state, String message);
+        void onCameraCaptureState(
+            String state,
+            String message,
+            long reconnectCount,
+            long recoveryAttemptCount,
+            long consecutiveFailureCount,
+            long lastRecoveryDurationMs,
+            String lastDisconnectReason
+        );
         void onCameraCaptureConfigApplied(int port, int width, int height, int fps, String codec, String facing);
-        void onCameraCaptureStats(long packetsSent, long bytesSent, long keyFrames, long codecConfigPackets);
+        void onCameraCaptureStats(
+            long packetsSent,
+            long bytesSent,
+            long keyFrames,
+            long codecConfigPackets,
+            long reconnectCount,
+            long recoveryAttemptCount,
+            long consecutiveFailureCount,
+            long lastRecoveryDurationMs,
+            String lastDisconnectReason,
+            double actualFps,
+            double actualKbps,
+            double fpsJitter,
+            double bitrateJitter
+        );
     }
 
     private static final int HEADER_SIZE = 40;
@@ -65,6 +87,9 @@ public final class CameraCaptureClient {
     private static final String HEVC_CODEC = "video/hevc";
     private static final String[] CAMERA_ENCODER_CODECS = new String[] { DEFAULT_CODEC, HEVC_CODEC };
     private static final int[] PREFERRED_TARGET_FPS = new int[] { 30, 60, 120, 24, 15 };
+    private static final long INITIAL_RECOVERY_DELAY_MS = 300L;
+    private static final long MAX_RECOVERY_DELAY_MS = 15000L;
+    private static final long STABLE_CAPTURE_RESET_MS = 10000L;
 
     private final Context context;
     private final Listener listener;
@@ -81,6 +106,12 @@ public final class CameraCaptureClient {
     private int fps = 30;
     private String codec = DEFAULT_CODEC;
     private String facing = "back";
+    private long reconnectCount;
+    private long recoveryAttemptCount;
+    private long consecutiveFailureCount;
+    private long lastRecoveryDurationMs;
+    private long recoveryStartedAtMs;
+    private String lastDisconnectReason = "";
 
     public CameraCaptureClient(Context context, Listener listener) {
         this.context = context.getApplicationContext();
@@ -225,6 +256,8 @@ public final class CameraCaptureClient {
         CountDownLatch previousStopLatch = stopLatch;
         running = false;
         generation += 1;
+        consecutiveFailureCount = 0L;
+        recoveryStartedAtMs = 0L;
         closeSocket();
         if (executor != null) {
             executor.shutdownNow();
@@ -251,9 +284,11 @@ public final class CameraCaptureClient {
 
     private void cameraLoop(long runGeneration, CountDownLatch runStopLatch) {
         try {
-            long reconnectDelayMs = 300L;
+            long reconnectDelayMs = INITIAL_RECOVERY_DELAY_MS;
+            long captureStartedAtMs = 0L;
             while (running && isCurrentGeneration(runGeneration)) {
                 if (!hasCameraPermission()) {
+                    lastDisconnectReason = "permission_required";
                     emitState("waiting_permission", "Camera permission is required.");
                     return;
                 }
@@ -264,6 +299,7 @@ public final class CameraCaptureClient {
                 Surface encoderSurface = null;
                 CameraDevice cameraDevice = null;
                 CameraCaptureSession captureSession = null;
+                AtomicReference<Exception> cameraRuntimeError = new AtomicReference<>();
 
                 try {
                     emitState("preparing", "Preparing camera uplink.");
@@ -302,20 +338,52 @@ public final class CameraCaptureClient {
                     cameraThread.start();
                     Handler cameraHandler = new Handler(cameraThread.getLooper());
 
-                    cameraDevice = openCamera(cameraManager, cameraId, cameraHandler);
+                    cameraDevice = openCamera(cameraManager, cameraId, cameraHandler, cameraRuntimeError);
                     captureSession = createCaptureSession(cameraDevice, encoderSurface, cameraHandler);
                     startRepeatingCapture(cameraDevice, captureSession, encoderSurface, characteristics, fpsRange);
 
                     emitConfigApplied(port, captureSize.getWidth(), captureSize.getHeight(), effectiveFps, effectiveCodec, effectiveFacing);
+                    long nowMs = System.currentTimeMillis();
+                    if (recoveryStartedAtMs > 0L) {
+                        lastRecoveryDurationMs = Math.max(0L, nowMs - recoveryStartedAtMs);
+                        emitState("recovered", "Camera capture recovered in " + lastRecoveryDurationMs + " ms.");
+                    }
                     emitState("capturing", "Camera capture started (" + effectiveFacing + ").");
-                    reconnectDelayMs = 300L;
-                    drainEncoder(encoder, nextSocket.getOutputStream(), runGeneration);
+                    reconnectDelayMs = INITIAL_RECOVERY_DELAY_MS;
+                    recoveryStartedAtMs = 0L;
+                    captureStartedAtMs = nowMs;
+                    consecutiveFailureCount = 0L;
+                    drainEncoder(encoder, nextSocket.getOutputStream(), runGeneration, cameraRuntimeError);
                 } catch (Exception ex) {
                     if (running && isCurrentGeneration(runGeneration)) {
+                        long nowMs = System.currentTimeMillis();
+                        if (captureStartedAtMs > 0L && nowMs - captureStartedAtMs >= STABLE_CAPTURE_RESET_MS) {
+                            consecutiveFailureCount = 0L;
+                        }
+
+                        if (recoveryStartedAtMs == 0L) {
+                            recoveryStartedAtMs = nowMs;
+                        }
+
+                        recoveryAttemptCount += 1L;
+                        consecutiveFailureCount += 1L;
+                        if (isNetworkException(ex)) {
+                            reconnectCount += 1L;
+                        }
+
+                        lastDisconnectReason = classifyDisconnectReason(ex);
                         String state = isNetworkException(ex) ? "disconnected" : "unavailable";
-                        emitState(state, exceptionSummary(ex));
+                        emitState(
+                            "recovering",
+                            exceptionSummary(ex)
+                                + "; retrying in " + reconnectDelayMs + " ms"
+                                + " (attempt " + recoveryAttemptCount
+                                + ", consecutive " + consecutiveFailureCount + ").");
                         sleepQuietly(reconnectDelayMs);
-                        reconnectDelayMs = Math.min(reconnectDelayMs * 2L, 3000L);
+                        reconnectDelayMs = Math.min(reconnectDelayMs * 2L, MAX_RECOVERY_DELAY_MS);
+                        if (running && isCurrentGeneration(runGeneration)) {
+                            emitState(state, lastDisconnectReason);
+                        }
                     }
                 } finally {
                     closeCaptureSession(captureSession);
@@ -335,20 +403,35 @@ public final class CameraCaptureClient {
         }
     }
 
-    private void drainEncoder(MediaCodec encoder, OutputStream output, long runGeneration) throws Exception {
+    private void drainEncoder(
+        MediaCodec encoder,
+        OutputStream output,
+        long runGeneration,
+        AtomicReference<Exception> cameraRuntimeError
+    ) throws Exception {
         MediaCodec.BufferInfo bufferInfo = new MediaCodec.BufferInfo();
         byte[] header = new byte[HEADER_SIZE];
         byte[] payload = new byte[0];
         long sequence = 0L;
         long packetsSent = 0L;
         long bytesSent = 0L;
+        long videoFramesSent = 0L;
         long keyFrames = 0L;
         long codecConfigPackets = 0L;
         long lastStatsAtMs = 0L;
+        long lastStatsFrames = 0L;
+        long lastStatsBytes = 0L;
         long lastSyncFrameRequestMs = 0L;
+        double previousActualFps = 0.0d;
+        double previousActualKbps = 0.0d;
         byte[] codecConfig = new byte[0];
 
         while (running && isCurrentGeneration(runGeneration)) {
+            Exception asyncCameraError = cameraRuntimeError.get();
+            if (asyncCameraError != null) {
+                throw asyncCameraError;
+            }
+
             long loopNowMs = System.currentTimeMillis();
             if (loopNowMs - lastSyncFrameRequestMs >= 1000L) {
                 lastSyncFrameRequestMs = loopNowMs;
@@ -404,12 +487,34 @@ public final class CameraCaptureClient {
                     }
                     if ((flags & FLAG_CODEC_CONFIG) != 0) {
                         codecConfigPackets += 1L;
+                    } else {
+                        videoFramesSent += 1L;
                     }
 
                     long now = System.currentTimeMillis();
                     if (now - lastStatsAtMs >= 1000L) {
+                        double elapsedSeconds = lastStatsAtMs == 0L
+                            ? 1.0d
+                            : Math.max(0.001d, (now - lastStatsAtMs) / 1000.0d);
+                        double actualFps = Math.max(0.0d, (videoFramesSent - lastStatsFrames) / elapsedSeconds);
+                        double actualKbps = Math.max(0.0d, ((bytesSent - lastStatsBytes) * 8.0d) / 1000.0d / elapsedSeconds);
+                        double fpsJitter = jitterPercent(previousActualFps, actualFps);
+                        double bitrateJitter = jitterPercent(previousActualKbps, actualKbps);
+
                         lastStatsAtMs = now;
-                        emitStats(packetsSent, bytesSent, keyFrames, codecConfigPackets);
+                        lastStatsFrames = videoFramesSent;
+                        lastStatsBytes = bytesSent;
+                        previousActualFps = actualFps;
+                        previousActualKbps = actualKbps;
+                        emitStats(
+                            packetsSent,
+                            bytesSent,
+                            keyFrames,
+                            codecConfigPackets,
+                            actualFps,
+                            actualKbps,
+                            fpsJitter,
+                            bitrateJitter);
                     }
                 }
             } finally {
@@ -590,7 +695,12 @@ public final class CameraCaptureClient {
     }
 
     @SuppressLint("MissingPermission")
-    private CameraDevice openCamera(CameraManager cameraManager, String cameraId, Handler cameraHandler) throws Exception {
+    private CameraDevice openCamera(
+        CameraManager cameraManager,
+        String cameraId,
+        Handler cameraHandler,
+        AtomicReference<Exception> runtimeError
+    ) throws Exception {
         CountDownLatch latch = new CountDownLatch(1);
         AtomicReference<CameraDevice> deviceRef = new AtomicReference<>();
         AtomicReference<Exception> errorRef = new AtomicReference<>();
@@ -604,14 +714,24 @@ public final class CameraCaptureClient {
 
             @Override
             public void onDisconnected(CameraDevice camera) {
-                errorRef.compareAndSet(null, new IllegalStateException("Camera disconnected."));
+                IllegalStateException error = new IllegalStateException("Camera disconnected.");
+                if (deviceRef.get() == null) {
+                    errorRef.compareAndSet(null, error);
+                } else {
+                    runtimeError.compareAndSet(null, error);
+                }
                 closeCamera(camera);
                 latch.countDown();
             }
 
             @Override
             public void onError(CameraDevice camera, int error) {
-                errorRef.compareAndSet(null, new IllegalStateException("Camera error " + error + "."));
+                IllegalStateException exception = new IllegalStateException("Camera error " + error + ".");
+                if (deviceRef.get() == null) {
+                    errorRef.compareAndSet(null, exception);
+                } else {
+                    runtimeError.compareAndSet(null, exception);
+                }
                 closeCamera(camera);
                 latch.countDown();
             }
@@ -2049,6 +2169,40 @@ public final class CameraCaptureClient {
         return false;
     }
 
+    private static String classifyDisconnectReason(Exception ex) {
+        Throwable current = ex;
+        while (current != null) {
+            String name = current.getClass().getName();
+            String message = current.getMessage() == null ? "" : current.getMessage();
+            if (name.startsWith("java.net.") || name.startsWith("java.io.")) {
+                return "socket_disconnected: " + exceptionSummary(ex);
+            }
+            if (current instanceof CameraAccessException) {
+                return "camera_access_error: " + exceptionSummary(ex);
+            }
+            if (name.contains("MediaCodec") || message.contains("codec") || message.contains("encoder")) {
+                return "encoder_error: " + exceptionSummary(ex);
+            }
+            if (message.contains("permission")) {
+                return "permission_required: " + exceptionSummary(ex);
+            }
+            if (message.contains("Camera disconnected") || message.contains("Camera error")) {
+                return "camera_runtime_error: " + exceptionSummary(ex);
+            }
+            current = current.getCause();
+        }
+
+        return "capture_error: " + exceptionSummary(ex);
+    }
+
+    private static double jitterPercent(double previous, double current) {
+        if (previous <= 0.0d || Double.isNaN(previous) || Double.isInfinite(previous)) {
+            return 0.0d;
+        }
+
+        return Math.abs(current - previous) * 100.0d / previous;
+    }
+
     private String generationDetails(long runGeneration) {
         synchronized (lifecycleLock) {
             return "generation=" + runGeneration
@@ -2074,15 +2228,44 @@ public final class CameraCaptureClient {
     }
 
     private void emitState(String state, String message) {
-        listener.onCameraCaptureState(state, message);
+        listener.onCameraCaptureState(
+            state,
+            message,
+            reconnectCount,
+            recoveryAttemptCount,
+            consecutiveFailureCount,
+            lastRecoveryDurationMs,
+            lastDisconnectReason);
     }
 
     private void emitConfigApplied(int port, int width, int height, int fps, String codec, String facing) {
         listener.onCameraCaptureConfigApplied(port, width, height, fps, codec, facing);
     }
 
-    private void emitStats(long packetsSent, long bytesSent, long keyFrames, long codecConfigPackets) {
-        listener.onCameraCaptureStats(packetsSent, bytesSent, keyFrames, codecConfigPackets);
+    private void emitStats(
+        long packetsSent,
+        long bytesSent,
+        long keyFrames,
+        long codecConfigPackets,
+        double actualFps,
+        double actualKbps,
+        double fpsJitter,
+        double bitrateJitter
+    ) {
+        listener.onCameraCaptureStats(
+            packetsSent,
+            bytesSent,
+            keyFrames,
+            codecConfigPackets,
+            reconnectCount,
+            recoveryAttemptCount,
+            consecutiveFailureCount,
+            lastRecoveryDurationMs,
+            lastDisconnectReason,
+            actualFps,
+            actualKbps,
+            fpsJitter,
+            bitrateJitter);
     }
 
     private static final class StopToken {

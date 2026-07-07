@@ -31,9 +31,16 @@ internal static partial class Program
         private readonly TcpListener _listener = new(address, options.CameraPort);
         private readonly CameraLatestFrameCache _latestFrameCache = new(cameraRuntimeState.Current.Width, cameraRuntimeState.Current.Height);
         private readonly object _connectionLock = new();
+        private readonly object _stabilityLock = new();
         private CancellationTokenSource? _activeConnectionCts;
         private Task? _activeConnectionTask;
         private int _connectionSerial;
+        private long _reconnectCount;
+        private long _recoveryAttemptCount;
+        private long _consecutiveFailureCount;
+        private long _lastRecoveryDurationMs;
+        private DateTimeOffset? _recoveryStartedAt;
+        private string _lastDisconnectReason = "";
 
         public async Task RunAsync(CancellationToken cancellationToken)
         {
@@ -124,8 +131,15 @@ internal static partial class Program
                 Log(
                     $"CAMERA {connectionId}",
                     $"camera-state=connected remote={remote} local={local} socket={DescribeSocket(client)}");
+                var recoverySuccess = MarkRecoverySucceeded();
+                if (!string.IsNullOrWhiteSpace(recoverySuccess))
+                {
+                    Log("CAMERA", recoverySuccess);
+                }
+
                 await PublishServerStatusAsync("connected", "Android camera socket connected", connectionCts.Token);
 
+                var disconnectReason = "socket_closed";
                 try
                 {
                     client.NoDelay = true;
@@ -134,32 +148,38 @@ internal static partial class Program
                 }
                 catch (OperationCanceledException) when (appToken.IsCancellationRequested || connectionCts.IsCancellationRequested)
                 {
-                    // Application shutdown or superseded connection.
+                    disconnectReason = appToken.IsCancellationRequested ? "host_stopping" : "superseded_connection";
                 }
                 catch (EndOfStreamException ex)
                 {
+                    disconnectReason = "eof: " + ex.Message;
                     Log($"CAMERA {connectionId}", $"camera-state=disconnected endType=EOF message={ex.Message}");
                 }
                 catch (IOException ex)
                 {
+                    disconnectReason = "socket_disconnected: " + ex.Message;
                     Log($"CAMERA {connectionId}", $"camera-state=disconnected endType=IOException exception={ex.GetType().Name} message={ex.Message}");
                 }
                 catch (InvalidDataException ex)
                 {
+                    disconnectReason = "invalid_stream: " + ex.Message;
                     Log($"CAMERA {connectionId}", $"camera-state=unavailable endType=InvalidDataException exception={ex.GetType().Name} message={ex.Message}");
                     await PublishServerStatusAsync("unavailable", ex.Message, CancellationToken.None);
                 }
                 catch (Exception ex)
                 {
+                    disconnectReason = "receive_error: " + ex.Message;
                     Log($"CAMERA {connectionId}", $"camera-state=unavailable endType=Exception exception={ex.GetType().Name} message={ex.Message}");
                     await PublishServerStatusAsync("unavailable", ex.Message, CancellationToken.None);
                 }
                 finally
                 {
+                    var wasActiveConnection = false;
                     lock (_connectionLock)
                     {
                         if (ReferenceEquals(_activeConnectionCts, connectionCts))
                         {
+                            wasActiveConnection = true;
                             _activeConnectionCts = null;
                             _activeConnectionTask = null;
                         }
@@ -167,7 +187,14 @@ internal static partial class Program
 
                     CloseSocket(client);
                     Log($"CAMERA {connectionId}", $"camera-state=disconnected remote={remote}");
-                    await PublishServerStatusAsync("disconnected", "Android camera socket disconnected", CancellationToken.None);
+                    if (wasActiveConnection && !appToken.IsCancellationRequested)
+                    {
+                        var recoveryStart = MarkRecoveryStarted(disconnectReason);
+                        Log("CAMERA", recoveryStart);
+                        await PublishServerStatusAsync("disconnected", disconnectReason, CancellationToken.None);
+                        Log("CAMERA", $"camera-state=listening reason=awaiting_reconnect {StabilityLogFields()}");
+                        await PublishServerStatusAsync("listening", "waiting for Android camera stream after disconnect", CancellationToken.None);
+                    }
                 }
             }
         }
@@ -180,6 +207,8 @@ internal static partial class Program
             long lastLogPackets = 0;
             long lastLogFrames = 0;
             long lastLogBytes = 0;
+            double lastApproxFps = 0.0;
+            double lastApproxKbps = 0.0;
             byte[]? codecConfig = null;
             byte[]? payloadBuffer = null;
             var needsKeyFrame = true;
@@ -241,11 +270,14 @@ internal static partial class Program
                         var byteDelta = stats.ByteCount - lastLogBytes;
                         var fps = frameDelta / elapsedSeconds;
                         var kbps = byteDelta * 8.0 / 1000.0 / elapsedSeconds;
+                        var fpsJitter = JitterPercent(lastApproxFps, fps);
+                        var bitrateJitter = JitterPercent(lastApproxKbps, kbps);
 
                         Log(
                             "CAMERA",
                             $"camera-state=receiving connection={connectionId} packets={stats.PacketCount} frames={stats.FrameCount} bytes={stats.ByteCount} "
                             + $"deltaPackets={packetDelta} approxFps={fps:F1} approxKbps={kbps:F0} "
+                            + $"fpsJitter={fpsJitter:F1} bitrateJitter={bitrateJitter:F1} {StabilityLogFields()} "
                             + $"lastSeq={packet.Sequence} flags={FormatFlags(packet.Flags)} payload={packet.PayloadLength} "
                             + $"keyFrames={stats.KeyFrameCount} codecConfigPackets={stats.CodecConfigPacketCount} "
                             + $"decodedFrames={stats.DecodedFrameCount} decodeErrors={stats.DecodeErrorCount} "
@@ -258,12 +290,16 @@ internal static partial class Program
                             cancellationToken,
                             stats,
                             fps,
-                            kbps);
+                            kbps,
+                            fpsJitter,
+                            bitrateJitter);
 
                         lastLogAt = now;
                         lastLogPackets = stats.PacketCount;
                         lastLogFrames = stats.FrameCount;
                         lastLogBytes = stats.ByteCount;
+                        lastApproxFps = fps;
+                        lastApproxKbps = kbps;
                     }
                 }
             }
@@ -643,9 +679,12 @@ internal static partial class Program
             CancellationToken cancellationToken,
             CameraReceiveStats? stats = null,
             double approxFps = 0.0,
-            double approxKbps = 0.0)
+            double approxKbps = 0.0,
+            double fpsJitter = 0.0,
+            double bitrateJitter = 0.0)
         {
             var config = cameraRuntimeState.Current.WithEffectiveEnabled(options);
+            var stability = StabilitySnapshot();
             return controlPublisher.PublishAsync("camera_server_status", new JsonObject
             {
                 ["state"] = state,
@@ -665,6 +704,13 @@ internal static partial class Program
                 ["decodeErrors"] = stats?.DecodeErrorCount ?? 0,
                 ["approxFps"] = approxFps,
                 ["approxKbps"] = approxKbps,
+                ["fpsJitter"] = fpsJitter,
+                ["bitrateJitter"] = bitrateJitter,
+                ["reconnectCount"] = stability.ReconnectCount,
+                ["recoveryAttemptCount"] = stability.RecoveryAttemptCount,
+                ["consecutiveFailureCount"] = stability.ConsecutiveFailureCount,
+                ["lastRecoveryDurationMs"] = stability.LastRecoveryDurationMs,
+                ["lastDisconnectReason"] = stability.LastDisconnectReason,
                 ["decodeLagMs"] = stats?.LastDecodeLagMs ?? 0.0,
                 ["lastFrameAt"] = FormatTimestamp(stats?.LastFrameAt),
                 ["lastDecodedFrameAt"] = FormatTimestamp(stats?.LastDecodedFrameAt),
@@ -677,6 +723,76 @@ internal static partial class Program
         private static string FormatCameraConfig(EffectiveCameraRuntimeConfig config)
         {
             return $"{config.Width}x{config.Height}@{config.Fps} codec={config.Codec} facing={config.Facing} enabled={config.Enabled}";
+        }
+
+        private string MarkRecoveryStarted(string reason)
+        {
+            var now = DateTimeOffset.UtcNow;
+            lock (_stabilityLock)
+            {
+                _recoveryAttemptCount++;
+                _consecutiveFailureCount++;
+                _lastDisconnectReason = string.IsNullOrWhiteSpace(reason) ? "socket_disconnected" : reason;
+                _recoveryStartedAt ??= now;
+                return $"camera-recovery-event=recovery_start attempts={_recoveryAttemptCount} "
+                    + $"consecutiveFailures={_consecutiveFailureCount} lastDisconnectReason={SanitizeLogValue(_lastDisconnectReason)}";
+            }
+        }
+
+        private string MarkRecoverySucceeded()
+        {
+            lock (_stabilityLock)
+            {
+                if (_recoveryStartedAt is null)
+                {
+                    _consecutiveFailureCount = 0;
+                    return string.Empty;
+                }
+
+                _reconnectCount++;
+                _lastRecoveryDurationMs = (long)Math.Max(
+                    0.0,
+                    (DateTimeOffset.UtcNow - _recoveryStartedAt.Value).TotalMilliseconds);
+                _recoveryStartedAt = null;
+                _consecutiveFailureCount = 0;
+                return $"camera-recovery-event=recovery_success reconnects={_reconnectCount} "
+                    + $"lastRecoveryDurationMs={_lastRecoveryDurationMs} lastDisconnectReason={SanitizeLogValue(_lastDisconnectReason)}";
+            }
+        }
+
+        private string StabilityLogFields()
+        {
+            var snapshot = StabilitySnapshot();
+            return $"reconnects={snapshot.ReconnectCount} recoveryAttempts={snapshot.RecoveryAttemptCount} "
+                + $"consecutiveFailures={snapshot.ConsecutiveFailureCount} lastRecoveryDurationMs={snapshot.LastRecoveryDurationMs} "
+                + $"lastDisconnectReason={SanitizeLogValue(snapshot.LastDisconnectReason)}";
+        }
+
+        private CameraStabilitySnapshot StabilitySnapshot()
+        {
+            lock (_stabilityLock)
+            {
+                return new CameraStabilitySnapshot(
+                    _reconnectCount,
+                    _recoveryAttemptCount,
+                    _consecutiveFailureCount,
+                    _lastRecoveryDurationMs,
+                    _lastDisconnectReason);
+            }
+        }
+
+        private static double JitterPercent(double previous, double current)
+        {
+            return previous <= 0.0 || double.IsNaN(previous) || double.IsInfinity(previous)
+                ? 0.0
+                : Math.Abs(current - previous) * 100.0 / previous;
+        }
+
+        private static string SanitizeLogValue(string value)
+        {
+            return string.IsNullOrWhiteSpace(value)
+                ? ""
+                : value.Replace('\r', ' ').Replace('\n', ' ').Replace(' ', '_');
         }
 
         private static string FormatTimestamp(DateTimeOffset? value)
@@ -847,6 +963,13 @@ internal static partial class Program
             long Sequence,
             long TimestampUs,
             int PayloadLength);
+
+        private readonly record struct CameraStabilitySnapshot(
+            long ReconnectCount,
+            long RecoveryAttemptCount,
+            long ConsecutiveFailureCount,
+            long LastRecoveryDurationMs,
+            string LastDisconnectReason);
     }
 
     private sealed class CameraLatestFrameCache : IDisposable
