@@ -138,11 +138,21 @@ internal static class VirtualDisplayModeService
                 VirtualDisplayPresentationMode.Unknown);
         }
 
+        if (mode == VirtualDisplayPresentationMode.Mirror)
+        {
+            return ApplyMirrorPresentationMode();
+        }
+
+        if (mode == VirtualDisplayPresentationMode.SecondaryOnly)
+        {
+            return ApplySecondaryOnlyPresentationMode();
+        }
+
         if (mode != VirtualDisplayPresentationMode.Extend)
         {
             var currentState = GetPresentationState();
             return VirtualDisplayPresentationApplyResult.Failed(
-                "该显示模式暂未支持，需要后续安全确认流程。",
+                "未知显示模式，已拒绝修改显示拓扑。",
                 currentState.Mode);
         }
 
@@ -229,6 +239,519 @@ internal static class VirtualDisplayModeService
             VirtualDisplayPresentationMode.Extend);
     }
 
+    public static VirtualDisplayPresentationApplyResult RestorePresentationMode(
+        PresentationRollbackToken rollbackToken,
+        string reason)
+    {
+        if (!OperatingSystem.IsWindows())
+        {
+            return VirtualDisplayPresentationApplyResult.Failed(
+                "显示拓扑恢复仅支持 Windows。",
+                VirtualDisplayPresentationMode.Unknown,
+                BuildDiagnosticSummary(
+                    rollbackToken.TargetMode,
+                    rollbackToken.OriginalTopologySummary,
+                    "当前系统不是 Windows，未执行恢复。",
+                    null,
+                    rollbackToken.SideDockMatchSummary,
+                    reason));
+        }
+
+        var restoreResult = rollbackToken.Restore();
+        var currentState = GetPresentationState();
+        var currentSummary = GetCurrentTopologyDiagnosticSummary();
+        var diagnostic = BuildDiagnosticSummary(
+            rollbackToken.TargetMode,
+            rollbackToken.OriginalTopologySummary,
+            currentSummary,
+            restoreResult.WinApiReturnCode,
+            rollbackToken.SideDockMatchSummary,
+            $"{reason}{Environment.NewLine}{restoreResult.Summary}");
+
+        return restoreResult.Success
+            ? VirtualDisplayPresentationApplyResult.Succeeded(
+                "已恢复切换前的显示拓扑。",
+                currentState.Mode,
+                diagnostic)
+            : VirtualDisplayPresentationApplyResult.Failed(
+                $"恢复切换前显示拓扑失败：{restoreResult.Summary}",
+                currentState.Mode,
+                diagnostic);
+    }
+
+    public static VirtualDisplayPresentationApplyResult CommitPresentationMode(
+        PresentationRollbackToken rollbackToken,
+        string reason)
+    {
+        if (!OperatingSystem.IsWindows())
+        {
+            return VirtualDisplayPresentationApplyResult.Failed(
+                "显示拓扑保存仅支持 Windows。",
+                VirtualDisplayPresentationMode.Unknown,
+                BuildDiagnosticSummary(
+                    rollbackToken.TargetMode,
+                    rollbackToken.OriginalTopologySummary,
+                    "当前系统不是 Windows，未执行保存。",
+                    null,
+                    rollbackToken.SideDockMatchSummary,
+                    reason));
+        }
+
+        var captureResult = TryCaptureActiveDisplayTopology(out var current, out var currentMessage);
+        if (captureResult != ErrorSuccess || current is null)
+        {
+            return VirtualDisplayPresentationApplyResult.Failed(
+                $"无法读取当前显示拓扑，未保存临时拓扑：{currentMessage}",
+                VirtualDisplayPresentationMode.Unknown,
+                BuildDiagnosticSummary(
+                    rollbackToken.TargetMode,
+                    rollbackToken.OriginalTopologySummary,
+                    $"读取当前拓扑失败：{currentMessage}",
+                    captureResult,
+                    rollbackToken.SideDockMatchSummary,
+                    reason));
+        }
+
+        if (current.Mode != rollbackToken.TargetMode)
+        {
+            return VirtualDisplayPresentationApplyResult.Failed(
+                $"当前拓扑不是待确认的 {PresentationModeDiagnosticLabel(rollbackToken.TargetMode)}，未保存临时拓扑。",
+                current.Mode,
+                BuildDiagnosticSummary(
+                    rollbackToken.TargetMode,
+                    rollbackToken.OriginalTopologySummary,
+                    current.FormatDiagnosticSummary(),
+                    null,
+                    rollbackToken.SideDockMatchSummary,
+                    reason));
+        }
+
+        var validateResult = SetDisplayConfig(
+            (uint)current.Paths.Length,
+            current.Paths,
+            (uint)current.Modes.Length,
+            current.Modes,
+            SdcUseSuppliedDisplayConfig | SdcValidate | SdcAllowChanges);
+        if (validateResult != ErrorSuccess)
+        {
+            return VirtualDisplayPresentationApplyResult.Failed(
+                $"当前临时拓扑预验证失败，未保存：SetDisplayConfig(validate)={validateResult}。",
+                current.Mode,
+                BuildDiagnosticSummary(
+                    rollbackToken.TargetMode,
+                    rollbackToken.OriginalTopologySummary,
+                    current.FormatDiagnosticSummary(),
+                    validateResult,
+                    rollbackToken.SideDockMatchSummary,
+                    $"{reason}{Environment.NewLine}Validate 失败，未调用保存。"));
+        }
+
+        var saveResult = SetDisplayConfig(
+            (uint)current.Paths.Length,
+            current.Paths,
+            (uint)current.Modes.Length,
+            current.Modes,
+            SdcUseSuppliedDisplayConfig | SdcApply | SdcSaveToDatabase | SdcAllowChanges);
+        var savedState = GetPresentationState();
+        var diagnostic = BuildDiagnosticSummary(
+            rollbackToken.TargetMode,
+            rollbackToken.OriginalTopologySummary,
+            GetCurrentTopologyDiagnosticSummary(),
+            saveResult,
+            rollbackToken.SideDockMatchSummary,
+            $"{reason}{Environment.NewLine}Validate={validateResult}; Save={saveResult}.");
+        return saveResult == ErrorSuccess
+            ? VirtualDisplayPresentationApplyResult.Succeeded(
+                $"已保存{PresentationModeDiagnosticLabel(rollbackToken.TargetMode)}模式。",
+                rollbackToken.TargetMode,
+                diagnostic)
+            : VirtualDisplayPresentationApplyResult.Failed(
+                $"保存临时拓扑失败：SetDisplayConfig(save)={saveResult}。",
+                savedState.Mode,
+                diagnostic);
+    }
+
+    private static VirtualDisplayPresentationApplyResult ApplyMirrorPresentationMode()
+    {
+        var beforeResult = TryCaptureActiveDisplayTopology(out var before, out var beforeMessage);
+        if (beforeResult != ErrorSuccess || before is null)
+        {
+            return VirtualDisplayPresentationApplyResult.Failed(
+                $"镜像模式切换前无法读取当前显示拓扑：{beforeMessage}",
+                VirtualDisplayPresentationMode.Unknown,
+                BuildDiagnosticSummary(
+                    VirtualDisplayPresentationMode.Mirror,
+                    $"读取原拓扑失败：{beforeMessage}",
+                    GetCurrentTopologyDiagnosticSummary(),
+                    beforeResult,
+                    "SideDock 匹配信息不可用。",
+                    "预检失败，未调用 SetDisplayConfig。"));
+        }
+
+        if (!TryResolvePresentationTargets(
+                before,
+                requirePrimary: true,
+                out var primaryPath,
+                out var sideDockPath,
+                out var targetFailure,
+                out var sideDockMatchSummary)
+            || primaryPath is null
+            || sideDockPath is null)
+        {
+            return VirtualDisplayPresentationApplyResult.Failed(
+                targetFailure,
+                before.Mode,
+                BuildDiagnosticSummary(
+                    VirtualDisplayPresentationMode.Mirror,
+                    before.FormatDiagnosticSummary(),
+                    GetCurrentTopologyDiagnosticSummary(),
+                    null,
+                    sideDockMatchSummary,
+                    "预检失败，未调用 SetDisplayConfig。"));
+        }
+
+        var unsafeClone = before.ActivePaths.Any(path =>
+            !path.IsSideDock
+            && path.TargetKey != primaryPath.TargetKey
+            && path.SourceKey == primaryPath.SourceKey);
+        if (unsafeClone)
+        {
+            return VirtualDisplayPresentationApplyResult.Failed(
+                "检测到其它非 SideDock 显示器已经与主屏共享同一个源，无法保证只镜像主屏和 SideDock，已拒绝切换。",
+                before.Mode,
+                BuildDiagnosticSummary(
+                    VirtualDisplayPresentationMode.Mirror,
+                    before.FormatDiagnosticSummary(),
+                    GetCurrentTopologyDiagnosticSummary(),
+                    null,
+                    sideDockMatchSummary,
+                    "预检失败，未调用 SetDisplayConfig。"));
+        }
+
+        if (IsPrimarySideDockMirror(before, primaryPath, sideDockPath))
+        {
+            return VirtualDisplayPresentationApplyResult.Succeeded(
+                "当前已是镜像模式。",
+                VirtualDisplayPresentationMode.Mirror,
+                BuildDiagnosticSummary(
+                    VirtualDisplayPresentationMode.Mirror,
+                    before.FormatDiagnosticSummary(),
+                    before.FormatDiagnosticSummary(),
+                    null,
+                    sideDockMatchSummary,
+                    "未调用 SetDisplayConfig。"));
+        }
+
+        var compatibilityFailure = ValidateSideDockCanMirrorPrimary(
+            primaryPath,
+            sideDockPath,
+            out var primaryModeRequest,
+            out var modeMatchSummary);
+        sideDockMatchSummary = $"{sideDockMatchSummary}{Environment.NewLine}{modeMatchSummary}";
+        if (!string.IsNullOrWhiteSpace(compatibilityFailure) || primaryModeRequest is null)
+        {
+            return VirtualDisplayPresentationApplyResult.Failed(
+                compatibilityFailure ?? "无法确认 SideDock 与主屏模式兼容，已拒绝切换。",
+                before.Mode,
+                BuildDiagnosticSummary(
+                    VirtualDisplayPresentationMode.Mirror,
+                    before.FormatDiagnosticSummary(),
+                    GetCurrentTopologyDiagnosticSummary(),
+                    null,
+                    sideDockMatchSummary,
+                    "预检失败，未调用 SetDisplayConfig。"));
+        }
+
+        if (!TryBuildMirrorDisplayConfig(
+                before,
+                primaryPath,
+                sideDockPath,
+                primaryModeRequest,
+                out var updatedPaths,
+                out var updatedModes,
+                out var buildFailure))
+        {
+            return VirtualDisplayPresentationApplyResult.Failed(
+                buildFailure,
+                before.Mode,
+                BuildDiagnosticSummary(
+                    VirtualDisplayPresentationMode.Mirror,
+                    before.FormatDiagnosticSummary(),
+                    GetCurrentTopologyDiagnosticSummary(),
+                    null,
+                    sideDockMatchSummary,
+                    "预检失败，未调用 SetDisplayConfig。"));
+        }
+
+        var validateResult = SetDisplayConfig(
+            (uint)updatedPaths.Length,
+            updatedPaths,
+            (uint)updatedModes.Length,
+            updatedModes,
+            SdcUseSuppliedDisplayConfig | SdcValidate | SdcAllowChanges);
+        if (validateResult != ErrorSuccess)
+        {
+            return VirtualDisplayPresentationApplyResult.Failed(
+                $"镜像模式预验证失败：SetDisplayConfig(validate)={validateResult}。",
+                before.Mode,
+                BuildDiagnosticSummary(
+                    VirtualDisplayPresentationMode.Mirror,
+                    before.FormatDiagnosticSummary(),
+                    GetCurrentTopologyDiagnosticSummary(),
+                    validateResult,
+                    sideDockMatchSummary,
+                    "Validate 失败，未调用 Apply。"));
+        }
+
+        var applyResult = SetDisplayConfig(
+            (uint)updatedPaths.Length,
+            updatedPaths,
+            (uint)updatedModes.Length,
+            updatedModes,
+            SdcUseSuppliedDisplayConfig | SdcApply | SdcSaveToDatabase | SdcAllowChanges);
+        if (applyResult != ErrorSuccess)
+        {
+            var restoreResult = RestoreDisplayTopology(before);
+            var currentState = GetPresentationState();
+            return VirtualDisplayPresentationApplyResult.Failed(
+                $"镜像模式切换失败：SetDisplayConfig(apply)={applyResult}。{restoreResult.Summary}",
+                currentState.Mode,
+                BuildDiagnosticSummary(
+                    VirtualDisplayPresentationMode.Mirror,
+                    before.FormatDiagnosticSummary(),
+                    GetCurrentTopologyDiagnosticSummary(),
+                    applyResult,
+                    sideDockMatchSummary,
+                    $"Apply 失败，随后尝试恢复：{restoreResult.Summary}"));
+        }
+
+        var afterResult = WaitForActiveDisplayTopology(out var after, out var afterMessage);
+        if (afterResult != ErrorSuccess || after is null)
+        {
+            var restoreResult = RestoreDisplayTopology(before);
+            var currentState = GetPresentationState();
+            return VirtualDisplayPresentationApplyResult.Failed(
+                $"镜像模式切换后无法确认显示拓扑：{afterMessage}。{restoreResult.Summary}",
+                currentState.Mode,
+                BuildDiagnosticSummary(
+                    VirtualDisplayPresentationMode.Mirror,
+                    before.FormatDiagnosticSummary(),
+                    GetCurrentTopologyDiagnosticSummary(),
+                    afterResult,
+                    sideDockMatchSummary,
+                    $"Apply 已返回成功，但确认拓扑失败，随后尝试恢复：{restoreResult.Summary}"));
+        }
+
+        var validationFailure = ValidateMirrorTopologyResult(before, after, primaryPath, sideDockPath);
+        if (!string.IsNullOrWhiteSpace(validationFailure))
+        {
+            var restoreResult = RestoreDisplayTopology(before);
+            var currentState = GetPresentationState();
+            return VirtualDisplayPresentationApplyResult.Failed(
+                $"{validationFailure}。{restoreResult.Summary}",
+                currentState.Mode,
+                BuildDiagnosticSummary(
+                    VirtualDisplayPresentationMode.Mirror,
+                    before.FormatDiagnosticSummary(),
+                    after.FormatDiagnosticSummary(),
+                    applyResult,
+                    sideDockMatchSummary,
+                    $"Apply 后安全校验失败，随后尝试恢复：{restoreResult.Summary}"));
+        }
+
+        return VirtualDisplayPresentationApplyResult.Succeeded(
+            "已切换为镜像模式。",
+            VirtualDisplayPresentationMode.Mirror,
+            BuildDiagnosticSummary(
+                VirtualDisplayPresentationMode.Mirror,
+                before.FormatDiagnosticSummary(),
+                after.FormatDiagnosticSummary(),
+                applyResult,
+                sideDockMatchSummary,
+                "Validate 和 Apply 均成功。"));
+    }
+
+    private static VirtualDisplayPresentationApplyResult ApplySecondaryOnlyPresentationMode()
+    {
+        var beforeResult = TryCaptureActiveDisplayTopology(out var before, out var beforeMessage);
+        if (beforeResult != ErrorSuccess || before is null)
+        {
+            return VirtualDisplayPresentationApplyResult.Failed(
+                $"仅副屏模式切换前无法读取当前显示拓扑：{beforeMessage}",
+                VirtualDisplayPresentationMode.Unknown,
+                BuildDiagnosticSummary(
+                    VirtualDisplayPresentationMode.SecondaryOnly,
+                    $"读取原拓扑失败：{beforeMessage}",
+                    GetCurrentTopologyDiagnosticSummary(),
+                    beforeResult,
+                    "SideDock 匹配信息不可用。",
+                    "预检失败，未调用 SetDisplayConfig。"));
+        }
+
+        if (before.Mode == VirtualDisplayPresentationMode.SecondaryOnly)
+        {
+            return VirtualDisplayPresentationApplyResult.Succeeded(
+                "当前已是仅副屏模式。",
+                VirtualDisplayPresentationMode.SecondaryOnly,
+                BuildDiagnosticSummary(
+                    VirtualDisplayPresentationMode.SecondaryOnly,
+                    before.FormatDiagnosticSummary(),
+                    before.FormatDiagnosticSummary(),
+                    null,
+                    FormatSideDockMatchSummary(before, before.SideDockPaths.ToArray()),
+                    "未调用 SetDisplayConfig。"));
+        }
+
+        if (!TryResolvePresentationTargets(
+                before,
+                requirePrimary: true,
+                out var primaryPath,
+                out var sideDockPath,
+                out var targetFailure,
+                out var sideDockMatchSummary)
+            || primaryPath is null
+            || sideDockPath is null)
+        {
+            return VirtualDisplayPresentationApplyResult.Failed(
+                targetFailure,
+                before.Mode,
+                BuildDiagnosticSummary(
+                    VirtualDisplayPresentationMode.SecondaryOnly,
+                    before.FormatDiagnosticSummary(),
+                    GetCurrentTopologyDiagnosticSummary(),
+                    null,
+                    sideDockMatchSummary,
+                    "预检失败，未调用 SetDisplayConfig。"));
+        }
+
+        var sideDockDisplaySearch = FindSideDockDisplay();
+        if (sideDockDisplaySearch.Display is null
+            || !sideDockDisplaySearch.Display.DeviceName.Equals(sideDockPath.SourceName, StringComparison.OrdinalIgnoreCase))
+        {
+            return VirtualDisplayPresentationApplyResult.Failed(
+                "SideDock 当前不是独立活动扩展源，无法安全切换为仅副屏。请先切换为扩展模式并确认 SideDock 可见。",
+                before.Mode,
+                BuildDiagnosticSummary(
+                    VirtualDisplayPresentationMode.SecondaryOnly,
+                    before.FormatDiagnosticSummary(),
+                    GetCurrentTopologyDiagnosticSummary(),
+                    null,
+                    sideDockMatchSummary,
+                    $"预检失败，未调用 SetDisplayConfig。SideDock 源匹配：{sideDockDisplaySearch.FailureSummary}"));
+        }
+
+        if (!TryBuildSinglePathDisplayConfig(
+                before,
+                sideDockPath,
+                out var updatedPaths,
+                out var updatedModes,
+                out var buildFailure))
+        {
+            return VirtualDisplayPresentationApplyResult.Failed(
+                buildFailure,
+                before.Mode,
+                BuildDiagnosticSummary(
+                    VirtualDisplayPresentationMode.SecondaryOnly,
+                    before.FormatDiagnosticSummary(),
+                    GetCurrentTopologyDiagnosticSummary(),
+                    null,
+                    sideDockMatchSummary,
+                    "预检失败，未调用 SetDisplayConfig。"));
+        }
+
+        var validateResult = SetDisplayConfig(
+            (uint)updatedPaths.Length,
+            updatedPaths,
+            (uint)updatedModes.Length,
+            updatedModes,
+            SdcUseSuppliedDisplayConfig | SdcValidate | SdcAllowChanges);
+        if (validateResult != ErrorSuccess)
+        {
+            return VirtualDisplayPresentationApplyResult.Failed(
+                $"仅副屏模式预验证失败：SetDisplayConfig(validate)={validateResult}。",
+                before.Mode,
+                BuildDiagnosticSummary(
+                    VirtualDisplayPresentationMode.SecondaryOnly,
+                    before.FormatDiagnosticSummary(),
+                    GetCurrentTopologyDiagnosticSummary(),
+                    validateResult,
+                    sideDockMatchSummary,
+                    "Validate 失败，未调用 Apply。"));
+        }
+
+        var applyResult = SetDisplayConfig(
+            (uint)updatedPaths.Length,
+            updatedPaths,
+            (uint)updatedModes.Length,
+            updatedModes,
+            SdcUseSuppliedDisplayConfig | SdcApply | SdcAllowChanges);
+        if (applyResult != ErrorSuccess)
+        {
+            var restoreResult = RestoreDisplayTopology(before);
+            var currentState = GetPresentationState();
+            return VirtualDisplayPresentationApplyResult.Failed(
+                $"仅副屏模式切换失败：SetDisplayConfig(apply)={applyResult}。{restoreResult.Summary}",
+                currentState.Mode,
+                BuildDiagnosticSummary(
+                    VirtualDisplayPresentationMode.SecondaryOnly,
+                    before.FormatDiagnosticSummary(),
+                    GetCurrentTopologyDiagnosticSummary(),
+                    applyResult,
+                    sideDockMatchSummary,
+                    $"Apply 失败，随后尝试恢复：{restoreResult.Summary}"));
+        }
+
+        var afterResult = WaitForActiveDisplayTopology(out var after, out var afterMessage);
+        if (afterResult != ErrorSuccess || after is null)
+        {
+            var restoreResult = RestoreDisplayTopology(before);
+            var currentState = GetPresentationState();
+            return VirtualDisplayPresentationApplyResult.Failed(
+                $"仅副屏模式切换后无法确认显示拓扑：{afterMessage}。{restoreResult.Summary}",
+                currentState.Mode,
+                BuildDiagnosticSummary(
+                    VirtualDisplayPresentationMode.SecondaryOnly,
+                    before.FormatDiagnosticSummary(),
+                    GetCurrentTopologyDiagnosticSummary(),
+                    afterResult,
+                    sideDockMatchSummary,
+                    $"Apply 已返回成功，但确认拓扑失败，随后尝试恢复：{restoreResult.Summary}"));
+        }
+
+        var validationFailure = ValidateSecondaryOnlyTopologyResult(after, sideDockPath);
+        if (!string.IsNullOrWhiteSpace(validationFailure))
+        {
+            var restoreResult = RestoreDisplayTopology(before);
+            var currentState = GetPresentationState();
+            return VirtualDisplayPresentationApplyResult.Failed(
+                $"{validationFailure}。{restoreResult.Summary}",
+                currentState.Mode,
+                BuildDiagnosticSummary(
+                    VirtualDisplayPresentationMode.SecondaryOnly,
+                    before.FormatDiagnosticSummary(),
+                    after.FormatDiagnosticSummary(),
+                    applyResult,
+                    sideDockMatchSummary,
+                    $"Apply 后安全校验失败，随后尝试恢复：{restoreResult.Summary}"));
+        }
+
+        var rollbackToken = new PresentationRollbackToken(
+            VirtualDisplayPresentationMode.SecondaryOnly,
+            before,
+            sideDockMatchSummary);
+        return VirtualDisplayPresentationApplyResult.Succeeded(
+            "已临时切换为仅副屏模式，请确认是否保留此设置。",
+            VirtualDisplayPresentationMode.SecondaryOnly,
+            BuildDiagnosticSummary(
+                VirtualDisplayPresentationMode.SecondaryOnly,
+                before.FormatDiagnosticSummary(),
+                after.FormatDiagnosticSummary(),
+                applyResult,
+                sideDockMatchSummary,
+                "Validate 和 Apply 均成功，等待用户确认保留。"),
+            rollbackToken);
+    }
+
     private static bool TryApplyDisplayMode(
         string deviceName,
         NativeDevMode devMode,
@@ -247,6 +770,434 @@ internal static class VirtualDisplayModeService
             + $"win32={win32Error} "
             + $"mode={FormatMode(changedDisplay?.CurrentMode)}");
         return changed;
+    }
+
+    private static bool TryResolvePresentationTargets(
+        DisplayTopologySnapshot snapshot,
+        bool requirePrimary,
+        out ActiveDisplayPathSnapshot? primaryPath,
+        out ActiveDisplayPathSnapshot? sideDockPath,
+        out string failure,
+        out string sideDockMatchSummary)
+    {
+        primaryPath = snapshot.PrimaryPath;
+        var sideDockPaths = snapshot.SideDockPaths.ToArray();
+        sideDockPath = sideDockPaths.Length == 1 ? sideDockPaths[0] : null;
+        sideDockMatchSummary = FormatSideDockMatchSummary(snapshot, sideDockPaths);
+
+        if (sideDockPaths.Length == 0)
+        {
+            var adapterSearch = FindSideDockAdapter(includeInactive: true);
+            failure = adapterSearch.Adapter is null
+                ? "未检测到 SideDock 虚拟显示器，已拒绝修改显示拓扑。"
+                : $"检测到 SideDock 虚拟显示器（{adapterSearch.Adapter.DisplayName} / {adapterSearch.Adapter.DeviceName}），但它当前未启用，已拒绝修改显示拓扑。";
+            sideDockMatchSummary = adapterSearch.Adapter is null
+                ? $"{sideDockMatchSummary}{Environment.NewLine}{adapterSearch.FailureSummary}"
+                : $"{sideDockMatchSummary}{Environment.NewLine}EnumDisplayDevices: {adapterSearch.Adapter.DisplayName} / {adapterSearch.Adapter.DeviceName}, active={adapterSearch.Adapter.IsActive}, primary={adapterSearch.Adapter.IsPrimary}.";
+            return false;
+        }
+
+        if (sideDockPaths.Length > 1)
+        {
+            failure = "检测到多个 SideDock 活动路径，无法唯一确认目标虚拟显示器，已拒绝修改显示拓扑。";
+            return false;
+        }
+
+        if (sideDockPath?.IsPrimary == true)
+        {
+            failure = $"SideDock 当前被识别为主屏（{sideDockPath.DisplayName} / {sideDockPath.SourceName}），已拒绝修改显示拓扑。";
+            return false;
+        }
+
+        if (requirePrimary && primaryPath is null)
+        {
+            failure = $"未能在活动路径中确认当前主屏（PrimaryDeviceName={snapshot.PrimaryDeviceName}），已拒绝修改显示拓扑。";
+            return false;
+        }
+
+        if (requirePrimary
+            && primaryPath is not null
+            && sideDockPath is not null
+            && primaryPath.TargetKey == sideDockPath.TargetKey)
+        {
+            failure = "主屏和 SideDock 指向同一个显示目标，无法安全修改显示拓扑。";
+            return false;
+        }
+
+        failure = string.Empty;
+        return true;
+    }
+
+    private static bool IsPrimarySideDockMirror(
+        DisplayTopologySnapshot snapshot,
+        ActiveDisplayPathSnapshot primaryPath,
+        ActiveDisplayPathSnapshot sideDockPath)
+    {
+        return snapshot.Mode == VirtualDisplayPresentationMode.Mirror
+            && primaryPath.SourceKey == sideDockPath.SourceKey
+            && !snapshot.ActivePaths.Any(path =>
+                !path.IsSideDock
+                && path.TargetKey != primaryPath.TargetKey
+                && path.SourceKey == primaryPath.SourceKey);
+    }
+
+    private static string? ValidateSideDockCanMirrorPrimary(
+        ActiveDisplayPathSnapshot primaryPath,
+        ActiveDisplayPathSnapshot sideDockPath,
+        out VirtualDisplayModeRequest? primaryModeRequest,
+        out string sideDockModeSummary)
+    {
+        primaryModeRequest = null;
+        sideDockModeSummary = "SideDock 模式兼容性尚未确认。";
+
+        if (!TryGetCurrentDevMode(primaryPath.SourceName, out var primaryMode, out var primaryModeMessage))
+        {
+            return $"无法读取当前主屏模式：{primaryModeMessage}";
+        }
+
+        if (primaryMode.PelsWidth == 0 || primaryMode.PelsHeight == 0 || primaryMode.DisplayFrequency == 0)
+        {
+            return $"当前主屏模式不完整，无法确认 SideDock 是否兼容：{FormatDevMode(primaryMode)}";
+        }
+
+        primaryModeRequest = new VirtualDisplayModeRequest(
+            "primary",
+            (int)primaryMode.PelsWidth,
+            (int)primaryMode.PelsHeight,
+            primaryMode.DisplayFrequency.ToString(CultureInfo.InvariantCulture),
+            (int)primaryMode.DisplayFrequency);
+
+        var sideDockDisplaySearch = FindSideDockDisplay();
+        if (sideDockDisplaySearch.Display is null)
+        {
+            sideDockModeSummary = $"无法枚举 SideDock 当前显示源：{sideDockDisplaySearch.FailureSummary}";
+            return "SideDock 当前不是独立活动扩展源，无法安全验证镜像模式兼容性。请先切换为扩展模式并确认 SideDock 可见。";
+        }
+
+        if (!sideDockDisplaySearch.Display.DeviceName.Equals(sideDockPath.SourceName, StringComparison.OrdinalIgnoreCase))
+        {
+            sideDockModeSummary =
+                $"SideDock 活动目标={sideDockPath.DisplayName}/{sideDockPath.SourceName}; "
+                + $"EnumDisplayDevices 匹配={sideDockDisplaySearch.Display.DisplayName}/{sideDockDisplaySearch.Display.DeviceName}.";
+            return "SideDock 当前不是独立活动扩展源，无法安全验证镜像模式兼容性。请先切换为扩展模式并确认 SideDock 可见。";
+        }
+
+        var advertisedModes = EnumerateDisplayModes(sideDockDisplaySearch.Display.DeviceName);
+        var selectedMode = SelectDisplayMode(advertisedModes, primaryModeRequest);
+        sideDockModeSummary =
+            $"SideDock 匹配={sideDockDisplaySearch.Display.DisplayName}/{sideDockDisplaySearch.Display.DeviceName}; "
+            + $"current={FormatMode(sideDockDisplaySearch.Display.CurrentMode)}; "
+            + $"target={FormatRequest(primaryModeRequest)}; "
+            + FormatAdvertisedModes(advertisedModes, primaryModeRequest.Width, primaryModeRequest.Height);
+        if (selectedMode is null)
+        {
+            return $"主屏当前模式 {FormatRequest(primaryModeRequest)} 不受 SideDock 虚拟显示器支持，已拒绝镜像。";
+        }
+
+        return null;
+    }
+
+    private static bool TryBuildMirrorDisplayConfig(
+        DisplayTopologySnapshot snapshot,
+        ActiveDisplayPathSnapshot primaryPathSnapshot,
+        ActiveDisplayPathSnapshot sideDockPathSnapshot,
+        VirtualDisplayModeRequest primaryModeRequest,
+        out DisplayConfigPathInfo[] paths,
+        out DisplayConfigModeInfo[] modes,
+        out string failure)
+    {
+        paths = snapshot.Paths.ToArray();
+        modes = snapshot.Modes.ToArray();
+
+        if (!TryGetPathAt(snapshot, primaryPathSnapshot, out var primaryPath)
+            || !TryGetPathAt(snapshot, sideDockPathSnapshot, out var sideDockPath))
+        {
+            failure = "无法从原始拓扑中定位主屏或 SideDock 活动路径。";
+            return false;
+        }
+
+        var primarySourceModeIndex = EnsureDisplayConfigSourceMode(
+            modes,
+            primaryPath.sourceInfo.adapterId,
+            primaryPath.sourceInfo.id);
+        var sideDockTargetModeIndex = EnsureDisplayConfigTargetMode(
+            modes,
+            sideDockPath.targetInfo.adapterId,
+            sideDockPath.targetInfo.id);
+        if (primarySourceModeIndex < 0 || sideDockTargetModeIndex < 0)
+        {
+            failure =
+                "无法定位镜像所需的源/目标模式索引："
+                + $"primarySourceIdx={primarySourceModeIndex}, sideDockTargetIdx={sideDockTargetModeIndex}。";
+            return false;
+        }
+
+        sideDockPath.sourceInfo.adapterId = primaryPath.sourceInfo.adapterId;
+        sideDockPath.sourceInfo.id = primaryPath.sourceInfo.id;
+        sideDockPath.sourceInfo.modeInfoIdx = (uint)primarySourceModeIndex;
+        sideDockPath.sourceInfo.statusFlags = primaryPath.sourceInfo.statusFlags;
+        sideDockPath.targetInfo.modeInfoIdx = (uint)sideDockTargetModeIndex;
+        sideDockPath.targetInfo.refreshRate.Numerator = (uint)primaryModeRequest.RefreshRate;
+        sideDockPath.targetInfo.refreshRate.Denominator = 1;
+        sideDockPath.targetInfo.scanLineOrdering = DisplayConfigScanlineOrderingProgressive;
+        sideDockPath.flags |= DisplayConfigPathActive;
+        paths[sideDockPathSnapshot.Index] = sideDockPath;
+
+        modes[primarySourceModeIndex].sourceMode.width = (uint)primaryModeRequest.Width;
+        modes[primarySourceModeIndex].sourceMode.height = (uint)primaryModeRequest.Height;
+        modes[primarySourceModeIndex].sourceMode.pixelFormat = DisplayConfigPixelFormat32Bpp;
+        UpdateTargetModeSignal(
+            ref modes[sideDockTargetModeIndex],
+            primaryModeRequest.Width,
+            primaryModeRequest.Height,
+            primaryModeRequest.RefreshRate);
+
+        failure = string.Empty;
+        return true;
+    }
+
+    private static bool TryBuildSinglePathDisplayConfig(
+        DisplayTopologySnapshot snapshot,
+        ActiveDisplayPathSnapshot pathSnapshot,
+        out DisplayConfigPathInfo[] paths,
+        out DisplayConfigModeInfo[] modes,
+        out string failure)
+    {
+        paths = [];
+        modes = [];
+
+        if (!TryGetPathAt(snapshot, pathSnapshot, out var path))
+        {
+            failure = "无法从原始拓扑中定位 SideDock 活动路径。";
+            return false;
+        }
+
+        var sourceModeIndex = EnsureDisplayConfigSourceMode(
+            snapshot.Modes,
+            path.sourceInfo.adapterId,
+            path.sourceInfo.id);
+        var targetModeIndex = EnsureDisplayConfigTargetMode(
+            snapshot.Modes,
+            path.targetInfo.adapterId,
+            path.targetInfo.id);
+        if (sourceModeIndex < 0 || targetModeIndex < 0)
+        {
+            failure =
+                "无法定位仅副屏所需的源/目标模式索引："
+                + $"sourceIdx={sourceModeIndex}, targetIdx={targetModeIndex}。";
+            return false;
+        }
+
+        path.sourceInfo.modeInfoIdx = 0;
+        path.targetInfo.modeInfoIdx = 1;
+        path.flags |= DisplayConfigPathActive;
+        paths = [path];
+        modes = [snapshot.Modes[sourceModeIndex], snapshot.Modes[targetModeIndex]];
+        failure = string.Empty;
+        return true;
+    }
+
+    private static bool TryGetPathAt(
+        DisplayTopologySnapshot snapshot,
+        ActiveDisplayPathSnapshot pathSnapshot,
+        out DisplayConfigPathInfo path)
+    {
+        if (pathSnapshot.Index >= 0 && pathSnapshot.Index < snapshot.Paths.Length)
+        {
+            path = snapshot.Paths[pathSnapshot.Index];
+            return true;
+        }
+
+        path = default;
+        return false;
+    }
+
+    private static string? ValidateMirrorTopologyResult(
+        DisplayTopologySnapshot before,
+        DisplayTopologySnapshot after,
+        ActiveDisplayPathSnapshot beforePrimaryPath,
+        ActiveDisplayPathSnapshot beforeSideDockPath)
+    {
+        var afterPrimaryPath = after.FindByTargetKey(beforePrimaryPath.TargetKey);
+        if (afterPrimaryPath is null)
+        {
+            return $"镜像模式切换后未检测到原主屏目标路径（{beforePrimaryPath.DisplayName} / {beforePrimaryPath.TargetKey}）";
+        }
+
+        var afterSideDockPath = after.FindByTargetKey(beforeSideDockPath.TargetKey);
+        if (afterSideDockPath is null || !afterSideDockPath.IsSideDock)
+        {
+            return $"镜像模式切换后未检测到 SideDock 目标路径（{beforeSideDockPath.DisplayName} / {beforeSideDockPath.TargetKey}）";
+        }
+
+        if (afterPrimaryPath.SourceKey != afterSideDockPath.SourceKey)
+        {
+            return $"镜像模式切换后主屏和 SideDock 未共享同一源：主屏={afterPrimaryPath.SourceKey}, SideDock={afterSideDockPath.SourceKey}";
+        }
+
+        var externalInCloneGroup = after.ActivePaths
+            .Where(path =>
+                !path.IsSideDock
+                && path.TargetKey != afterPrimaryPath.TargetKey
+                && path.SourceKey == afterPrimaryPath.SourceKey)
+            .Select(path => $"{path.DisplayName}/{path.TargetKey}")
+            .ToArray();
+        if (externalInCloneGroup.Length > 0)
+        {
+            return $"镜像模式切换后检测到其它显示器被纳入主屏镜像组：{string.Join(", ", externalInCloneGroup)}";
+        }
+
+        var missingProtectedTargets = before.ProtectedTargetKeys
+            .Where(targetKey => !after.HasActiveTargetKey(targetKey))
+            .ToArray();
+        if (missingProtectedTargets.Length > 0)
+        {
+            return $"镜像模式切换后原有非 SideDock 显示目标消失：{string.Join(", ", missingProtectedTargets)}";
+        }
+
+        if (after.Mode != VirtualDisplayPresentationMode.Mirror)
+        {
+            return $"镜像模式切换后未处于可确认的镜像拓扑，当前路径：{after.FormatActivePaths()}";
+        }
+
+        return null;
+    }
+
+    private static string? ValidateSecondaryOnlyTopologyResult(
+        DisplayTopologySnapshot after,
+        ActiveDisplayPathSnapshot beforeSideDockPath)
+    {
+        if (after.ActivePaths.Count != 1 || after.SideDockPaths.Count != 1)
+        {
+            return $"仅副屏模式切换后活动路径不是唯一 SideDock：{after.FormatActivePaths()}";
+        }
+
+        if (!after.HasActiveTargetKey(beforeSideDockPath.TargetKey))
+        {
+            return $"仅副屏模式切换后未检测到原 SideDock 目标路径（{beforeSideDockPath.TargetKey}）";
+        }
+
+        if (after.Mode != VirtualDisplayPresentationMode.SecondaryOnly)
+        {
+            return $"仅副屏模式切换后未处于可确认的仅副屏拓扑，当前路径：{after.FormatActivePaths()}";
+        }
+
+        return null;
+    }
+
+    private static void UpdateTargetModeSignal(
+        ref DisplayConfigModeInfo modeInfo,
+        int width,
+        int height,
+        int refreshRate)
+    {
+        var targetSignal = modeInfo.targetMode.targetVideoSignalInfo;
+        targetSignal.activeSize.cx = (uint)width;
+        targetSignal.activeSize.cy = (uint)height;
+        if (targetSignal.totalSize.cx == 0 || targetSignal.totalSize.cx < targetSignal.activeSize.cx)
+        {
+            targetSignal.totalSize.cx = targetSignal.activeSize.cx;
+        }
+
+        if (targetSignal.totalSize.cy == 0 || targetSignal.totalSize.cy < targetSignal.activeSize.cy)
+        {
+            targetSignal.totalSize.cy = targetSignal.activeSize.cy;
+        }
+
+        targetSignal.vSyncFreq.Numerator = (uint)refreshRate;
+        targetSignal.vSyncFreq.Denominator = 1;
+        targetSignal.hSyncFreq.Numerator = (uint)(refreshRate * Math.Max(1, height));
+        targetSignal.hSyncFreq.Denominator = 1;
+        targetSignal.pixelRate = (ulong)refreshRate * (ulong)width * (ulong)height;
+        targetSignal.scanLineOrdering = DisplayConfigScanlineOrderingProgressive;
+        modeInfo.targetMode.targetVideoSignalInfo = targetSignal;
+    }
+
+    private static bool TryGetCurrentDevMode(string deviceName, out NativeDevMode mode, out string message)
+    {
+        mode = NativeDevMode.Create();
+        if (string.IsNullOrWhiteSpace(deviceName))
+        {
+            message = "设备名为空。";
+            return false;
+        }
+
+        if (!EnumDisplaySettingsW(deviceName, EnumCurrentSettings, ref mode))
+        {
+            message = $"EnumDisplaySettingsW({deviceName}) 失败，win32={Marshal.GetLastWin32Error()}。";
+            return false;
+        }
+
+        message = FormatDevMode(mode);
+        return true;
+    }
+
+    private static DisplayTopologyRestoreResult RestoreDisplayTopology(DisplayTopologySnapshot snapshot)
+    {
+        try
+        {
+            var restoreResult = SetDisplayConfig(
+                (uint)snapshot.Paths.Length,
+                snapshot.Paths,
+                (uint)snapshot.Modes.Length,
+                snapshot.Modes,
+                SdcUseSuppliedDisplayConfig | SdcApply | SdcSaveToDatabase | SdcAllowChanges);
+            return restoreResult == ErrorSuccess
+                ? new DisplayTopologyRestoreResult(true, "已尝试恢复切换前的显示拓扑。", restoreResult)
+                : new DisplayTopologyRestoreResult(false, $"恢复切换前显示拓扑失败：SetDisplayConfig={restoreResult}。", restoreResult);
+        }
+        catch (Exception ex)
+        {
+            return new DisplayTopologyRestoreResult(false, $"恢复切换前显示拓扑时出错：{ex.Message}", null);
+        }
+    }
+
+    private static string BuildDiagnosticSummary(
+        VirtualDisplayPresentationMode targetMode,
+        string originalTopologySummary,
+        string currentTopologySummary,
+        int? winApiReturnCode,
+        string sideDockMatchSummary,
+        string detail)
+    {
+        return string.Join(
+            Environment.NewLine,
+            $"切换目标：{PresentationModeDiagnosticLabel(targetMode)}",
+            $"原拓扑摘要：{originalTopologySummary}",
+            $"当前拓扑摘要：{currentTopologySummary}",
+            $"WinAPI 返回码：{(winApiReturnCode.HasValue ? winApiReturnCode.Value.ToString(CultureInfo.InvariantCulture) : "未调用")}",
+            $"SideDock 匹配信息：{sideDockMatchSummary}",
+            $"诊断详情：{detail}");
+    }
+
+    private static string GetCurrentTopologyDiagnosticSummary()
+    {
+        var result = TryCaptureActiveDisplayTopology(out var snapshot, out var message);
+        return result == ErrorSuccess && snapshot is not null
+            ? snapshot.FormatDiagnosticSummary()
+            : $"读取当前拓扑失败：{message} (code={result})";
+    }
+
+    private static string FormatSideDockMatchSummary(
+        DisplayTopologySnapshot snapshot,
+        IReadOnlyList<ActiveDisplayPathSnapshot> sideDockPaths)
+    {
+        var activeSummary = sideDockPaths.Count == 0
+            ? "活动路径中未发现 SideDock。"
+            : string.Join("; ", sideDockPaths.Select(path =>
+                $"{path.DisplayName}, source={path.SourceName}, sourceKey={path.SourceKey}, target={path.TargetName}, targetKey={path.TargetKey}, primary={path.IsPrimary}"));
+        return $"PrimaryDeviceName={snapshot.PrimaryDeviceName}; {activeSummary}";
+    }
+
+    private static string PresentationModeDiagnosticLabel(VirtualDisplayPresentationMode mode)
+    {
+        return mode switch
+        {
+            VirtualDisplayPresentationMode.Mirror => "镜像",
+            VirtualDisplayPresentationMode.SecondaryOnly => "仅副屏",
+            VirtualDisplayPresentationMode.Extend => "扩展",
+            _ => "未知"
+        };
     }
 
     private static bool TryStageAndApplyDisplayMode(
@@ -402,7 +1353,7 @@ internal static class VirtualDisplayModeService
                 "当前已是扩展桌面。"),
             VirtualDisplayPresentationMode.Mirror => new VirtualDisplayPresentationState(
                 VirtualDisplayPresentationMode.Mirror,
-                "当前处于镜像拓扑；应用内暂不执行镜像切换。"),
+                "当前处于镜像拓扑。"),
             VirtualDisplayPresentationMode.SecondaryOnly => new VirtualDisplayPresentationState(
                 VirtualDisplayPresentationMode.SecondaryOnly,
                 "当前仅 SideDock 虚拟显示器处于活动状态。"),
@@ -443,14 +1394,26 @@ internal static class VirtualDisplayModeService
             }
 
             adapters.TryGetValue(sourceName, out var adapter);
-            var displayName = adapter?.DisplayName ?? sourceName;
+            var targetNameResult = TryGetDisplayConfigTargetName(path, out var targetName, out var targetDevicePath);
+            if (targetNameResult != ErrorSuccess)
+            {
+                targetName = $"target:{FormatLuid(path.targetInfo.adapterId)}:{path.targetInfo.id}";
+                targetDevicePath = string.Empty;
+            }
+
+            var isSideDock = adapter?.SideDockScore > 0 || IsSideDockVirtualDisplay(targetName, targetDevicePath);
+            var displayName = isSideDock
+                ? FirstNonEmpty(targetName, adapter?.DisplayName, sourceName)
+                : FirstNonEmpty(adapter?.DisplayName, targetName, sourceName);
             activePaths.Add(new ActiveDisplayPathSnapshot(
                 index,
                 sourceName,
                 FormatSourceKey(path.sourceInfo.adapterId, path.sourceInfo.id),
                 FormatSourceKey(path.targetInfo.adapterId, path.targetInfo.id),
                 displayName,
-                adapter?.SideDockScore > 0,
+                targetName,
+                targetDevicePath,
+                isSideDock,
                 adapter?.IsPrimary == true,
                 FormatDisplayConfigPath(path)));
         }
@@ -537,22 +1500,7 @@ internal static class VirtualDisplayModeService
 
     private static string TryRestoreDisplayTopology(DisplayTopologySnapshot snapshot)
     {
-        try
-        {
-            var restoreResult = SetDisplayConfig(
-                (uint)snapshot.Paths.Length,
-                snapshot.Paths,
-                (uint)snapshot.Modes.Length,
-                snapshot.Modes,
-                SdcUseSuppliedDisplayConfig | SdcApply | SdcSaveToDatabase | SdcAllowChanges);
-            return restoreResult == ErrorSuccess
-                ? "已尝试恢复切换前的显示拓扑。"
-                : $"恢复切换前显示拓扑失败：SetDisplayConfig={restoreResult}。";
-        }
-        catch (Exception ex)
-        {
-            return $"恢复切换前显示拓扑时出错：{ex.Message}";
-        }
+        return RestoreDisplayTopology(snapshot).Summary;
     }
 
     private static DisplayAdapterSearchResult FindSideDockAdapter(bool includeInactive)
@@ -628,6 +1576,18 @@ internal static class VirtualDisplayModeService
         var sourceNamePacket = DisplayConfigSourceDeviceName.Create(path.sourceInfo.adapterId, path.sourceInfo.id);
         var result = DisplayConfigGetDeviceInfo(ref sourceNamePacket);
         sourceName = result == ErrorSuccess ? CleanString(sourceNamePacket.viewGdiDeviceName) : string.Empty;
+        return result;
+    }
+
+    private static int TryGetDisplayConfigTargetName(
+        DisplayConfigPathInfo path,
+        out string targetName,
+        out string targetDevicePath)
+    {
+        var targetNamePacket = DisplayConfigTargetDeviceName.Create(path.targetInfo.adapterId, path.targetInfo.id);
+        var result = DisplayConfigGetDeviceInfo(ref targetNamePacket);
+        targetName = result == ErrorSuccess ? CleanString(targetNamePacket.monitorFriendlyDeviceName) : string.Empty;
+        targetDevicePath = result == ErrorSuccess ? CleanString(targetNamePacket.monitorDevicePath) : string.Empty;
         return result;
     }
 
@@ -865,6 +1825,13 @@ internal static class VirtualDisplayModeService
         return score;
     }
 
+    private static bool IsSideDockVirtualDisplay(params string?[] values)
+    {
+        return values.Any(value =>
+            !string.IsNullOrWhiteSpace(value)
+            && SideDockKeywords.Any(keyword => value.Contains(keyword, StringComparison.OrdinalIgnoreCase)));
+    }
+
     private static bool IsModeMatch(VirtualDisplayMode? currentMode, VirtualDisplayModeRequest requestedMode)
     {
         return currentMode is not null
@@ -1033,6 +2000,11 @@ internal static class VirtualDisplayModeService
         return $"source={path.sourceInfo.id}/{path.sourceInfo.modeInfoIdx} target={path.targetInfo.id}/{path.targetInfo.modeInfoIdx} refresh={FormatRational(path.targetInfo.refreshRate)} flags=0x{path.flags:X}";
     }
 
+    private static string FormatDevMode(NativeDevMode mode)
+    {
+        return $"{mode.PelsWidth.ToString(CultureInfo.InvariantCulture)} × {mode.PelsHeight.ToString(CultureInfo.InvariantCulture)} @ {mode.DisplayFrequency.ToString(CultureInfo.InvariantCulture)} Hz pos=({mode.PositionX.ToString(CultureInfo.InvariantCulture)}, {mode.PositionY.ToString(CultureInfo.InvariantCulture)}) bpp={mode.BitsPerPel.ToString(CultureInfo.InvariantCulture)}";
+    }
+
     private static string FormatSourceKey(Luid adapterId, uint id)
     {
         return $"{FormatLuid(adapterId)}:{id}";
@@ -1193,6 +2165,37 @@ internal static class VirtualDisplayModeService
     [DllImport("user32.dll", ExactSpelling = true)]
     private static extern int DisplayConfigGetDeviceInfo(ref DisplayConfigSourceDeviceName requestPacket);
 
+    [DllImport("user32.dll", ExactSpelling = true)]
+    private static extern int DisplayConfigGetDeviceInfo(ref DisplayConfigTargetDeviceName requestPacket);
+
+    internal sealed class PresentationRollbackToken
+    {
+        private readonly object _snapshot;
+
+        internal PresentationRollbackToken(
+            VirtualDisplayPresentationMode targetMode,
+            object snapshot,
+            string sideDockMatchSummary)
+        {
+            TargetMode = targetMode;
+            _snapshot = snapshot;
+            OriginalTopologySummary = ((DisplayTopologySnapshot)snapshot).FormatDiagnosticSummary();
+            SideDockMatchSummary = sideDockMatchSummary;
+        }
+
+        public VirtualDisplayPresentationMode TargetMode { get; }
+
+        public string OriginalTopologySummary { get; }
+
+        public string SideDockMatchSummary { get; }
+
+        internal (bool Success, string Summary, int? WinApiReturnCode) Restore()
+        {
+            var result = RestoreDisplayTopology((DisplayTopologySnapshot)_snapshot);
+            return (result.Success, result.Summary, result.WinApiReturnCode);
+        }
+    }
+
     private sealed class DisplayTopologySnapshot
     {
         public DisplayTopologySnapshot(
@@ -1215,6 +2218,12 @@ internal static class VirtualDisplayModeService
                 .Where(sourceName => !string.IsNullOrWhiteSpace(sourceName))
                 .Distinct(StringComparer.OrdinalIgnoreCase)
                 .ToArray();
+            ProtectedTargetKeys = activePaths
+                .Where(path => !path.IsSideDock)
+                .Select(path => path.TargetKey)
+                .Where(targetKey => !string.IsNullOrWhiteSpace(targetKey))
+                .Distinct(StringComparer.Ordinal)
+                .ToArray();
         }
 
         public DisplayConfigPathInfo[] Paths { get; }
@@ -1231,9 +2240,20 @@ internal static class VirtualDisplayModeService
 
         public IReadOnlyList<string> ProtectedSourceNames { get; }
 
+        public IReadOnlyList<string> ProtectedTargetKeys { get; }
+
         public bool HasActiveSideDockPath => ActivePaths.Any(path => path.IsSideDock);
 
         public bool IsExtendedDesktopWithSideDock => Mode == VirtualDisplayPresentationMode.Extend;
+
+        public IReadOnlyList<ActiveDisplayPathSnapshot> SideDockPaths =>
+            ActivePaths.Where(path => path.IsSideDock).ToArray();
+
+        public ActiveDisplayPathSnapshot? PrimaryPath =>
+            ActivePaths.FirstOrDefault(path => !path.IsSideDock && path.IsPrimary)
+            ?? ActivePaths.FirstOrDefault(path =>
+                !path.IsSideDock
+                && path.SourceName.Equals(PrimaryDeviceName, StringComparison.OrdinalIgnoreCase));
 
         public VirtualDisplayPresentationMode Mode
         {
@@ -1274,6 +2294,19 @@ internal static class VirtualDisplayModeService
                 && ActivePaths.Any(path => path.SourceName.Equals(sourceName, StringComparison.OrdinalIgnoreCase));
         }
 
+        public bool HasActiveTargetKey(string targetKey)
+        {
+            return !string.IsNullOrWhiteSpace(targetKey)
+                && ActivePaths.Any(path => path.TargetKey.Equals(targetKey, StringComparison.Ordinal));
+        }
+
+        public ActiveDisplayPathSnapshot? FindByTargetKey(string targetKey)
+        {
+            return string.IsNullOrWhiteSpace(targetKey)
+                ? null
+                : ActivePaths.FirstOrDefault(path => path.TargetKey.Equals(targetKey, StringComparison.Ordinal));
+        }
+
         public string FormatActivePaths()
         {
             return ActivePaths.Count == 0
@@ -1281,7 +2314,12 @@ internal static class VirtualDisplayModeService
                 : string.Join(
                     "; ",
                     ActivePaths.Select(path =>
-                        $"#{path.Index}:{path.SourceName}/{path.DisplayName} sideDock={path.IsSideDock} primary={path.IsPrimary} {path.PathSummary}"));
+                        $"#{path.Index}:{path.SourceName}/{path.DisplayName} target={path.TargetName}/{path.TargetKey} sideDock={path.IsSideDock} primary={path.IsPrimary} {path.PathSummary}"));
+        }
+
+        public string FormatDiagnosticSummary()
+        {
+            return $"topology={FormatTopologyId(TopologyId)} ({TopologyQueryMessage}); primary={PrimaryDeviceName}; activePaths={FormatActivePaths()}";
         }
     }
 
@@ -1291,9 +2329,13 @@ internal static class VirtualDisplayModeService
         string SourceKey,
         string TargetKey,
         string DisplayName,
+        string TargetName,
+        string TargetDevicePath,
         bool IsSideDock,
         bool IsPrimary,
         string PathSummary);
+
+    private sealed record DisplayTopologyRestoreResult(bool Success, string Summary, int? WinApiReturnCode);
 
     private sealed record DisplayAdapterSnapshot(
         string DeviceName,
@@ -1524,6 +2566,41 @@ internal static class VirtualDisplayModeService
     }
 
     [StructLayout(LayoutKind.Sequential, CharSet = CharSet.Unicode)]
+    private struct DisplayConfigTargetDeviceName
+    {
+        private const uint DisplayConfigDeviceInfoGetTargetName = 2;
+
+        public DisplayConfigDeviceInfoHeader header;
+        public uint flags;
+        public uint outputTechnology;
+        public ushort edidManufactureId;
+        public ushort edidProductCodeId;
+        public uint connectorInstance;
+
+        [MarshalAs(UnmanagedType.ByValTStr, SizeConst = 64)]
+        public string monitorFriendlyDeviceName;
+
+        [MarshalAs(UnmanagedType.ByValTStr, SizeConst = 128)]
+        public string monitorDevicePath;
+
+        public static DisplayConfigTargetDeviceName Create(Luid adapterId, uint targetId)
+        {
+            return new DisplayConfigTargetDeviceName
+            {
+                header = new DisplayConfigDeviceInfoHeader
+                {
+                    type = DisplayConfigDeviceInfoGetTargetName,
+                    size = (uint)Marshal.SizeOf<DisplayConfigTargetDeviceName>(),
+                    adapterId = adapterId,
+                    id = targetId
+                },
+                monitorFriendlyDeviceName = string.Empty,
+                monitorDevicePath = string.Empty
+            };
+        }
+    }
+
+    [StructLayout(LayoutKind.Sequential, CharSet = CharSet.Unicode)]
     private struct NativeDisplayDevice
     {
         public int Cb;
@@ -1638,19 +2715,24 @@ internal sealed record VirtualDisplayPresentationState(
 internal sealed record VirtualDisplayPresentationApplyResult(
     bool Success,
     string Summary,
-    VirtualDisplayPresentationMode CurrentMode)
+    VirtualDisplayPresentationMode CurrentMode,
+    string? DiagnosticSummary = null,
+    VirtualDisplayModeService.PresentationRollbackToken? RollbackToken = null)
 {
     public static VirtualDisplayPresentationApplyResult Succeeded(
         string summary,
-        VirtualDisplayPresentationMode currentMode)
+        VirtualDisplayPresentationMode currentMode,
+        string? diagnosticSummary = null,
+        VirtualDisplayModeService.PresentationRollbackToken? rollbackToken = null)
     {
-        return new VirtualDisplayPresentationApplyResult(true, summary, currentMode);
+        return new VirtualDisplayPresentationApplyResult(true, summary, currentMode, diagnosticSummary, rollbackToken);
     }
 
     public static VirtualDisplayPresentationApplyResult Failed(
         string summary,
-        VirtualDisplayPresentationMode currentMode)
+        VirtualDisplayPresentationMode currentMode,
+        string? diagnosticSummary = null)
     {
-        return new VirtualDisplayPresentationApplyResult(false, summary, currentMode);
+        return new VirtualDisplayPresentationApplyResult(false, summary, currentMode, diagnosticSummary);
     }
 }

@@ -238,6 +238,7 @@ public sealed partial class MainWindow : Window
     private bool _updatingOverviewVirtualDisplaySwitch;
     private bool _virtualDisplayOperationInProgress;
     private bool _virtualDisplayModeApplyInProgress;
+    private VirtualDisplayModeService.PresentationRollbackToken? _pendingVirtualDisplayPresentationRollback;
     private bool _driverInstallInProgress;
     private bool _virtualDisplayAutoRestoreInProgress;
     private bool _syncingOverviewCameraOptions;
@@ -395,6 +396,7 @@ public sealed partial class MainWindow : Window
             _cameraPreviewReader?.Dispose();
             ResetOverviewPreview(clearImage: true);
             DisposeTrayIcon();
+            RestorePendingVirtualDisplayPresentationOnExit();
             StopHost();
         };
 
@@ -480,6 +482,7 @@ public sealed partial class MainWindow : Window
         OverviewDisplayPage.ShowLogsRequested += StaticDisplayPage_ShowLogsRequested;
         OverviewDisplayPage.DisplayModeApplyRequested += StaticDisplayPage_DisplayModeApplyRequested;
         OverviewDisplayPage.PresentationModeApplyRequested += StaticDisplayPage_PresentationModeApplyRequested;
+        OverviewDisplayPage.PresentationModePendingActionRequested += StaticDisplayPage_PresentationModePendingActionRequested;
         OverviewDisplayPage.SettingsChanged += StaticDisplayPage_SettingsChanged;
         OverviewDisplayPage.AutostartChangeRequested += StaticDisplayPage_AutostartChangeRequested;
     }
@@ -3478,6 +3481,13 @@ public sealed partial class MainWindow : Window
         return ApplyVirtualDisplayPresentationModeSelectionAsync(e.Mode);
     }
 
+    private Task<StaticDisplayPresentationModePendingActionResult> StaticDisplayPage_PresentationModePendingActionRequested(
+        object sender,
+        StaticDisplayPresentationModePendingActionRequestedEventArgs e)
+    {
+        return CompletePendingVirtualDisplayPresentationModeAsync(e.Action);
+    }
+
     private void StaticDisplayPage_SettingsChanged(object? sender, StaticDisplaySettingsChangedEventArgs e)
     {
         _appSettings.VirtualDisplayResolution = e.Resolution;
@@ -4494,7 +4504,7 @@ public sealed partial class MainWindow : Window
             else
             {
                 OverviewDisplayPage.AddActivityLog(
-                    "Mirror and secondary-only modes are saved for UI restore only; no startup topology switch was attempted.",
+                    "Mirror and secondary-only modes are not restored automatically at startup; no high-risk topology switch was attempted.",
                     StaticDisplayActivityKind.Info);
             }
         }
@@ -5056,13 +5066,13 @@ public sealed partial class MainWindow : Window
             };
         }
 
-        if (mode is VirtualDisplayPresentationMode.Mirror or VirtualDisplayPresentationMode.SecondaryOnly)
+        if (_pendingVirtualDisplayPresentationRollback is not null)
         {
             var currentState = VirtualDisplayModeService.GetPresentationState();
             return new StaticDisplayPresentationModeApplyResult
             {
                 Success = false,
-                Message = "该显示模式暂未支持，需要后续安全确认流程。",
+                Message = "仅副屏模式正在等待确认，请先保留或恢复当前临时拓扑。",
                 CurrentMode = currentState.Mode
             };
         }
@@ -5073,16 +5083,24 @@ public sealed partial class MainWindow : Window
         try
         {
             var serviceResult = await Task.Run(() => VirtualDisplayModeService.ApplyPresentationMode(mode));
-            if (serviceResult.Success)
+            if (serviceResult.Success && serviceResult.RollbackToken is null)
             {
                 SaveLastAppliedPresentationMode(serviceResult.CurrentMode);
+            }
+
+            if (serviceResult.RollbackToken is not null)
+            {
+                _pendingVirtualDisplayPresentationRollback = serviceResult.RollbackToken;
             }
 
             return new StaticDisplayPresentationModeApplyResult
             {
                 Success = serviceResult.Success,
                 Message = serviceResult.Summary,
-                CurrentMode = serviceResult.CurrentMode
+                CurrentMode = serviceResult.CurrentMode,
+                DiagnosticSummary = serviceResult.DiagnosticSummary,
+                RequiresKeepConfirmation = serviceResult.RollbackToken is not null,
+                KeepConfirmationSeconds = serviceResult.RollbackToken is not null ? 20 : 0
             };
         }
         catch (Exception ex)
@@ -5099,6 +5117,118 @@ public sealed partial class MainWindow : Window
         {
             _virtualDisplayModeApplyInProgress = false;
             RefreshVirtualDisplayState();
+        }
+    }
+
+    private async Task<StaticDisplayPresentationModePendingActionResult> CompletePendingVirtualDisplayPresentationModeAsync(
+        StaticDisplayPresentationModePendingAction action)
+    {
+        if (_virtualDisplayModeApplyInProgress || _virtualDisplayOperationInProgress || _driverInstallInProgress)
+        {
+            var busyState = VirtualDisplayModeService.GetPresentationState();
+            return new StaticDisplayPresentationModePendingActionResult
+            {
+                Success = false,
+                Message = "显示器操作正在进行中，请稍后再试。",
+                CurrentMode = busyState.Mode
+            };
+        }
+
+        var rollbackToken = _pendingVirtualDisplayPresentationRollback;
+        if (rollbackToken is null)
+        {
+            var currentState = VirtualDisplayModeService.GetPresentationState();
+            return new StaticDisplayPresentationModePendingActionResult
+            {
+                Success = false,
+                Message = "没有等待确认的仅副屏切换。",
+                CurrentMode = currentState.Mode
+            };
+        }
+
+        _virtualDisplayModeApplyInProgress = true;
+        RefreshVirtualDisplayState();
+
+        try
+        {
+            if (action == StaticDisplayPresentationModePendingAction.Keep)
+            {
+                var keepResult = await Task.Run(() => VirtualDisplayModeService.CommitPresentationMode(
+                    rollbackToken,
+                    "用户确认保留仅副屏拓扑。"));
+                if (keepResult.Success)
+                {
+                    _pendingVirtualDisplayPresentationRollback = null;
+                    SaveLastAppliedPresentationMode(keepResult.CurrentMode);
+                }
+
+                return new StaticDisplayPresentationModePendingActionResult
+                {
+                    Success = keepResult.Success,
+                    Message = keepResult.Summary,
+                    CurrentMode = keepResult.CurrentMode,
+                    DiagnosticSummary = keepResult.DiagnosticSummary
+                };
+            }
+
+            var serviceResult = await Task.Run(() => VirtualDisplayModeService.RestorePresentationMode(
+                rollbackToken,
+                "用户请求恢复仅副屏切换前拓扑。"));
+            if (serviceResult.Success)
+            {
+                _pendingVirtualDisplayPresentationRollback = null;
+            }
+
+            return new StaticDisplayPresentationModePendingActionResult
+            {
+                Success = serviceResult.Success,
+                Message = serviceResult.Summary,
+                CurrentMode = serviceResult.CurrentMode,
+                DiagnosticSummary = serviceResult.DiagnosticSummary
+            };
+        }
+        catch (Exception ex)
+        {
+            var currentState = VirtualDisplayModeService.GetPresentationState();
+            return new StaticDisplayPresentationModePendingActionResult
+            {
+                Success = false,
+                Message = ex.Message,
+                CurrentMode = currentState.Mode
+            };
+        }
+        finally
+        {
+            _virtualDisplayModeApplyInProgress = false;
+            RefreshVirtualDisplayState();
+        }
+    }
+
+    private void RestorePendingVirtualDisplayPresentationOnExit()
+    {
+        var rollbackToken = _pendingVirtualDisplayPresentationRollback;
+        if (rollbackToken is null)
+        {
+            return;
+        }
+
+        _pendingVirtualDisplayPresentationRollback = null;
+        try
+        {
+            var result = VirtualDisplayModeService.RestorePresentationMode(
+                rollbackToken,
+                "应用关闭时检测到未确认的仅副屏拓扑，自动尝试恢复。");
+            OverviewDisplayPage.AddActivityLog(
+                result.Success
+                    ? "应用关闭前已恢复未确认的仅副屏拓扑。"
+                    : $"应用关闭前恢复未确认的仅副屏拓扑失败：{result.Summary}",
+                result.Success ? StaticDisplayActivityKind.Success : StaticDisplayActivityKind.Failure);
+        }
+        catch (Exception ex)
+        {
+            OverviewDisplayPage.AddActivityLog(
+                $"应用关闭前恢复未确认的仅副屏拓扑失败：{ex.Message}",
+                StaticDisplayActivityKind.Failure);
         }
     }
 
