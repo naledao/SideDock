@@ -89,6 +89,7 @@ public sealed partial class MainWindow : Window
     private const int OverviewPreviewIntervalMs = 33;
     private const int MaxOverviewDiagnosticsSamples = 11;
     private const string AudioPreferencesFileName = "audio-preferences.json";
+    private static readonly TimeSpan AudioTelemetryStaleAfter = TimeSpan.FromSeconds(5);
     private static readonly TimeSpan OverviewPreviewStaleAfter = TimeSpan.FromMilliseconds(1500);
     private static readonly TimeSpan VirtualDisplayStatusCacheDuration = TimeSpan.FromSeconds(30);
     private static readonly string DeviceToolProcessName = Path.GetFileNameWithoutExtension(DeviceToolExe);
@@ -100,6 +101,7 @@ public sealed partial class MainWindow : Window
     private readonly DispatcherTimer _overviewPreviewTimer = new();
     private readonly DispatcherTimer _virtualCameraStatusTimer = new();
     private readonly DispatcherTimer _runtimeDiagnosticsTimer = new();
+    private readonly DispatcherTimer _audioTelemetryStaleTimer = new();
     private readonly object _audioLogGate = new();
     private readonly object _cameraLogGate = new();
     private readonly Queue<string> _recentAudioLogLines = new();
@@ -156,6 +158,11 @@ public sealed partial class MainWindow : Window
     private AudioCapabilityStatus? _audioOverrideStatus;
     private AudioCapabilityStatus? _microphoneRuntimeStatus;
     private AudioCapabilityStatus? _speakerRuntimeStatus;
+    private AudioRuntimeDirectionTelemetry? _hostMicrophoneTelemetry;
+    private AudioRuntimeDirectionTelemetry? _hostSpeakerTelemetry;
+    private AudioRuntimeDirectionTelemetry? _androidMicrophoneTelemetry;
+    private AudioRuntimeDirectionTelemetry? _androidSpeakerTelemetry;
+    private bool _audioAndroidControlConnected;
     private string _lastAudioHint = "等待 Android 设备连接。";
     private string? _lastMicrophoneStatusLine;
     private string? _lastSpeakerStatusLine;
@@ -389,6 +396,7 @@ public sealed partial class MainWindow : Window
             _cameraPreviewTimer.Stop();
             _overviewPreviewTimer.Stop();
             _virtualCameraStatusTimer.Stop();
+            _audioTelemetryStaleTimer.Stop();
             _cameraPreviewReader?.Dispose();
             ResetOverviewPreview(clearImage: true);
             DisposeTrayIcon();
@@ -438,6 +446,10 @@ public sealed partial class MainWindow : Window
         _runtimeDiagnosticsTimer.Tick += (_, _) => UpdateOverviewRuntimeDiagnostics();
         _runtimeDiagnosticsTimer.Start();
         UpdateOverviewRuntimeDiagnostics();
+
+        _audioTelemetryStaleTimer.Interval = TimeSpan.FromSeconds(1);
+        _audioTelemetryStaleTimer.Tick += (_, _) => RefreshAudioRuntimeTelemetryStatus();
+        _audioTelemetryStaleTimer.Start();
 
         _uiReady = true;
         _ = RefreshAdbDevicesAsync(showErrors: false);
@@ -9322,6 +9334,11 @@ public sealed partial class MainWindow : Window
         {
             _microphoneRuntimeStatus = null;
             _speakerRuntimeStatus = null;
+            _hostMicrophoneTelemetry = null;
+            _hostSpeakerTelemetry = null;
+            _androidMicrophoneTelemetry = null;
+            _androidSpeakerTelemetry = null;
+            _audioAndroidControlConnected = false;
             _appliedAudioRuntimeConfiguration = null;
             _audioRuntimeChangesPending = false;
         }
@@ -10559,6 +10576,94 @@ public sealed partial class MainWindow : Window
         };
     }
 
+    private static long ReadJsonLong(JsonElement element, string propertyName, long fallback)
+    {
+        if (!element.TryGetProperty(propertyName, out var property))
+        {
+            return fallback;
+        }
+
+        return property.ValueKind switch
+        {
+            JsonValueKind.Number when property.TryGetInt64(out var value) => value,
+            JsonValueKind.String when long.TryParse(property.GetString(), NumberStyles.Integer, CultureInfo.InvariantCulture, out var value) => value,
+            _ => fallback
+        };
+    }
+
+    private static long? ReadJsonNullableLong(JsonElement element, string propertyName)
+    {
+        if (!element.TryGetProperty(propertyName, out var property)
+            || property.ValueKind is JsonValueKind.Null or JsonValueKind.Undefined)
+        {
+            return null;
+        }
+
+        return property.ValueKind switch
+        {
+            JsonValueKind.Number when property.TryGetInt64(out var value) => value,
+            JsonValueKind.String when long.TryParse(property.GetString(), NumberStyles.Integer, CultureInfo.InvariantCulture, out var value) => value,
+            _ => null
+        };
+    }
+
+    private static double ReadJsonDouble(JsonElement element, string propertyName, double fallback)
+    {
+        if (!element.TryGetProperty(propertyName, out var property))
+        {
+            return fallback;
+        }
+
+        return property.ValueKind switch
+        {
+            JsonValueKind.Number when property.TryGetDouble(out var value) => value,
+            JsonValueKind.String when double.TryParse(property.GetString(), NumberStyles.Float, CultureInfo.InvariantCulture, out var value) => value,
+            _ => fallback
+        };
+    }
+
+    private static double? ReadJsonNullableDouble(JsonElement element, string propertyName)
+    {
+        if (!element.TryGetProperty(propertyName, out var property)
+            || property.ValueKind is JsonValueKind.Null or JsonValueKind.Undefined)
+        {
+            return null;
+        }
+
+        return property.ValueKind switch
+        {
+            JsonValueKind.Number when property.TryGetDouble(out var value) => value,
+            JsonValueKind.String when double.TryParse(property.GetString(), NumberStyles.Float, CultureInfo.InvariantCulture, out var value) => value,
+            _ => null
+        };
+    }
+
+    private static bool? ReadJsonNullableBool(JsonElement element, string propertyName)
+    {
+        if (!element.TryGetProperty(propertyName, out var property))
+        {
+            return null;
+        }
+
+        return property.ValueKind switch
+        {
+            JsonValueKind.True => true,
+            JsonValueKind.False => false,
+            _ => null
+        };
+    }
+
+    private static string? ReadJsonString(JsonElement element, string propertyName)
+    {
+        if (!element.TryGetProperty(propertyName, out var property)
+            || property.ValueKind is JsonValueKind.Null or JsonValueKind.Undefined)
+        {
+            return null;
+        }
+
+        return property.ValueKind == JsonValueKind.String ? property.GetString() : property.ToString();
+    }
+
     private async Task RefreshVirtualCameraStatusAsync()
     {
         try
@@ -11367,6 +11472,11 @@ public sealed partial class MainWindow : Window
         _lastSpeakerErrorMessage = null;
         _lastMicrophoneSystemEndpointMessage = null;
         _lastSpeakerSystemEndpointMessage = null;
+        _hostMicrophoneTelemetry = null;
+        _hostSpeakerTelemetry = null;
+        _androidMicrophoneTelemetry = null;
+        _androidSpeakerTelemetry = null;
+        _audioAndroidControlConnected = false;
         _lastCameraStatusLine = null;
         _lastCameraErrorLine = null;
         _lastCameraErrorMessage = null;
@@ -11425,6 +11535,12 @@ public sealed partial class MainWindow : Window
         if (line.Contains("video stats", StringComparison.OrdinalIgnoreCase))
         {
             HandleVideoStatsHostOutputLine(line);
+        }
+
+        if (line.Contains("audio_runtime_telemetry", StringComparison.OrdinalIgnoreCase)
+            && TryHandleAudioRuntimeTelemetryLine(line))
+        {
+            return;
         }
 
         if (line.Contains("[ENCODER", StringComparison.OrdinalIgnoreCase)
@@ -11517,6 +11633,420 @@ public sealed partial class MainWindow : Window
             ? AudioUnavailableHint(direction, errorMessage)
             : AudioStateHint(direction, nextStatus.Value);
         UpdateAudioState(hint);
+    }
+
+    private bool TryHandleAudioRuntimeTelemetryLine(string line)
+    {
+        const string payloadMarker = "payload=";
+        var payloadIndex = line.IndexOf(payloadMarker, StringComparison.OrdinalIgnoreCase);
+        if (payloadIndex < 0)
+        {
+            return false;
+        }
+
+        var payloadText = line[(payloadIndex + payloadMarker.Length)..].Trim();
+        if (!TryExtractJsonObject(payloadText, out var json))
+        {
+            return false;
+        }
+
+        try
+        {
+            using var document = JsonDocument.Parse(json);
+            ApplyAudioRuntimeTelemetry(document.RootElement);
+            return true;
+        }
+        catch (JsonException ex)
+        {
+            AppendRecentAudioLogLine($"audio_runtime_telemetry parse failed: {ex.Message}");
+            return false;
+        }
+    }
+
+    private void ApplyAudioRuntimeTelemetry(JsonElement root)
+    {
+        var origin = ReadJsonString(root, "origin");
+        if (string.IsNullOrWhiteSpace(origin))
+        {
+            origin = "host";
+        }
+
+        if (root.TryGetProperty("androidControlConnected", out var connectedProperty)
+            && connectedProperty.ValueKind is JsonValueKind.True or JsonValueKind.False)
+        {
+            _audioAndroidControlConnected = connectedProperty.GetBoolean();
+        }
+        else if (origin.Equals("android", StringComparison.OrdinalIgnoreCase))
+        {
+            _audioAndroidControlConnected = true;
+        }
+
+        var receivedAt = DateTimeOffset.Now;
+        if (root.TryGetProperty("microphone", out var microphoneElement)
+            && microphoneElement.ValueKind == JsonValueKind.Object)
+        {
+            var telemetry = ReadAudioRuntimeDirectionTelemetry(origin, AudioDirection.Microphone, microphoneElement, receivedAt);
+            if (origin.Equals("android", StringComparison.OrdinalIgnoreCase))
+            {
+                _androidMicrophoneTelemetry = telemetry;
+            }
+            else
+            {
+                _hostMicrophoneTelemetry = telemetry;
+            }
+        }
+
+        if (root.TryGetProperty("speaker", out var speakerElement)
+            && speakerElement.ValueKind == JsonValueKind.Object)
+        {
+            var telemetry = ReadAudioRuntimeDirectionTelemetry(origin, AudioDirection.Speaker, speakerElement, receivedAt);
+            if (origin.Equals("android", StringComparison.OrdinalIgnoreCase))
+            {
+                _androidSpeakerTelemetry = telemetry;
+            }
+            else
+            {
+                _hostSpeakerTelemetry = telemetry;
+            }
+        }
+
+        RefreshAudioRuntimeTelemetryStatusCore(DateTimeOffset.Now);
+        UpdateAudioState(BuildAudioRuntimeTelemetryHint());
+    }
+
+    private static bool TryExtractJsonObject(string text, out string json)
+    {
+        json = string.Empty;
+        var start = text.IndexOf('{');
+        if (start < 0)
+        {
+            return false;
+        }
+
+        var depth = 0;
+        var inString = false;
+        var escaped = false;
+        for (var index = start; index < text.Length; index++)
+        {
+            var ch = text[index];
+            if (inString)
+            {
+                if (escaped)
+                {
+                    escaped = false;
+                }
+                else if (ch == '\\')
+                {
+                    escaped = true;
+                }
+                else if (ch == '"')
+                {
+                    inString = false;
+                }
+
+                continue;
+            }
+
+            if (ch == '"')
+            {
+                inString = true;
+                continue;
+            }
+
+            if (ch == '{')
+            {
+                depth++;
+            }
+            else if (ch == '}')
+            {
+                depth--;
+                if (depth == 0)
+                {
+                    json = text[start..(index + 1)];
+                    return true;
+                }
+            }
+        }
+
+        return false;
+    }
+
+    private AudioRuntimeDirectionTelemetry ReadAudioRuntimeDirectionTelemetry(
+        string origin,
+        AudioDirection direction,
+        JsonElement element,
+        DateTimeOffset receivedAt)
+    {
+        var lastPacketUnixMs = ReadJsonNullableLong(element, "lastPacketUnixMs");
+        return new AudioRuntimeDirectionTelemetry(
+            Origin: origin,
+            Direction: direction,
+            State: ReadJsonString(element, "state") ?? "",
+            Message: ReadJsonString(element, "message") ?? "",
+            Packets: ReadJsonLong(element, "packets", 0),
+            Bytes: ReadJsonLong(element, "bytes", 0),
+            PacketsPerSecond: ReadJsonDouble(element, "packetsPerSecond", 0),
+            BytesPerSecond: ReadJsonDouble(element, "bytesPerSecond", 0),
+            LevelPercent: ReadJsonNullableDouble(element, "levelPercent") ?? ReadJsonNullableDouble(element, "peakLevel"),
+            LastPacketUnixMs: lastPacketUnixMs,
+            LastPacketAgeMs: ReadJsonNullableLong(element, "lastPacketAgeMs"),
+            SourceAgeMs: ReadJsonNullableLong(element, "sourceAgeMs"),
+            ApproximateLatencyMs: ReadJsonNullableLong(element, "approximateLatencyMs"),
+            EndpointId: ReadJsonString(element, "endpointId"),
+            EndpointName: ReadJsonString(element, "endpointName"),
+            EndpointReady: ReadJsonNullableBool(element, "endpointReady"),
+            LastError: ReadJsonString(element, "lastError"),
+            ReconnectCount: ReadJsonLong(element, "reconnectCount", 0),
+            DisconnectCount: ReadJsonLong(element, "disconnectCount", 0),
+            PermissionGranted: ReadJsonNullableBool(element, "permissionGranted"),
+            Muted: ReadJsonNullableBool(element, "muted"),
+            Stopped: ReadJsonNullableBool(element, "stopped"),
+            SilentPackets: ReadJsonLong(element, "silentPackets", 0),
+            AudioSource: ReadJsonString(element, "audioSource"),
+            SampleRate: ReadJsonInt(element, "sampleRate", 0),
+            Channels: ReadJsonInt(element, "channels", 0),
+            BitsPerSample: ReadJsonInt(element, "bitsPerSample", 0),
+            Backend: ReadJsonString(element, "backend"),
+            ReceivedAt: receivedAt);
+    }
+
+    private void RefreshAudioRuntimeTelemetryStatus()
+    {
+        var now = DateTimeOffset.Now;
+        var hasTelemetry = HasAudioRuntimeTelemetry();
+        RefreshAudioRuntimeTelemetryStatusCore(now);
+        if (hasTelemetry)
+        {
+            UpdateAudioState(BuildAudioRuntimeTelemetryHint());
+        }
+    }
+
+    private void RefreshAudioRuntimeTelemetryStatusCore(DateTimeOffset now)
+    {
+        var microphoneStatus = ResolveAudioRuntimeStatus(AudioDirection.Microphone, now);
+        if (microphoneStatus.HasValue)
+        {
+            _microphoneRuntimeStatus = microphoneStatus.Value;
+        }
+
+        var speakerStatus = ResolveAudioRuntimeStatus(AudioDirection.Speaker, now);
+        if (speakerStatus.HasValue)
+        {
+            _speakerRuntimeStatus = speakerStatus.Value;
+        }
+    }
+
+    private bool HasAudioRuntimeTelemetry()
+    {
+        return _hostMicrophoneTelemetry is not null
+            || _hostSpeakerTelemetry is not null
+            || _androidMicrophoneTelemetry is not null
+            || _androidSpeakerTelemetry is not null;
+    }
+
+    private AudioCapabilityStatus? ResolveAudioRuntimeStatus(AudioDirection direction, DateTimeOffset now)
+    {
+        var host = HostAudioTelemetry(direction);
+        var android = AndroidAudioTelemetry(direction);
+        if (host is null && android is null)
+        {
+            return null;
+        }
+
+        if (_hostProcess is not { HasExited: false })
+        {
+            return AudioCapabilityStatus.WaitingDevice;
+        }
+
+        if (IsAudioTelemetryStale(host, now, AudioTelemetryStaleAfter)
+            || IsAudioTelemetryStale(android, now, AudioTelemetryStaleAfter))
+        {
+            return AudioCapabilityStatus.Reconnecting;
+        }
+
+        var hostStatus = MapAudioRuntimeState(host?.State);
+        var androidStatus = MapAudioRuntimeState(android?.State);
+
+        if (android?.PermissionGranted == false && direction == AudioDirection.Microphone)
+        {
+            return AudioCapabilityStatus.AuthorizationRequired;
+        }
+
+        if (android?.Stopped == true)
+        {
+            return AudioCapabilityStatus.Closed;
+        }
+
+        if (android?.Muted == true)
+        {
+            return AudioCapabilityStatus.Muted;
+        }
+
+        if (hostStatus == AudioCapabilityStatus.Error || androidStatus == AudioCapabilityStatus.Error)
+        {
+            return AudioCapabilityStatus.Error;
+        }
+
+        if (host is not null
+            && !_audioAndroidControlConnected
+            && !IsTerminalAudioState(host.State))
+        {
+            return AudioCapabilityStatus.WaitingDevice;
+        }
+
+        if (hostStatus == AudioCapabilityStatus.Closed || androidStatus == AudioCapabilityStatus.Closed)
+        {
+            return AudioCapabilityStatus.Closed;
+        }
+
+        if (hostStatus == AudioCapabilityStatus.AuthorizationRequired || androidStatus == AudioCapabilityStatus.AuthorizationRequired)
+        {
+            return AudioCapabilityStatus.AuthorizationRequired;
+        }
+
+        if (hostStatus == AudioCapabilityStatus.Muted || androidStatus == AudioCapabilityStatus.Muted)
+        {
+            return AudioCapabilityStatus.Muted;
+        }
+
+        if (direction == AudioDirection.Microphone
+            && (hostStatus == AudioCapabilityStatus.Capturing || androidStatus == AudioCapabilityStatus.Capturing))
+        {
+            return AudioCapabilityStatus.Capturing;
+        }
+
+        if (direction == AudioDirection.Speaker
+            && (hostStatus == AudioCapabilityStatus.Playing || androidStatus == AudioCapabilityStatus.Playing))
+        {
+            return AudioCapabilityStatus.Playing;
+        }
+
+        if (hostStatus == AudioCapabilityStatus.Available || androidStatus == AudioCapabilityStatus.Available)
+        {
+            return AudioCapabilityStatus.Available;
+        }
+
+        return hostStatus ?? androidStatus;
+    }
+
+    private static AudioCapabilityStatus? MapAudioRuntimeState(string? state)
+    {
+        if (string.IsNullOrWhiteSpace(state))
+        {
+            return null;
+        }
+
+        return state.Trim().ToLowerInvariant() switch
+        {
+            "disabled" => AudioCapabilityStatus.Closed,
+            "stopped" => AudioCapabilityStatus.Closed,
+            "authorization_required" => AudioCapabilityStatus.AuthorizationRequired,
+            "preparing" => AudioCapabilityStatus.Preparing,
+            "waiting_device" => AudioCapabilityStatus.WaitingDevice,
+            "available" => AudioCapabilityStatus.Available,
+            "capturing" => AudioCapabilityStatus.Capturing,
+            "playing" => AudioCapabilityStatus.Playing,
+            "muted" => AudioCapabilityStatus.Muted,
+            "reconnecting" => AudioCapabilityStatus.Reconnecting,
+            "unavailable" => AudioCapabilityStatus.Error,
+            _ => null
+        };
+    }
+
+    private static bool IsAudioTelemetryStale(
+        AudioRuntimeDirectionTelemetry? telemetry,
+        DateTimeOffset now,
+        TimeSpan staleAfter)
+    {
+        if (telemetry is null || IsTerminalAudioState(telemetry.State))
+        {
+            return false;
+        }
+
+        return now - telemetry.ReceivedAt > staleAfter;
+    }
+
+    private static bool IsTerminalAudioState(string? state)
+    {
+        return state is not null
+            && (state.Equals("disabled", StringComparison.OrdinalIgnoreCase)
+                || state.Equals("stopped", StringComparison.OrdinalIgnoreCase));
+    }
+
+    private AudioRuntimeDirectionTelemetry? HostAudioTelemetry(AudioDirection direction)
+    {
+        return direction == AudioDirection.Microphone ? _hostMicrophoneTelemetry : _hostSpeakerTelemetry;
+    }
+
+    private AudioRuntimeDirectionTelemetry? AndroidAudioTelemetry(AudioDirection direction)
+    {
+        return direction == AudioDirection.Microphone ? _androidMicrophoneTelemetry : _androidSpeakerTelemetry;
+    }
+
+    private string BuildAudioRuntimeTelemetryHint()
+    {
+        if (_hostProcess is not { HasExited: false })
+        {
+            return "Host 未运行，等待启动后接收音频指标。";
+        }
+
+        var microphoneIssue = BuildAudioRuntimeDirectionIssue(AudioDirection.Microphone);
+        if (!string.IsNullOrWhiteSpace(microphoneIssue))
+        {
+            return microphoneIssue;
+        }
+
+        var speakerIssue = BuildAudioRuntimeDirectionIssue(AudioDirection.Speaker);
+        if (!string.IsNullOrWhiteSpace(speakerIssue))
+        {
+            return speakerIssue;
+        }
+
+        if (!_audioAndroidControlConnected && (_hostMicrophoneTelemetry is not null || _hostSpeakerTelemetry is not null))
+        {
+            return "Host 已启动，正在等待 Android 控制通道连接。";
+        }
+
+        if (!HasAudioRuntimeTelemetry())
+        {
+            return "等待音频指标数据。";
+        }
+
+        return "音频运行指标已连接。";
+    }
+
+    private string? BuildAudioRuntimeDirectionIssue(AudioDirection direction)
+    {
+        var host = HostAudioTelemetry(direction);
+        var android = AndroidAudioTelemetry(direction);
+        var now = DateTimeOffset.Now;
+        if (IsAudioTelemetryStale(host, now, AudioTelemetryStaleAfter)
+            || IsAudioTelemetryStale(android, now, AudioTelemetryStaleAfter))
+        {
+            return direction == AudioDirection.Microphone
+                ? "Android 麦克风指标已中断，等待新的采集数据。"
+                : "电脑声音输出指标已中断，等待新的播放数据。";
+        }
+
+        var error = FirstNonEmpty(host?.LastError, android?.LastError);
+        if (!string.IsNullOrWhiteSpace(error))
+        {
+            return direction == AudioDirection.Microphone
+                ? $"Android 麦克风写入异常：{error}"
+                : $"电脑声音发送异常：{error}";
+        }
+
+        if (direction == AudioDirection.Microphone && android?.PermissionGranted == false)
+        {
+            return "需要在 Android 端允许麦克风权限。";
+        }
+
+        if (android?.Stopped == true)
+        {
+            return "Android 端已停止音频，副屏仍在运行。";
+        }
+
+        return null;
     }
 
     private void HandleVideoStatsHostOutputLine(string line)
@@ -12246,6 +12776,14 @@ public sealed partial class MainWindow : Window
                 AudioEndpointBindingHealth.EnumerationFailed => "端点枚举失败",
                 _ => "未检测到可写入端点"
             };
+        var speakerRuntimeView = BuildAudioRuntimeDirectionView(
+            AudioDirection.Speaker,
+            speakerStatus,
+            audioEnabled && speakerIntent);
+        var microphoneRuntimeView = BuildAudioRuntimeDirectionView(
+            AudioDirection.Microphone,
+            microphoneStatus,
+            audioEnabled && microphoneIntent);
 
         _updatingStaticAudioPage = true;
         try
@@ -12283,12 +12821,14 @@ public sealed partial class MainWindow : Window
                 MicrophoneStatusIconGlyph = AudioStatusIconGlyph(microphoneStatus),
                 SpeakerEndpointSummary = EndpointDisplaySummary(_speakerCaptureEndpointDiagnostics),
                 MicrophoneEndpointSummary = EndpointDisplaySummary(_microphoneRenderEndpointDiagnostics),
-                SpeakerFormatText = "固定 48 kHz, 16-bit, 2ch",
-                MicrophoneFormatText = "固定 48 kHz, 16-bit, 2ch",
-                SpeakerLevelText = "暂无实时音量数据",
-                MicrophoneLevelText = "暂无实时电平数据",
-                SpeakerLatencyText = "暂无数据",
-                MicrophoneLatencyText = "暂无数据",
+                SpeakerFormatText = speakerRuntimeView.FormatText,
+                MicrophoneFormatText = microphoneRuntimeView.FormatText,
+                SpeakerLevelText = speakerRuntimeView.LevelText,
+                SpeakerLevelPercent = speakerRuntimeView.LevelPercent,
+                MicrophoneLevelText = microphoneRuntimeView.LevelText,
+                MicrophoneLevelPercent = microphoneRuntimeView.LevelPercent,
+                SpeakerLatencyText = speakerRuntimeView.TimingText,
+                MicrophoneLatencyText = microphoneRuntimeView.TimingText,
                 VirtualCableStatusText = virtualCableStatusText,
                 VirtualCableStatusBrush = virtualCableStatusBrush,
                 VirtualCableStatusIconGlyph = virtualCableReady ? "\uE73E" : "\uE7BA",
@@ -12307,6 +12847,175 @@ public sealed partial class MainWindow : Window
 
         SyncStaticAudioPageEndpointChoices();
         OverviewAudioPage.UpdateRecentLogs(SnapshotRecentAudioLogLines());
+    }
+
+    private AudioRuntimeDirectionView BuildAudioRuntimeDirectionView(
+        AudioDirection direction,
+        AudioCapabilityStatus status,
+        bool directionEnabled)
+    {
+        if (!directionEnabled)
+        {
+            return new AudioRuntimeDirectionView("未启用", "未启用", "未启用", 0);
+        }
+
+        var now = DateTimeOffset.Now;
+        var host = HostAudioTelemetry(direction);
+        var android = AndroidAudioTelemetry(direction);
+        var primary = PrimaryAudioTelemetry(direction, host, android);
+        if (primary is null)
+        {
+            return new AudioRuntimeDirectionView("等待指标数据", "等待指标数据", "等待指标数据", 0);
+        }
+
+        var stale = IsAudioTelemetryStale(primary, now, AudioTelemetryStaleAfter)
+            || IsAudioTelemetryStale(host, now, AudioTelemetryStaleAfter)
+            || IsAudioTelemetryStale(android, now, AudioTelemetryStaleAfter);
+        var levelPercent = stale ? 0 : Math.Clamp(primary.LevelPercent ?? 0, 0, 100);
+        var trafficText = FormatAudioTraffic(primary);
+        var stateText = stale
+            ? $"指标中断，最后更新 {FormatAge(now - primary.ReceivedAt)}前"
+            : AudioRuntimeStateDetail(direction, status, host, android);
+        var levelText = $"{levelPercent:F0}% · {trafficText} · {stateText}";
+        var timingText = FormatAudioTiming(primary, now);
+        var errorText = FirstNonEmpty(host?.LastError, android?.LastError);
+        if (!string.IsNullOrWhiteSpace(errorText))
+        {
+            timingText = $"{timingText} · 最近错误：{errorText}";
+        }
+
+        return new AudioRuntimeDirectionView(
+            FormatAudioRuntimeFormat(primary),
+            levelText,
+            timingText,
+            levelPercent);
+    }
+
+    private static AudioRuntimeDirectionTelemetry? PrimaryAudioTelemetry(
+        AudioDirection direction,
+        AudioRuntimeDirectionTelemetry? host,
+        AudioRuntimeDirectionTelemetry? android)
+    {
+        return direction == AudioDirection.Microphone
+            ? android ?? host
+            : host ?? android;
+    }
+
+    private static string FormatAudioRuntimeFormat(AudioRuntimeDirectionTelemetry telemetry)
+    {
+        if (telemetry.SampleRate <= 0 || telemetry.Channels <= 0)
+        {
+            return "等待格式数据";
+        }
+
+        var bits = telemetry.BitsPerSample > 0 ? telemetry.BitsPerSample : 16;
+        return $"{telemetry.SampleRate / 1000.0:F1} kHz, {bits}-bit, {telemetry.Channels}ch";
+    }
+
+    private static string FormatAudioTraffic(AudioRuntimeDirectionTelemetry telemetry)
+    {
+        var packetsPerSecond = telemetry.PacketsPerSecond > 0 ? $"{telemetry.PacketsPerSecond:F1} pkt/s" : "0 pkt/s";
+        var bytesPerSecond = FormatByteRate(telemetry.BytesPerSecond);
+        return $"{packetsPerSecond} · {bytesPerSecond} · 包 {telemetry.Packets:N0} / {FormatBytes(telemetry.Bytes)}";
+    }
+
+    private static string FormatAudioTiming(AudioRuntimeDirectionTelemetry telemetry, DateTimeOffset now)
+    {
+        var packetAgeText = telemetry.LastPacketUnixMs.HasValue
+            ? FormatRelativeAge(TimeSpan.FromMilliseconds(Math.Max(0, now.ToUnixTimeMilliseconds() - telemetry.LastPacketUnixMs.Value)))
+            : "暂无包";
+        var latency = telemetry.ApproximateLatencyMs ?? telemetry.SourceAgeMs;
+        var latencyText = latency.HasValue ? $"约 {latency.Value:N0} ms" : "暂无延迟";
+        return $"最近包：{packetAgeText} · 近似延迟：{latencyText}";
+    }
+
+    private static string AudioRuntimeStateDetail(
+        AudioDirection direction,
+        AudioCapabilityStatus status,
+        AudioRuntimeDirectionTelemetry? host,
+        AudioRuntimeDirectionTelemetry? android)
+    {
+        if (android?.PermissionGranted == false && direction == AudioDirection.Microphone)
+        {
+            return "Android 麦克风权限未授权";
+        }
+
+        if (android?.Stopped == true)
+        {
+            return "Android 已停止音频";
+        }
+
+        if (android?.Muted == true)
+        {
+            return direction == AudioDirection.Microphone ? "Android 麦克风静音" : "Android 音响静音";
+        }
+
+        if (status is AudioCapabilityStatus.Capturing or AudioCapabilityStatus.Playing
+            && (PrimaryPacketRate(direction, host, android) <= 0.01))
+        {
+            return "运行中但暂无包增长";
+        }
+
+        return status switch
+        {
+            AudioCapabilityStatus.WaitingDevice => "等待 Android 连接",
+            AudioCapabilityStatus.Preparing => "正在准备",
+            AudioCapabilityStatus.Available => "等待数据流",
+            AudioCapabilityStatus.Capturing => "Android 麦克风正在写入 Windows",
+            AudioCapabilityStatus.Playing => "电脑声音正在发送到 Android",
+            AudioCapabilityStatus.Muted => "已静音",
+            AudioCapabilityStatus.Reconnecting => "连接中断",
+            AudioCapabilityStatus.Error => "异常",
+            _ => "等待数据"
+        };
+    }
+
+    private static double PrimaryPacketRate(
+        AudioDirection direction,
+        AudioRuntimeDirectionTelemetry? host,
+        AudioRuntimeDirectionTelemetry? android)
+    {
+        return PrimaryAudioTelemetry(direction, host, android)?.PacketsPerSecond ?? 0;
+    }
+
+    private static string FormatBytes(long bytes)
+    {
+        var units = new[] { "B", "KB", "MB", "GB" };
+        var value = Math.Max(0, bytes);
+        var unit = 0;
+        var display = (double)value;
+        while (display >= 1024 && unit < units.Length - 1)
+        {
+            display /= 1024;
+            unit++;
+        }
+
+        return unit == 0 ? $"{display:N0} {units[unit]}" : $"{display:N1} {units[unit]}";
+    }
+
+    private static string FormatByteRate(double bytesPerSecond)
+    {
+        return $"{FormatBytes((long)Math.Max(0, bytesPerSecond))}/s";
+    }
+
+    private static string FormatAge(TimeSpan age)
+    {
+        if (age.TotalSeconds < 1)
+        {
+            return "刚刚";
+        }
+
+        if (age.TotalSeconds < 60)
+        {
+            return $"{age.TotalSeconds:F0} 秒";
+        }
+
+        return $"{age.TotalMinutes:F1} 分钟";
+    }
+
+    private static string FormatRelativeAge(TimeSpan age)
+    {
+        return age.TotalSeconds < 1 ? "刚刚" : $"{FormatAge(age)}前";
     }
 
     private string BuildStaticAudioRepairHint(bool microphoneIntent, bool speakerIntent)
@@ -13001,6 +13710,43 @@ public sealed partial class MainWindow : Window
         IntPtr lParam,
         UIntPtr subclassId,
         UIntPtr refData);
+
+    private sealed record AudioRuntimeDirectionTelemetry(
+        string Origin,
+        AudioDirection Direction,
+        string State,
+        string Message,
+        long Packets,
+        long Bytes,
+        double PacketsPerSecond,
+        double BytesPerSecond,
+        double? LevelPercent,
+        long? LastPacketUnixMs,
+        long? LastPacketAgeMs,
+        long? SourceAgeMs,
+        long? ApproximateLatencyMs,
+        string? EndpointId,
+        string? EndpointName,
+        bool? EndpointReady,
+        string? LastError,
+        long ReconnectCount,
+        long DisconnectCount,
+        bool? PermissionGranted,
+        bool? Muted,
+        bool? Stopped,
+        long SilentPackets,
+        string? AudioSource,
+        int SampleRate,
+        int Channels,
+        int BitsPerSample,
+        string? Backend,
+        DateTimeOffset ReceivedAt);
+
+    private sealed record AudioRuntimeDirectionView(
+        string FormatText,
+        string LevelText,
+        string TimingText,
+        double LevelPercent);
 
     private enum AudioDirection
     {

@@ -656,6 +656,92 @@ public final class ControlClient {
         ));
     }
 
+    public void sendAudioRuntimeTelemetry(
+        String microphoneState,
+        boolean microphoneMuted,
+        boolean stopped,
+        boolean permissionGranted,
+        int port,
+        int microphoneSampleRate,
+        int microphoneChannels,
+        long microphonePackets,
+        long microphoneBytes,
+        double microphonePacketsPerSecond,
+        double microphoneBytesPerSecond,
+        int microphonePeakSample,
+        long microphoneSilentPackets,
+        long microphoneLastPacketUnixMs,
+        String audioSource,
+        String microphoneLastError,
+        String speakerState,
+        boolean speakerMuted,
+        int speakerSampleRate,
+        int speakerChannels,
+        long speakerPackets,
+        long speakerBytes,
+        double speakerPacketsPerSecond,
+        double speakerBytesPerSecond,
+        int speakerPeakSample,
+        long speakerSourceAgeMs,
+        long speakerLastPacketUnixMs,
+        int speakerPlayState,
+        String speakerLastError
+    ) {
+        long now = System.currentTimeMillis();
+        JSONObject microphone = payload(
+            "direction", "microphone",
+            "state", microphoneState == null ? "" : microphoneState,
+            "muted", microphoneMuted,
+            "stopped", stopped,
+            "permissionGranted", permissionGranted,
+            "port", port,
+            "sampleRate", microphoneSampleRate,
+            "channels", microphoneChannels,
+            "bitsPerSample", 16,
+            "packets", microphonePackets,
+            "bytes", microphoneBytes,
+            "packetsPerSecond", microphonePacketsPerSecond,
+            "bytesPerSecond", microphoneBytesPerSecond,
+            "peakSample", microphonePeakSample,
+            "levelPercent", peakSampleToPercent(microphonePeakSample),
+            "silentPackets", microphoneSilentPackets,
+            "audioSource", audioSource == null ? "" : audioSource,
+            "lastPacketUnixMs", microphoneLastPacketUnixMs > 0L ? microphoneLastPacketUnixMs : JSONObject.NULL,
+            "lastPacketAgeMs", microphoneLastPacketUnixMs > 0L ? Math.max(0L, now - microphoneLastPacketUnixMs) : JSONObject.NULL,
+            "lastError", microphoneLastError == null || microphoneLastError.isEmpty() ? JSONObject.NULL : microphoneLastError
+        );
+        JSONObject speaker = payload(
+            "direction", "speaker",
+            "state", speakerState == null ? "" : speakerState,
+            "muted", speakerMuted,
+            "stopped", stopped,
+            "port", port,
+            "sampleRate", speakerSampleRate,
+            "channels", speakerChannels,
+            "bitsPerSample", 16,
+            "packets", speakerPackets,
+            "bytes", speakerBytes,
+            "packetsPerSecond", speakerPacketsPerSecond,
+            "bytesPerSecond", speakerBytesPerSecond,
+            "peakSample", speakerPeakSample,
+            "levelPercent", peakSampleToPercent(speakerPeakSample),
+            "sourceAgeMs", speakerSourceAgeMs,
+            "approximateLatencyMs", speakerSourceAgeMs,
+            "lastPacketUnixMs", speakerLastPacketUnixMs > 0L ? speakerLastPacketUnixMs : JSONObject.NULL,
+            "lastPacketAgeMs", speakerLastPacketUnixMs > 0L ? Math.max(0L, now - speakerLastPacketUnixMs) : JSONObject.NULL,
+            "playState", speakerPlayState,
+            "lastError", speakerLastError == null || speakerLastError.isEmpty() ? JSONObject.NULL : speakerLastError
+        );
+
+        sendFromAnyThread("audio_runtime_telemetry", payload(
+            "origin", "android",
+            "telemetryUnixMs", now,
+            "audioPort", port,
+            "microphone", microphone,
+            "speaker", speaker
+        ));
+    }
+
     public void sendCameraStatus(
         String state,
         String message,
@@ -686,6 +772,11 @@ public final class ControlClient {
             "keyFrames", keyFrames,
             "codecConfigPackets", codecConfigPackets
         ));
+    }
+
+    private static int peakSampleToPercent(int peakSample) {
+        int normalized = Math.max(0, Math.min(Short.MAX_VALUE, peakSample));
+        return Math.max(0, Math.min(100, (int) Math.round((normalized * 100.0d) / Short.MAX_VALUE)));
     }
 
     public void sendKeyboardInput(

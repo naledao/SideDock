@@ -27,7 +27,7 @@ public final class AudioCaptureClient {
         void onAudioCaptureState(String state, String message);
         void onAudioCaptureStats(long packetsSent, long bytesSent, int peakSample, long silentPackets, String audioSourceName);
         void onAudioPlaybackState(String state, String message);
-        void onAudioPlaybackStats(long packetsReceived, long bytesReceived);
+        void onAudioPlaybackStats(long packetsReceived, long bytesReceived, int peakSample, long sourceAgeMs, int playState);
     }
 
     private static final int HEADER_SIZE = 36;
@@ -333,6 +333,8 @@ public final class AudioCaptureClient {
         long packetsReceived = 0L;
         long bytesReceived = 0L;
         long lastStatsAtMs = 0L;
+        int peakSample = 0;
+        long lastSourceAgeMs = 0L;
         boolean playbackStarted = false;
 
         try {
@@ -342,6 +344,7 @@ public final class AudioCaptureClient {
             while (running && isCurrentGeneration(runGeneration)) {
                 readExactly(input, header, 0, HEADER_SIZE, "read speaker header", runGeneration);
                 validateHeader(header, SPEAKER_MAGIC, "speaker");
+                long timestampMs = readLong(header, 16);
                 int receivedSampleRate = readInt(header, 24);
                 int receivedChannels = readShort(header, 28);
                 int receivedBits = readShort(header, 30);
@@ -360,6 +363,7 @@ public final class AudioCaptureClient {
                 readExactly(input, pcm, 0, payloadLength, "read speaker payload", runGeneration);
                 packetsReceived += 1L;
                 bytesReceived += payloadLength;
+                peakSample = Math.max(peakSample, calculatePeakSample(pcm, payloadLength));
 
                 if (!speakerMuted) {
                     if (!playbackStarted) {
@@ -374,11 +378,12 @@ public final class AudioCaptureClient {
                 }
 
                 long now = System.currentTimeMillis();
+                lastSourceAgeMs = Math.max(0L, now - timestampMs);
                 if (packetsReceived == 1L || now - lastStatsAtMs >= 1000L) {
                     lastStatsAtMs = now;
                     emitPlaybackState(speakerMuted ? "muted" : "playing",
                         speakerMuted ? "本机音响已静音。" : "正在播放电脑声音。");
-                    emitPlaybackStats(packetsReceived, bytesReceived);
+                    emitPlaybackStats(packetsReceived, bytesReceived, peakSample, lastSourceAgeMs, track.getPlayState());
                 }
             }
         } finally {
@@ -485,6 +490,10 @@ public final class AudioCaptureClient {
 
     private static int readInt(byte[] buffer, int offset) {
         return ByteBuffer.wrap(buffer, offset, 4).order(ByteOrder.LITTLE_ENDIAN).getInt();
+    }
+
+    private static long readLong(byte[] buffer, int offset) {
+        return ByteBuffer.wrap(buffer, offset, 8).order(ByteOrder.LITTLE_ENDIAN).getLong();
     }
 
     private static int readShort(byte[] buffer, int offset) {
@@ -631,8 +640,8 @@ public final class AudioCaptureClient {
         listener.onAudioPlaybackState(state, message);
     }
 
-    private void emitPlaybackStats(long packetsReceived, long bytesReceived) {
-        listener.onAudioPlaybackStats(packetsReceived, bytesReceived);
+    private void emitPlaybackStats(long packetsReceived, long bytesReceived, int peakSample, long sourceAgeMs, int playState) {
+        listener.onAudioPlaybackStats(packetsReceived, bytesReceived, peakSample, sourceAgeMs, playState);
     }
 
     private static final class WorkerFailure {
