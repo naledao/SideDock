@@ -316,7 +316,7 @@
                                     </Border>
                                     <StackPanel Grid.Column="1" VerticalAlignment="Center" Spacing="4">
                                         <TextBlock Text="保留最近日志" FontSize="14" Foreground="{StaticResource SettingsTextBrush}" />
-                                        <TextBlock Text="保留最近日志文件以便排查问题（建议开启）" FontSize="12" Foreground="{StaticResource SettingsMutedBrush}" TextWrapping="Wrap" />
+                                        <TextBlock Text="清理时保留最近 1 个日志文件以便排查问题（建议开启）" FontSize="12" Foreground="{StaticResource SettingsMutedBrush}" TextWrapping="Wrap" />
                                     </StackPanel>
                                     <ToggleSwitch x:Name="RecentLogsSwitch" Grid.Column="2" MinWidth="54" IsOn="True" OnContent="" OffContent="" />
                                 </Grid>
@@ -351,7 +351,7 @@
                                         </StackPanel>
                                     </Button>
                                     <StackPanel Grid.Column="2" Orientation="Horizontal" Spacing="8" VerticalAlignment="Center">
-                                        <TextBlock x:Name="LogSizeText" Text="当前日志大小： 24.7 MB" FontSize="12" Foreground="{StaticResource SettingsMutedBrush}" />
+                                        <TextBlock x:Name="LogSizeText" Text="当前日志大小：正在计算..." FontSize="12" Foreground="{StaticResource SettingsMutedBrush}" />
                                         <FontIcon Glyph="&#xE946;" FontSize="14" Foreground="#30363D" />
                                     </StackPanel>
                                 </Grid>

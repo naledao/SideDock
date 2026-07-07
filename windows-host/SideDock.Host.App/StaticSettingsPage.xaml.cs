@@ -10,6 +10,7 @@ public sealed partial class StaticSettingsPage : UserControl
     public StaticSettingsPage()
     {
         InitializeComponent();
+        Loaded += StaticSettingsPage_Loaded;
     }
 
     public void ScrollToTop()
@@ -104,15 +105,50 @@ public sealed partial class StaticSettingsPage : UserControl
         ShowBanner("设置未保存", detail);
     }
 
+    internal async Task RefreshLogSizeAsync()
+    {
+        LogSizeText.Text = "当前日志大小：正在计算...";
+        var result = await Task.Run(SideDockLogMaintenance.CalculateSize);
+        UpdateLogSizeText(result);
+    }
+
+    private async void StaticSettingsPage_Loaded(object sender, RoutedEventArgs e)
+    {
+        await RefreshLogSizeAsync();
+    }
+
     private void RestorePortsButton_Click(object sender, RoutedEventArgs e)
     {
         RestorePorts();
         ShowBanner("端口已恢复", "控制、视频、音频和摄像头端口已恢复为默认值。");
     }
 
-    private void CleanLogsButton_Click(object sender, RoutedEventArgs e)
+    private async void CleanLogsButton_Click(object sender, RoutedEventArgs e)
     {
-        ShowBanner("清理日志暂未接入", "日志清理会在后续阶段接入真实文件清理。");
+        if (sender is Button button)
+        {
+            button.IsEnabled = false;
+        }
+
+        try
+        {
+            LogSizeText.Text = "当前日志大小：正在清理...";
+            var result = await Task.Run(() => SideDockLogMaintenance.Clean(RecentLogsSwitch.IsOn));
+            UpdateLogSizeText(result.After);
+            ShowLogCleanupResult(result);
+        }
+        catch (Exception ex)
+        {
+            ShowBanner("清理日志失败", $"日志清理未完成：{ex.Message}");
+            await RefreshLogSizeAsync();
+        }
+        finally
+        {
+            if (sender is Button cleanupButton)
+            {
+                cleanupButton.IsEnabled = true;
+            }
+        }
     }
 
     private void CheckUpdateButton_Click(object sender, RoutedEventArgs e)
@@ -211,6 +247,104 @@ public sealed partial class StaticSettingsPage : UserControl
         }
 
         return true;
+    }
+
+    private void UpdateLogSizeText(LogScanResult result)
+    {
+        var suffix = result switch
+        {
+            { FileCount: 0, ExistingLocationCount: 0 } => "（日志目录不存在）",
+            { FileCount: 0, MissingLocationCount: > 0 } => "（日志目录不存在或暂无日志文件）",
+            { FileCount: 0 } => "（暂无日志文件）",
+            { HasWarnings: true } => $"（{result.FileCount} 个文件，部分目录不可访问）",
+            _ => $"（{result.FileCount} 个文件）"
+        };
+
+        LogSizeText.Text = $"当前日志大小：{FormatFileSize(result.TotalBytes)} {suffix}";
+    }
+
+    private void ShowLogCleanupResult(LogCleanupResult result)
+    {
+        if (result.Before.FileCount == 0
+            && (result.Before.ExistingLocationCount == 0 || result.Before.MissingLocationCount > 0))
+        {
+            ShowBanner("没有可清理的日志", "日志目录不存在或尚未生成日志文件，启动或导出日志后这里会自动显示真实大小。");
+            return;
+        }
+
+        if (result.Before.FileCount == 0)
+        {
+            var emptyWarning = FormatWarningSummary(result.Warnings);
+            ShowBanner(
+                result.HasWarnings ? "日志目录检查完成" : "没有可清理的日志",
+                string.IsNullOrWhiteSpace(emptyWarning)
+                    ? "未发现可清理的日志文件。"
+                    : $"未发现可清理的日志文件。{emptyWarning}");
+            return;
+        }
+
+        var title = result.HasWarnings ? "日志已部分清理" : "日志已清理";
+        var detail = $"已删除 {result.DeletedFiles} 个日志文件（{FormatFileSize(result.DeletedBytes)}），"
+            + $"剩余 {result.After.FileCount} 个文件（{FormatFileSize(result.After.TotalBytes)}）。";
+
+        if (!string.IsNullOrWhiteSpace(result.RetentionDescription))
+        {
+            detail += result.RetentionDescription;
+        }
+
+        if (result.SkippedFiles > 0)
+        {
+            detail += $"跳过 {result.SkippedFiles} 个正在使用或不可访问的日志文件。";
+        }
+
+        var cleanupWarning = FormatWarningSummary(result.Warnings);
+        if (!string.IsNullOrWhiteSpace(cleanupWarning))
+        {
+            detail += cleanupWarning;
+        }
+
+        ShowBanner(title, detail);
+    }
+
+    private static string FormatWarningSummary(IReadOnlyList<string> warnings)
+    {
+        if (warnings.Count == 0)
+        {
+            return string.Empty;
+        }
+
+        var preview = string.Join("；", warnings.Take(2));
+        if (warnings.Count > 2)
+        {
+            preview += $"；另有 {warnings.Count - 2} 项。";
+        }
+
+        return $"提示：{preview}";
+    }
+
+    private static string FormatFileSize(long bytes)
+    {
+        if (bytes <= 0)
+        {
+            return "0 B";
+        }
+
+        if (bytes < 1024)
+        {
+            return $"{bytes} B";
+        }
+
+        if (bytes < 1024L * 1024L)
+        {
+            return $"{bytes / 1024.0:F1} KB";
+        }
+
+        if (bytes < 1024L * 1024L * 1024L)
+        {
+            return $"{bytes / 1024.0 / 1024.0:F1} MB";
+        }
+
+        return $"{bytes / 1024.0 / 1024.0 / 1024.0:F1} GB";
     }
 
     private void ShowBanner(string title, string detail)

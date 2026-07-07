@@ -10,6 +10,7 @@ using System.Runtime.InteropServices;
 using System.Runtime.InteropServices.WindowsRuntime;
 using System.Text;
 using System.Text.Json;
+using System.Text.RegularExpressions;
 using Microsoft.UI;
 using Microsoft.UI.Text;
 using Microsoft.UI.Windowing;
@@ -828,6 +829,7 @@ public sealed partial class MainWindow : Window
         {
             OverviewNavigationDetailPanel.Visibility = Visibility.Collapsed;
             OverviewSettingsPage.ScrollToTop();
+            _ = OverviewSettingsPage.RefreshLogSizeAsync();
             return;
         }
 
@@ -6210,6 +6212,106 @@ public sealed partial class MainWindow : Window
         return $"{bitsPerSecond:F0} bps";
     }
 
+    private bool IncludeDiagnosticPortInfo => _appSettings.IncludePortInfoInDiagnostics;
+
+    private string FormatAdbStatusForDiagnostics(string status)
+    {
+        if (IncludeDiagnosticPortInfo)
+        {
+            return status;
+        }
+
+        if (status.Contains("reverse", StringComparison.OrdinalIgnoreCase))
+        {
+            return _lastAdbReverseConfigured switch
+            {
+                true => "ADB reverse 已配置（映射信息已隐藏）。",
+                false => "ADB reverse 未配置或已关闭。",
+                _ => "ADB reverse 状态待启动时确认。"
+            };
+        }
+
+        return RedactDiagnosticPortInfo(status);
+    }
+
+    private void AppendDiagnosticStartupArguments(StringBuilder report, string? arguments)
+    {
+        if (IncludeDiagnosticPortInfo)
+        {
+            report.AppendLine($"启动参数: {FormatOptional(arguments)}");
+            return;
+        }
+
+        report.AppendLine("启动参数: 已按设置隐藏。");
+    }
+
+    private void AppendDiagnosticLines(StringBuilder report, IEnumerable<string> lines)
+    {
+        foreach (var line in lines)
+        {
+            report.AppendLine(RedactDiagnosticPortInfo(line));
+        }
+    }
+
+    private void AppendDiagnosticHostLog(StringBuilder report, HostProcessLog? hostLog)
+    {
+        if (hostLog is null)
+        {
+            report.AppendLine("(当前没有主机日志缓存)");
+            return;
+        }
+
+        report.Append(RedactDiagnosticPortInfo(hostLog.Snapshot()));
+    }
+
+    private string RedactDiagnosticPortInfo(string text)
+    {
+        if (IncludeDiagnosticPortInfo || string.IsNullOrEmpty(text))
+        {
+            return text;
+        }
+
+        var redacted = text;
+        foreach (var port in DiagnosticPortValues())
+        {
+            var pattern = $@"(?<!\d){Regex.Escape(port.ToString(CultureInfo.InvariantCulture))}(?!\d)";
+            redacted = Regex.Replace(redacted, pattern, "[已隐藏]");
+        }
+
+        return redacted;
+    }
+
+    private int[] DiagnosticPortValues()
+    {
+        var ports = new List<int>();
+        AddDiagnosticPort(ports, StaticOverviewUi ? OverviewControlPortBox : ControlPortBox, _appSettings.ControlPort);
+        AddDiagnosticPort(ports, StaticOverviewUi ? OverviewVideoPortBox : VideoPortBox, _appSettings.VideoPort);
+        AddDiagnosticPort(ports, StaticOverviewUi ? OverviewAudioPortBox : null, _appSettings.AudioPort);
+        AddDiagnosticPort(ports, StaticOverviewUi ? OverviewCameraPortBox : null, _appSettings.CameraPort);
+        return ports.Distinct().ToArray();
+    }
+
+    private static void AddDiagnosticPort(List<int> ports, NumberBox? numberBox, int fallback)
+    {
+        var port = fallback;
+        try
+        {
+            if (numberBox is not null && !double.IsNaN(numberBox.Value))
+            {
+                port = (int)Math.Round(numberBox.Value);
+            }
+        }
+        catch
+        {
+            port = fallback;
+        }
+
+        if (port is >= 1 and <= 65535)
+        {
+            ports.Add(port);
+        }
+    }
+
     private async Task ShowOverviewDiagnosticsDialogAsync()
     {
         UpdateOverviewRuntimeDiagnostics();
@@ -6369,7 +6471,7 @@ public sealed partial class MainWindow : Window
         report.AppendLine($"接收速率: {(_lastNetworkReceiveBps.HasValue ? FormatBitRate(_lastNetworkReceiveBps.Value) : "暂无数据")}");
         report.AppendLine($"丢包/丢帧: {_lastOverviewPacketLossText}");
         report.AppendLine($"延迟: {_lastOverviewLatencyText} ({_lastOverviewLatencyDetailText})");
-        report.AppendLine($"ADB 状态: {_lastAdbStatusText}");
+        report.AppendLine($"ADB 状态: {FormatAdbStatusForDiagnostics(_lastAdbStatusText)}");
         report.AppendLine($"ADB 设备: {FormatOptional(SelectedAdbSerial())}");
         report.AppendLine();
 
@@ -8525,6 +8627,7 @@ public sealed partial class MainWindow : Window
         HostProcessLog? hostLog,
         Exception? exception)
     {
+        var includePortInfo = IncludeDiagnosticPortInfo;
         var report = new StringBuilder();
         report.AppendLine("SideDock 主机启动失败诊断报告");
         report.AppendLine($"时间: {DateTimeOffset.Now:yyyy-MM-dd HH:mm:ss zzz}");
@@ -8536,16 +8639,24 @@ public sealed partial class MainWindow : Window
 
         report.AppendLine($"Host 路径: {FormatOptional(hostPath)}");
         report.AppendLine($"工作目录: {FormatOptional(workingDirectory)}");
-        report.AppendLine($"启动参数: {FormatOptional(arguments)}");
+        AppendDiagnosticStartupArguments(report, arguments);
         report.AppendLine($"ADB 路径: {FormatOptional(adbPath)}");
         report.AppendLine($"ADB 设备: {FormatOptional(adbSerial)}");
         report.AppendLine($"视频源: {Selected(VideoSourceCombo)}");
         report.AppendLine($"分辨率: {Selected(ResolutionCombo)}");
         report.AppendLine($"刷新率: {Selected(RefreshRateCombo)}");
-        report.AppendLine($"控制端口: {FormatNumberBox(ControlPortBox)}");
-        report.AppendLine($"视频端口: {FormatNumberBox(VideoPortBox)}");
-        report.AppendLine($"音频端口: {(StaticOverviewUi ? FormatNumberBox(OverviewAudioPortBox) : DefaultAudioPort.ToString(CultureInfo.InvariantCulture))}");
-        report.AppendLine($"摄像头端口: {(StaticOverviewUi ? FormatNumberBox(OverviewCameraPortBox) : DefaultCameraPort.ToString(CultureInfo.InvariantCulture))}");
+        if (includePortInfo)
+        {
+            report.AppendLine($"控制端口: {FormatNumberBox(ControlPortBox)}");
+            report.AppendLine($"视频端口: {FormatNumberBox(VideoPortBox)}");
+            report.AppendLine($"音频端口: {(StaticOverviewUi ? FormatNumberBox(OverviewAudioPortBox) : DefaultAudioPort.ToString(CultureInfo.InvariantCulture))}");
+            report.AppendLine($"摄像头端口: {(StaticOverviewUi ? FormatNumberBox(OverviewCameraPortBox) : DefaultCameraPort.ToString(CultureInfo.InvariantCulture))}");
+        }
+        else
+        {
+            report.AppendLine("网络映射信息: 已按设置隐藏。");
+        }
+
         report.AppendLine($"启用触控输入: {InputInjectionSwitch.IsOn}");
         report.AppendLine($"自动管理虚拟显示器: {ManageDisplaySwitch.IsOn}");
 
@@ -8560,7 +8671,7 @@ public sealed partial class MainWindow : Window
         {
             report.AppendLine();
             report.AppendLine("---- stdout/stderr ----");
-            report.Append(hostLog.Snapshot());
+            report.Append(RedactDiagnosticPortInfo(hostLog.Snapshot()));
         }
 
         return report.ToString();
@@ -10988,6 +11099,7 @@ public sealed partial class MainWindow : Window
         var hostLog = _currentHostLog;
         var recentAudioLines = SnapshotRecentAudioLogLines();
         var recentCameraLines = SnapshotRecentCameraLogLines();
+        var includePortInfo = IncludeDiagnosticPortInfo;
         var report = new StringBuilder();
         report.AppendLine("SideDock 音频设备诊断报告");
         report.AppendLine($"时间: {DateTimeOffset.Now:yyyy-MM-dd HH:mm:ss zzz}");
@@ -11012,7 +11124,7 @@ public sealed partial class MainWindow : Window
         report.AppendLine($"最后摄像头状态日志: {FormatOptional(_lastCameraStatusLine)}");
         report.AppendLine($"最后摄像头错误日志: {FormatOptional(_lastCameraErrorLine)}");
         report.AppendLine($"最后摄像头错误: {FormatOptional(_lastCameraErrorMessage)}");
-        AppendCameraDiagnosticsSummary(report);
+        AppendCameraDiagnosticsSummary(report, includePortInfo);
         report.AppendLine();
 
         report.AppendLine("---- 配置 ----");
@@ -11026,14 +11138,22 @@ public sealed partial class MainWindow : Window
         report.AppendLine($"Android 麦克风写入端点状态: {_microphoneRenderEndpointDiagnostics.Summary}");
         report.AppendLine($"Android 麦克风写入 endpoint id: {FormatOptional(_boundMicrophoneRenderEndpointId)}");
         report.AppendLine($"Android 麦克风写入端点名称: {FormatOptional(_boundMicrophoneRenderEndpointName)}");
-        var audioPortText = StaticOverviewUi ? FormatNumberBox(OverviewAudioPortBox) : DefaultAudioPort.ToString(CultureInfo.InvariantCulture);
-        var cameraPortText = StaticOverviewUi ? FormatNumberBox(OverviewCameraPortBox) : DefaultCameraPort.ToString(CultureInfo.InvariantCulture);
-        report.AppendLine($"音频端口: {audioPortText}");
-        report.AppendLine($"摄像头端口: {cameraPortText}");
+        if (includePortInfo)
+        {
+            var audioPortText = StaticOverviewUi ? FormatNumberBox(OverviewAudioPortBox) : DefaultAudioPort.ToString(CultureInfo.InvariantCulture);
+            var cameraPortText = StaticOverviewUi ? FormatNumberBox(OverviewCameraPortBox) : DefaultCameraPort.ToString(CultureInfo.InvariantCulture);
+            report.AppendLine($"音频端口: {audioPortText}");
+            report.AppendLine($"摄像头端口: {cameraPortText}");
+            report.AppendLine($"摄像头 reverse: tcp:{cameraPortText} -> tcp:{cameraPortText}");
+            report.AppendLine($"控制端口: {FormatNumberBox(ControlPortBox)}");
+            report.AppendLine($"视频端口: {FormatNumberBox(VideoPortBox)}");
+        }
+        else
+        {
+            report.AppendLine("网络映射信息: 已按设置隐藏。");
+        }
+
         report.AppendLine($"摄像头方向: {Selected(CameraFacingCombo)}");
-        report.AppendLine($"摄像头 reverse: tcp:{cameraPortText} -> tcp:{cameraPortText}");
-        report.AppendLine($"控制端口: {FormatNumberBox(ControlPortBox)}");
-        report.AppendLine($"视频端口: {FormatNumberBox(VideoPortBox)}");
         report.AppendLine($"视频源: {Selected(VideoSourceCombo)}");
         report.AppendLine($"分辨率: {Selected(ResolutionCombo)}");
         report.AppendLine($"刷新率: {Selected(RefreshRateCombo)}");
@@ -11044,7 +11164,7 @@ public sealed partial class MainWindow : Window
         report.AppendLine("---- Host 进程 ----");
         report.AppendLine($"Host 路径: {FormatOptional(hostLog?.HostPath ?? _hostPath)}");
         report.AppendLine($"工作目录: {FormatOptional(hostLog?.WorkingDirectory)}");
-        report.AppendLine($"启动参数: {FormatOptional(hostLog?.Arguments ?? TryBuildArgumentsForDiagnostics())}");
+        AppendDiagnosticStartupArguments(report, hostLog?.Arguments ?? TryBuildArgumentsForDiagnostics());
         report.AppendLine($"ADB 路径: {FormatOptional(hostLog?.AdbPath)}");
         report.AppendLine($"ADB 设备: {FormatOptional(hostLog?.AdbSerial)}");
         report.AppendLine();
@@ -11056,10 +11176,7 @@ public sealed partial class MainWindow : Window
         }
         else
         {
-            foreach (var line in recentCameraLines)
-            {
-                report.AppendLine(line);
-            }
+            AppendDiagnosticLines(report, recentCameraLines);
         }
 
         report.AppendLine();
@@ -11071,22 +11188,12 @@ public sealed partial class MainWindow : Window
         }
         else
         {
-            foreach (var line in recentAudioLines)
-            {
-                report.AppendLine(line);
-            }
+            AppendDiagnosticLines(report, recentAudioLines);
         }
 
         report.AppendLine();
         report.AppendLine("---- 主机 stdout/stderr ----");
-        if (hostLog is null)
-        {
-            report.AppendLine("(当前没有主机日志缓存)");
-        }
-        else
-        {
-            report.Append(hostLog.Snapshot());
-        }
+        AppendDiagnosticHostLog(report, hostLog);
 
         return report.ToString();
     }
@@ -11095,6 +11202,7 @@ public sealed partial class MainWindow : Window
     {
         var hostLog = _currentHostLog;
         var recentCameraLines = SnapshotRecentCameraLogLines();
+        var includePortInfo = IncludeDiagnosticPortInfo;
         var report = new StringBuilder();
         report.AppendLine("SideDock 摄像头诊断报告");
         report.AppendLine($"时间: {DateTimeOffset.Now:yyyy-MM-dd HH:mm:ss zzz}");
@@ -11103,10 +11211,18 @@ public sealed partial class MainWindow : Window
         report.AppendLine("---- 当前状态 ----");
         report.AppendLine($"主机状态: {OverallStatusText.Text}");
         report.AppendLine($"主机进程: {FormatHostProcessState()}");
-        report.AppendLine($"ADB reverse 状态: {AdbStatusText.Text}");
-        var cameraPortText = StaticOverviewUi ? FormatNumberBox(OverviewCameraPortBox) : DefaultCameraPort.ToString(CultureInfo.InvariantCulture);
-        report.AppendLine($"摄像头 reverse: tcp:{cameraPortText} -> tcp:{cameraPortText}");
-        AppendCameraDiagnosticsSummary(report);
+        report.AppendLine($"ADB reverse 状态: {FormatAdbStatusForDiagnostics(AdbStatusText.Text)}");
+        if (includePortInfo)
+        {
+            var cameraPortText = StaticOverviewUi ? FormatNumberBox(OverviewCameraPortBox) : DefaultCameraPort.ToString(CultureInfo.InvariantCulture);
+            report.AppendLine($"摄像头 reverse: tcp:{cameraPortText} -> tcp:{cameraPortText}");
+        }
+        else
+        {
+            report.AppendLine("网络映射信息: 已按设置隐藏。");
+        }
+
+        AppendCameraDiagnosticsSummary(report, includePortInfo);
         report.AppendLine($"最后摄像头状态日志: {FormatOptional(_lastCameraStatusLine)}");
         report.AppendLine($"最后摄像头错误日志: {FormatOptional(_lastCameraErrorLine)}");
         report.AppendLine($"最后摄像头错误: {FormatOptional(_lastCameraErrorMessage)}");
@@ -11115,7 +11231,7 @@ public sealed partial class MainWindow : Window
         report.AppendLine("---- Host 进程 ----");
         report.AppendLine($"Host 路径: {FormatOptional(hostLog?.HostPath ?? _hostPath)}");
         report.AppendLine($"工作目录: {FormatOptional(hostLog?.WorkingDirectory)}");
-        report.AppendLine($"启动参数: {FormatOptional(hostLog?.Arguments ?? TryBuildArgumentsForDiagnostics())}");
+        AppendDiagnosticStartupArguments(report, hostLog?.Arguments ?? TryBuildArgumentsForDiagnostics());
         report.AppendLine($"ADB 路径: {FormatOptional(hostLog?.AdbPath)}");
         report.AppendLine($"ADB 设备: {FormatOptional(hostLog?.AdbSerial)}");
         report.AppendLine();
@@ -11127,33 +11243,27 @@ public sealed partial class MainWindow : Window
         }
         else
         {
-            foreach (var line in recentCameraLines)
-            {
-                report.AppendLine(line);
-            }
+            AppendDiagnosticLines(report, recentCameraLines);
         }
 
         report.AppendLine();
         report.AppendLine("---- 主机 stdout/stderr ----");
-        if (hostLog is null)
-        {
-            report.AppendLine("(当前没有主机日志缓存)");
-        }
-        else
-        {
-            report.Append(hostLog.Snapshot());
-        }
+        AppendDiagnosticHostLog(report, hostLog);
 
         return report.ToString();
     }
 
-    private void AppendCameraDiagnosticsSummary(StringBuilder report)
+    private void AppendCameraDiagnosticsSummary(StringBuilder report, bool includePortInfo)
     {
         var camera = _cameraDiagnostics;
         report.AppendLine($"Camera server 状态: {FormatOptional(camera.ServerState)}");
         report.AppendLine($"Camera client 状态: {FormatOptional(camera.ClientState)}");
         report.AppendLine($"Android 权限: {FormatOptional(camera.PermissionText)}");
-        report.AppendLine($"端口: {camera.Port}");
+        if (includePortInfo)
+        {
+            report.AppendLine($"端口: {camera.Port}");
+        }
+
         report.AppendLine($"配置: {camera.Width}x{camera.Height}@{camera.Fps} {camera.Codec}");
         report.AppendLine($"接收包/帧/字节: {camera.Packets}/{camera.Frames}/{camera.Bytes}");
         report.AppendLine($"Keyframe/config 包: {camera.KeyFrames}/{camera.CodecConfigPackets}");
