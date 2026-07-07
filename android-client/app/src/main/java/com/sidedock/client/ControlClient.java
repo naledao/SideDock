@@ -28,6 +28,7 @@ public final class ControlClient {
         void onStats(long sent, long received);
         void onVideoStart(int port, int width, int height, int fps);
         void onAudioConfig(AudioConfig config);
+        void onAudioTestRequest(AudioTestRequest request);
         void onCameraConfig(CameraConfig config);
         void onClockSync(ClockSync clockSync);
         void onCaptureStatus(CaptureStatus status);
@@ -98,6 +99,25 @@ public final class ControlClient {
             this.fps = fps;
             this.codec = codec;
             this.facing = facing;
+        }
+    }
+
+    public static final class AudioTestRequest {
+        public final String testId;
+        public final String kind;
+        public final int durationMs;
+        public final int timeoutMs;
+
+        public AudioTestRequest(
+            String testId,
+            String kind,
+            int durationMs,
+            int timeoutMs
+        ) {
+            this.testId = testId;
+            this.kind = kind;
+            this.durationMs = durationMs;
+            this.timeoutMs = timeoutMs;
         }
     }
 
@@ -742,6 +762,56 @@ public final class ControlClient {
         ));
     }
 
+    public void sendAudioTestStatus(
+        String testId,
+        String kind,
+        String status,
+        boolean ok,
+        String phase,
+        String message,
+        long startedAtMs,
+        long completedAtMs,
+        long packetsSent,
+        long bytesSent,
+        long packetsReceived,
+        long bytesReceived,
+        int peakSample,
+        int peakLevelPercent,
+        long silentPackets,
+        double silentRatio,
+        boolean permissionGranted,
+        boolean muted,
+        boolean stopped,
+        int playState,
+        long writeErrors,
+        String error
+    ) {
+        sendFromAnyThread("audio_test_status", payload(
+            "testId", testId == null ? "" : testId,
+            "kind", kind == null ? "" : kind,
+            "status", status == null ? "" : status,
+            "ok", ok,
+            "phase", phase == null ? "" : phase,
+            "message", message == null ? "" : message,
+            "startedAtUnixMs", startedAtMs,
+            "completedAtUnixMs", completedAtMs,
+            "packetsSent", packetsSent,
+            "bytesSent", bytesSent,
+            "packetsReceived", packetsReceived,
+            "bytesReceived", bytesReceived,
+            "peakSample", peakSample,
+            "peakLevelPercent", peakLevelPercent,
+            "silentPackets", silentPackets,
+            "silentRatio", silentRatio,
+            "permissionGranted", permissionGranted,
+            "muted", muted,
+            "stopped", stopped,
+            "playState", playState,
+            "writeErrors", writeErrors,
+            "error", error == null ? "" : error
+        ));
+    }
+
     public void sendCameraStatus(
         String state,
         String message,
@@ -946,6 +1016,9 @@ public final class ControlClient {
                 break;
             case "audio_config":
                 emitAudioConfig(audioConfigFromPayload(message.payload));
+                break;
+            case "audio_test_request":
+                emitAudioTestRequest(audioTestRequestFromPayload(message.payload));
                 break;
             case "camera_config":
                 emitCameraConfig(cameraConfigFromPayload(message.payload));
@@ -1326,6 +1399,15 @@ public final class ControlClient {
         );
     }
 
+    private AudioTestRequest audioTestRequestFromPayload(JSONObject payload) {
+        return new AudioTestRequest(
+            payload.optString("testId", ""),
+            payload.optString("kind", ""),
+            Math.max(1, payload.optInt("durationMs", 2000)),
+            Math.max(1, payload.optInt("timeoutMs", 8000))
+        );
+    }
+
     private CameraConfig cameraConfigFromHelloPayload(JSONObject payload) {
         return new CameraConfig(
             payload.optBoolean("cameraEnabled", false),
@@ -1355,6 +1437,15 @@ public final class ControlClient {
             @Override
             public void run() {
                 listener.onAudioConfig(config);
+            }
+        });
+    }
+
+    private void emitAudioTestRequest(AudioTestRequest request) {
+        mainHandler.post(new Runnable() {
+            @Override
+            public void run() {
+                listener.onAudioTestRequest(request);
             }
         });
     }

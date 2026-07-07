@@ -24,7 +24,11 @@ internal static partial class Program
         public const int SpeakerFrameBytes = SpeakerChannels * (BitsPerSample / 8);
     }
 
-    private sealed class AudioServer(IPAddress address, HostOptions options, ControlMessagePublisher controlPublisher)
+    private sealed class AudioServer(
+        IPAddress address,
+        HostOptions options,
+        ControlMessagePublisher controlPublisher,
+        AudioTestCoordinator audioTestCoordinator)
     {
         private const int HeaderSize = 36;
         private const int MaxMicPayloadBytes = AudioDefaults.SampleRate * AudioDefaults.MicFrameBytes;
@@ -246,6 +250,11 @@ internal static partial class Program
                     + $"microphone={(options.MicrophoneEnabled ? "enabled" : "disabled")} "
                     + $"speaker={(options.SpeakerEnabled ? "enabled" : "disabled")} "
                     + $"socket={DescribeSocket(client)}");
+                audioTestCoordinator.UpdateAudioConnectionState(
+                    connectionId,
+                    connected: true,
+                    microphoneEnabled: options.MicrophoneEnabled,
+                    speakerEnabled: options.SpeakerEnabled);
 
                 try
                 {
@@ -362,6 +371,11 @@ internal static partial class Program
                     CloseAudioSocket(client);
                     Log($"AUDIO {connectionId}", $"关闭音频 socket 后状态 {DescribeSocket(client)}");
                     await DrainAudioDirectionTasksAsync(connectionId, directionTasks);
+                    audioTestCoordinator.UpdateAudioConnectionState(
+                        connectionId,
+                        connected: false,
+                        microphoneEnabled: false,
+                        speakerEnabled: false);
 
                     lock (_connectionLock)
                     {
@@ -430,13 +444,15 @@ internal static partial class Program
 
                     var now = DateTimeOffset.UtcNow;
                     var sourceAgeMs = Math.Max(0, now.ToUnixTimeMilliseconds() - timestampMs);
+                    var levelPercent = CalculatePcm16LevelPercent(payload, payloadLength);
+                    audioTestCoordinator.RecordMicrophonePacket(payloadLength, levelPercent, endpointReady, endpointMessage);
                     UpdateDirectionTelemetry(
                         AudioRuntimeDirection.Microphone,
                         state: endpointReady ? "capturing" : "unavailable",
                         message: endpointReady ? "Android 麦克风正在采集并写入 Windows。" : endpointMessage,
                         packets: packetCount,
                         bytes: byteCount,
-                        levelPercent: CalculatePcm16LevelPercent(payload, payloadLength),
+                        levelPercent: levelPercent,
                         lastPacketUnixMs: now.ToUnixTimeMilliseconds(),
                         sourceAgeMs: sourceAgeMs,
                         approximateLatencyMs: sourceAgeMs,
@@ -497,6 +513,37 @@ internal static partial class Program
             {
                 while (!cancellationToken.IsCancellationRequested)
                 {
+                    if (audioTestCoordinator.TryReadPlaybackTone(payload, SpeakerChunkBytes, out var testBytesRead))
+                    {
+                        packetCount += 1;
+                        byteCount += testBytesRead;
+                        var testNowMs = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds();
+                        WriteHeader(header, SpeakerMagic, packetCount, testNowMs, AudioDefaults.SpeakerChannels, testBytesRead);
+                        await stream.WriteAsync(header.AsMemory(0, HeaderSize), cancellationToken);
+                        await stream.WriteAsync(payload.AsMemory(0, testBytesRead), cancellationToken);
+                        await stream.FlushAsync(cancellationToken);
+
+                        UpdateDirectionTelemetry(
+                            AudioRuntimeDirection.Speaker,
+                            state: "playing",
+                            message: "正在发送播放测试音到 Android。",
+                            packets: packetCount,
+                            bytes: byteCount,
+                            levelPercent: CalculatePcm16LevelPercent(payload, testBytesRead),
+                            lastPacketUnixMs: testNowMs,
+                            sourceAgeMs: 0,
+                            approximateLatencyMs: 0,
+                            endpointReady: true);
+                        await PublishSpeakerStatusAsync(
+                            "playing",
+                            "正在发送播放测试音到 Android。",
+                            cancellationToken,
+                            packetCount,
+                            byteCount);
+                        await Task.Delay(20, cancellationToken);
+                        continue;
+                    }
+
                     var readResult = _audioBackend.ReadSpeaker(payload, SpeakerChunkBytes);
                     if (!readResult.EndpointReady)
                     {
@@ -823,6 +870,9 @@ internal static partial class Program
                 direction,
                 entry =>
                 {
+                    var effectiveEndpointReady = endpointReady ?? (direction == AudioRuntimeDirection.Microphone
+                        ? _audioBackend.IsMicrophoneReady
+                        : _audioBackend.IsSpeakerReady);
                     entry.State = state;
                     entry.Message = message;
                     entry.SampleRate = AudioDefaults.SampleRate;
@@ -831,9 +881,7 @@ internal static partial class Program
                         ? AudioDefaults.MicChannels
                         : AudioDefaults.SpeakerChannels;
                     entry.Backend = _audioBackend.Name;
-                    entry.EndpointReady = endpointReady ?? (direction == AudioRuntimeDirection.Microphone
-                        ? _audioBackend.IsMicrophoneReady
-                        : _audioBackend.IsSpeakerReady);
+                    entry.EndpointReady = effectiveEndpointReady;
                     entry.EndpointId = direction == AudioRuntimeDirection.Microphone
                         ? _audioBackend.MicrophoneEndpointId
                         : _audioBackend.SpeakerEndpointId;
@@ -867,6 +915,15 @@ internal static partial class Program
                     entry.SourceAgeMs = sourceAgeMs;
                     entry.ApproximateLatencyMs = approximateLatencyMs;
                 });
+            audioTestCoordinator.UpdateDirectionSnapshot(
+                direction == AudioRuntimeDirection.Microphone
+                    ? AudioTestDirection.Microphone
+                    : AudioTestDirection.Speaker,
+                state,
+                message,
+                endpointReady ?? (direction == AudioRuntimeDirection.Microphone
+                    ? _audioBackend.IsMicrophoneReady
+                    : _audioBackend.IsSpeakerReady));
         }
 
         private void UpdateReconnectCount(long reconnectCount)
