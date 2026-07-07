@@ -20,6 +20,7 @@ public sealed partial class StaticAudioPage : UserControl
 
     private bool _syncingState;
     private bool _statusBannerDismissed;
+    private AudioRecoveryAction _primaryRecoveryAction = AudioRecoveryAction.NoAction;
 
     public StaticAudioPage()
     {
@@ -55,6 +56,8 @@ public sealed partial class StaticAudioPage : UserControl
     public event EventHandler? AutoBindEndpointsRequested;
 
     public event EventHandler? ApplyAudioChangesRequested;
+
+    public event EventHandler<StaticAudioRecoveryActionEventArgs>? PrimaryRecoveryActionRequested;
 
     public event EventHandler<StaticAudioEndpointChangedEventArgs>? SpeakerEndpointChanged;
 
@@ -136,17 +139,25 @@ public sealed partial class StaticAudioPage : UserControl
         AudioPendingChangesPanel.Visibility = state.ShowPendingChanges ? Visibility.Visible : Visibility.Collapsed;
         AudioPendingChangesText.Text = state.PendingChangesText;
         WizardRepairHintText.Text = state.RepairHintText;
+        _primaryRecoveryAction = state.PrimaryRecoveryAction;
+        PrimaryRecoveryActionButton.IsEnabled = state.CanRunPrimaryRecoveryAction;
+        PrimaryRecoveryActionText.Text = state.PrimaryRecoveryActionText;
+        PrimaryRecoveryActionIcon.Glyph = state.PrimaryRecoveryActionIconGlyph;
+        ToolTipService.SetToolTip(PrimaryRecoveryActionButton, state.PrimaryRecoveryActionToolTip);
 
         RefreshEndpointsButton.IsEnabled = state.CanRefreshEndpoints;
         RefreshMicrophoneEndpointsButton.IsEnabled = state.CanRefreshEndpoints;
         RefreshMicrophoneRenderButton.IsEnabled = state.CanRefreshEndpoints;
-        AutoBindEndpointsButton.IsEnabled = state.CanAutoBindEndpoints;
         ApplyAudioChangesButton.IsEnabled = state.CanApplyPendingChanges;
-        RepairEndpointsButton.IsEnabled = state.CanInstallVirtualAudioCable;
         ReloadVirtualCableButton.IsEnabled = state.CanInstallVirtualAudioCable;
-        WizardOpenSoundSettingsButton.IsEnabled = state.CanOpenSoundSettings;
         MicrophoneOpenSoundSettingsButton.IsEnabled = state.CanOpenSoundSettings;
         SpeakerOpenSoundSettingsButton.IsEnabled = state.CanOpenSoundSettings;
+        RefreshAudioActionMenuItem.IsEnabled = state.CanRefreshEndpoints;
+        InstallVirtualAudioCableActionMenuItem.IsEnabled = state.CanInstallVirtualAudioCable;
+        AutoBindAudioActionMenuItem.IsEnabled = state.CanAutoBindEndpoints;
+        ApplyAndRestartAudioActionMenuItem.IsEnabled = state.CanApplyAndRestartAudio;
+        OpenSoundSettingsActionMenuItem.IsEnabled = state.CanOpenSoundSettings;
+        CopyDiagnosticsActionMenuItem.IsEnabled = state.CanCopyDiagnostics;
 
         SetWizardStep(WizardInstallStepIcon, state.InstallStepState);
         SetWizardStep(WizardSpeakerStepIcon, state.SpeakerStepState);
@@ -418,11 +429,34 @@ public sealed partial class StaticAudioPage : UserControl
         ApplyAudioChangesRequested?.Invoke(this, EventArgs.Empty);
     }
 
+    private void PrimaryRecoveryActionButton_Click(object sender, RoutedEventArgs e)
+    {
+        if (_primaryRecoveryAction is AudioRecoveryAction.None
+            or AudioRecoveryAction.NoAction
+            or AudioRecoveryAction.WaitForAndroidDevice
+            or AudioRecoveryAction.RequestAndroidMicrophonePermission)
+        {
+            return;
+        }
+
+        PrimaryRecoveryActionRequested?.Invoke(this, new StaticAudioRecoveryActionEventArgs(_primaryRecoveryAction));
+    }
+
     private void StatusBannerCloseButton_Click(object sender, RoutedEventArgs e)
     {
         _statusBannerDismissed = true;
         AudioStatusBanner.Visibility = Visibility.Collapsed;
     }
+}
+
+public sealed class StaticAudioRecoveryActionEventArgs : EventArgs
+{
+    public StaticAudioRecoveryActionEventArgs(AudioRecoveryAction action)
+    {
+        Action = action;
+    }
+
+    public AudioRecoveryAction Action { get; }
 }
 
 public sealed class StaticAudioEndpointChangedEventArgs : EventArgs
@@ -485,6 +519,20 @@ internal sealed class StaticAudioPageState
     public bool ShowPendingChanges { get; init; }
 
     public bool CanApplyPendingChanges { get; init; }
+
+    public bool CanApplyAndRestartAudio { get; init; }
+
+    public bool CanCopyDiagnostics { get; init; } = true;
+
+    public AudioRecoveryAction PrimaryRecoveryAction { get; init; } = AudioRecoveryAction.NoAction;
+
+    public string PrimaryRecoveryActionText { get; init; } = "状态正常";
+
+    public string PrimaryRecoveryActionIconGlyph { get; init; } = "\uE73E";
+
+    public string PrimaryRecoveryActionToolTip { get; init; } = "当前无需恢复动作。";
+
+    public bool CanRunPrimaryRecoveryAction { get; init; }
 
     public string PendingChangesText { get; init; } = "有未应用的音频更改。";
 

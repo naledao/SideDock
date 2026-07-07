@@ -749,6 +749,7 @@ public sealed partial class MainWindow : Window
         OverviewAudioPage.OpenSoundSettingsRequested += StaticAudioPage_OpenSoundSettingsRequested;
         OverviewAudioPage.AutoBindEndpointsRequested += StaticAudioPage_AutoBindEndpointsRequested;
         OverviewAudioPage.ApplyAudioChangesRequested += StaticAudioPage_ApplyAudioChangesRequested;
+        OverviewAudioPage.PrimaryRecoveryActionRequested += StaticAudioPage_PrimaryRecoveryActionRequested;
         OverviewAudioPage.SpeakerEndpointChanged += StaticAudioPage_SpeakerEndpointChanged;
         OverviewAudioPage.MicrophoneEndpointChanged += StaticAudioPage_MicrophoneEndpointChanged;
         OverviewAudioPage.SpeakerEnabledChanged += StaticAudioPage_AudioDirectionEnabledChanged;
@@ -3862,6 +3863,36 @@ public sealed partial class MainWindow : Window
     private async void StaticAudioPage_ApplyAudioChangesRequested(object? sender, EventArgs e)
     {
         await ApplyAudioRuntimeChangesAsync();
+    }
+
+    private async void StaticAudioPage_PrimaryRecoveryActionRequested(object? sender, StaticAudioRecoveryActionEventArgs e)
+    {
+        switch (e.Action)
+        {
+            case AudioRecoveryAction.StartHost:
+                await StartHostAsync();
+                break;
+            case AudioRecoveryAction.InstallOrRepairVirtualAudioCable:
+                await InstallVirtualAudioCableAsync();
+                break;
+            case AudioRecoveryAction.AutoBindRecommendedEndpoints:
+                await AutoBindRecommendedAudioEndpointsAsync();
+                break;
+            case AudioRecoveryAction.RefreshEndpoints:
+                await RefreshAudioEndpointsAsync(showHint: true);
+                UpdateAudioState();
+                break;
+            case AudioRecoveryAction.ApplyAndRestartAudio:
+                await ApplyAudioRuntimeChangesAsync();
+                break;
+            case AudioRecoveryAction.OpenSoundSettings:
+                StaticAudioPage_OpenSoundSettingsRequested(sender, EventArgs.Empty);
+                break;
+            case AudioRecoveryAction.CopyDiagnostics:
+                CopyAudioDiagnosticsToClipboard();
+                UpdateAudioState("音频诊断日志已复制。");
+                break;
+        }
     }
 
     private void StaticAudioPage_SpeakerEndpointChanged(object? sender, StaticAudioEndpointChangedEventArgs e)
@@ -14107,8 +14138,17 @@ public sealed partial class MainWindow : Window
             return;
         }
 
+        var recoveryState = BuildAudioRecoveryState(
+            audioEnabled,
+            microphoneIntent,
+            speakerIntent,
+            overallStatus,
+            microphoneStatus,
+            speakerStatus,
+            audioHint,
+            DateTimeOffset.Now);
         var (bannerTitle, bannerDetail, bannerTextBrush, bannerBackground, bannerBorder, bannerIconBackground, bannerIconGlyph, bannerSeverity) =
-            BuildStaticAudioBannerView(audioEnabled, microphoneIntent, speakerIntent, overallStatus, microphoneStatus, speakerStatus, audioHint);
+            BuildStaticAudioBannerView(recoveryState);
         var microphoneStatusBrush = AudioBrush(microphoneStatus);
         var speakerStatusBrush = AudioBrush(speakerStatus);
         var virtualEndpointCount = _microphoneRenderEndpointDiagnostics.AvailableEndpointCount;
@@ -14155,13 +14195,20 @@ public sealed partial class MainWindow : Window
                 CanInstallVirtualAudioCable = !_virtualAudioCableInstallInProgress,
                 CanOpenSoundSettings = true,
                 CanAutoBindEndpoints = CanAutoBindRecommendedAudioEndpoints(),
+                CanApplyAndRestartAudio = CanApplyAndRestartAudio(),
+                CanCopyDiagnostics = true,
+                PrimaryRecoveryAction = recoveryState.PrimaryAction,
+                PrimaryRecoveryActionText = BuildAudioRecoveryActionText(recoveryState.PrimaryAction, recoveryState.Issue),
+                PrimaryRecoveryActionIconGlyph = AudioRecoveryActionIconGlyph(recoveryState.PrimaryAction, recoveryState.Issue),
+                PrimaryRecoveryActionToolTip = recoveryState.ActionDescription,
+                CanRunPrimaryRecoveryAction = CanRunPrimaryAudioRecoveryAction(recoveryState.PrimaryAction),
                 ShowPendingChanges = _audioRuntimeChangesPending,
                 CanApplyPendingChanges = _audioRuntimeChangesPending && !_applyingAudioRuntimeChanges,
                 PendingChangesText = _applyingAudioRuntimeChanges
                     ? "正在保存配置并重启 Host，请稍候。"
                     : "有未应用的音频更改。当前 Host 仍在使用旧端点或开关，点击后会保存配置并重启 Host。",
                 CurrentDeviceText = CurrentAudioDeviceLabel(),
-                HintText = audioHint,
+                HintText = recoveryState.Message,
                 HintBrush = bannerTextBrush == _dangerBrush ? _dangerBrush : _overviewNeutralBrush,
                 SpeakerStatusText = AudioDirectionText(AudioDirection.Speaker, speakerStatus),
                 SpeakerStatusBrush = speakerStatusBrush,
@@ -14184,7 +14231,7 @@ public sealed partial class MainWindow : Window
                 VirtualCableStatusIconGlyph = virtualCableReady ? "\uE73E" : "\uE7BA",
                 VirtualCableVersionText = "不可用",
                 VirtualCableEndpointText = virtualEndpointCount > 0 ? $"{virtualEndpointCount} 个可写入端点" : "暂无数据",
-                RepairHintText = BuildStaticAudioRepairHint(microphoneIntent, speakerIntent),
+                RepairHintText = recoveryState.Message,
                 InstallStepState = virtualCableReady ? StaticAudioStepState.Ready : StaticAudioStepState.Warning,
                 SpeakerStepState = AudioEndpointStepState(_speakerCaptureEndpointDiagnostics, audioEnabled && speakerIntent),
                 MicrophoneStepState = AudioEndpointStepState(_microphoneRenderEndpointDiagnostics, audioEnabled && microphoneIntent)
@@ -14368,157 +14415,611 @@ public sealed partial class MainWindow : Window
         return age.TotalSeconds < 1 ? "刚刚" : $"{FormatAge(age)}前";
     }
 
-    private string BuildStaticAudioRepairHint(bool microphoneIntent, bool speakerIntent)
+    private (string Title, string Detail, Brush TextBrush, Brush Background, Brush Border, Brush IconBackground, string IconGlyph, StaticAudioBannerSeverity Severity)
+        BuildStaticAudioBannerView(AudioRecoveryState recoveryState)
     {
-        if (_applyingAudioRuntimeChanges)
+        var severity = AudioRecoveryBannerSeverity(recoveryState.Issue);
+        var (textBrush, background, border, iconBackground) = severity switch
         {
-            return "正在应用音频更改并重启 Host。";
-        }
+            StaticAudioBannerSeverity.Ready => (_successBrush, _overviewReadyBackgroundBrush, _overviewReadyBorderBrush, _successBrush),
+            StaticAudioBannerSeverity.Warning => (_warningBrush, _overviewWarningBackgroundBrush, _overviewWarningBorderBrush, _warningBrush),
+            StaticAudioBannerSeverity.Error => (_dangerBrush, _overviewErrorBackgroundBrush, _overviewErrorBorderBrush, _dangerBrush),
+            _ => (_secondaryBrush, _overviewNeutralBackgroundBrush, _overviewNeutralBorderBrush, _secondaryBrush)
+        };
 
-        if (_audioRuntimeChangesPending)
-        {
-            return "配置已保存但当前 Host 仍使用旧参数；点击“应用并重启 Host”后生效。";
-        }
-
-        var recoveryHint = BuildAudioEndpointRecoveryHint(microphoneIntent, speakerIntent);
-        if (!string.IsNullOrWhiteSpace(recoveryHint))
-        {
-            return recoveryHint;
-        }
-
-        if (_audioEndpointRecommendations.MicrophoneRenderEndpoint is { } microphoneRecommendation)
-        {
-            var hostEndpoint = string.IsNullOrWhiteSpace(microphoneRecommendation.HostEndpointDisplayName)
-                ? microphoneRecommendation.DisplayName
-                : microphoneRecommendation.HostEndpointDisplayName;
-            return $"推荐麦克风录制端：{microphoneRecommendation.DisplayName}；Host 实际写入：{hostEndpoint}。通话软件请选择录制端。";
-        }
-
-        if (_audioEndpointRecommendations.SpeakerLoopbackEndpoint is { } speakerRecommendation)
-        {
-            return $"推荐电脑声音 loopback 输出端点：{speakerRecommendation.DisplayName}。";
-        }
-
-        return VirtualAudioCableInstallStatusText?.Text
-            ?? "修复端点会启动已有的虚拟音频线安装/修复流程。";
+        return (
+            recoveryState.Title,
+            recoveryState.Message,
+            textBrush,
+            background,
+            border,
+            iconBackground,
+            AudioRecoveryIssueIconGlyph(recoveryState.Issue),
+            severity);
     }
 
-    private (string Title, string Detail, Brush TextBrush, Brush Background, Brush Border, Brush IconBackground, string IconGlyph, StaticAudioBannerSeverity Severity)
-        BuildStaticAudioBannerView(
-            bool audioEnabled,
-            bool microphoneIntent,
-            bool speakerIntent,
-            AudioCapabilityStatus overallStatus,
-            AudioCapabilityStatus microphoneStatus,
-            AudioCapabilityStatus speakerStatus,
-            string audioHint)
+    private AudioRecoveryState BuildAudioRecoveryState(
+        bool audioEnabled,
+        bool microphoneIntent,
+        bool speakerIntent,
+        AudioCapabilityStatus overallStatus,
+        AudioCapabilityStatus microphoneStatus,
+        AudioCapabilityStatus speakerStatus,
+        string audioHint,
+        DateTimeOffset now)
     {
-        if (_applyingAudioRuntimeChanges)
-        {
-            return (
-                "正在应用音频更改",
-                "正在保存配置并重启 Host，完成后会刷新端点和运行状态。",
-                _warningBrush,
-                _overviewWarningBackgroundBrush,
-                _overviewWarningBorderBrush,
-                _warningBrush,
-                "\uE72C",
-                StaticAudioBannerSeverity.Warning);
-        }
-
-        if (_audioRuntimeChangesPending)
-        {
-            return (
-                "有未应用更改",
-                "音频配置已保存，但当前 Host 仍在使用旧端点或开关；请点击“应用并重启 Host”。",
-                _warningBrush,
-                _overviewWarningBackgroundBrush,
-                _overviewWarningBorderBrush,
-                _warningBrush,
-                "\uE7BA",
-                StaticAudioBannerSeverity.Warning);
-        }
+        var hostRunning = _hostProcess is { HasExited: false };
 
         if (!audioEnabled || (!microphoneIntent && !speakerIntent))
         {
-            return (
+            return CreateAudioRecoveryState(
+                AudioRecoveryIssue.AudioDisabled,
+                SelectPrimaryAudioRecoveryAction(AudioRecoveryIssue.AudioDisabled),
                 "音频桥接已关闭",
-                audioHint,
-                _secondaryBrush,
-                _overviewNeutralBackgroundBrush,
-                _overviewNeutralBorderBrush,
-                _secondaryBrush,
-                "\uE711",
-                StaticAudioBannerSeverity.Neutral);
+                "音频桥接当前已关闭。需要音频时请先启用麦克风或音响开关；当前不需要安装虚拟音频线。");
         }
 
-        var endpointIssue = BuildAudioEndpointIssueHint(microphoneIntent, speakerIntent);
-        if (!string.IsNullOrWhiteSpace(endpointIssue))
+        if (!hostRunning)
         {
-            return (
-                "音频端点需要设置",
-                endpointIssue,
-                _warningBrush,
-                _overviewWarningBackgroundBrush,
-                _overviewWarningBorderBrush,
-                _warningBrush,
-                "\uE7BA",
-                StaticAudioBannerSeverity.Warning);
+            return CreateAudioRecoveryState(
+                AudioRecoveryIssue.HostNotRunning,
+                SelectPrimaryAudioRecoveryAction(AudioRecoveryIssue.HostNotRunning),
+                "Host 未运行",
+                "音频桥接已启用，但 Host 尚未启动。请启动 Host 以接收音频指标并连接 Android 设备。");
         }
 
-        if (microphoneStatus == AudioCapabilityStatus.AuthorizationRequired)
+        if (_applyingAudioRuntimeChanges)
         {
-            return (
+            return CreateAudioRecoveryState(
+                AudioRecoveryIssue.PendingChanges,
+                SelectPrimaryAudioRecoveryAction(AudioRecoveryIssue.PendingChanges),
+                "正在应用音频更改",
+                "正在保存配置并重启 Host，完成后会刷新端点和运行状态。");
+        }
+
+        if (_audioRuntimeChangesPending)
+        {
+            return CreateAudioRecoveryState(
+                AudioRecoveryIssue.PendingChanges,
+                SelectPrimaryAudioRecoveryAction(AudioRecoveryIssue.PendingChanges),
+                "有未应用更改",
+                "音频配置已保存，但当前 Host 仍在使用旧端点或开关。请点击“应用并重启音频/Host”让配置生效。");
+        }
+
+        if (IsVirtualCableMissing(microphoneIntent))
+        {
+            return CreateAudioRecoveryState(
+                AudioRecoveryIssue.VirtualCableMissing,
+                SelectPrimaryAudioRecoveryAction(AudioRecoveryIssue.VirtualCableMissing),
+                "未检测到虚拟音频线",
+                "未检测到 VB-CABLE 或其它可写入虚拟音频端点。请安装/修复虚拟音频线，然后刷新端点。");
+        }
+
+        if (HasEndpointHealth(microphoneIntent, speakerIntent, AudioEndpointBindingHealth.EnumerationFailed)
+            || HasEndpointHealth(microphoneIntent, speakerIntent, AudioEndpointBindingHealth.Unsupported))
+        {
+            return CreateAudioRecoveryState(
+                AudioRecoveryIssue.EndpointEnumerationFailed,
+                SelectPrimaryAudioRecoveryAction(AudioRecoveryIssue.EndpointEnumerationFailed),
+                "端点枚举失败",
+                $"{BuildEndpointHealthMessage(microphoneIntent, speakerIntent, AudioEndpointBindingHealth.EnumerationFailed, AudioEndpointBindingHealth.Unsupported)} 请刷新端点；如果仍失败，请复制诊断日志。");
+        }
+
+        if (HasEndpointHealth(microphoneIntent, speakerIntent, AudioEndpointBindingHealth.Disabled))
+        {
+            return CreateAudioRecoveryState(
+                AudioRecoveryIssue.EndpointDisabled,
+                SelectPrimaryAudioRecoveryAction(AudioRecoveryIssue.EndpointDisabled),
+                "音频端点已禁用",
+                $"{BuildEndpointHealthMessage(microphoneIntent, speakerIntent, AudioEndpointBindingHealth.Disabled)} 请打开 Windows 声音设置启用它，再刷新端点。");
+        }
+
+        if (HasEndpointHealth(microphoneIntent, speakerIntent, AudioEndpointBindingHealth.Unconfigured))
+        {
+            return CreateAudioRecoveryState(
+                AudioRecoveryIssue.EndpointUnbound,
+                SelectPrimaryAudioRecoveryAction(AudioRecoveryIssue.EndpointUnbound),
+                "音频端点未绑定",
+                $"{BuildEndpointHealthMessage(microphoneIntent, speakerIntent, AudioEndpointBindingHealth.Unconfigured)} 请自动绑定推荐端点，或刷新端点后手动选择。");
+        }
+
+        if (HasEndpointHealth(microphoneIntent, speakerIntent, AudioEndpointBindingHealth.Missing))
+        {
+            return CreateAudioRecoveryState(
+                AudioRecoveryIssue.EndpointMissing,
+                SelectPrimaryAudioRecoveryAction(AudioRecoveryIssue.EndpointMissing),
+                "音频端点丢失",
+                $"{BuildEndpointHealthMessage(microphoneIntent, speakerIntent, AudioEndpointBindingHealth.Missing)} 请刷新端点列表，或自动绑定推荐端点重新恢复。");
+        }
+
+        if (!IsAudioAndroidConnected(now) && overallStatus == AudioCapabilityStatus.WaitingDevice)
+        {
+            return CreateAudioRecoveryState(
+                AudioRecoveryIssue.AndroidNotConnected,
+                SelectPrimaryAudioRecoveryAction(AudioRecoveryIssue.AndroidNotConnected),
+                "Android 未连接",
+                "Host 正在等待 Android 音频控制通道。请连接 Android 设备并保持 SideDock 客户端在线。");
+        }
+
+        if (microphoneIntent && IsAndroidMicrophonePermissionMissing(microphoneStatus))
+        {
+            return CreateAudioRecoveryState(
+                AudioRecoveryIssue.AndroidMicrophonePermissionMissing,
+                SelectPrimaryAudioRecoveryAction(AudioRecoveryIssue.AndroidMicrophonePermissionMissing),
                 "需要 Android 麦克风权限",
-                "请在 Android 设备上允许 SideDock 使用麦克风。",
-                _dangerBrush,
-                _overviewErrorBackgroundBrush,
-                _overviewErrorBorderBrush,
-                _dangerBrush,
-                "\uE783",
-                StaticAudioBannerSeverity.Error);
+                "Android 端未授予麦克风权限。请在 Android 设备上允许 SideDock 使用麦克风。");
         }
 
-        if (overallStatus == AudioCapabilityStatus.Error
-            || microphoneStatus == AudioCapabilityStatus.Error
-            || speakerStatus == AudioCapabilityStatus.Error)
+        if (HasHostTelemetryStale(microphoneIntent, speakerIntent, now))
         {
-            return (
-                "音频桥接异常",
-                audioHint,
-                _dangerBrush,
-                _overviewErrorBackgroundBrush,
-                _overviewErrorBorderBrush,
-                _dangerBrush,
-                "\uE783",
-                StaticAudioBannerSeverity.Error);
+            return CreateAudioRecoveryState(
+                AudioRecoveryIssue.HostTelemetryStale,
+                SelectPrimaryAudioRecoveryAction(AudioRecoveryIssue.HostTelemetryStale),
+                "Host 音频指标中断",
+                $"Host 正在运行但 {AudioTelemetryStaleAfter.TotalSeconds:F0} 秒未收到音频指标。请应用并重启音频/Host。");
         }
 
-        if (overallStatus is AudioCapabilityStatus.Available
+        if (HasAndroidTelemetryStale(microphoneIntent, speakerIntent, now))
+        {
+            return CreateAudioRecoveryState(
+                AudioRecoveryIssue.AndroidTelemetryStale,
+                SelectPrimaryAudioRecoveryAction(AudioRecoveryIssue.AndroidTelemetryStale),
+                "Android 音频指标中断",
+                $"Android 控制通道已连接，但 {AudioTelemetryStaleAfter.TotalSeconds:F0} 秒未收到 Android 音频指标。请应用并重启音频/Host；若仍存在，请检查 Android 客户端。");
+        }
+
+        if (microphoneIntent && IsAudioMutedOrStopped(AudioDirection.Microphone, microphoneStatus))
+        {
+            return CreateAudioRecoveryState(
+                AudioRecoveryIssue.MicrophoneMutedOrStopped,
+                SelectPrimaryAudioRecoveryAction(AudioRecoveryIssue.MicrophoneMutedOrStopped),
+                "麦克风已静音或停止",
+                "Android 麦克风当前静音或已停止采集。请在 Android 设备上取消静音、允许麦克风权限并保持客户端运行。");
+        }
+
+        if (speakerIntent && IsAudioMutedOrStopped(AudioDirection.Speaker, speakerStatus))
+        {
+            return CreateAudioRecoveryState(
+                AudioRecoveryIssue.SpeakerMutedOrStopped,
+                SelectPrimaryAudioRecoveryAction(AudioRecoveryIssue.SpeakerMutedOrStopped),
+                "音响已静音或停止",
+                "Android 音响当前静音或已停止播放。请在 Android 设备上取消静音并保持客户端运行。");
+        }
+
+        if (microphoneIntent && HasNoAudioPackets(AudioDirection.Microphone, microphoneStatus, now))
+        {
+            return CreateAudioRecoveryState(
+                AudioRecoveryIssue.NoMicrophonePackets,
+                SelectPrimaryAudioRecoveryAction(AudioRecoveryIssue.NoMicrophonePackets),
+                "麦克风没有音频包",
+                "Android 麦克风处于运行状态但音频包没有增长。请应用并重启音频/Host；若仍存在，请检查 Android 客户端采集状态。");
+        }
+
+        if (speakerIntent && HasNoAudioPackets(AudioDirection.Speaker, speakerStatus, now))
+        {
+            return CreateAudioRecoveryState(
+                AudioRecoveryIssue.NoSpeakerPackets,
+                SelectPrimaryAudioRecoveryAction(AudioRecoveryIssue.NoSpeakerPackets),
+                "音响没有音频包",
+                "电脑声音发送处于运行状态但音频包没有增长。请应用并重启音频/Host，并确认 Windows 输出端点正在播放声音。");
+        }
+
+        if (microphoneIntent && HasLongSilentLevel(AudioDirection.Microphone, now))
+        {
+            return CreateAudioRecoveryState(
+                AudioRecoveryIssue.SilentMicrophoneInput,
+                SelectPrimaryAudioRecoveryAction(AudioRecoveryIssue.SilentMicrophoneInput),
+                "麦克风输入电平为 0",
+                "音频包在增长但输入电平长期为 0。请检查 Android 麦克风静音、系统权限或输入源。");
+        }
+
+        if (speakerIntent && HasLongSilentLevel(AudioDirection.Speaker, now))
+        {
+            return CreateAudioRecoveryState(
+                AudioRecoveryIssue.NoSpeakerOutputLevel,
+                SelectPrimaryAudioRecoveryAction(AudioRecoveryIssue.NoSpeakerOutputLevel),
+                "音响输出电平为 0",
+                "音频包在增长但输出电平长期为 0。请确认 Windows 输出端点正在播放声音，并检查系统音量或应用静音状态。");
+        }
+
+        var recentError = IsCurrentAudioError(overallStatus, microphoneStatus, speakerStatus)
+            ? RecentHostAudioError()
+            : null;
+        if (!string.IsNullOrWhiteSpace(recentError))
+        {
+            return CreateAudioRecoveryState(
+                AudioRecoveryIssue.RecentHostError,
+                SelectPrimaryAudioRecoveryAction(AudioRecoveryIssue.RecentHostError),
+                "最近出现 Host 音频错误",
+                $"最近 Host 报告音频错误：{recentError} 请复制诊断日志后排查。");
+        }
+
+        if (IsAudioRecoveryHealthy(overallStatus, microphoneIntent, speakerIntent, microphoneStatus, speakerStatus))
+        {
+            return CreateAudioRecoveryState(
+                AudioRecoveryIssue.Healthy,
+                SelectPrimaryAudioRecoveryAction(AudioRecoveryIssue.Healthy),
+                "音频状态正常",
+                "音频端点和运行指标看起来正常，当前无需恢复动作。");
+        }
+
+        return CreateAudioRecoveryState(
+            AudioRecoveryIssue.Unknown,
+            SelectPrimaryAudioRecoveryAction(AudioRecoveryIssue.Unknown),
+            "音频状态待确认",
+            string.IsNullOrWhiteSpace(audioHint)
+                ? "暂未识别出明确根因。请复制诊断日志后继续排查。"
+                : $"{audioHint} 暂未识别出明确根因，请复制诊断日志后继续排查。");
+    }
+
+    private AudioRecoveryAction SelectPrimaryAudioRecoveryAction(AudioRecoveryIssue issue)
+    {
+        return AudioRecoveryActions.SelectPrimaryAudioRecoveryAction(
+            issue,
+            CanAutoBindRecommendedAudioEndpoints());
+    }
+
+    private static AudioRecoveryState CreateAudioRecoveryState(
+        AudioRecoveryIssue issue,
+        AudioRecoveryAction action,
+        string title,
+        string message)
+    {
+        return new AudioRecoveryState(
+            issue,
+            action,
+            title,
+            message,
+            BuildAudioRecoveryActionDescription(action, issue));
+    }
+
+    private bool CanApplyAndRestartAudio()
+    {
+        return _hostProcess is { HasExited: false } && !_applyingAudioRuntimeChanges;
+    }
+
+    private bool CanRunPrimaryAudioRecoveryAction(AudioRecoveryAction action)
+    {
+        return action switch
+        {
+            AudioRecoveryAction.StartHost => CanStartOverviewHost() && _hostProcess is not { HasExited: false },
+            AudioRecoveryAction.InstallOrRepairVirtualAudioCable => !_virtualAudioCableInstallInProgress,
+            AudioRecoveryAction.AutoBindRecommendedEndpoints => CanAutoBindRecommendedAudioEndpoints(),
+            AudioRecoveryAction.RefreshEndpoints => !_loadingAudioEndpointChoices,
+            AudioRecoveryAction.ApplyAndRestartAudio => CanApplyAndRestartAudio(),
+            AudioRecoveryAction.OpenSoundSettings => true,
+            AudioRecoveryAction.CopyDiagnostics => true,
+            _ => false
+        };
+    }
+
+    private static string BuildAudioRecoveryActionText(AudioRecoveryAction action, AudioRecoveryIssue issue)
+    {
+        return action switch
+        {
+            AudioRecoveryAction.StartHost => "启动 Host",
+            AudioRecoveryAction.InstallOrRepairVirtualAudioCable => "安装/修复虚拟音频线",
+            AudioRecoveryAction.AutoBindRecommendedEndpoints => "自动绑定推荐端点",
+            AudioRecoveryAction.RefreshEndpoints => "刷新端点",
+            AudioRecoveryAction.ApplyAndRestartAudio => "应用并重启音频",
+            AudioRecoveryAction.OpenSoundSettings => "打开声音设置",
+            AudioRecoveryAction.CopyDiagnostics => "复制诊断日志",
+            AudioRecoveryAction.WaitForAndroidDevice => "连接 Android 设备",
+            AudioRecoveryAction.RequestAndroidMicrophonePermission => "在 Android 授权麦克风",
+            AudioRecoveryAction.NoAction when issue == AudioRecoveryIssue.AudioDisabled => "音频已关闭",
+            AudioRecoveryAction.NoAction => "状态正常",
+            _ => "暂无可用动作"
+        };
+    }
+
+    private static string BuildAudioRecoveryActionDescription(AudioRecoveryAction action, AudioRecoveryIssue issue)
+    {
+        return action switch
+        {
+            AudioRecoveryAction.StartHost => "启动 SideDock Host。",
+            AudioRecoveryAction.InstallOrRepairVirtualAudioCable => "打开已有的虚拟音频线安装/修复流程。",
+            AudioRecoveryAction.AutoBindRecommendedEndpoints => "使用当前推荐端点自动绑定音频输入输出。",
+            AudioRecoveryAction.RefreshEndpoints => "重新枚举 Windows 音频端点。",
+            AudioRecoveryAction.ApplyAndRestartAudio => "保存音频偏好并重启 Host，使当前配置重新生效。",
+            AudioRecoveryAction.OpenSoundSettings => "打开 Windows 声音设置。",
+            AudioRecoveryAction.CopyDiagnostics => "复制音频诊断日志到剪贴板。",
+            AudioRecoveryAction.WaitForAndroidDevice => "需要在 Android 设备上处理，Windows 端无法自动完成。",
+            AudioRecoveryAction.RequestAndroidMicrophonePermission => "需要在 Android 设备上允许麦克风权限，Windows 端无法自动授权。",
+            AudioRecoveryAction.NoAction when issue == AudioRecoveryIssue.AudioDisabled => "音频桥接已关闭，当前无需恢复动作。",
+            AudioRecoveryAction.NoAction => "当前无需恢复动作。",
+            _ => "当前没有可自动执行的恢复动作。"
+        };
+    }
+
+    private static string AudioRecoveryActionIconGlyph(AudioRecoveryAction action, AudioRecoveryIssue issue)
+    {
+        return action switch
+        {
+            AudioRecoveryAction.StartHost => "\uE768",
+            AudioRecoveryAction.InstallOrRepairVirtualAudioCable => "\uE90F",
+            AudioRecoveryAction.AutoBindRecommendedEndpoints => "\uE8A7",
+            AudioRecoveryAction.RefreshEndpoints => "\uE72C",
+            AudioRecoveryAction.ApplyAndRestartAudio => "\uE72C",
+            AudioRecoveryAction.OpenSoundSettings => "\uE713",
+            AudioRecoveryAction.CopyDiagnostics => "\uE8C8",
+            AudioRecoveryAction.WaitForAndroidDevice => "\uE8CD",
+            AudioRecoveryAction.RequestAndroidMicrophonePermission => "\uE72E",
+            AudioRecoveryAction.NoAction when issue == AudioRecoveryIssue.AudioDisabled => "\uE711",
+            AudioRecoveryAction.NoAction => "\uE73E",
+            _ => "\uE946"
+        };
+    }
+
+    private static StaticAudioBannerSeverity AudioRecoveryBannerSeverity(AudioRecoveryIssue issue)
+    {
+        return issue switch
+        {
+            AudioRecoveryIssue.Healthy => StaticAudioBannerSeverity.Ready,
+            AudioRecoveryIssue.AudioDisabled => StaticAudioBannerSeverity.Neutral,
+            AudioRecoveryIssue.AndroidMicrophonePermissionMissing
+                or AudioRecoveryIssue.EndpointEnumerationFailed
+                or AudioRecoveryIssue.RecentHostError => StaticAudioBannerSeverity.Error,
+            AudioRecoveryIssue.None => StaticAudioBannerSeverity.Neutral,
+            _ => StaticAudioBannerSeverity.Warning
+        };
+    }
+
+    private static string AudioRecoveryIssueIconGlyph(AudioRecoveryIssue issue)
+    {
+        return issue switch
+        {
+            AudioRecoveryIssue.Healthy => "\uE73E",
+            AudioRecoveryIssue.AudioDisabled => "\uE711",
+            AudioRecoveryIssue.AndroidMicrophonePermissionMissing
+                or AudioRecoveryIssue.EndpointEnumerationFailed
+                or AudioRecoveryIssue.RecentHostError => "\uE783",
+            AudioRecoveryIssue.PendingChanges
+                or AudioRecoveryIssue.HostTelemetryStale
+                or AudioRecoveryIssue.AndroidTelemetryStale => "\uE72C",
+            _ => "\uE7BA"
+        };
+    }
+
+    private bool IsVirtualCableMissing(bool microphoneIntent)
+    {
+        return microphoneIntent
+            && _microphoneRenderEndpointDiagnostics.AvailableEndpointCount == 0
+            && _microphoneRenderEndpointDiagnostics.Health is
+                AudioEndpointBindingHealth.Unconfigured
+                or AudioEndpointBindingHealth.Missing;
+    }
+
+    private bool HasEndpointHealth(
+        bool microphoneIntent,
+        bool speakerIntent,
+        params AudioEndpointBindingHealth[] health)
+    {
+        return (microphoneIntent && health.Contains(_microphoneRenderEndpointDiagnostics.Health))
+            || (speakerIntent && health.Contains(_speakerCaptureEndpointDiagnostics.Health));
+    }
+
+    private string BuildEndpointHealthMessage(
+        bool microphoneIntent,
+        bool speakerIntent,
+        params AudioEndpointBindingHealth[] health)
+    {
+        var parts = new List<string>(2);
+        if (microphoneIntent && health.Contains(_microphoneRenderEndpointDiagnostics.Health))
+        {
+            parts.Add(_microphoneRenderEndpointDiagnostics.Summary);
+        }
+
+        if (speakerIntent && health.Contains(_speakerCaptureEndpointDiagnostics.Health))
+        {
+            parts.Add(_speakerCaptureEndpointDiagnostics.Summary);
+        }
+
+        return parts.Count == 0 ? "音频端点需要检查。" : string.Join("；", parts);
+    }
+
+    private bool IsAudioAndroidConnected(DateTimeOffset now)
+    {
+        if (_audioAndroidControlConnected)
+        {
+            return true;
+        }
+
+        return WasAudioTelemetryReceivedRecently(_androidMicrophoneTelemetry, now)
+            || WasAudioTelemetryReceivedRecently(_androidSpeakerTelemetry, now);
+    }
+
+    private bool IsAndroidMicrophonePermissionMissing(AudioCapabilityStatus microphoneStatus)
+    {
+        return microphoneStatus == AudioCapabilityStatus.AuthorizationRequired
+            || _androidMicrophoneTelemetry?.PermissionGranted == false;
+    }
+
+    private bool HasHostTelemetryStale(bool microphoneIntent, bool speakerIntent, DateTimeOffset now)
+    {
+        return (microphoneIntent && IsDirectionHostTelemetryStale(AudioDirection.Microphone, now))
+            || (speakerIntent && IsDirectionHostTelemetryStale(AudioDirection.Speaker, now));
+    }
+
+    private bool HasAndroidTelemetryStale(bool microphoneIntent, bool speakerIntent, DateTimeOffset now)
+    {
+        if (!IsAudioAndroidConnected(now))
+        {
+            return false;
+        }
+
+        return (microphoneIntent && IsDirectionAndroidTelemetryStale(AudioDirection.Microphone, now))
+            || (speakerIntent && IsDirectionAndroidTelemetryStale(AudioDirection.Speaker, now));
+    }
+
+    private bool IsDirectionHostTelemetryStale(AudioDirection direction, DateTimeOffset now)
+    {
+        var telemetry = HostAudioTelemetry(direction);
+        if (IsAudioTelemetryStale(telemetry, now, AudioTelemetryStaleAfter))
+        {
+            return true;
+        }
+
+        return telemetry is null && IsHostProcessOlderThan(now, AudioTelemetryStaleAfter);
+    }
+
+    private bool IsDirectionAndroidTelemetryStale(AudioDirection direction, DateTimeOffset now)
+    {
+        var telemetry = AndroidAudioTelemetry(direction);
+        if (IsAudioTelemetryStale(telemetry, now, AudioTelemetryStaleAfter))
+        {
+            return true;
+        }
+
+        return telemetry is null && IsHostProcessOlderThan(now, AudioTelemetryStaleAfter);
+    }
+
+    private bool IsHostProcessOlderThan(DateTimeOffset now, TimeSpan age)
+    {
+        var process = _hostProcess;
+        if (process is not { HasExited: false })
+        {
+            return false;
+        }
+
+        try
+        {
+            return now - new DateTimeOffset(process.StartTime.ToLocalTime()) > age;
+        }
+        catch
+        {
+            return false;
+        }
+    }
+
+    private static bool WasAudioTelemetryReceivedRecently(AudioRuntimeDirectionTelemetry? telemetry, DateTimeOffset now)
+    {
+        return telemetry is not null && now - telemetry.ReceivedAt <= AudioTelemetryStaleAfter;
+    }
+
+    private bool IsAudioMutedOrStopped(AudioDirection direction, AudioCapabilityStatus status)
+    {
+        var host = HostAudioTelemetry(direction);
+        var android = AndroidAudioTelemetry(direction);
+        return status == AudioCapabilityStatus.Muted
+            || host?.Muted == true
+            || host?.Stopped == true
+            || android?.Muted == true
+            || android?.Stopped == true
+            || IsStoppedAudioState(host?.State)
+            || IsStoppedAudioState(android?.State);
+    }
+
+    private static bool IsStoppedAudioState(string? state)
+    {
+        return state is not null && state.Equals("stopped", StringComparison.OrdinalIgnoreCase);
+    }
+
+    private bool HasNoAudioPackets(AudioDirection direction, AudioCapabilityStatus status, DateTimeOffset now)
+    {
+        var host = HostAudioTelemetry(direction);
+        var android = AndroidAudioTelemetry(direction);
+        if (!IsAudioDirectionActivelyStreaming(direction, status, host, android))
+        {
+            return false;
+        }
+
+        var primary = PrimaryAudioTelemetry(direction, host, android);
+        if (primary is null || IsAudioTelemetryStale(primary, now, AudioTelemetryStaleAfter))
+        {
+            return false;
+        }
+
+        var noTrafficGrowth = primary.PacketsPerSecond <= 0.01 && primary.BytesPerSecond <= 1;
+        if (!noTrafficGrowth)
+        {
+            return false;
+        }
+
+        if (!primary.LastPacketUnixMs.HasValue)
+        {
+            return true;
+        }
+
+        var lastPacketAge = TimeSpan.FromMilliseconds(
+            Math.Max(0, now.ToUnixTimeMilliseconds() - primary.LastPacketUnixMs.Value));
+        return lastPacketAge > AudioTelemetryStaleAfter;
+    }
+
+    private static bool IsAudioDirectionActivelyStreaming(
+        AudioDirection direction,
+        AudioCapabilityStatus status,
+        AudioRuntimeDirectionTelemetry? host,
+        AudioRuntimeDirectionTelemetry? android)
+    {
+        if (direction == AudioDirection.Microphone)
+        {
+            return status == AudioCapabilityStatus.Capturing
+                || IsRuntimeState(host, "capturing")
+                || IsRuntimeState(android, "capturing");
+        }
+
+        return status == AudioCapabilityStatus.Playing
+            || IsRuntimeState(host, "playing")
+            || IsRuntimeState(android, "playing");
+    }
+
+    private static bool IsRuntimeState(AudioRuntimeDirectionTelemetry? telemetry, string state)
+    {
+        return telemetry?.State.Equals(state, StringComparison.OrdinalIgnoreCase) == true;
+    }
+
+    private bool HasLongSilentLevel(AudioDirection direction, DateTimeOffset now)
+    {
+        var host = HostAudioTelemetry(direction);
+        var android = AndroidAudioTelemetry(direction);
+        var primary = PrimaryAudioTelemetry(direction, host, android);
+        if (primary is null || IsAudioTelemetryStale(primary, now, AudioTelemetryStaleAfter))
+        {
+            return false;
+        }
+
+        var hasTraffic = primary.PacketsPerSecond > 0.01 || primary.BytesPerSecond > 1;
+        var levelIsZero = (primary.LevelPercent ?? 0) <= 0.5;
+        var enoughSamples = primary.SilentPackets >= 30 || primary.Packets >= 30;
+        return hasTraffic && levelIsZero && enoughSamples;
+    }
+
+    private string? RecentHostAudioError()
+    {
+        return FirstNonEmpty(
+            _hostMicrophoneTelemetry?.LastError,
+            _hostSpeakerTelemetry?.LastError,
+            _lastMicrophoneErrorMessage,
+            _lastSpeakerErrorMessage);
+    }
+
+    private static bool IsCurrentAudioError(
+        AudioCapabilityStatus overallStatus,
+        AudioCapabilityStatus microphoneStatus,
+        AudioCapabilityStatus speakerStatus)
+    {
+        return overallStatus == AudioCapabilityStatus.Error
+            || microphoneStatus == AudioCapabilityStatus.Error
+            || speakerStatus == AudioCapabilityStatus.Error;
+    }
+
+    private static bool IsAudioRecoveryHealthy(
+        AudioCapabilityStatus overallStatus,
+        bool microphoneIntent,
+        bool speakerIntent,
+        AudioCapabilityStatus microphoneStatus,
+        AudioCapabilityStatus speakerStatus)
+    {
+        if (overallStatus is not (AudioCapabilityStatus.Available
             or AudioCapabilityStatus.PartialAvailable
             or AudioCapabilityStatus.Capturing
-            or AudioCapabilityStatus.Playing)
+            or AudioCapabilityStatus.Playing))
         {
-            return (
-                AudioOverallText(overallStatus),
-                audioHint,
-                _successBrush,
-                _overviewReadyBackgroundBrush,
-                _overviewReadyBorderBrush,
-                _successBrush,
-                "\uE73E",
-                StaticAudioBannerSeverity.Ready);
+            return false;
         }
 
-        return (
-            AudioOverallText(overallStatus),
-            audioHint,
-            _secondaryBrush,
-            _overviewNeutralBackgroundBrush,
-            _overviewNeutralBorderBrush,
-            _secondaryBrush,
-            "\uE946",
-            StaticAudioBannerSeverity.Neutral);
+        return (!microphoneIntent || microphoneStatus is AudioCapabilityStatus.Available or AudioCapabilityStatus.Capturing)
+            && (!speakerIntent || speakerStatus is AudioCapabilityStatus.Available or AudioCapabilityStatus.Playing);
     }
 
     private static string EndpointDisplaySummary(AudioEndpointDiagnostics diagnostics)
@@ -15097,6 +15598,13 @@ public sealed partial class MainWindow : Window
         string LevelText,
         string TimingText,
         double LevelPercent);
+
+    private sealed record AudioRecoveryState(
+        AudioRecoveryIssue Issue,
+        AudioRecoveryAction PrimaryAction,
+        string Title,
+        string Message,
+        string ActionDescription);
 
     private enum AudioDirection
     {
