@@ -417,6 +417,7 @@ public sealed partial class MainWindow : Window
         InitializeOverviewConnectionControls();
         InitializeAudioEndpointCombos();
         InitializeOverviewVirtualDisplayOptions();
+        LoadCameraConfigPreferences();
         InitializeOverviewCameraOptions();
         LoadAudioPreferences();
         SetRunningState(false);
@@ -4330,6 +4331,7 @@ public sealed partial class MainWindow : Window
 
     private async void OverviewCameraResolutionCombo_SelectionChanged(object sender, SelectionChangedEventArgs e)
     {
+        MarkCameraConfigUserSelection();
         SyncOverviewCameraComboSelection(OverviewCameraResolutionCombo, OverviewCameraPageResolutionCombo);
         RefreshOverviewCameraCapabilityOptions(SelectedOverviewCameraConfig(_overviewCameraRequestedEnabled));
         await HandleOverviewCameraConfigSelectionChangedAsync();
@@ -4337,6 +4339,7 @@ public sealed partial class MainWindow : Window
 
     private async void OverviewCameraFrameRateCombo_SelectionChanged(object sender, SelectionChangedEventArgs e)
     {
+        MarkCameraConfigUserSelection();
         SyncOverviewCameraComboSelection(OverviewCameraFrameRateCombo, OverviewCameraPageFrameRateCombo);
         RefreshOverviewCameraCapabilityOptions(SelectedOverviewCameraConfig(_overviewCameraRequestedEnabled));
         await HandleOverviewCameraConfigSelectionChangedAsync();
@@ -4345,12 +4348,12 @@ public sealed partial class MainWindow : Window
     private async void OverviewCameraPageFacingCombo_SelectionChanged(object sender, SelectionChangedEventArgs e)
     {
         SyncOverviewCameraComboSelection(OverviewCameraPageFacingCombo, CameraFacingCombo);
-        RefreshOverviewCameraCapabilityOptions(SelectedOverviewCameraConfig(_overviewCameraRequestedEnabled));
-        await HandleOverviewCameraConfigSelectionChangedAsync();
+        await HandleOverviewCameraFacingSelectionChangedAsync();
     }
 
     private async void OverviewCameraPageResolutionCombo_SelectionChanged(object sender, SelectionChangedEventArgs e)
     {
+        MarkCameraConfigUserSelection();
         SyncOverviewCameraComboSelection(OverviewCameraPageResolutionCombo, OverviewCameraResolutionCombo);
         RefreshOverviewCameraCapabilityOptions(SelectedOverviewCameraConfig(_overviewCameraRequestedEnabled));
         await HandleOverviewCameraConfigSelectionChangedAsync();
@@ -4358,6 +4361,7 @@ public sealed partial class MainWindow : Window
 
     private async void OverviewCameraPageFrameRateCombo_SelectionChanged(object sender, SelectionChangedEventArgs e)
     {
+        MarkCameraConfigUserSelection();
         SyncOverviewCameraComboSelection(OverviewCameraPageFrameRateCombo, OverviewCameraFrameRateCombo);
         RefreshOverviewCameraCapabilityOptions(SelectedOverviewCameraConfig(_overviewCameraRequestedEnabled));
         await HandleOverviewCameraConfigSelectionChangedAsync();
@@ -4365,6 +4369,7 @@ public sealed partial class MainWindow : Window
 
     private async void OverviewCameraPageCodecCombo_SelectionChanged(object sender, SelectionChangedEventArgs e)
     {
+        MarkCameraConfigUserSelection();
         RefreshOverviewCameraCapabilityOptions(SelectedOverviewCameraConfig(_overviewCameraRequestedEnabled));
         await HandleOverviewCameraConfigSelectionChangedAsync();
     }
@@ -4387,6 +4392,7 @@ public sealed partial class MainWindow : Window
         }
 
         _lastAdbReverseConfigured = null;
+        MarkCameraConfigUserSelection();
         SyncOverviewCameraOptionsToDiagnostics();
         UpdateOverviewConnectionPage();
     }
@@ -4404,6 +4410,11 @@ public sealed partial class MainWindow : Window
     private async void OverviewCameraReconnectButton_Click(object sender, RoutedEventArgs e)
     {
         await RestartCameraPipelineFromUiAsync();
+    }
+
+    private async void OverviewCameraRestoreRecommendedButton_Click(object sender, RoutedEventArgs e)
+    {
+        await RestoreRecommendedCameraConfigFromUiAsync();
     }
 
     private async void OverviewCameraShowEventsButton_Click(object sender, RoutedEventArgs e)
@@ -5032,6 +5043,7 @@ public sealed partial class MainWindow : Window
             }
 
             hostPath = _hostPath ??= ResolveHostPath();
+            PrepareCameraConfigForHostStart();
             arguments = BuildArguments();
             workingDirectory = Path.GetDirectoryName(hostPath) ?? Environment.CurrentDirectory;
             var startInfo = new ProcessStartInfo
@@ -5717,7 +5729,7 @@ public sealed partial class MainWindow : Window
         var lenses = capabilities?.Lenses.Count > 0
             ? capabilities.Lenses
             : CreateDefaultCameraLenses();
-        var usingReportedCapabilities = capabilities?.Lenses.Count > 0;
+        var usingReportedCapabilities = capabilities?.HasReportedLenses == true;
 
         var selectedLens = FindCameraLens(lenses, preferredConfig.Facing) ?? lenses[0];
         var selectedSize = FindCameraSize(selectedLens, preferredConfig.Width, preferredConfig.Height)
@@ -5978,7 +5990,9 @@ public sealed partial class MainWindow : Window
         SyncOverviewCameraOptionsToDiagnostics();
     }
 
-    private async Task ApplyOverviewCameraRuntimeConfigSelectionAsync()
+    private async Task ApplyOverviewCameraRuntimeConfigSelectionAsync(
+        CameraConfigSource source = CameraConfigSource.UserManual,
+        bool saveWhenApplied = true)
     {
         if (_cameraRuntimeConfigApplyInProgress)
         {
@@ -5994,7 +6008,10 @@ public sealed partial class MainWindow : Window
 
         var requested = SelectedOverviewCameraConfig(_overviewCameraRequestedEnabled);
         _pendingCameraRuntimeConfig = _overviewCameraRequestedEnabled ? requested : null;
+        _pendingCameraRuntimeConfigSource = source;
+        _pendingCameraRuntimeConfigShouldSave = saveWhenApplied;
         _cameraRuntimeConfigApplyInProgress = true;
+        SetCameraConfigSource(source, requested.Summary, logEvent: false);
         SetCameraRuntimeApplyState(
             CameraRuntimeApplyState.Applying,
             _overviewCameraRequestedEnabled
@@ -6007,6 +6024,7 @@ public sealed partial class MainWindow : Window
             if (!result.Ok)
             {
                 _pendingCameraRuntimeConfig = null;
+                _pendingCameraRuntimeConfigShouldSave = false;
                 SetCameraRuntimeApplyState(CameraRuntimeApplyState.Failed, result.Message);
                 _cameraDiagnostics.LastError = result.Message;
                 SyncOverviewCameraSelectionsFromConfig(result.EffectiveConfig);
@@ -8298,6 +8316,7 @@ public sealed partial class MainWindow : Window
 
         _lastAdbReverseConfigured = null;
         _lastDiagnosticsAdbSnapshot = DiagnosticsAdbReverseSnapshot.NotChecked("ADB 设备选择已变更，尚未重新检查 ADB reverse。");
+        ResetCameraConfigForDeviceSelectionChanged();
         UpdateAudioState();
         UpdateOverviewAndroidDeviceState();
         UpdateOverviewConnectionPage();
@@ -10997,7 +11016,7 @@ public sealed partial class MainWindow : Window
 
         var camera = _cameraDiagnostics;
         CameraStatusText.Text = $"Server: {camera.ServerState}  Android: {camera.ClientState}  权限: {camera.PermissionText}";
-        CameraConfigText.Text = $"port {camera.Port} · {camera.Width}x{camera.Height}@{camera.Fps} · {camera.Codec} · {camera.Facing}";
+        CameraConfigText.Text = $"port {camera.Port} · {camera.Width}x{camera.Height}@{camera.Fps} · {camera.Codec} · {camera.Facing} · {FormatCameraConfigSourceLabel(_cameraConfigSource)}";
         CameraMetricsText.Text =
             $"{camera.ApproxFps:F1} fps · {camera.ApproxKbps:F0} kbps · packets {camera.Packets} · frames {camera.Frames} · decoded {camera.DecodedFrames} · "
             + $"decode {camera.DecodeLagMs:F0}ms · preview {FormatCameraPreviewState()} · last {FormatCameraAge(camera.LastFrameAt)}";
@@ -11483,7 +11502,7 @@ public sealed partial class MainWindow : Window
         OverviewCameraSwitch.IsEnabled = !_overviewCameraOperationInProgress;
         OverviewCameraStatusText.Text = statusText;
         OverviewCameraStatusText.Foreground = statusBrush;
-        OverviewCameraHintText.Text = hintText;
+        OverviewCameraHintText.Text = $"{hintText} {FormatCameraConfigSourceLabel(_cameraConfigSource)}.";
         UpdateOverviewCameraOptionsEnabled(hostRunning);
         UpdateStaticDiagnosticsPage();
     }
@@ -11588,10 +11607,12 @@ public sealed partial class MainWindow : Window
         OverviewCameraPageCodecCombo.IsEnabled = enabled && OverviewCameraPageCodecCombo.Items.Count > 1;
         OverviewCameraPagePortBox.IsEnabled = portEnabled;
         OverviewCameraSettingsButton.IsEnabled = enabled;
+        OverviewCameraRestoreRecommendedButton.IsEnabled = enabled;
         OverviewCameraPageConfigHintText.Text = hostRunning
             ? "主机运行中可动态应用镜头、分辨率和帧率；端口会在下次启动生效。当前链路仅支持 video/avc。"
             : "镜头、分辨率、帧率和端口会在下次启动摄像头管线时生效。当前链路仅支持 video/avc。";
         OverviewCameraPageConfigHintText.Text = $"{OverviewCameraPageConfigHintText.Text} {_cameraCapabilityHint}";
+        UpdateCameraConfigSourceView();
     }
 
     private bool HasCameraError()
@@ -13491,6 +13512,7 @@ public sealed partial class MainWindow : Window
                 var effectiveConfig = CurrentCameraConfigSelection(_overviewCameraRequestedEnabled);
                 RefreshOverviewCameraCapabilityOptions(effectiveConfig);
                 SyncOverviewCameraSelectionsFromConfig(effectiveConfig);
+                SaveEffectiveCameraConfigIfUsable(effectiveConfig, _cameraConfigSource);
             }
         }
 
@@ -13522,6 +13544,8 @@ public sealed partial class MainWindow : Window
             _cameraDiagnostics.LastError = $"Unable to parse Android camera capabilities: {ex.Message}";
             UpdateCameraStatusView();
         }
+
+        _ = RestoreCameraConfigAfterCapabilitiesAsync();
     }
 
     private void HandleCameraConfigChangeHostOutputLine(string line)
@@ -13580,9 +13604,29 @@ public sealed partial class MainWindow : Window
             _cameraDiagnostics.Codec,
             _cameraDiagnostics.Facing);
         var requestedConfig = _pendingCameraRuntimeConfig;
+        var source = _pendingCameraRuntimeConfigSource;
+        var shouldSave = _pendingCameraRuntimeConfigShouldSave;
         _pendingCameraRuntimeConfig = null;
+        _pendingCameraRuntimeConfigShouldSave = false;
+        if (!CameraConfigMatches(requestedConfig, effectiveConfig))
+        {
+            source = CameraConfigSource.Fallback;
+            shouldSave = true;
+        }
+
         ApplyCameraConfigSelectionToDiagnostics(effectiveConfig);
         SyncOverviewCameraSelectionsFromConfig(effectiveConfig);
+        SetCameraConfigSource(
+            source,
+            CameraConfigMatches(requestedConfig, effectiveConfig)
+                ? effectiveConfig.Summary
+                : $"Requested {requestedConfig.Summary}; Android applied {effectiveConfig.Summary}.",
+            logEvent: source is CameraConfigSource.Fallback);
+        if (shouldSave)
+        {
+            SaveEffectiveCameraConfigIfUsable(effectiveConfig, source);
+        }
+
         SetCameraRuntimeApplyState(
             CameraRuntimeApplyState.Succeeded,
             CameraConfigMatches(requestedConfig, effectiveConfig)
@@ -15398,7 +15442,12 @@ public sealed partial class MainWindow : Window
     private sealed record CameraCapabilitiesSnapshot(
         IReadOnlyList<CameraLensCapability> Lenses,
         CameraConfigSelection? Current,
-        string Error)
+        string Error,
+        bool HasReportedLenses,
+        string DeviceId,
+        string Manufacturer,
+        string Model,
+        int? AndroidSdk)
     {
         public static CameraCapabilitiesSnapshot Parse(string json)
         {
@@ -15425,6 +15474,12 @@ public sealed partial class MainWindow : Window
                 ? errorElement.GetString() ?? string.Empty
                 : string.Empty;
 
+            var hasReportedLenses = lenses.Count > 0;
+            var deviceId = ReadJsonString(root, "deviceId", string.Empty);
+            var manufacturer = ReadJsonString(root, "manufacturer", string.Empty);
+            var model = ReadJsonString(root, "model", string.Empty);
+            var androidSdk = ReadJsonInt(root, "androidSdk", 0);
+
             if (lenses.Count == 0)
             {
                 lenses.AddRange(CreateDefaultCameraLenses());
@@ -15436,7 +15491,12 @@ public sealed partial class MainWindow : Window
                     .ThenBy(lens => lens.CameraId)
                     .ToArray(),
                 current,
-                error);
+                error,
+                hasReportedLenses,
+                deviceId,
+                manufacturer,
+                model,
+                androidSdk > 0 ? androidSdk : null);
         }
 
         private static CameraLensCapability ParseLens(JsonElement element)
