@@ -367,7 +367,6 @@
                                 <RowDefinition Height="*" />
                                 <RowDefinition Height="Auto" />
                                 <RowDefinition Height="Auto" />
-                                <RowDefinition Height="Auto" />
                             </Grid.RowDefinitions>
 
                             <TextBlock Text="端点向导" FontSize="17" FontWeight="SemiBold" Foreground="{StaticResource AudioTextBrush}" />
@@ -446,41 +445,34 @@
                                 </Grid>
                             </Grid>
 
-                            <Grid Grid.Row="4" ColumnSpacing="16">
+                            <Grid Grid.Row="4" ColumnSpacing="10">
                                 <Grid.ColumnDefinitions>
                                     <ColumnDefinition Width="*" />
-                                    <ColumnDefinition Width="Auto" />
                                     <ColumnDefinition Width="52" />
                                 </Grid.ColumnDefinitions>
-                                <Button x:Name="RepairEndpointsButton" Click="InstallVirtualAudioCableButton_Click" Style="{StaticResource AudioPrimaryButtonStyle}">
+                                <Button x:Name="PrimaryRecoveryActionButton" Click="PrimaryRecoveryActionButton_Click" Style="{StaticResource AudioPrimaryButtonStyle}">
                                     <StackPanel Orientation="Horizontal" Spacing="10" HorizontalAlignment="Center">
-                                        <FontIcon Glyph="&#xE90F;" FontSize="18" Foreground="White" />
-                                        <TextBlock Text="修复端点" FontWeight="SemiBold" />
+                                        <FontIcon x:Name="PrimaryRecoveryActionIcon" Glyph="&#xE73E;" FontSize="18" Foreground="White" />
+                                        <TextBlock x:Name="PrimaryRecoveryActionText" Text="状态正常" FontWeight="SemiBold" />
                                     </StackPanel>
                                 </Button>
-                                <Button x:Name="TestEchoButton" Grid.Column="1" IsEnabled="False" ToolTipService.ToolTip="暂未实现" Style="{StaticResource AudioOutlineButtonStyle}">
-                                    <StackPanel Orientation="Horizontal" Spacing="8">
-                                        <FontIcon Glyph="&#xE720;" FontSize="16" Foreground="#30363D" />
-                                        <TextBlock Text="测试回声" />
-                                    </StackPanel>
-                                </Button>
-                                <Button x:Name="WizardOpenSoundSettingsButton" Grid.Column="2" Width="52" Height="42" Padding="0" Click="OpenSoundSettingsButton_Click" CornerRadius="5" Background="#FFFFFF" BorderBrush="{StaticResource AudioStrokeBrush}" ToolTipService.ToolTip="打开声音设置">
-                                    <FontIcon Glyph="&#xE713;" FontSize="17" Foreground="#111827" />
+                                <Button x:Name="MoreAudioActionsButton" Grid.Column="1" Width="52" Height="42" Padding="0" CornerRadius="5" Background="#FFFFFF" BorderBrush="{StaticResource AudioStrokeBrush}" ToolTipService.ToolTip="更多恢复动作">
+                                    <FontIcon Glyph="&#xE712;" FontSize="17" Foreground="#111827" />
+                                    <Button.Flyout>
+                                        <MenuFlyout>
+                                            <MenuFlyoutItem x:Name="RefreshAudioActionMenuItem" Text="刷新端点" Click="RefreshEndpointsButton_Click" />
+                                            <MenuFlyoutItem x:Name="InstallVirtualAudioCableActionMenuItem" Text="安装/修复虚拟音频线" Click="InstallVirtualAudioCableButton_Click" />
+                                            <MenuFlyoutItem x:Name="AutoBindAudioActionMenuItem" Text="自动绑定推荐端点" Click="AutoBindEndpointsButton_Click" />
+                                            <MenuFlyoutItem x:Name="ApplyAndRestartAudioActionMenuItem" Text="应用并重启音频/Host" Click="ApplyAudioChangesButton_Click" />
+                                            <MenuFlyoutItem x:Name="OpenSoundSettingsActionMenuItem" Text="打开 Windows 声音设置" Click="OpenSoundSettingsButton_Click" />
+                                            <MenuFlyoutSeparator />
+                                            <MenuFlyoutItem x:Name="CopyDiagnosticsActionMenuItem" Text="复制诊断日志" Click="CopyLogButton_Click" />
+                                        </MenuFlyout>
+                                    </Button.Flyout>
                                 </Button>
                             </Grid>
 
-                            <Button
-                                x:Name="AutoBindEndpointsButton"
-                                Grid.Row="5"
-                                Click="AutoBindEndpointsButton_Click"
-                                Style="{StaticResource AudioPrimaryButtonStyle}">
-                                <StackPanel Orientation="Horizontal" Spacing="10" HorizontalAlignment="Center">
-                                    <FontIcon Glyph="&#xE8A7;" FontSize="18" Foreground="White" />
-                                    <TextBlock Text="自动绑定推荐端点" FontWeight="SemiBold" />
-                                </StackPanel>
-                            </Button>
-
-                            <Border Grid.Row="6" Padding="12" CornerRadius="5" Background="#F8FAFC" BorderBrush="#8FB8FF" BorderThickness="1">
+                            <Border Grid.Row="5" Padding="12" CornerRadius="5" Background="#F8FAFC" BorderBrush="#8FB8FF" BorderThickness="1">
                                 <Grid ColumnSpacing="10">
                                     <Grid.ColumnDefinitions>
                                         <ColumnDefinition Width="Auto" />
