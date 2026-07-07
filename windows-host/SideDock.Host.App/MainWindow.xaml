@@ -2765,6 +2765,13 @@
                                                 FontSize="12"
                                                 Foreground="#5B6570"
                                                 TextWrapping="Wrap" />
+                                            <TextBlock
+                                                x:Name="OverviewCameraPageConfigSourceText"
+                                                Text="推荐配置"
+                                                FontSize="12"
+                                                FontWeight="SemiBold"
+                                                Foreground="#5B6570"
+                                                TextWrapping="Wrap" />
                                             <Grid ColumnSpacing="8" RowSpacing="8">
                                                 <Grid.RowDefinitions>
                                                     <RowDefinition Height="Auto" />
@@ -2799,12 +2806,23 @@
                                                 <Button
                                                     x:Name="OverviewCameraReconnectButton"
                                                     Grid.Row="1"
-                                                    Grid.ColumnSpan="2"
+                                                    Grid.Column="0"
                                                     Height="34"
                                                     Click="OverviewCameraReconnectButton_Click">
                                                     <StackPanel Orientation="Horizontal" Spacing="8" HorizontalAlignment="Center">
                                                         <FontIcon Glyph="&#xE72C;" FontSize="14" />
                                                         <TextBlock Text="重新连接" />
+                                                    </StackPanel>
+                                                </Button>
+                                                <Button
+                                                    x:Name="OverviewCameraRestoreRecommendedButton"
+                                                    Grid.Row="1"
+                                                    Grid.Column="1"
+                                                    Height="34"
+                                                    Click="OverviewCameraRestoreRecommendedButton_Click">
+                                                    <StackPanel Orientation="Horizontal" Spacing="8" HorizontalAlignment="Center">
+                                                        <FontIcon Glyph="&#xE777;" FontSize="14" />
+                                                        <TextBlock Text="恢复推荐配置" />
                                                     </StackPanel>
                                                 </Button>
                                             </Grid>

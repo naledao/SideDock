@@ -20,6 +20,7 @@ import android.os.Build;
 import android.os.Bundle;
 import android.os.Handler;
 import android.os.HandlerThread;
+import android.provider.Settings;
 import android.util.Range;
 import android.util.Size;
 import android.view.Surface;
@@ -159,6 +160,7 @@ public final class CameraCaptureClient {
             root.put("schema", 1);
             root.put("reason", reason == null ? "" : reason);
             root.put("queriedAtMs", System.currentTimeMillis());
+            root.put("deviceId", stableDeviceId());
             root.put("manufacturer", Build.MANUFACTURER == null ? "" : Build.MANUFACTURER);
             root.put("model", Build.MODEL == null ? "" : Build.MODEL);
             root.put("androidSdk", Build.VERSION.SDK_INT);
@@ -207,6 +209,15 @@ public final class CameraCaptureClient {
         }
 
         return root;
+    }
+
+    private String stableDeviceId() {
+        try {
+            String value = Settings.Secure.getString(context.getContentResolver(), Settings.Secure.ANDROID_ID);
+            return value == null ? "" : value;
+        } catch (Exception ex) {
+            return "";
+        }
     }
 
     private StopToken stopLocked() {
