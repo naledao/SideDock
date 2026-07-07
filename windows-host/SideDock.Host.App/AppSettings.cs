@@ -17,6 +17,19 @@ internal enum AppInterfaceDensity
     Compact
 }
 
+internal enum AppUpdateSourceKind
+{
+    None,
+    GitHubReleases,
+    Manifest
+}
+
+internal enum AppReleaseChannel
+{
+    Stable,
+    Preview
+}
+
 internal sealed class AppSettings
 {
     public const int DefaultControlPort = 27183;
@@ -26,6 +39,7 @@ internal sealed class AppSettings
     public const int DefaultNv12PoolSize = 4;
     public const int DefaultEncodedPacketQueue = 2;
     public const string DefaultAdbSerialValue = "HA1K3AX0";
+    public const string DefaultUpdateGitHubRepository = "naledao/SideDock";
 
     public bool StartWithWindows { get; set; } = true;
     public bool MinimizeToTrayOnClose { get; set; } = true;
@@ -50,6 +64,10 @@ internal sealed class AppSettings
     public int EncodedPacketQueue { get; set; } = DefaultEncodedPacketQueue;
     public AppThemeMode ThemeMode { get; set; } = AppThemeMode.System;
     public AppInterfaceDensity InterfaceDensity { get; set; } = AppInterfaceDensity.Standard;
+    public AppUpdateSourceKind UpdateSourceKind { get; set; } = AppUpdateSourceKind.GitHubReleases;
+    public string UpdateGitHubRepository { get; set; } = DefaultUpdateGitHubRepository;
+    public string UpdateManifestUrl { get; set; } = string.Empty;
+    public AppReleaseChannel ReleaseChannel { get; set; } = AppReleaseChannel.Stable;
 
     public static AppSettings CreateDefault()
     {
@@ -79,6 +97,10 @@ internal sealed class AppSettings
         EncodedPacketQueue = Clamp(EncodedPacketQueue, 1, 8, DefaultEncodedPacketQueue);
         ThemeMode = NormalizeThemeMode(ThemeMode);
         InterfaceDensity = NormalizeInterfaceDensity(InterfaceDensity);
+        UpdateSourceKind = NormalizeUpdateSourceKind(UpdateSourceKind);
+        UpdateGitHubRepository = NormalizeGitHubRepository(UpdateGitHubRepository);
+        UpdateManifestUrl = (UpdateManifestUrl ?? string.Empty).Trim();
+        ReleaseChannel = NormalizeReleaseChannel(ReleaseChannel);
         return this;
     }
 
@@ -113,6 +135,40 @@ internal sealed class AppSettings
             AppInterfaceDensity.Standard or AppInterfaceDensity.Compact => value,
             _ => AppInterfaceDensity.Standard
         };
+    }
+
+    private static AppUpdateSourceKind NormalizeUpdateSourceKind(AppUpdateSourceKind value)
+    {
+        return value switch
+        {
+            AppUpdateSourceKind.None or AppUpdateSourceKind.GitHubReleases or AppUpdateSourceKind.Manifest => value,
+            _ => AppUpdateSourceKind.None
+        };
+    }
+
+    private static AppReleaseChannel NormalizeReleaseChannel(AppReleaseChannel value)
+    {
+        return value switch
+        {
+            AppReleaseChannel.Stable or AppReleaseChannel.Preview => value,
+            _ => AppReleaseChannel.Stable
+        };
+    }
+
+    private static string NormalizeGitHubRepository(string? value)
+    {
+        var normalized = (value ?? string.Empty).Trim().Trim('/');
+        if (normalized.StartsWith("https://github.com/", StringComparison.OrdinalIgnoreCase))
+        {
+            normalized = normalized["https://github.com/".Length..].Trim('/');
+        }
+
+        if (normalized.EndsWith(".git", StringComparison.OrdinalIgnoreCase))
+        {
+            normalized = normalized[..^4];
+        }
+
+        return normalized;
     }
 
     private static string NormalizeVirtualDisplayResolution(string? value)

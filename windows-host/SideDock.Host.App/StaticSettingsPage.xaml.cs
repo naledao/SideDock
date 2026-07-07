@@ -1,5 +1,6 @@
 using Microsoft.UI.Xaml;
 using Microsoft.UI.Xaml.Controls;
+using Windows.System;
 
 namespace SideDock.Host.App;
 
@@ -9,12 +10,15 @@ public sealed partial class StaticSettingsPage : UserControl
     internal event EventHandler<AppearanceSettingsChangedEventArgs>? AppearanceChanged;
 
     private bool _syncingAppearanceOptions;
+    private Uri? _releaseNotesUri;
+    private Uri? _downloadUri;
 
     public StaticSettingsPage()
     {
         InitializeComponent();
         SettingsAboutVersionText.Text = $"SideDock Host  {AppVersionInfo.DisplayVersion}";
         Loaded += StaticSettingsPage_Loaded;
+        ResetUpdateStatusFromControls();
     }
 
     public void ScrollToTop()
@@ -49,6 +53,12 @@ public sealed partial class StaticSettingsPage : UserControl
         IncludePortInfoSwitch.IsOn = settings.IncludePortInfoInDiagnostics;
         Nv12ThreadsBox.Value = settings.Nv12PoolSize;
         EncoderQueueBox.Value = settings.EncodedPacketQueue;
+        SelectUpdateSourceKind(settings.UpdateSourceKind);
+        UpdateGitHubRepositoryBox.Text = settings.UpdateGitHubRepository;
+        UpdateManifestUrlBox.Text = settings.UpdateManifestUrl;
+        SelectReleaseChannel(settings.ReleaseChannel);
+        UpdateSourceControls();
+        ResetUpdateStatusFromControls();
     }
 
     internal void ApplyAppearance(AppAppearancePalette palette, AppInterfaceDensity density)
@@ -98,7 +108,11 @@ public sealed partial class StaticSettingsPage : UserControl
             Nv12PoolSize = nv12PoolSize,
             EncodedPacketQueue = encodedPacketQueue,
             ThemeMode = SelectedThemeMode(),
-            InterfaceDensity = SelectedInterfaceDensity()
+            InterfaceDensity = SelectedInterfaceDensity(),
+            UpdateSourceKind = SelectedUpdateSourceKind(),
+            UpdateGitHubRepository = UpdateGitHubRepositoryBox.Text.Trim(),
+            UpdateManifestUrl = UpdateManifestUrlBox.Text.Trim(),
+            ReleaseChannel = SelectedReleaseChannel()
         };
         return true;
     }
@@ -176,10 +190,200 @@ public sealed partial class StaticSettingsPage : UserControl
         }
     }
 
-    private void CheckUpdateButton_Click(object sender, RoutedEventArgs e)
+    private async void CheckUpdateButton_Click(object sender, RoutedEventArgs e)
     {
-        UpdateStatusText.Text = "未配置更新源";
-        ShowBanner("未配置更新源", "当前没有配置 GitHub Releases、更新 manifest 或其它真实发布源，因此不会执行假的更新检查。");
+        CheckUpdateButton.IsEnabled = false;
+        SetUpdateChecking();
+
+        try
+        {
+            var settings = BuildUpdateSettingsFromControls();
+            var result = await AppUpdateService.CheckAsync(settings, AppVersionInfo.CurrentVersion);
+            ApplyUpdateResult(result);
+            ShowBanner(result.Title, result.Detail);
+        }
+        finally
+        {
+            CheckUpdateButton.IsEnabled = true;
+        }
+    }
+
+    private async void OpenReleaseNotesButton_Click(object sender, RoutedEventArgs e)
+    {
+        await OpenUpdateUriAsync(_releaseNotesUri, "发布说明");
+    }
+
+    private async void OpenDownloadPageButton_Click(object sender, RoutedEventArgs e)
+    {
+        await OpenUpdateUriAsync(_downloadUri, "下载页面");
+    }
+
+    private void UpdateSourceCombo_SelectionChanged(object sender, SelectionChangedEventArgs e)
+    {
+        UpdateSourceControls();
+        ResetUpdateStatusFromControls();
+    }
+
+    private void ReleaseChannelCombo_SelectionChanged(object sender, SelectionChangedEventArgs e)
+    {
+        ResetUpdateStatusFromControls();
+    }
+
+    private void UpdateSourceTextBox_TextChanged(object sender, TextChangedEventArgs e)
+    {
+        ResetUpdateStatusFromControls();
+    }
+
+    private AppSettings BuildUpdateSettingsFromControls()
+    {
+        return new AppSettings
+        {
+            UpdateSourceKind = SelectedUpdateSourceKind(),
+            UpdateGitHubRepository = UpdateGitHubRepositoryBox.Text.Trim(),
+            UpdateManifestUrl = UpdateManifestUrlBox.Text.Trim(),
+            ReleaseChannel = SelectedReleaseChannel()
+        }.Normalize();
+    }
+
+    private void SetUpdateChecking()
+    {
+        UpdateStatusText.Text = "检查中";
+        UpdateDetailText.Text = "正在连接发布源...";
+        UpdateReleaseLinkButtons(null, null);
+    }
+
+    private void ApplyUpdateResult(AppUpdateCheckResult result)
+    {
+        UpdateStatusText.Text = result.Status switch
+        {
+            AppUpdateCheckStatus.NotConfigured => "未配置更新源",
+            AppUpdateCheckStatus.Checking => "检查中",
+            AppUpdateCheckStatus.UpToDate => "已是最新版本",
+            AppUpdateCheckStatus.UpdateAvailable => $"发现新版本 {FormatVersion(result.LatestVersion)}",
+            _ => "检查失败"
+        };
+        UpdateDetailText.Text = BuildUpdateDetail(result);
+
+        if (result.Status == AppUpdateCheckStatus.UpdateAvailable)
+        {
+            UpdateReleaseLinkButtons(result.ReleaseNotesUri, result.DownloadUri);
+            return;
+        }
+
+        UpdateReleaseLinkButtons(null, null);
+    }
+
+    private void ResetUpdateStatusFromControls()
+    {
+        if (UpdateStatusText is null || UpdateDetailText is null)
+        {
+            return;
+        }
+
+        UpdateReleaseLinkButtons(null, null);
+        var sourceKind = SelectedUpdateSourceKind();
+        switch (sourceKind)
+        {
+            case AppUpdateSourceKind.GitHubReleases:
+                var repository = UpdateGitHubRepositoryBox?.Text.Trim() ?? string.Empty;
+                if (string.IsNullOrWhiteSpace(repository))
+                {
+                    UpdateStatusText.Text = "未配置更新源";
+                    UpdateDetailText.Text = "请输入 GitHub 仓库后再检查更新。";
+                    return;
+                }
+
+                UpdateStatusText.Text = "尚未检查更新";
+                UpdateDetailText.Text = $"发布源：GitHub Releases · {repository} · {FormatReleaseChannel(SelectedReleaseChannel())}";
+                return;
+
+            case AppUpdateSourceKind.Manifest:
+                var manifestUrl = UpdateManifestUrlBox?.Text.Trim() ?? string.Empty;
+                if (string.IsNullOrWhiteSpace(manifestUrl))
+                {
+                    UpdateStatusText.Text = "未配置更新源";
+                    UpdateDetailText.Text = "请输入更新 manifest URL 后再检查更新。";
+                    return;
+                }
+
+                UpdateStatusText.Text = "尚未检查更新";
+                UpdateDetailText.Text = $"发布源：Manifest · {manifestUrl}";
+                return;
+
+            default:
+                UpdateStatusText.Text = "未配置更新源";
+                UpdateDetailText.Text = "当前没有配置 GitHub Releases、更新 manifest 或其它真实发布源。";
+                return;
+        }
+    }
+
+    private void UpdateSourceControls()
+    {
+        if (UpdateGitHubRepositoryBox is null
+            || UpdateManifestUrlBox is null
+            || ReleaseChannelCombo is null)
+        {
+            return;
+        }
+
+        var sourceKind = SelectedUpdateSourceKind();
+        UpdateGitHubRepositoryBox.IsEnabled = sourceKind == AppUpdateSourceKind.GitHubReleases;
+        UpdateManifestUrlBox.IsEnabled = sourceKind == AppUpdateSourceKind.Manifest;
+        ReleaseChannelCombo.IsEnabled = sourceKind == AppUpdateSourceKind.GitHubReleases;
+    }
+
+    private void UpdateReleaseLinkButtons(Uri? releaseNotesUri, Uri? downloadUri)
+    {
+        _releaseNotesUri = releaseNotesUri;
+        _downloadUri = downloadUri is not null && !Equals(downloadUri, releaseNotesUri)
+            ? downloadUri
+            : null;
+
+        if (OpenReleaseNotesButton is null || OpenDownloadPageButton is null)
+        {
+            return;
+        }
+
+        OpenReleaseNotesButton.Visibility = _releaseNotesUri is null ? Visibility.Collapsed : Visibility.Visible;
+        OpenDownloadPageButton.Visibility = _downloadUri is null ? Visibility.Collapsed : Visibility.Visible;
+    }
+
+    private async Task OpenUpdateUriAsync(Uri? uri, string label)
+    {
+        if (uri is null)
+        {
+            ShowBanner("无法打开链接", $"{label}地址不可用。");
+            return;
+        }
+
+        try
+        {
+            var launched = await Launcher.LaunchUriAsync(uri);
+            if (!launched)
+            {
+                ShowBanner("无法打开链接", $"系统没有接受 {label} 地址：{uri}");
+            }
+        }
+        catch (Exception ex)
+        {
+            ShowBanner("无法打开链接", $"{label}打开失败：{ex.Message}");
+        }
+    }
+
+    private static string BuildUpdateDetail(AppUpdateCheckResult result)
+    {
+        var detail = result.Detail;
+        if (result.PublishedAt is { } publishedAt)
+        {
+            detail += $" 发布时间：{publishedAt.LocalDateTime:yyyy-MM-dd HH:mm}。";
+        }
+
+        return detail;
+    }
+
+    private static string FormatVersion(string? version)
+    {
+        return string.IsNullOrWhiteSpace(version) ? string.Empty : version.Trim();
     }
 
     private void AppearanceOption_Checked(object sender, RoutedEventArgs e)
@@ -291,6 +495,56 @@ public sealed partial class StaticSettingsPage : UserControl
         return CompactDensityRadio.IsChecked == true
             ? AppInterfaceDensity.Compact
             : AppInterfaceDensity.Standard;
+    }
+
+    private void SelectUpdateSourceKind(AppUpdateSourceKind sourceKind)
+    {
+        SelectComboBoxItemByTag(UpdateSourceCombo, sourceKind.ToString());
+    }
+
+    private AppUpdateSourceKind SelectedUpdateSourceKind()
+    {
+        return Enum.TryParse<AppUpdateSourceKind>(SelectedComboBoxTag(UpdateSourceCombo), out var sourceKind)
+            ? sourceKind
+            : AppUpdateSourceKind.None;
+    }
+
+    private void SelectReleaseChannel(AppReleaseChannel channel)
+    {
+        SelectComboBoxItemByTag(ReleaseChannelCombo, channel.ToString());
+    }
+
+    private AppReleaseChannel SelectedReleaseChannel()
+    {
+        return Enum.TryParse<AppReleaseChannel>(SelectedComboBoxTag(ReleaseChannelCombo), out var channel)
+            ? channel
+            : AppReleaseChannel.Stable;
+    }
+
+    private static void SelectComboBoxItemByTag(ComboBox comboBox, string tag)
+    {
+        foreach (var item in comboBox.Items.OfType<ComboBoxItem>())
+        {
+            if (string.Equals(item.Tag?.ToString(), tag, StringComparison.OrdinalIgnoreCase))
+            {
+                comboBox.SelectedItem = item;
+                return;
+            }
+        }
+
+        comboBox.SelectedIndex = Math.Max(0, comboBox.Items.Count - 1);
+    }
+
+    private static string SelectedComboBoxTag(ComboBox comboBox)
+    {
+        return comboBox.SelectedItem is ComboBoxItem item
+            ? item.Tag?.ToString() ?? string.Empty
+            : string.Empty;
+    }
+
+    private static string FormatReleaseChannel(AppReleaseChannel channel)
+    {
+        return channel == AppReleaseChannel.Preview ? "预览版" : "稳定版";
     }
 
     private static bool TryReadInt(
