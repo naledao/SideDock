@@ -66,6 +66,7 @@ public sealed partial class StaticDiagnosticsPage : UserControl
     public StaticDiagnosticsPage()
     {
         InitializeComponent();
+        DiagnosticsAutoScrollSwitch.IsOn = true;
         UpdateLogFilterButtons();
         UpdateTrendRangeButtons();
         RenderLogRows();

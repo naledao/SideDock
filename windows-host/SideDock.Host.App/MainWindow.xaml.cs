@@ -140,6 +140,10 @@ public sealed partial class MainWindow : Window
     private readonly Brush _overviewPreviewErrorBadgeBrush = new SolidColorBrush(ColorHelper.FromArgb(221, 196, 43, 28));
     private readonly AppLaunchOptions _launchOptions;
     private readonly IntPtr _windowHandle;
+    private StaticDisplayPage OverviewDisplayPage = null!;
+    private StaticSettingsPage OverviewSettingsPage = null!;
+    private StaticAudioPage OverviewAudioPage = null!;
+    private StaticDiagnosticsPage OverviewDiagnosticsPage = null!;
 
     private AppSettings _appSettings = AppSettings.CreateDefault();
     private Process? _hostProcess;
@@ -361,6 +365,7 @@ public sealed partial class MainWindow : Window
     {
         _launchOptions = launchOptions ?? new AppLaunchOptions(StartMinimized: false, StartInTray: false);
         InitializeComponent();
+        InitializeStaticOverviewPages();
         OverviewSidebarVersionText.Text = AppVersionInfo.DisplayVersion;
         _appSettings = AppSettingsStore.Load();
         var settingsLoadError = AppSettingsStore.LastLoadError;
@@ -504,6 +509,19 @@ public sealed partial class MainWindow : Window
                 presenter.Minimize();
             }
         });
+    }
+
+    private void InitializeStaticOverviewPages()
+    {
+        OverviewDisplayPage = new StaticDisplayPage { Visibility = Visibility.Collapsed };
+        OverviewSettingsPage = new StaticSettingsPage { Visibility = Visibility.Collapsed };
+        OverviewAudioPage = new StaticAudioPage { Visibility = Visibility.Collapsed };
+        OverviewDiagnosticsPage = new StaticDiagnosticsPage { Visibility = Visibility.Collapsed };
+
+        OverviewStaticPagesHost.Children.Add(OverviewDisplayPage);
+        OverviewStaticPagesHost.Children.Add(OverviewSettingsPage);
+        OverviewStaticPagesHost.Children.Add(OverviewAudioPage);
+        OverviewDiagnosticsPageHost.Children.Add(OverviewDiagnosticsPage);
     }
 
     private void WireStaticDisplayPage()
@@ -2256,10 +2274,10 @@ public sealed partial class MainWindow : Window
         }
     }
 
-    private static bool TryReadPort(NumberBox numberBox, out int port)
+    private static bool TryReadPort(NumberBox? numberBox, out int port)
     {
         port = 0;
-        if (double.IsNaN(numberBox.Value))
+        if (numberBox is null || double.IsNaN(numberBox.Value))
         {
             return false;
         }
@@ -8618,9 +8636,9 @@ public sealed partial class MainWindow : Window
         return string.Empty;
     }
 
-    private static string Selected(ComboBox comboBox)
+    private static string Selected(ComboBox? comboBox)
     {
-        if (comboBox.SelectedItem is not ComboBoxItem item)
+        if (comboBox?.SelectedItem is not ComboBoxItem item)
         {
             return string.Empty;
         }

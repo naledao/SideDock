@@ -55,6 +55,16 @@ public sealed partial class StaticDisplayPage : UserControl
     public StaticDisplayPage()
     {
         InitializeComponent();
+        _syncingSettings = true;
+        try
+        {
+            AutoManageDisplaySwitch.IsOn = _autoManageEnabled;
+        }
+        finally
+        {
+            _syncingSettings = false;
+        }
+
         StaticDisplaySidebarVersionText.Text = AppVersionInfo.DisplayVersion;
         _secondaryOnlyRollbackTimer.Interval = TimeSpan.FromSeconds(1);
         _secondaryOnlyRollbackTimer.Tick += SecondaryOnlyRollbackTimer_Tick;

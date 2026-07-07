@@ -254,7 +254,6 @@
                                     <TextBlock Text="自动滚动" FontSize="13" Foreground="{StaticResource DiagBodyBrush}" VerticalAlignment="Center" />
                                     <ToggleSwitch
                                         x:Name="DiagnosticsAutoScrollSwitch"
-                                        IsOn="True"
                                         MinWidth="56"
                                         OnContent=""
                                         OffContent=""

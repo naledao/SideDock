@@ -693,7 +693,6 @@
                                                     x:Name="AutoManageDisplaySwitch"
                                                     Grid.Column="1"
                                                     MinWidth="54"
-                                                    IsOn="True"
                                                     OnContent=""
                                                     OffContent=""
                                                     Toggled="AutoManageDisplaySwitch_Toggled" />
