@@ -131,6 +131,7 @@ public sealed partial class MainWindow : Window
     private readonly Brush _overviewPreviewErrorBadgeBrush = new SolidColorBrush(ColorHelper.FromArgb(221, 196, 43, 28));
     private readonly IntPtr _windowHandle;
 
+    private AppSettings _appSettings = AppSettings.CreateDefault();
     private Process? _hostProcess;
     private Process? _deviceToolProcess;
     private SubclassProc? _subclassProc;
@@ -302,9 +303,11 @@ public sealed partial class MainWindow : Window
     public MainWindow()
     {
         InitializeComponent();
-        _uiReady = true;
+        _appSettings = AppSettingsStore.Load();
         WireStaticDisplayPage();
         WireStaticDiagnosticsPage();
+        WireStaticSettingsPage();
+        ApplyAppSettingsToUi(_appSettings);
         StaticOverviewShell.Visibility = StaticOverviewUi ? Visibility.Visible : Visibility.Collapsed;
         LegacyShell.Visibility = StaticOverviewUi ? Visibility.Collapsed : Visibility.Visible;
         if (StaticOverviewUi)
@@ -399,6 +402,7 @@ public sealed partial class MainWindow : Window
         _runtimeDiagnosticsTimer.Start();
         UpdateOverviewRuntimeDiagnostics();
 
+        _uiReady = true;
         _ = RefreshAdbDevicesAsync(showErrors: false);
         _ = RefreshAudioEndpointsAsync(showHint: false);
         _ = RefreshVirtualCameraStatusAsync();
@@ -424,6 +428,78 @@ public sealed partial class MainWindow : Window
         OverviewDiagnosticsPage.ExportLogsRequested += StaticDiagnosticsPage_ExportLogsRequested;
         OverviewDiagnosticsPage.RefreshRequested += StaticDiagnosticsPage_RefreshRequested;
         OverviewDiagnosticsPage.RecheckRequested += StaticDiagnosticsPage_RecheckRequested;
+    }
+
+    private void WireStaticSettingsPage()
+    {
+        OverviewSettingsPage.BrowseAdbPathRequested += StaticSettingsPage_BrowseAdbPathRequested;
+    }
+
+    private void ApplyAppSettingsToUi(AppSettings settings)
+    {
+        _appSettings = settings.Normalize();
+        OverviewSettingsPage.ApplySettings(_appSettings);
+
+        _syncingOverviewConnectionControls = true;
+        try
+        {
+            ControlPortBox.Value = _appSettings.ControlPort;
+            VideoPortBox.Value = _appSettings.VideoPort;
+            AdbPathBox.Text = _appSettings.AdbPath;
+            ManageDisplaySwitch.IsOn = _appSettings.StartVirtualDisplayWithHost;
+
+            if (StaticOverviewUi)
+            {
+                OverviewControlPortBox.Value = _appSettings.ControlPort;
+                OverviewVideoPortBox.Value = _appSettings.VideoPort;
+                OverviewAudioPortBox.Value = _appSettings.AudioPort;
+                OverviewCameraPortBox.Value = _appSettings.CameraPort;
+                OverviewCameraPagePortBox.Value = _appSettings.CameraPort;
+                OverviewAdbPathBox.Text = _appSettings.AdbPath;
+            }
+        }
+        finally
+        {
+            _syncingOverviewConnectionControls = false;
+        }
+
+        _lastAdbReverseConfigured = null;
+        if (_uiReady)
+        {
+            UpdateOverviewConnectionPage();
+            RefreshVirtualDisplayState();
+        }
+    }
+
+    private void SaveAndApplyAppSettings(AppSettings settings)
+    {
+        AppSettingsStore.Save(settings);
+        ApplyAppSettingsToUi(settings);
+    }
+
+    private async void StaticSettingsPage_BrowseAdbPathRequested(object? sender, EventArgs e)
+    {
+        try
+        {
+            var picker = new FileOpenPicker
+            {
+                SuggestedStartLocation = PickerLocationId.ComputerFolder
+            };
+            picker.FileTypeFilter.Add(".exe");
+            InitializeWithWindow.Initialize(picker, _windowHandle);
+
+            var file = await picker.PickSingleFileAsync();
+            if (file is null)
+            {
+                return;
+            }
+
+            OverviewSettingsPage.SetAdbPath(file.Path);
+        }
+        catch (Exception ex)
+        {
+            OverviewSettingsPage.ShowSaveFailed($"无法打开文件选择器：{ex.Message}");
+        }
     }
 
     private void UpdateOverviewMainContentMinHeight()
@@ -677,12 +753,12 @@ public sealed partial class MainWindow : Window
         _syncingOverviewConnectionControls = true;
         try
         {
-            OverviewControlPortBox.Value = double.IsNaN(ControlPortBox.Value) ? DefaultControlPort : ControlPortBox.Value;
-            OverviewVideoPortBox.Value = double.IsNaN(VideoPortBox.Value) ? DefaultVideoPort : VideoPortBox.Value;
-            OverviewAudioPortBox.Value = DefaultAudioPort;
-            OverviewCameraPortBox.Value = DefaultCameraPort;
+            OverviewControlPortBox.Value = double.IsNaN(ControlPortBox.Value) ? _appSettings.ControlPort : ControlPortBox.Value;
+            OverviewVideoPortBox.Value = double.IsNaN(VideoPortBox.Value) ? _appSettings.VideoPort : VideoPortBox.Value;
+            OverviewAudioPortBox.Value = _appSettings.AudioPort;
+            OverviewCameraPortBox.Value = _appSettings.CameraPort;
             OverviewCameraPagePortBox.Value = OverviewCameraPortBox.Value;
-            OverviewAdbPathBox.Text = AdbPathBox.Text;
+            OverviewAdbPathBox.Text = _appSettings.AdbPath;
             OverviewInputInjectionSwitch.IsOn = InputInjectionSwitch.IsOn;
             OverviewInputInjectionStatusText.Text = OverviewInputInjectionSwitch.IsOn ? "已启用" : "未启用";
         }
@@ -2536,6 +2612,11 @@ public sealed partial class MainWindow : Window
             return;
         }
 
+        if (!_appSettings.MinimizeToTrayOnClose)
+        {
+            return;
+        }
+
         if (!_trayIconAdded)
         {
             return;
@@ -2902,21 +2983,41 @@ public sealed partial class MainWindow : Window
 
     private void OverviewSettingsSaveButton_Click(object sender, RoutedEventArgs e)
     {
-        OverviewSettingsPage.SaveChanges();
+        if (!OverviewSettingsPage.TryBuildSettings(out var settings))
+        {
+            return;
+        }
+
+        try
+        {
+            SaveAndApplyAppSettings(settings);
+            OverviewSettingsPage.ShowSettingsSaved();
+        }
+        catch (Exception ex)
+        {
+            OverviewSettingsPage.ShowSaveFailed($"保存设置失败：{ex.Message}");
+        }
     }
 
     private void OverviewSettingsRestoreButton_Click(object sender, RoutedEventArgs e)
     {
-        OverviewSettingsPage.RestoreDefaults();
+        var settings = OverviewSettingsPage.RestoreDefaults();
+        try
+        {
+            SaveAndApplyAppSettings(settings);
+            OverviewSettingsPage.ShowDefaultsRestored();
+        }
+        catch (Exception ex)
+        {
+            OverviewSettingsPage.ShowSaveFailed($"恢复默认设置失败：{ex.Message}");
+        }
     }
 
     private void OverviewSettingsOpenDataDirectoryButton_Click(object sender, RoutedEventArgs e)
     {
         try
         {
-            var directory = Path.Combine(
-                Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
-                "SideDock");
+            var directory = AppSettingsStore.SettingsDirectory;
             Directory.CreateDirectory(directory);
             Process.Start(new ProcessStartInfo
             {
@@ -3775,38 +3876,54 @@ public sealed partial class MainWindow : Window
             CameraFacingCombo.IsEnabled = false;
             OverallStatusText.Text = "启动中";
             OverallStatusText.Foreground = _secondaryBrush;
-            SetAdbStatus("正在检查 ADB reverse...", _secondaryBrush);
-            SetOverviewHostState(OverviewHostServiceState.Starting, "正在检查 ADB reverse...");
+            var configureAdbReverse = _appSettings.ConfigureAdbReverseOnHostStart;
+            var adbStartupStatus = configureAdbReverse
+                ? "正在检查 ADB reverse..."
+                : "ADB reverse 自动配置已关闭。";
+            SetAdbStatus(adbStartupStatus, _secondaryBrush);
+            SetOverviewHostState(OverviewHostServiceState.Starting, adbStartupStatus);
             UpdateOverviewConnectionPage();
 
             adbPath = ResolveAdbPath(AdbPathBox.Text.Trim());
-            var explicitAdbSerial = SelectedAdbSerial();
-            await RefreshAdbDevicesAsync(showErrors: false, resolvedAdbPath: adbPath);
-            var selectedAdbSerial = explicitAdbSerial ?? SelectedAdbSerial();
-            var reversePorts = GetConfiguredReversePorts();
-            var adbPreflight = await ConfigureAdbReverseBeforeHostStartAsync(adbPath, reversePorts, selectedAdbSerial);
-            if (!adbPreflight.Success)
+            if (configureAdbReverse)
             {
-                _lastAdbReverseConfigured = false;
+                var explicitAdbSerial = SelectedAdbSerial();
+                await RefreshAdbDevicesAsync(showErrors: false, resolvedAdbPath: adbPath);
+                var selectedAdbSerial = explicitAdbSerial ?? SelectedAdbSerial();
+                var reversePorts = GetConfiguredReversePorts();
+                var adbPreflight = await ConfigureAdbReverseBeforeHostStartAsync(adbPath, reversePorts, selectedAdbSerial);
+                if (!adbPreflight.Success)
+                {
+                    _lastAdbReverseConfigured = false;
+                    _lastAdbReverseSerial = adbPreflight.Serial;
+                    _lastAdbReverseDetail = adbPreflight.Summary;
+                    SetRunningState(false);
+                    SetAdbStatus(adbPreflight.Summary, _dangerBrush);
+                    SetOverviewHostState(OverviewHostServiceState.Error, adbPreflight.Summary);
+                    UpdateOverviewConnectionPage();
+                    ShowErrorWithDetails(
+                        "无法配置 ADB reverse",
+                        adbPreflight.Summary,
+                        adbPreflight.Details);
+                    return;
+                }
+
+                adbSerial = adbPreflight.Serial;
+                _lastAdbReverseConfigured = true;
                 _lastAdbReverseSerial = adbPreflight.Serial;
                 _lastAdbReverseDetail = adbPreflight.Summary;
-                SetRunningState(false);
-                SetAdbStatus(adbPreflight.Summary, _dangerBrush);
-                SetOverviewHostState(OverviewHostServiceState.Error, adbPreflight.Summary);
+                SetAdbStatus(adbPreflight.Summary, _successBrush);
                 UpdateOverviewConnectionPage();
-                ShowErrorWithDetails(
-                    "无法配置 ADB reverse",
-                    adbPreflight.Summary,
-                    adbPreflight.Details);
-                return;
             }
-
-            adbSerial = adbPreflight.Serial;
-            _lastAdbReverseConfigured = true;
-            _lastAdbReverseSerial = adbPreflight.Serial;
-            _lastAdbReverseDetail = adbPreflight.Summary;
-            SetAdbStatus(adbPreflight.Summary, _successBrush);
-            UpdateOverviewConnectionPage();
+            else
+            {
+                adbSerial = SelectedOrKnownDefaultAdbSerial();
+                _lastAdbReverseConfigured = false;
+                _lastAdbReverseSerial = adbSerial;
+                _lastAdbReverseDetail = "ADB reverse 自动配置已关闭。";
+                SetAdbStatus(_lastAdbReverseDetail, _secondaryBrush);
+                UpdateOverviewConnectionPage();
+            }
 
             if (ShouldManageVirtualDisplayWithHost())
             {
@@ -3913,6 +4030,8 @@ public sealed partial class MainWindow : Window
             "--camera-height", cameraHeight.ToString(CultureInfo.InvariantCulture),
             "--camera-fps", cameraFps.ToString(CultureInfo.InvariantCulture),
             "--camera-facing", Selected(CameraFacingCombo),
+            "--nv12-pool-size", _appSettings.Nv12PoolSize.ToString(CultureInfo.InvariantCulture),
+            "--encoded-packet-queue", _appSettings.EncodedPacketQueue.ToString(CultureInfo.InvariantCulture),
             "--audio-backend", "wasapi-virtual-cable"
         };
 
@@ -3977,19 +4096,19 @@ public sealed partial class MainWindow : Window
 
     private int ConfiguredAudioPortNumber()
     {
-        return StaticOverviewUi ? PortNumber(OverviewAudioPortBox, "audio") : DefaultAudioPort;
+        return StaticOverviewUi ? PortNumber(OverviewAudioPortBox, "audio") : _appSettings.AudioPort;
     }
 
     private int ConfiguredCameraPortNumber()
     {
-        return StaticOverviewUi ? PortNumber(OverviewCameraPortBox, "camera") : DefaultCameraPort;
+        return StaticOverviewUi ? PortNumber(OverviewCameraPortBox, "camera") : _appSettings.CameraPort;
     }
 
     private void InitializeAdbDeviceCombo()
     {
         AdbDeviceCombo.DisplayMemberPath = nameof(AdbDeviceChoice.DisplayName);
         OverviewConnectionAdbDeviceCombo.DisplayMemberPath = nameof(AdbDeviceChoice.DisplayName);
-        SetAdbDeviceChoices(Array.Empty<AdbDeviceRow>(), selectedSerial: null);
+        SetAdbDeviceChoices(Array.Empty<AdbDeviceRow>(), _appSettings.DefaultAdbSerial);
     }
 
     private void InitializeAudioEndpointCombos()
@@ -5746,7 +5865,7 @@ public sealed partial class MainWindow : Window
 
     private async Task RefreshAdbDevicesAsync(bool showErrors, string? resolvedAdbPath = null)
     {
-        var selectedSerial = SelectedAdbSerial();
+        var selectedSerial = SelectedAdbSerial() ?? _appSettings.DefaultAdbSerial;
         _adbRefreshInProgress = true;
         UpdateOverviewActionButtons();
         UpdateOverviewConnectionPage();
@@ -5965,6 +6084,20 @@ public sealed partial class MainWindow : Window
         return SelectedAdbDeviceChoice() is { Serial.Length: > 0 } choice
             ? choice.Serial
             : null;
+    }
+
+    private string? SelectedOrKnownDefaultAdbSerial()
+    {
+        if (SelectedAdbSerial() is { Length: > 0 } selectedSerial)
+        {
+            return selectedSerial;
+        }
+
+        var defaultSerial = _appSettings.DefaultAdbSerial;
+        return !string.IsNullOrWhiteSpace(defaultSerial)
+            && _lastAdbDeviceRows.Any(row => row.Serial.Equals(defaultSerial, StringComparison.OrdinalIgnoreCase))
+                ? defaultSerial
+                : null;
     }
 
     private AdbDeviceChoice? SelectedAdbDeviceChoice()
@@ -7196,7 +7329,7 @@ public sealed partial class MainWindow : Window
 
     private bool ShouldManageVirtualDisplayWithHost()
     {
-        return ManageDisplaySwitch.IsOn && RequiresVirtualDisplay();
+        return _appSettings.StartVirtualDisplayWithHost && ManageDisplaySwitch.IsOn && RequiresVirtualDisplay();
     }
 
     private bool RequiresVirtualDisplay()
