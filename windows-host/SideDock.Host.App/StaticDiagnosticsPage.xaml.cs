@@ -1,18 +1,31 @@
+using System.Globalization;
 using Microsoft.UI;
+using Microsoft.UI.Text;
 using Microsoft.UI.Xaml;
 using Microsoft.UI.Xaml.Controls;
 using Microsoft.UI.Xaml.Media;
 using Microsoft.UI.Xaml.Shapes;
+using Windows.Foundation;
 
 namespace SideDock.Host.App;
 
 public sealed partial class StaticDiagnosticsPage : UserControl
 {
+    private const int MaxDiagnosticsLogEntries = 1000;
+    private static readonly TimeSpan MaxPerformanceTrendRange = TimeSpan.FromMinutes(15);
+
     private readonly Brush _successBrush = new SolidColorBrush(ColorHelper.FromArgb(255, 22, 138, 26));
     private readonly Brush _warningBrush = new SolidColorBrush(ColorHelper.FromArgb(255, 215, 120, 0));
     private readonly Brush _errorBrush = new SolidColorBrush(ColorHelper.FromArgb(255, 196, 43, 28));
     private readonly Brush _mutedBrush = new SolidColorBrush(ColorHelper.FromArgb(255, 102, 113, 125));
     private readonly Brush _bodyBrush = new SolidColorBrush(ColorHelper.FromArgb(255, 48, 54, 61));
+    private readonly Brush _softStrokeBrush = new SolidColorBrush(ColorHelper.FromArgb(255, 231, 235, 239));
+    private readonly Brush _cardBrush = new SolidColorBrush(Colors.White);
+    private readonly Brush _primaryBrush = new SolidColorBrush(ColorHelper.FromArgb(255, 8, 124, 137));
+    private readonly Brush _cpuTrendBrush = new SolidColorBrush(ColorHelper.FromArgb(255, 15, 163, 177));
+    private readonly Brush _memoryTrendBrush = new SolidColorBrush(ColorHelper.FromArgb(255, 46, 109, 235));
+    private readonly Brush _networkTrendBrush = new SolidColorBrush(ColorHelper.FromArgb(255, 74, 174, 82));
+    private readonly Brush _networkBarBrush = new SolidColorBrush(ColorHelper.FromArgb(140, 130, 216, 150));
     private readonly Brush _successBackgroundBrush = new SolidColorBrush(ColorHelper.FromArgb(255, 242, 255, 240));
     private readonly Brush _warningBackgroundBrush = new SolidColorBrush(ColorHelper.FromArgb(255, 255, 244, 229));
     private readonly Brush _errorBackgroundBrush = new SolidColorBrush(ColorHelper.FromArgb(255, 253, 242, 242));
@@ -22,10 +35,21 @@ public sealed partial class StaticDiagnosticsPage : UserControl
     private readonly Brush _errorBorderBrush = new SolidColorBrush(ColorHelper.FromArgb(255, 248, 113, 113));
     private readonly Brush _unknownBorderBrush = new SolidColorBrush(ColorHelper.FromArgb(255, 216, 222, 228));
     private readonly Brush _whiteBrush = new SolidColorBrush(Colors.White);
+    private readonly FontFamily _logFontFamily = new("Consolas");
+    private readonly List<DiagnosticsLogEntry> _logEntries = new();
+    private readonly List<DiagnosticsPerformanceSample> _performanceSamples = new();
+
+    private DiagnosticsLogSource _selectedLogSource = DiagnosticsLogSource.All;
+    private DiagnosticsTrendRange _selectedTrendRange = DiagnosticsTrendRange.OneMinute;
+    private bool _isHostRunning;
 
     public StaticDiagnosticsPage()
     {
         InitializeComponent();
+        UpdateLogFilterButtons();
+        UpdateTrendRangeButtons();
+        RenderLogRows();
+        RenderPerformanceTrend();
         UpdateState(new DiagnosticsPageState());
     }
 
@@ -39,6 +63,14 @@ public sealed partial class StaticDiagnosticsPage : UserControl
 
     public void UpdateState(DiagnosticsPageState state)
     {
+        var wasHostRunning = _isHostRunning;
+        _isHostRunning = state.IsHostRunning;
+        if (wasHostRunning && !_isHostRunning)
+        {
+            _performanceSamples.Clear();
+            RenderPerformanceTrend();
+        }
+
         SetOverallStatus(state.OverallStatus, state.OverallTitle, state.OverallDetail);
         SetStatusCard(HostStatusValueText, HostStatusDetailText, HostStatusDot, state.Host);
         SetStatusCard(AdbReverseStatusValueText, AdbReverseStatusDetailText, AdbReverseStatusDot, state.AdbReverse);
@@ -51,6 +83,506 @@ public sealed partial class StaticDiagnosticsPage : UserControl
         SetHealthCheck(VirtualDisplayDetailText, VirtualDisplayStatusText, VirtualDisplayStatusIcon, state.VirtualDisplay);
         SetHealthCheck(VirtualCameraDetailText, VirtualCameraStatusText, VirtualCameraStatusIcon, state.VirtualCamera);
         SetHealthCheck(AudioEndpointDetailText, AudioEndpointStatusText, AudioEndpointStatusIcon, state.AudioEndpoint);
+        UpdateLogEmptyState();
+    }
+
+    public void AppendLog(
+        DiagnosticsLogSource source,
+        string? message,
+        DiagnosticsLogSeverity severity = DiagnosticsLogSeverity.Info,
+        DateTimeOffset? timestamp = null,
+        bool isHostPipe = false)
+    {
+        if (!DispatcherQueue.HasThreadAccess)
+        {
+            DispatcherQueue.TryEnqueue(() => AppendLog(source, message, severity, timestamp, isHostPipe));
+            return;
+        }
+
+        if (string.IsNullOrWhiteSpace(message))
+        {
+            return;
+        }
+
+        if (source == DiagnosticsLogSource.All)
+        {
+            source = DiagnosticsLogSource.Host;
+        }
+
+        var entry = new DiagnosticsLogEntry(
+            timestamp ?? DateTimeOffset.Now,
+            source,
+            severity,
+            message.TrimEnd(),
+            isHostPipe);
+        _logEntries.Add(entry);
+
+        while (_logEntries.Count > MaxDiagnosticsLogEntries)
+        {
+            var removed = _logEntries[0];
+            _logEntries.RemoveAt(0);
+            if (MatchesSelectedLogSource(removed) && DiagnosticsLogPanel.Children.Count > 0)
+            {
+                DiagnosticsLogPanel.Children.RemoveAt(0);
+            }
+        }
+
+        if (MatchesSelectedLogSource(entry))
+        {
+            DiagnosticsLogPanel.Children.Add(CreateLogRow(entry));
+            ScrollLogToEndIfNeeded();
+        }
+
+        UpdateLogEmptyState();
+    }
+
+    public void AppendPerformanceSample(DiagnosticsPerformanceSample sample)
+    {
+        if (!DispatcherQueue.HasThreadAccess)
+        {
+            DispatcherQueue.TryEnqueue(() => AppendPerformanceSample(sample));
+            return;
+        }
+
+        _isHostRunning = sample.IsHostRunning;
+        if (!sample.IsHostRunning)
+        {
+            if (_performanceSamples.Count > 0)
+            {
+                _performanceSamples.Clear();
+            }
+
+            RenderPerformanceTrend();
+            UpdateLogEmptyState();
+            return;
+        }
+
+        _performanceSamples.Add(sample);
+        var cutoff = sample.Timestamp - MaxPerformanceTrendRange;
+        _performanceSamples.RemoveAll(existing => existing.Timestamp < cutoff);
+        RenderPerformanceTrend();
+        UpdateLogEmptyState();
+    }
+
+    private void RenderLogRows()
+    {
+        DiagnosticsLogPanel.Children.Clear();
+        foreach (var entry in _logEntries.Where(MatchesSelectedLogSource))
+        {
+            DiagnosticsLogPanel.Children.Add(CreateLogRow(entry));
+        }
+
+        ScrollLogToEndIfNeeded();
+        UpdateLogEmptyState();
+    }
+
+    private Grid CreateLogRow(DiagnosticsLogEntry entry)
+    {
+        var row = new Grid
+        {
+            MinHeight = 24,
+            ColumnSpacing = 8
+        };
+        row.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(164) });
+        row.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(64) });
+        row.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(70) });
+        row.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(1, GridUnitType.Star) });
+
+        AddLogText(row, entry.Timestamp.ToString("yyyy-MM-dd HH:mm:ss.fff", CultureInfo.InvariantCulture), 0, _bodyBrush);
+        AddLogText(row, SeverityLabel(entry.Severity), 1, SeverityBrush(entry.Severity));
+        AddLogText(row, LogSourceLabel(entry.Source), 2, _bodyBrush);
+        AddLogText(row, entry.Message, 3, _bodyBrush, trim: true);
+
+        return row;
+    }
+
+    private void AddLogText(Grid row, string text, int column, Brush foreground, bool trim = false)
+    {
+        var textBlock = new TextBlock
+        {
+            Text = text,
+            FontFamily = _logFontFamily,
+            FontSize = 12,
+            Foreground = foreground,
+            VerticalAlignment = VerticalAlignment.Center,
+            TextTrimming = trim ? TextTrimming.CharacterEllipsis : TextTrimming.None
+        };
+        Grid.SetColumn(textBlock, column);
+        row.Children.Add(textBlock);
+    }
+
+    private bool MatchesSelectedLogSource(DiagnosticsLogEntry entry)
+    {
+        return _selectedLogSource == DiagnosticsLogSource.All
+            || entry.Source == _selectedLogSource
+            || (_selectedLogSource == DiagnosticsLogSource.Host && entry.IsHostPipe);
+    }
+
+    private void UpdateLogEmptyState()
+    {
+        var hasVisibleLogs = DiagnosticsLogPanel.Children.Count > 0;
+        DiagnosticsLogEmptyText.Visibility = hasVisibleLogs ? Visibility.Collapsed : Visibility.Visible;
+        if (hasVisibleLogs)
+        {
+            return;
+        }
+
+        if (_logEntries.Count == 0)
+        {
+            DiagnosticsLogEmptyText.Text = _isHostRunning
+                ? "Host 已启动，等待实时日志输出。"
+                : "Host 未启动，暂无实时日志。";
+            return;
+        }
+
+        DiagnosticsLogEmptyText.Text = $"当前筛选暂无{LogSourceLabel(_selectedLogSource)}日志。";
+    }
+
+    private void ScrollLogToEndIfNeeded()
+    {
+        if (DiagnosticsAutoScrollSwitch.IsOn)
+        {
+            DiagnosticsLogScrollViewer.ChangeView(null, double.MaxValue, null, disableAnimation: true);
+        }
+    }
+
+    private void UpdateLogFilterButtons()
+    {
+        UpdateSegmentButton(LogFilterAllButton, _selectedLogSource == DiagnosticsLogSource.All);
+        UpdateSegmentButton(LogFilterHostButton, _selectedLogSource == DiagnosticsLogSource.Host);
+        UpdateSegmentButton(LogFilterAdbButton, _selectedLogSource == DiagnosticsLogSource.Adb);
+        UpdateSegmentButton(LogFilterCameraButton, _selectedLogSource == DiagnosticsLogSource.Camera);
+        UpdateSegmentButton(LogFilterAudioButton, _selectedLogSource == DiagnosticsLogSource.Audio);
+    }
+
+    private void UpdateTrendRangeButtons()
+    {
+        UpdateSegmentButton(TrendRangeOneMinuteButton, _selectedTrendRange == DiagnosticsTrendRange.OneMinute);
+        UpdateSegmentButton(TrendRangeFiveMinutesButton, _selectedTrendRange == DiagnosticsTrendRange.FiveMinutes);
+        UpdateSegmentButton(TrendRangeFifteenMinutesButton, _selectedTrendRange == DiagnosticsTrendRange.FifteenMinutes);
+    }
+
+    private void UpdateSegmentButton(Button button, bool selected)
+    {
+        button.Background = selected ? _primaryBrush : _cardBrush;
+        button.BorderBrush = selected ? _primaryBrush : _unknownBorderBrush;
+        button.BorderThickness = new Thickness(1);
+        button.Foreground = selected ? _whiteBrush : _bodyBrush;
+
+        if (button.Content is TextBlock textBlock)
+        {
+            textBlock.Foreground = selected ? _whiteBrush : _bodyBrush;
+            textBlock.FontWeight = selected ? FontWeights.SemiBold : FontWeights.Normal;
+        }
+    }
+
+    private void RenderPerformanceTrend()
+    {
+        UpdateTrendRangeButtons();
+        DiagnosticsTrendCanvas.Children.Clear();
+
+        var now = DateTimeOffset.Now;
+        var range = SelectedTrendDuration();
+        var start = now - range;
+        var visibleSamples = _performanceSamples
+            .Where(sample => sample.Timestamp >= start && sample.Timestamp <= now)
+            .OrderBy(sample => sample.Timestamp)
+            .ToArray();
+        var hasData = _isHostRunning
+            && visibleSamples.Any(sample =>
+                sample.CpuPercent.HasValue
+                || sample.MemoryBytes.HasValue
+                || sample.NetworkMbps.HasValue);
+
+        UpdateTrendLegend(visibleSamples.LastOrDefault());
+        TrendStartTimeText.Text = hasData ? start.ToLocalTime().ToString("HH:mm:ss", CultureInfo.InvariantCulture) : "--:--:--";
+        TrendEndTimeText.Text = hasData ? now.ToLocalTime().ToString("HH:mm:ss", CultureInfo.InvariantCulture) : "--:--:--";
+
+        var width = Math.Max(1, DiagnosticsTrendCanvas.ActualWidth);
+        var height = Math.Max(1, DiagnosticsTrendCanvas.ActualHeight);
+        DrawTrendGrid(width, height);
+
+        if (!hasData || width <= 1 || height <= 1)
+        {
+            DiagnosticsTrendEmptyText.Text = _isHostRunning
+                ? "正在采样性能数据..."
+                : "Host 未运行，暂无性能数据。";
+            DiagnosticsTrendEmptyText.Visibility = Visibility.Visible;
+            TrendRightTopLabel.Text = "1";
+            TrendRightMiddleLabel.Text = "0.5";
+            TrendRightBottomLabel.Text = "0";
+            TrendScaleHintText.Text = "内存按当前范围工作集峰值缩放";
+            return;
+        }
+
+        DiagnosticsTrendEmptyText.Visibility = Visibility.Collapsed;
+
+        var memoryScaleBytes = Math.Max(
+            256L * 1024L * 1024L,
+            visibleSamples
+                .Where(sample => sample.MemoryBytes.HasValue)
+                .Select(sample => sample.MemoryBytes!.Value)
+                .DefaultIfEmpty(0)
+                .Max());
+        var networkScaleMbps = NiceCeiling(visibleSamples
+            .Where(sample => sample.NetworkMbps.HasValue)
+            .Select(sample => sample.NetworkMbps!.Value)
+            .DefaultIfEmpty(0)
+            .Max());
+
+        TrendRightTopLabel.Text = FormatAxisValue(networkScaleMbps);
+        TrendRightMiddleLabel.Text = FormatAxisValue(networkScaleMbps / 2);
+        TrendRightBottomLabel.Text = "0";
+        TrendScaleHintText.Text = $"内存按峰值 {FormatByteSize(memoryScaleBytes)} 缩放";
+
+        DrawNetworkBars(visibleSamples, start, now, width, height, networkScaleMbps);
+        DrawTrendLine(visibleSamples, start, now, width, height, sample => sample.MemoryBytes, memoryScaleBytes, _memoryTrendBrush);
+        DrawTrendLine(visibleSamples, start, now, width, height, sample => sample.CpuPercent, 100, _cpuTrendBrush);
+    }
+
+    private void DrawTrendGrid(double width, double height)
+    {
+        AddTrendGridLine(0, width);
+        AddTrendGridLine(height / 2, width);
+        AddTrendGridLine(Math.Max(0, height - 1), width);
+    }
+
+    private void AddTrendGridLine(double y, double width)
+    {
+        DiagnosticsTrendCanvas.Children.Add(new Line
+        {
+            X1 = 0,
+            Y1 = y,
+            X2 = width,
+            Y2 = y,
+            Stroke = _softStrokeBrush,
+            StrokeThickness = 1
+        });
+    }
+
+    private void DrawNetworkBars(
+        IReadOnlyList<DiagnosticsPerformanceSample> samples,
+        DateTimeOffset start,
+        DateTimeOffset end,
+        double width,
+        double height,
+        double scaleMax)
+    {
+        var networkSamples = samples.Where(sample => sample.NetworkMbps.HasValue).ToArray();
+        if (networkSamples.Length == 0)
+        {
+            return;
+        }
+
+        var barWidth = Math.Clamp(width / Math.Max(30, networkSamples.Length * 1.8), 2, 7);
+        foreach (var sample in networkSamples)
+        {
+            var ratio = Math.Clamp(sample.NetworkMbps!.Value / Math.Max(1, scaleMax), 0, 1);
+            var barHeight = Math.Max(1, ratio * height);
+            var x = ScaleTime(sample.Timestamp, start, end, width) - (barWidth / 2);
+            var rectangle = new Rectangle
+            {
+                Width = barWidth,
+                Height = barHeight,
+                Fill = _networkBarBrush,
+                RadiusX = 1,
+                RadiusY = 1
+            };
+            Canvas.SetLeft(rectangle, Math.Clamp(x, 0, Math.Max(0, width - barWidth)));
+            Canvas.SetTop(rectangle, height - barHeight);
+            DiagnosticsTrendCanvas.Children.Add(rectangle);
+        }
+    }
+
+    private void DrawTrendLine(
+        IReadOnlyList<DiagnosticsPerformanceSample> samples,
+        DateTimeOffset start,
+        DateTimeOffset end,
+        double width,
+        double height,
+        Func<DiagnosticsPerformanceSample, double?> valueSelector,
+        double scaleMax,
+        Brush stroke)
+    {
+        var points = new PointCollection();
+        foreach (var sample in samples)
+        {
+            var value = valueSelector(sample);
+            if (!value.HasValue)
+            {
+                continue;
+            }
+
+            var ratio = Math.Clamp(value.Value / Math.Max(1, scaleMax), 0, 1);
+            points.Add(new Point(
+                ScaleTime(sample.Timestamp, start, end, width),
+                height - (ratio * height)));
+        }
+
+        if (points.Count < 2)
+        {
+            return;
+        }
+
+        DiagnosticsTrendCanvas.Children.Add(new Polyline
+        {
+            Points = points,
+            Stroke = stroke,
+            StrokeThickness = 2
+        });
+    }
+
+    private void UpdateTrendLegend(DiagnosticsPerformanceSample? latestSample)
+    {
+        TrendCpuValueText.Text = latestSample?.CpuPercent is { } cpuPercent
+            ? $"CPU {cpuPercent:F0}%"
+            : "CPU --";
+        TrendMemoryValueText.Text = latestSample?.MemoryBytes is { } memoryBytes
+            ? $"内存 {FormatByteSize(memoryBytes)}"
+            : "内存 --";
+        TrendNetworkValueText.Text = latestSample?.NetworkMbps is { } networkMbps
+            ? $"网络 {networkMbps:F2} Mbps"
+            : "网络 -- Mbps";
+    }
+
+    private TimeSpan SelectedTrendDuration()
+    {
+        return _selectedTrendRange switch
+        {
+            DiagnosticsTrendRange.FiveMinutes => TimeSpan.FromMinutes(5),
+            DiagnosticsTrendRange.FifteenMinutes => TimeSpan.FromMinutes(15),
+            _ => TimeSpan.FromMinutes(1)
+        };
+    }
+
+    private static double ScaleTime(DateTimeOffset timestamp, DateTimeOffset start, DateTimeOffset end, double width)
+    {
+        var totalSeconds = Math.Max(1, (end - start).TotalSeconds);
+        var elapsedSeconds = Math.Clamp((timestamp - start).TotalSeconds, 0, totalSeconds);
+        return elapsedSeconds / totalSeconds * width;
+    }
+
+    private static double NiceCeiling(double value)
+    {
+        if (value <= 1)
+        {
+            return 1;
+        }
+
+        var exponent = Math.Floor(Math.Log10(value));
+        var magnitude = Math.Pow(10, exponent);
+        var normalized = value / magnitude;
+        var ceiling = normalized <= 2
+            ? 2
+            : normalized <= 5
+                ? 5
+                : 10;
+        return ceiling * magnitude;
+    }
+
+    private static string FormatAxisValue(double value)
+    {
+        if (value >= 10)
+        {
+            return value.ToString("F0", CultureInfo.InvariantCulture);
+        }
+
+        return value.ToString("0.##", CultureInfo.InvariantCulture);
+    }
+
+    private static string FormatByteSize(long bytes)
+    {
+        if (bytes >= 1024L * 1024L * 1024L)
+        {
+            return $"{bytes / 1024.0 / 1024.0 / 1024.0:F1} GB";
+        }
+
+        if (bytes >= 1024L * 1024L)
+        {
+            return $"{bytes / 1024.0 / 1024.0:F0} MB";
+        }
+
+        if (bytes >= 1024L)
+        {
+            return $"{bytes / 1024.0:F0} KB";
+        }
+
+        return $"{bytes} B";
+    }
+
+    private void ClearDiagnosticsLogsButton_Click(object sender, RoutedEventArgs e)
+    {
+        _logEntries.Clear();
+        RenderLogRows();
+    }
+
+    private void DiagnosticsAutoScrollSwitch_Toggled(object sender, RoutedEventArgs e)
+    {
+        ScrollLogToEndIfNeeded();
+    }
+
+    private void LogFilterButton_Click(object sender, RoutedEventArgs e)
+    {
+        if (sender is not Button { Tag: string sourceName }
+            || !Enum.TryParse(sourceName, out DiagnosticsLogSource source))
+        {
+            return;
+        }
+
+        _selectedLogSource = source;
+        UpdateLogFilterButtons();
+        RenderLogRows();
+    }
+
+    private void TrendRangeButton_Click(object sender, RoutedEventArgs e)
+    {
+        if (sender is not Button { Tag: string rangeName }
+            || !Enum.TryParse(rangeName, out DiagnosticsTrendRange range))
+        {
+            return;
+        }
+
+        _selectedTrendRange = range;
+        RenderPerformanceTrend();
+    }
+
+    private void DiagnosticsTrendCanvas_SizeChanged(object sender, SizeChangedEventArgs e)
+    {
+        RenderPerformanceTrend();
+    }
+
+    private Brush SeverityBrush(DiagnosticsLogSeverity severity)
+    {
+        return severity switch
+        {
+            DiagnosticsLogSeverity.Warning => _warningBrush,
+            DiagnosticsLogSeverity.Error => _errorBrush,
+            DiagnosticsLogSeverity.Debug => _mutedBrush,
+            _ => _successBrush
+        };
+    }
+
+    private static string SeverityLabel(DiagnosticsLogSeverity severity)
+    {
+        return severity switch
+        {
+            DiagnosticsLogSeverity.Warning => "[WARN]",
+            DiagnosticsLogSeverity.Error => "[ERROR]",
+            DiagnosticsLogSeverity.Debug => "[DEBUG]",
+            _ => "[INFO]"
+        };
+    }
+
+    private static string LogSourceLabel(DiagnosticsLogSource source)
+    {
+        return source switch
+        {
+            DiagnosticsLogSource.Host => "Host",
+            DiagnosticsLogSource.Adb => "ADB",
+            DiagnosticsLogSource.Camera => "摄像头",
+            DiagnosticsLogSource.Audio => "音频",
+            _ => "全部"
+        };
     }
 
     private void SetOverallStatus(DiagnosticsStatusKind status, string title, string detail)
@@ -197,6 +729,8 @@ public enum DiagnosticsStatusKind
 
 public sealed class DiagnosticsPageState
 {
+    public bool IsHostRunning { get; init; }
+
     public DiagnosticsStatusKind OverallStatus { get; init; } = DiagnosticsStatusKind.Unknown;
 
     public string OverallTitle { get; init; } = string.Empty;
@@ -241,3 +775,47 @@ public sealed class DiagnosticsHealthCheckState
 
     public string Detail { get; init; } = "等待检测";
 }
+
+public enum DiagnosticsLogSource
+{
+    All,
+    Host,
+    Adb,
+    Camera,
+    Audio
+}
+
+public enum DiagnosticsLogSeverity
+{
+    Info,
+    Warning,
+    Error,
+    Debug
+}
+
+public sealed class DiagnosticsPerformanceSample
+{
+    public DateTimeOffset Timestamp { get; init; } = DateTimeOffset.Now;
+
+    public bool IsHostRunning { get; init; }
+
+    public double? CpuPercent { get; init; }
+
+    public long? MemoryBytes { get; init; }
+
+    public double? NetworkMbps { get; init; }
+}
+
+internal enum DiagnosticsTrendRange
+{
+    OneMinute,
+    FiveMinutes,
+    FifteenMinutes
+}
+
+internal sealed record DiagnosticsLogEntry(
+    DateTimeOffset Timestamp,
+    DiagnosticsLogSource Source,
+    DiagnosticsLogSeverity Severity,
+    string Message,
+    bool IsHostPipe);

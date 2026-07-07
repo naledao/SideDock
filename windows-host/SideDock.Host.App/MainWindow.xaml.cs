@@ -185,6 +185,9 @@ public sealed partial class MainWindow : Window
     private string _lastOverviewPacketLossText = "暂无数据";
     private string _lastOverviewLatencyText = "暂无数据";
     private string _lastOverviewLatencyDetailText = "等待视频统计";
+    private double? _lastOverviewCpuPercent;
+    private long? _lastOverviewMemoryBytes;
+    private double? _lastOverviewNetworkMbps;
     private bool _uiReady;
     private OverviewNavigationItem _overviewNavigationItem = OverviewNavigationItem.Overview;
     private bool _overviewSidebarCollapsed;
@@ -1192,6 +1195,7 @@ public sealed partial class MainWindow : Window
 
         return new DiagnosticsPageState
         {
+            IsHostRunning = TryGetRunningHostProcess(out _),
             OverallStatus = overallStatus,
             OverallTitle = DiagnosticsOverallTitle(overallStatus),
             OverallDetail = overallStatus == DiagnosticsStatusKind.Normal
@@ -2997,6 +3001,142 @@ public sealed partial class MainWindow : Window
         await RefreshOverviewAsync(showErrors: true);
     }
 
+    private void AppendStaticDiagnosticsLog(
+        DiagnosticsLogSource source,
+        string? message,
+        DiagnosticsLogSeverity severity = DiagnosticsLogSeverity.Info,
+        bool isHostPipe = false)
+    {
+        if (!StaticOverviewUi
+            || !_uiReady
+            || OverviewDiagnosticsPage is null
+            || string.IsNullOrWhiteSpace(message))
+        {
+            return;
+        }
+
+        OverviewDiagnosticsPage.AppendLog(source, message, severity, isHostPipe: isHostPipe);
+    }
+
+    private void AppendStaticHostPipeLog(string stream, string? line)
+    {
+        if (string.IsNullOrWhiteSpace(line))
+        {
+            return;
+        }
+
+        var source = ClassifyHostOutputLogSource(line);
+        var severity = stream.Equals("stderr", StringComparison.OrdinalIgnoreCase)
+            ? DiagnosticsLogSeverity.Error
+            : InferDiagnosticsLogSeverity(line);
+        AppendStaticDiagnosticsLog(source, $"{stream}: {line}", severity, isHostPipe: true);
+    }
+
+    private void AppendAdbCommandDiagnosticsLog(string arguments, AdbCommandResult result)
+    {
+        var severity = result.TimedOut || result.ExitCode != 0
+            ? DiagnosticsLogSeverity.Error
+            : DiagnosticsLogSeverity.Info;
+        AppendStaticDiagnosticsLog(
+            DiagnosticsLogSource.Adb,
+            $"adb {arguments} -> exit={result.ExitCode}{(result.TimedOut ? " timed out" : string.Empty)}",
+            severity);
+
+        AppendAdbCommandStreamDiagnosticsLog("stdout", arguments, result.Stdout, DiagnosticsLogSeverity.Info);
+        AppendAdbCommandStreamDiagnosticsLog("stderr", arguments, result.Stderr, DiagnosticsLogSeverity.Error);
+    }
+
+    private void AppendAdbCommandStreamDiagnosticsLog(
+        string stream,
+        string arguments,
+        string output,
+        DiagnosticsLogSeverity severity)
+    {
+        foreach (var line in SplitNonEmptyLines(output).Take(8))
+        {
+            AppendStaticDiagnosticsLog(DiagnosticsLogSource.Adb, $"adb {arguments} {stream}: {line}", severity);
+        }
+    }
+
+    private void UpdateStaticDiagnosticsPerformance(bool hostRunning)
+    {
+        if (!StaticOverviewUi || !_uiReady || OverviewDiagnosticsPage is null)
+        {
+            return;
+        }
+
+        OverviewDiagnosticsPage.AppendPerformanceSample(new DiagnosticsPerformanceSample
+        {
+            Timestamp = DateTimeOffset.Now,
+            IsHostRunning = hostRunning,
+            CpuPercent = _lastOverviewCpuPercent,
+            MemoryBytes = _lastOverviewMemoryBytes,
+            NetworkMbps = _lastOverviewNetworkMbps
+        });
+    }
+
+    private static DiagnosticsLogSource ClassifyHostOutputLogSource(string line)
+    {
+        if (line.Contains("[AUDIO", StringComparison.OrdinalIgnoreCase))
+        {
+            return DiagnosticsLogSource.Audio;
+        }
+
+        if (line.Contains("[CAMERA", StringComparison.OrdinalIgnoreCase))
+        {
+            return DiagnosticsLogSource.Camera;
+        }
+
+        return line.Contains("[ADB", StringComparison.OrdinalIgnoreCase)
+            || line.Contains(" adb ", StringComparison.OrdinalIgnoreCase)
+            ? DiagnosticsLogSource.Adb
+            : DiagnosticsLogSource.Host;
+    }
+
+    private static DiagnosticsLogSeverity InferDiagnosticsLogSeverity(string line)
+    {
+        if (line.Contains("[ERROR", StringComparison.OrdinalIgnoreCase)
+            || line.Contains(" error", StringComparison.OrdinalIgnoreCase)
+            || line.Contains("failed", StringComparison.OrdinalIgnoreCase)
+            || line.Contains("失败", StringComparison.OrdinalIgnoreCase))
+        {
+            return DiagnosticsLogSeverity.Error;
+        }
+
+        if (line.Contains("[WARN", StringComparison.OrdinalIgnoreCase)
+            || line.Contains(" warning", StringComparison.OrdinalIgnoreCase)
+            || line.Contains("超时", StringComparison.OrdinalIgnoreCase))
+        {
+            return DiagnosticsLogSeverity.Warning;
+        }
+
+        if (line.Contains("[DEBUG", StringComparison.OrdinalIgnoreCase)
+            || line.Contains("[TRACE", StringComparison.OrdinalIgnoreCase))
+        {
+            return DiagnosticsLogSeverity.Debug;
+        }
+
+        return DiagnosticsLogSeverity.Info;
+    }
+
+    private static IEnumerable<string> SplitNonEmptyLines(string text)
+    {
+        if (string.IsNullOrWhiteSpace(text))
+        {
+            yield break;
+        }
+
+        using var reader = new StringReader(text);
+        string? line;
+        while ((line = reader.ReadLine()) is not null)
+        {
+            if (!string.IsNullOrWhiteSpace(line))
+            {
+                yield return line.TrimEnd();
+            }
+        }
+    }
+
     private void OverviewSettingsSaveButton_Click(object sender, RoutedEventArgs e)
     {
         if (!OverviewSettingsPage.TryBuildSettings(out var settings))
@@ -4091,10 +4231,21 @@ public sealed partial class MainWindow : Window
                 hostLog.Append("stdout", args.Data);
                 if (!string.IsNullOrWhiteSpace(args.Data))
                 {
-                    DispatcherQueue.TryEnqueue(() => HandleHostOutputLine(args.Data));
+                    DispatcherQueue.TryEnqueue(() =>
+                    {
+                        AppendStaticHostPipeLog("stdout", args.Data);
+                        HandleHostOutputLine(args.Data);
+                    });
                 }
             };
-            process.ErrorDataReceived += (_, args) => hostLog.Append("stderr", args.Data);
+            process.ErrorDataReceived += (_, args) =>
+            {
+                hostLog.Append("stderr", args.Data);
+                if (!string.IsNullOrWhiteSpace(args.Data))
+                {
+                    DispatcherQueue.TryEnqueue(() => AppendStaticHostPipeLog("stderr", args.Data));
+                }
+            };
             process.Exited += (_, _) => DispatcherQueue.TryEnqueue(() => HandleHostExited(process, hostLog));
 
             if (!process.Start())
@@ -4995,6 +5146,7 @@ public sealed partial class MainWindow : Window
         UpdateOverviewNetworkDiagnostics();
         UpdateOverviewPacketLossDiagnostics(hostRunning);
         UpdateOverviewLatencyDiagnostics(hostRunning);
+        UpdateStaticDiagnosticsPerformance(hostRunning);
         UpdateStaticDiagnosticsPage();
     }
 
@@ -5030,6 +5182,8 @@ public sealed partial class MainWindow : Window
             ResetHostRuntimeSampling();
             _lastOverviewCpuText = "未运行";
             _lastOverviewMemoryText = "未运行";
+            _lastOverviewCpuPercent = null;
+            _lastOverviewMemoryBytes = null;
             OverviewDiagnosticsCpuText.Text = _lastOverviewCpuText;
             OverviewDiagnosticsCpuText.Foreground = _overviewNeutralBrush;
             OverviewDiagnosticsMemoryText.Text = _lastOverviewMemoryText;
@@ -5070,11 +5224,13 @@ public sealed partial class MainWindow : Window
             {
                 AppendOverviewSample(_overviewCpuSamples, cpuPercent.Value);
                 _lastOverviewCpuText = $"{cpuPercent.Value:F0}%";
+                _lastOverviewCpuPercent = cpuPercent.Value;
                 OverviewDiagnosticsCpuText.Foreground = CpuBrush(cpuPercent.Value);
             }
             else
             {
                 _lastOverviewCpuText = "采样中";
+                _lastOverviewCpuPercent = null;
                 OverviewDiagnosticsCpuText.Foreground = _overviewNeutralBrush;
             }
 
@@ -5082,6 +5238,7 @@ public sealed partial class MainWindow : Window
             var memoryMb = workingSetBytes / 1024.0 / 1024.0;
             AppendOverviewSample(_overviewMemorySamples, memoryMb);
             _lastOverviewMemoryText = FormatByteSize(workingSetBytes);
+            _lastOverviewMemoryBytes = workingSetBytes;
 
             OverviewDiagnosticsCpuText.Text = _lastOverviewCpuText;
             OverviewDiagnosticsMemoryText.Text = _lastOverviewMemoryText;
@@ -5097,6 +5254,8 @@ public sealed partial class MainWindow : Window
         {
             _lastOverviewCpuText = "不可读";
             _lastOverviewMemoryText = "不可读";
+            _lastOverviewCpuPercent = null;
+            _lastOverviewMemoryBytes = null;
             OverviewDiagnosticsCpuText.Text = _lastOverviewCpuText;
             OverviewDiagnosticsCpuText.Foreground = _warningBrush;
             OverviewDiagnosticsMemoryText.Text = _lastOverviewMemoryText;
@@ -5114,6 +5273,7 @@ public sealed partial class MainWindow : Window
             _lastNetworkLinkSpeedBps = null;
             _lastNetworkSendBps = sample?.SendBps;
             _lastNetworkReceiveBps = sample?.ReceiveBps;
+            _lastOverviewNetworkMbps = null;
             OverviewDiagnosticsNetworkText.Text = _lastOverviewNetworkText;
             OverviewDiagnosticsNetworkText.Foreground = _overviewNeutralBrush;
             UpdateOverviewFooterMachineInfo();
@@ -5124,6 +5284,9 @@ public sealed partial class MainWindow : Window
         _lastNetworkLinkSpeedBps = sample.LinkSpeedBps;
         _lastNetworkSendBps = sample.SendBps;
         _lastNetworkReceiveBps = sample.ReceiveBps;
+        _lastOverviewNetworkMbps = sample.SendBps.HasValue || sample.ReceiveBps.HasValue
+            ? ((sample.SendBps ?? 0) + (sample.ReceiveBps ?? 0)) / 1_000_000.0
+            : null;
         _lastOverviewNetworkText = $"链路 {FormatBitRate(sample.LinkSpeedBps)}";
         OverviewDiagnosticsNetworkText.Text = _lastOverviewNetworkText;
         OverviewDiagnosticsNetworkText.Foreground = _successBrush;
@@ -5323,6 +5486,8 @@ public sealed partial class MainWindow : Window
         _lastHostCpuSampleAt = null;
         _overviewCpuSamples.Clear();
         _overviewMemorySamples.Clear();
+        _lastOverviewCpuPercent = null;
+        _lastOverviewMemoryBytes = null;
     }
 
     private static void AppendOverviewSample(Queue<double> samples, double value)
@@ -6022,6 +6187,7 @@ public sealed partial class MainWindow : Window
         {
             var adbPath = resolvedAdbPath ?? ResolveAdbPath(AdbPathBox.Text.Trim());
             var devices = await RunAdbAsync(adbPath, "devices -l", TimeSpan.FromSeconds(8));
+            AppendAdbCommandDiagnosticsLog("devices -l", devices);
             if (devices.TimedOut)
             {
                 SetAdbDeviceChoices(Array.Empty<AdbDeviceRow>(), selectedSerial);
@@ -6118,6 +6284,7 @@ public sealed partial class MainWindow : Window
             SetAdbStatus("正在重启 ADB...", _secondaryBrush);
 
             var killResult = await RunAdbAsync(adbPath, "kill-server", TimeSpan.FromSeconds(8));
+            AppendAdbCommandDiagnosticsLog("kill-server", killResult);
             if (killResult.TimedOut || killResult.ExitCode != 0)
             {
                 var killedCount = TryKillAdbProcesses();
@@ -6130,6 +6297,7 @@ public sealed partial class MainWindow : Window
             await Task.Delay(500);
 
             var startResult = await RunAdbAsync(adbPath, "start-server", TimeSpan.FromSeconds(12));
+            AppendAdbCommandDiagnosticsLog("start-server", startResult);
             if (startResult.TimedOut)
             {
                 SetAdbStatus("ADB start-server 超时。", _dangerBrush);
@@ -6507,6 +6675,7 @@ public sealed partial class MainWindow : Window
 
         var devices = await RunAdbAsync(adbPath, "devices -l", TimeSpan.FromSeconds(8));
         AppendAdbCommand(report, adbPath, "devices -l", devices);
+        AppendAdbCommandDiagnosticsLog("devices -l", devices);
         if (devices.TimedOut)
         {
             return new AdbReversePreflight(false, "ADB devices 检查超时，未建立 reverse。", report.ToString(), null);
@@ -6567,6 +6736,7 @@ public sealed partial class MainWindow : Window
             var arguments = $"-s {QuoteArgument(serial)} reverse tcp:{port} tcp:{port}";
             var reverse = await RunAdbAsync(adbPath, arguments, TimeSpan.FromSeconds(8));
             AppendAdbCommand(report, adbPath, arguments, reverse);
+            AppendAdbCommandDiagnosticsLog(arguments, reverse);
             if (reverse.TimedOut)
             {
                 return new AdbReversePreflight(false, $"ADB reverse tcp:{port} 配置超时。", report.ToString(), serial);
@@ -6581,6 +6751,7 @@ public sealed partial class MainWindow : Window
         var listArguments = $"-s {QuoteArgument(serial)} reverse --list";
         var reverseList = await RunAdbAsync(adbPath, listArguments, TimeSpan.FromSeconds(8));
         AppendAdbCommand(report, adbPath, listArguments, reverseList);
+        AppendAdbCommandDiagnosticsLog(listArguments, reverseList);
 
         var summaryPorts = string.Join("/", ports.Distinct().Select(port => $"tcp:{port}"));
         return new AdbReversePreflight(true, $"ADB reverse 已配置：{serial} {summaryPorts}", report.ToString(), serial);
@@ -8281,6 +8452,12 @@ public sealed partial class MainWindow : Window
     private void SetAdbStatus(string text, Brush brush)
     {
         _lastAdbStatusText = text;
+        var severity = ReferenceEquals(brush, _dangerBrush)
+            ? DiagnosticsLogSeverity.Error
+            : ReferenceEquals(brush, _warningBrush)
+                ? DiagnosticsLogSeverity.Warning
+                : DiagnosticsLogSeverity.Info;
+        AppendStaticDiagnosticsLog(DiagnosticsLogSource.Adb, text, severity);
         AdbStatusText.Text = text;
         AdbStatusText.Foreground = brush;
         UpdateOverviewAndroidDeviceState();
