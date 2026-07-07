@@ -5,7 +5,9 @@ namespace SideDock.Host.App;
 
 internal static class AppVersionInfo
 {
-    public static string DisplayVersion { get; } = $"v{ResolveVersion()}";
+    public static string CurrentVersion { get; } = ResolveVersion();
+
+    public static string DisplayVersion { get; } = $"v{CurrentVersion}";
 
     private static string ResolveVersion()
     {
