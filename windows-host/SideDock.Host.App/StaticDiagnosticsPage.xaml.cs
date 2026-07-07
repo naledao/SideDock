@@ -1,10 +1,12 @@
 using System.Globalization;
+using System.Text;
 using Microsoft.UI;
 using Microsoft.UI.Text;
 using Microsoft.UI.Xaml;
 using Microsoft.UI.Xaml.Controls;
 using Microsoft.UI.Xaml.Media;
 using Microsoft.UI.Xaml.Shapes;
+using Windows.ApplicationModel.DataTransfer;
 using Windows.Foundation;
 
 namespace SideDock.Host.App;
@@ -12,7 +14,22 @@ namespace SideDock.Host.App;
 public sealed partial class StaticDiagnosticsPage : UserControl
 {
     private const int MaxDiagnosticsLogEntries = 1000;
+    private const int MaxDiagnosticsEventEntries = 200;
     private static readonly TimeSpan MaxPerformanceTrendRange = TimeSpan.FromMinutes(15);
+    private static readonly TimeSpan RecentDiagnosticsEventRange = TimeSpan.FromHours(24);
+    private static readonly string[] DiagnosticsEventKeywords = new[]
+    {
+        "ERROR",
+        "WARN",
+        "Exception",
+        "failed",
+        "unauthorized",
+        "offline",
+        "timeout",
+        "denied",
+        "port",
+        "reverse"
+    };
 
     private readonly Brush _successBrush = new SolidColorBrush(ColorHelper.FromArgb(255, 22, 138, 26));
     private readonly Brush _warningBrush = new SolidColorBrush(ColorHelper.FromArgb(255, 215, 120, 0));
@@ -37,10 +54,13 @@ public sealed partial class StaticDiagnosticsPage : UserControl
     private readonly Brush _whiteBrush = new SolidColorBrush(Colors.White);
     private readonly FontFamily _logFontFamily = new("Consolas");
     private readonly List<DiagnosticsLogEntry> _logEntries = new();
+    private readonly List<DiagnosticsEventEntry> _diagnosticEvents = new();
     private readonly List<DiagnosticsPerformanceSample> _performanceSamples = new();
+    private IReadOnlyList<DiagnosticsPortState> _portStates = Array.Empty<DiagnosticsPortState>();
 
     private DiagnosticsLogSource _selectedLogSource = DiagnosticsLogSource.All;
     private DiagnosticsTrendRange _selectedTrendRange = DiagnosticsTrendRange.OneMinute;
+    private DiagnosticsOperationKind? _busyOperation;
     private bool _isHostRunning;
 
     public StaticDiagnosticsPage()
@@ -50,6 +70,8 @@ public sealed partial class StaticDiagnosticsPage : UserControl
         UpdateTrendRangeButtons();
         RenderLogRows();
         RenderPerformanceTrend();
+        RenderPortSummaryRows();
+        UpdateRecentErrorCard();
         UpdateState(new DiagnosticsPageState());
     }
 
@@ -83,9 +105,19 @@ public sealed partial class StaticDiagnosticsPage : UserControl
 
     public event EventHandler? ExportLogsRequested;
 
+    public event EventHandler? ExportDiagnosticsPackageRequested;
+
     public event EventHandler? RefreshRequested;
 
     public event EventHandler? RecheckRequested;
+
+    public event EventHandler? RefreshAdbDevicesRequested;
+
+    public event EventHandler? ConfigureAdbReverseRequested;
+
+    public event EventHandler? OpenLogDirectoryRequested;
+
+    public event EventHandler? PortDetailsRequested;
 
     public void UpdateState(DiagnosticsPageState state)
     {
@@ -109,6 +141,8 @@ public sealed partial class StaticDiagnosticsPage : UserControl
         SetHealthCheck(VirtualDisplayDetailText, VirtualDisplayStatusText, VirtualDisplayStatusIcon, state.VirtualDisplay);
         SetHealthCheck(VirtualCameraDetailText, VirtualCameraStatusText, VirtualCameraStatusIcon, state.VirtualCamera);
         SetHealthCheck(AudioEndpointDetailText, AudioEndpointStatusText, AudioEndpointStatusIcon, state.AudioEndpoint);
+        _portStates = state.Ports.Count > 0 ? state.Ports : DiagnosticsPortState.DefaultPorts;
+        RenderPortSummaryRows();
         UpdateLogEmptyState();
     }
 
@@ -142,6 +176,7 @@ public sealed partial class StaticDiagnosticsPage : UserControl
             message.TrimEnd(),
             isHostPipe);
         _logEntries.Add(entry);
+        TrackDiagnosticEvent(entry);
 
         while (_logEntries.Count > MaxDiagnosticsLogEntries)
         {
@@ -237,6 +272,164 @@ public sealed partial class StaticDiagnosticsPage : UserControl
         row.Children.Add(textBlock);
     }
 
+    private void TrackDiagnosticEvent(DiagnosticsLogEntry entry)
+    {
+        if (!TryCreateDiagnosticEvent(entry, out var diagnosticEvent))
+        {
+            return;
+        }
+
+        _diagnosticEvents.Add(diagnosticEvent);
+        while (_diagnosticEvents.Count > MaxDiagnosticsEventEntries)
+        {
+            _diagnosticEvents.RemoveAt(0);
+        }
+
+        UpdateRecentErrorCard();
+    }
+
+    private static bool TryCreateDiagnosticEvent(DiagnosticsLogEntry entry, out DiagnosticsEventEntry diagnosticEvent)
+    {
+        var keyword = FirstMatchingDiagnosticsKeyword(entry.Message);
+        if (entry.Severity is not (DiagnosticsLogSeverity.Error or DiagnosticsLogSeverity.Warning)
+            && keyword is null)
+        {
+            diagnosticEvent = default!;
+            return false;
+        }
+
+        var severity = NormalizeEventSeverity(entry.Severity, entry.Message, keyword);
+        diagnosticEvent = new DiagnosticsEventEntry(
+            entry.Timestamp,
+            entry.Source,
+            severity,
+            keyword ?? SeverityLabel(entry.Severity).Trim('[', ']'),
+            entry.Message);
+        return true;
+    }
+
+    private static DiagnosticsLogSeverity NormalizeEventSeverity(
+        DiagnosticsLogSeverity severity,
+        string message,
+        string? keyword)
+    {
+        if (severity == DiagnosticsLogSeverity.Error
+            || ContainsAny(message, "ERROR", "Exception", "failed", "failure", "denied", "timeout"))
+        {
+            return DiagnosticsLogSeverity.Error;
+        }
+
+        if (severity == DiagnosticsLogSeverity.Warning
+            || ContainsAny(message, "WARN", "unauthorized", "offline"))
+        {
+            return DiagnosticsLogSeverity.Warning;
+        }
+
+        if (keyword is not null)
+        {
+            return DiagnosticsLogSeverity.Info;
+        }
+
+        return severity;
+    }
+
+    private static string? FirstMatchingDiagnosticsKeyword(string message)
+    {
+        return DiagnosticsEventKeywords.FirstOrDefault(keyword =>
+            message.Contains(keyword, StringComparison.OrdinalIgnoreCase));
+    }
+
+    private static bool ContainsAny(string message, params string[] values)
+    {
+        return values.Any(value => message.Contains(value, StringComparison.OrdinalIgnoreCase));
+    }
+
+    private void UpdateRecentErrorCard()
+    {
+        var cutoff = DateTimeOffset.Now - RecentDiagnosticsEventRange;
+        var recentEvents = _diagnosticEvents
+            .Where(entry => entry.Timestamp >= cutoff)
+            .ToArray();
+
+        if (recentEvents.Length == 0)
+        {
+            SetRecentErrorCard(
+                DiagnosticsStatusKind.Normal,
+                "无严重错误",
+                "最近 24 小时内未检测到错误或警告事件。");
+            return;
+        }
+
+        var errors = recentEvents.Count(entry => entry.Severity == DiagnosticsLogSeverity.Error);
+        var warnings = recentEvents.Count(entry => entry.Severity == DiagnosticsLogSeverity.Warning);
+        var latest = recentEvents.LastOrDefault(entry => entry.Severity != DiagnosticsLogSeverity.Info)
+            ?? recentEvents[^1];
+        var status = errors > 0
+            ? DiagnosticsStatusKind.Error
+            : warnings > 0
+                ? DiagnosticsStatusKind.Warning
+                : DiagnosticsStatusKind.Normal;
+        var title = errors > 0
+            ? $"{errors} 个错误"
+            : warnings > 0
+                ? $"{warnings} 个警告"
+                : $"{recentEvents.Length} 条诊断事件";
+        var detail = $"{latest.Timestamp:HH:mm:ss} · {LogSourceLabel(latest.Source)} · {latest.Message}";
+        SetRecentErrorCard(status, title, detail);
+    }
+
+    private void SetRecentErrorCard(DiagnosticsStatusKind status, string title, string detail)
+    {
+        var brush = StatusBrush(status);
+        RecentErrorIconBorder.BorderBrush = brush;
+        RecentErrorIcon.Glyph = StatusGlyph(status);
+        RecentErrorIcon.Foreground = brush;
+        RecentErrorTitleText.Text = title;
+        RecentErrorTitleText.Foreground = brush;
+        RecentErrorDetailText.Text = detail;
+    }
+
+    private void RenderPortSummaryRows()
+    {
+        var ports = _portStates.Count > 0 ? _portStates : DiagnosticsPortState.DefaultPorts;
+        SetPortSummaryRow(ports.ElementAtOrDefault(0), ControlPortValueText, ControlPortLocalText, ControlPortLocalDot, ControlPortReverseText, ControlPortReverseDot);
+        SetPortSummaryRow(ports.ElementAtOrDefault(1), VideoPortValueText, VideoPortLocalText, VideoPortLocalDot, VideoPortReverseText, VideoPortReverseDot);
+        SetPortSummaryRow(ports.ElementAtOrDefault(2), AudioPortValueText, AudioPortLocalText, AudioPortLocalDot, AudioPortReverseText, AudioPortReverseDot);
+        SetPortSummaryRow(ports.ElementAtOrDefault(3), CameraPortValueText, CameraPortLocalText, CameraPortLocalDot, CameraPortReverseText, CameraPortReverseDot);
+    }
+
+    private void SetPortSummaryRow(
+        DiagnosticsPortState? port,
+        TextBlock portText,
+        TextBlock localText,
+        Ellipse localDot,
+        TextBlock reverseText,
+        Ellipse reverseDot)
+    {
+        if (port is null)
+        {
+            portText.Text = "--";
+            localText.Text = "待检测";
+            reverseText.Text = "待检测";
+            localDot.Fill = _mutedBrush;
+            reverseDot.Fill = _mutedBrush;
+            return;
+        }
+
+        portText.Text = port.ConfiguredPort?.ToString(CultureInfo.InvariantCulture) ?? "--";
+        localText.Text = ShortStatusText(port.LocalStatusText);
+        reverseText.Text = ShortStatusText(port.ReverseStatusText);
+        localText.Foreground = StatusBrush(port.LocalStatus);
+        reverseText.Foreground = StatusBrush(port.ReverseStatus);
+        localDot.Fill = StatusBrush(port.LocalStatus);
+        reverseDot.Fill = StatusBrush(port.ReverseStatus);
+    }
+
+    private static string ShortStatusText(string value)
+    {
+        return string.IsNullOrWhiteSpace(value) ? "待检测" : value;
+    }
+
     private bool MatchesSelectedLogSource(DiagnosticsLogEntry entry)
     {
         return _selectedLogSource == DiagnosticsLogSource.All
@@ -279,6 +472,7 @@ public sealed partial class StaticDiagnosticsPage : UserControl
         UpdateSegmentButton(LogFilterAdbButton, _selectedLogSource == DiagnosticsLogSource.Adb);
         UpdateSegmentButton(LogFilterCameraButton, _selectedLogSource == DiagnosticsLogSource.Camera);
         UpdateSegmentButton(LogFilterAudioButton, _selectedLogSource == DiagnosticsLogSource.Audio);
+        UpdateSegmentButton(LogFilterDisplayButton, _selectedLogSource == DiagnosticsLogSource.Display);
     }
 
     private void UpdateTrendRangeButtons()
@@ -536,6 +730,381 @@ public sealed partial class StaticDiagnosticsPage : UserControl
         return $"{bytes} B";
     }
 
+    public string BuildErrorSummary()
+    {
+        var events = _diagnosticEvents
+            .OrderByDescending(entry => entry.Timestamp)
+            .Take(80)
+            .Reverse()
+            .ToArray();
+
+        if (events.Length == 0)
+        {
+            return "最近错误：暂无错误或警告事件。" + Environment.NewLine;
+        }
+
+        var report = new StringBuilder();
+        report.AppendLine("最近错误 / 错误历史");
+        report.AppendLine($"事件数量: {events.Length}");
+        report.AppendLine();
+        foreach (var entry in events)
+        {
+            report.AppendLine(FormatDiagnosticEventSummary(entry));
+        }
+
+        return report.ToString();
+    }
+
+    public string BuildPortDiagnosticsSummary()
+    {
+        var ports = _portStates.Count > 0 ? _portStates : DiagnosticsPortState.DefaultPorts;
+        var report = new StringBuilder();
+        report.AppendLine("完整端口信息");
+        report.AppendLine($"生成时间: {DateTimeOffset.Now:yyyy-MM-dd HH:mm:ss zzz}");
+        report.AppendLine();
+        foreach (var port in ports)
+        {
+            report.AppendLine($"{port.Module}");
+            report.AppendLine($"  启用: {(port.IsEnabled ? "是" : "否")}");
+            report.AppendLine($"  配置端口: {FormatPort(port.ConfiguredPort)}");
+            report.AppendLine($"  实际本地端口: {FormatPort(port.ActualLocalPort)}");
+            report.AppendLine($"  实际 reverse 端口: {FormatPort(port.ActualReversePort)}");
+            report.AppendLine($"  本地监听: {port.LocalStatusText}");
+            report.AppendLine($"  ADB reverse: {port.ReverseStatusText}");
+            report.AppendLine($"  详情: {port.Detail}");
+            report.AppendLine();
+        }
+
+        return report.ToString();
+    }
+
+    public async Task ShowErrorHistoryDialogAsync()
+    {
+        var filterCombo = new ComboBox
+        {
+            Width = 190,
+            DisplayMemberPath = nameof(DiagnosticsSourceFilterItem.Label),
+            ItemsSource = DiagnosticsSourceFilterItem.All
+        };
+        filterCombo.SelectedIndex = 0;
+
+        var rowsPanel = new StackPanel { Spacing = 8 };
+        var emptyText = new TextBlock
+        {
+            Text = "暂无错误历史。",
+            Foreground = _mutedBrush,
+            HorizontalAlignment = HorizontalAlignment.Center,
+            Margin = new Thickness(0, 28, 0, 28)
+        };
+
+        void RenderRows()
+        {
+            var selectedSource = filterCombo.SelectedItem is DiagnosticsSourceFilterItem item
+                ? item.Source
+                : DiagnosticsLogSource.All;
+            var events = _diagnosticEvents
+                .Where(entry => selectedSource == DiagnosticsLogSource.All || entry.Source == selectedSource)
+                .OrderByDescending(entry => entry.Timestamp)
+                .Take(120)
+                .ToArray();
+
+            rowsPanel.Children.Clear();
+            emptyText.Visibility = events.Length == 0 ? Visibility.Visible : Visibility.Collapsed;
+            foreach (var entry in events)
+            {
+                rowsPanel.Children.Add(CreateDiagnosticEventRow(entry));
+            }
+        }
+
+        filterCombo.SelectionChanged += (_, _) => RenderRows();
+        RenderRows();
+
+        var header = new Grid();
+        header.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(1, GridUnitType.Star) });
+        header.ColumnDefinitions.Add(new ColumnDefinition { Width = GridLength.Auto });
+        header.Children.Add(new TextBlock
+        {
+            Text = $"{_diagnosticEvents.Count} 条诊断事件",
+            VerticalAlignment = VerticalAlignment.Center,
+            Foreground = _bodyBrush
+        });
+        Grid.SetColumn(filterCombo, 1);
+        header.Children.Add(filterCombo);
+
+        var scrollViewer = new ScrollViewer
+        {
+            MaxHeight = 500,
+            Content = new Grid
+            {
+                Children =
+                {
+                    rowsPanel,
+                    emptyText
+                }
+            }
+        };
+        ScrollViewer.SetVerticalScrollBarVisibility(scrollViewer, ScrollBarVisibility.Auto);
+        ScrollViewer.SetHorizontalScrollBarVisibility(scrollViewer, ScrollBarVisibility.Disabled);
+
+        var panel = new StackPanel { Spacing = 12 };
+        panel.Children.Add(header);
+        panel.Children.Add(scrollViewer);
+
+        var dialog = new ContentDialog
+        {
+            XamlRoot = XamlRoot,
+            Title = "错误历史",
+            Content = panel,
+            PrimaryButtonText = "复制全部摘要",
+            CloseButtonText = "关闭",
+            DefaultButton = ContentDialogButton.Primary
+        };
+        dialog.Resources["ContentDialogMaxWidth"] = 920.0;
+        dialog.PrimaryButtonClick += (sender, args) =>
+        {
+            args.Cancel = true;
+            CopyTextToClipboard(BuildErrorSummary());
+            sender.PrimaryButtonText = "已复制";
+        };
+
+        await dialog.ShowAsync();
+    }
+
+    public async Task ShowPortDetailsDialogAsync()
+    {
+        var rowsPanel = new StackPanel { Spacing = 8 };
+        foreach (var port in _portStates.Count > 0 ? _portStates : DiagnosticsPortState.DefaultPorts)
+        {
+            rowsPanel.Children.Add(CreatePortDetailsRow(port));
+        }
+
+        var actions = new StackPanel
+        {
+            Orientation = Orientation.Horizontal,
+            Spacing = 8
+        };
+        actions.Children.Add(CreateDialogActionButton("刷新 ADB 设备", "\uE8B7", () => RefreshAdbDevicesRequested?.Invoke(this, EventArgs.Empty)));
+        actions.Children.Add(CreateDialogActionButton("重新配置 reverse", "\uE71B", () => ConfigureAdbReverseRequested?.Invoke(this, EventArgs.Empty)));
+        actions.Children.Add(CreateDialogActionButton("重新检查", "\uE72C", () => RecheckRequested?.Invoke(this, EventArgs.Empty)));
+        actions.Children.Add(CreateDialogActionButton("打开日志目录", "\uED25", () => OpenLogDirectoryRequested?.Invoke(this, EventArgs.Empty)));
+
+        var panel = new StackPanel { Spacing = 12 };
+        panel.Children.Add(new TextBlock
+        {
+            Text = "端口详情会显示配置端口、实际监听、ADB reverse 映射和当前异常判断。",
+            TextWrapping = TextWrapping.Wrap,
+            Foreground = _bodyBrush
+        });
+        panel.Children.Add(actions);
+        panel.Children.Add(new ScrollViewer
+        {
+            MaxHeight = 480,
+            Content = rowsPanel
+        });
+
+        var dialog = new ContentDialog
+        {
+            XamlRoot = XamlRoot,
+            Title = "完整端口信息",
+            Content = panel,
+            PrimaryButtonText = "复制端口诊断",
+            CloseButtonText = "关闭",
+            DefaultButton = ContentDialogButton.Primary
+        };
+        dialog.Resources["ContentDialogMaxWidth"] = 920.0;
+        dialog.PrimaryButtonClick += (sender, args) =>
+        {
+            args.Cancel = true;
+            CopyTextToClipboard(BuildPortDiagnosticsSummary());
+            sender.PrimaryButtonText = "已复制";
+        };
+
+        await dialog.ShowAsync();
+    }
+
+    public void SetOperationBusy(DiagnosticsOperationKind operation, bool isBusy)
+    {
+        _busyOperation = isBusy ? operation : null;
+        var busy = _busyOperation.HasValue;
+
+        CopyAllDiagnosticsButton.IsEnabled = !busy;
+        ExportLogsButton.IsEnabled = !busy;
+        ExportDiagnosticsPackageButton.IsEnabled = !busy;
+        RefreshDiagnosticsButton.IsEnabled = !busy;
+        RecheckDiagnosticsButton.IsEnabled = !busy;
+        RefreshAdbDevicesButton.IsEnabled = !busy;
+        ConfigureAdbReverseButton.IsEnabled = !busy;
+        OpenLogDirectoryButton.IsEnabled = !busy;
+        ViewFullPortInfoButton.IsEnabled = !busy;
+        ViewErrorHistoryButton.IsEnabled = !busy;
+
+        RefreshDiagnosticsButtonText.Text = operation == DiagnosticsOperationKind.Refresh && isBusy ? "刷新中" : "刷新";
+        RecheckDiagnosticsButtonText.Text = operation == DiagnosticsOperationKind.Recheck && isBusy ? "检查中" : "重新检查";
+        RefreshAdbDevicesButtonText.Text = operation == DiagnosticsOperationKind.RefreshAdb && isBusy ? "刷新中" : "刷新 ADB";
+        ConfigureAdbReverseButtonText.Text = operation == DiagnosticsOperationKind.ConfigureReverse && isBusy ? "配置中" : "重配 reverse";
+        ExportDiagnosticsPackageButtonText.Text = operation == DiagnosticsOperationKind.ExportPackage && isBusy ? "导出中" : "导出诊断包";
+    }
+
+    private Border CreateDiagnosticEventRow(DiagnosticsEventEntry entry)
+    {
+        var row = new Grid
+        {
+            ColumnSpacing = 10
+        };
+        row.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(170) });
+        row.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(76) });
+        row.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(78) });
+        row.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(1, GridUnitType.Star) });
+        row.ColumnDefinitions.Add(new ColumnDefinition { Width = GridLength.Auto });
+
+        AddDialogText(row, entry.Timestamp.ToString("yyyy-MM-dd HH:mm:ss.fff", CultureInfo.InvariantCulture), 0, _bodyBrush, useLogFont: true);
+        AddDialogText(row, SeverityLabel(entry.Severity), 1, SeverityBrush(entry.Severity), useLogFont: true);
+        AddDialogText(row, LogSourceLabel(entry.Source), 2, _bodyBrush);
+        AddDialogText(row, entry.Message, 3, _bodyBrush, trim: true);
+
+        var copyButton = new Button
+        {
+            Content = "复制",
+            MinWidth = 58,
+            Height = 30,
+            Padding = new Thickness(10, 0, 10, 0)
+        };
+        copyButton.Click += (_, _) => CopyTextToClipboard(FormatDiagnosticEventDetails(entry));
+        Grid.SetColumn(copyButton, 4);
+        row.Children.Add(copyButton);
+
+        return new Border
+        {
+            BorderBrush = _softStrokeBrush,
+            BorderThickness = new Thickness(1),
+            CornerRadius = new CornerRadius(6),
+            Padding = new Thickness(10, 8, 10, 8),
+            Background = _cardBrush,
+            Child = row
+        };
+    }
+
+    private Border CreatePortDetailsRow(DiagnosticsPortState port)
+    {
+        var row = new Grid
+        {
+            ColumnSpacing = 10
+        };
+        row.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(88) });
+        row.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(96) });
+        row.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(124) });
+        row.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(124) });
+        row.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(1, GridUnitType.Star) });
+
+        AddDialogText(row, port.Module, 0, _bodyBrush);
+        AddDialogText(row, $"配置 {FormatPort(port.ConfiguredPort)}", 1, _bodyBrush);
+        AddStatusPill(row, 2, port.LocalStatus, port.LocalStatusText);
+        AddStatusPill(row, 3, port.ReverseStatus, port.ReverseStatusText);
+        AddDialogText(row, port.Detail, 4, _bodyBrush, trim: true);
+
+        return new Border
+        {
+            BorderBrush = StatusBorderBrush(port.OverallStatus),
+            BorderThickness = new Thickness(1),
+            CornerRadius = new CornerRadius(6),
+            Padding = new Thickness(10, 8, 10, 8),
+            Background = StatusBackgroundBrush(port.OverallStatus),
+            Child = row
+        };
+    }
+
+    private Button CreateDialogActionButton(string text, string glyph, Action action)
+    {
+        var content = new StackPanel
+        {
+            Orientation = Orientation.Horizontal,
+            Spacing = 6
+        };
+        content.Children.Add(new FontIcon { Glyph = glyph, FontSize = 14, Foreground = _bodyBrush });
+        content.Children.Add(new TextBlock { Text = text, FontSize = 13, Foreground = _bodyBrush, VerticalAlignment = VerticalAlignment.Center });
+
+        var button = new Button
+        {
+            Content = content,
+            Height = 34,
+            Padding = new Thickness(10, 0, 10, 0)
+        };
+        button.Click += (_, _) => action();
+        return button;
+    }
+
+    private void AddDialogText(Grid row, string text, int column, Brush foreground, bool useLogFont = false, bool trim = false)
+    {
+        var textBlock = new TextBlock
+        {
+            Text = text,
+            FontFamily = useLogFont ? _logFontFamily : new FontFamily("Segoe UI"),
+            FontSize = 12,
+            Foreground = foreground,
+            VerticalAlignment = VerticalAlignment.Center,
+            TextTrimming = trim ? TextTrimming.CharacterEllipsis : TextTrimming.None
+        };
+        Grid.SetColumn(textBlock, column);
+        row.Children.Add(textBlock);
+    }
+
+    private void AddStatusPill(Grid row, int column, DiagnosticsStatusKind status, string text)
+    {
+        var panel = new StackPanel
+        {
+            Orientation = Orientation.Horizontal,
+            Spacing = 6
+        };
+        panel.Children.Add(new Ellipse
+        {
+            Width = 8,
+            Height = 8,
+            Fill = StatusBrush(status),
+            VerticalAlignment = VerticalAlignment.Center
+        });
+        panel.Children.Add(new TextBlock
+        {
+            Text = ShortStatusText(text),
+            FontSize = 12,
+            Foreground = StatusBrush(status),
+            VerticalAlignment = VerticalAlignment.Center,
+            TextTrimming = TextTrimming.CharacterEllipsis
+        });
+        Grid.SetColumn(panel, column);
+        row.Children.Add(panel);
+    }
+
+    private static string FormatDiagnosticEventSummary(DiagnosticsEventEntry entry)
+    {
+        return $"{entry.Timestamp:yyyy-MM-dd HH:mm:ss.fff} {SeverityLabel(entry.Severity)} {LogSourceLabel(entry.Source)} keyword={entry.Keyword} {entry.Message}";
+    }
+
+    private static string FormatDiagnosticEventDetails(DiagnosticsEventEntry entry)
+    {
+        var report = new StringBuilder();
+        report.AppendLine("SideDock 错误详情");
+        report.AppendLine($"时间: {entry.Timestamp:yyyy-MM-dd HH:mm:ss.fff zzz}");
+        report.AppendLine($"级别: {SeverityLabel(entry.Severity)}");
+        report.AppendLine($"模块: {LogSourceLabel(entry.Source)}");
+        report.AppendLine($"关键字: {entry.Keyword}");
+        report.AppendLine("日志:");
+        report.AppendLine(entry.Message);
+        return report.ToString();
+    }
+
+    private static string FormatPort(int? port)
+    {
+        return port.HasValue ? port.Value.ToString(CultureInfo.InvariantCulture) : "--";
+    }
+
+    private static void CopyTextToClipboard(string text)
+    {
+        var package = new DataPackage { RequestedOperation = DataPackageOperation.Copy };
+        package.SetText(text);
+        Clipboard.SetContent(package);
+        Clipboard.Flush();
+    }
+
     private void ClearDiagnosticsLogsButton_Click(object sender, RoutedEventArgs e)
     {
         _logEntries.Clear();
@@ -607,6 +1176,7 @@ public sealed partial class StaticDiagnosticsPage : UserControl
             DiagnosticsLogSource.Adb => "ADB",
             DiagnosticsLogSource.Camera => "摄像头",
             DiagnosticsLogSource.Audio => "音频",
+            DiagnosticsLogSource.Display => "显示器",
             _ => "全部"
         };
     }
@@ -657,6 +1227,11 @@ public sealed partial class StaticDiagnosticsPage : UserControl
         ExportLogsRequested?.Invoke(this, EventArgs.Empty);
     }
 
+    private void ExportDiagnosticsPackageButton_Click(object sender, RoutedEventArgs e)
+    {
+        ExportDiagnosticsPackageRequested?.Invoke(this, EventArgs.Empty);
+    }
+
     private void RefreshDiagnosticsButton_Click(object sender, RoutedEventArgs e)
     {
         RefreshRequested?.Invoke(this, EventArgs.Empty);
@@ -665,6 +1240,31 @@ public sealed partial class StaticDiagnosticsPage : UserControl
     private void RecheckDiagnosticsButton_Click(object sender, RoutedEventArgs e)
     {
         RecheckRequested?.Invoke(this, EventArgs.Empty);
+    }
+
+    private void RefreshAdbDevicesButton_Click(object sender, RoutedEventArgs e)
+    {
+        RefreshAdbDevicesRequested?.Invoke(this, EventArgs.Empty);
+    }
+
+    private void ConfigureAdbReverseButton_Click(object sender, RoutedEventArgs e)
+    {
+        ConfigureAdbReverseRequested?.Invoke(this, EventArgs.Empty);
+    }
+
+    private void OpenLogDirectoryButton_Click(object sender, RoutedEventArgs e)
+    {
+        OpenLogDirectoryRequested?.Invoke(this, EventArgs.Empty);
+    }
+
+    private void ViewFullPortInfoButton_Click(object sender, RoutedEventArgs e)
+    {
+        PortDetailsRequested?.Invoke(this, EventArgs.Empty);
+    }
+
+    private async void ViewErrorHistoryButton_Click(object sender, RoutedEventArgs e)
+    {
+        await ShowErrorHistoryDialogAsync();
     }
 
     private Brush StatusBrush(DiagnosticsStatusKind status)
@@ -782,6 +1382,8 @@ public sealed class DiagnosticsPageState
     public DiagnosticsHealthCheckState VirtualCamera { get; init; } = new();
 
     public DiagnosticsHealthCheckState AudioEndpoint { get; init; } = new();
+
+    public IReadOnlyList<DiagnosticsPortState> Ports { get; init; } = DiagnosticsPortState.DefaultPorts;
 }
 
 public sealed class DiagnosticsStatusCardState
@@ -802,13 +1404,47 @@ public sealed class DiagnosticsHealthCheckState
     public string Detail { get; init; } = "等待检测";
 }
 
+public sealed class DiagnosticsPortState
+{
+    public static IReadOnlyList<DiagnosticsPortState> DefaultPorts { get; } = new[]
+    {
+        new DiagnosticsPortState { Module = "控制", ConfiguredPort = 27183, ActualLocalPort = 27183, ActualReversePort = 27183 },
+        new DiagnosticsPortState { Module = "视频", ConfiguredPort = 27184, ActualLocalPort = 27184, ActualReversePort = 27184 },
+        new DiagnosticsPortState { Module = "音频", ConfiguredPort = 27185, ActualLocalPort = 27185, ActualReversePort = 27185 },
+        new DiagnosticsPortState { Module = "摄像头", ConfiguredPort = 27186, ActualLocalPort = 27186, ActualReversePort = 27186 }
+    };
+
+    public string Module { get; init; } = string.Empty;
+
+    public bool IsEnabled { get; init; } = true;
+
+    public int? ConfiguredPort { get; init; }
+
+    public int? ActualLocalPort { get; init; }
+
+    public int? ActualReversePort { get; init; }
+
+    public DiagnosticsStatusKind LocalStatus { get; init; } = DiagnosticsStatusKind.Unknown;
+
+    public string LocalStatusText { get; init; } = "待检测";
+
+    public DiagnosticsStatusKind ReverseStatus { get; init; } = DiagnosticsStatusKind.Unknown;
+
+    public string ReverseStatusText { get; init; } = "待检测";
+
+    public DiagnosticsStatusKind OverallStatus { get; init; } = DiagnosticsStatusKind.Unknown;
+
+    public string Detail { get; init; } = "等待检测";
+}
+
 public enum DiagnosticsLogSource
 {
     All,
     Host,
     Adb,
     Camera,
-    Audio
+    Audio,
+    Display
 }
 
 public enum DiagnosticsLogSeverity
@@ -817,6 +1453,15 @@ public enum DiagnosticsLogSeverity
     Warning,
     Error,
     Debug
+}
+
+public enum DiagnosticsOperationKind
+{
+    Refresh,
+    Recheck,
+    RefreshAdb,
+    ConfigureReverse,
+    ExportPackage
 }
 
 public sealed class DiagnosticsPerformanceSample
@@ -845,3 +1490,23 @@ internal sealed record DiagnosticsLogEntry(
     DiagnosticsLogSeverity Severity,
     string Message,
     bool IsHostPipe);
+
+internal sealed record DiagnosticsEventEntry(
+    DateTimeOffset Timestamp,
+    DiagnosticsLogSource Source,
+    DiagnosticsLogSeverity Severity,
+    string Keyword,
+    string Message);
+
+internal sealed record DiagnosticsSourceFilterItem(DiagnosticsLogSource Source, string Label)
+{
+    public static IReadOnlyList<DiagnosticsSourceFilterItem> All { get; } = new[]
+    {
+        new DiagnosticsSourceFilterItem(DiagnosticsLogSource.All, "全部"),
+        new DiagnosticsSourceFilterItem(DiagnosticsLogSource.Host, "Host"),
+        new DiagnosticsSourceFilterItem(DiagnosticsLogSource.Adb, "ADB"),
+        new DiagnosticsSourceFilterItem(DiagnosticsLogSource.Camera, "摄像头"),
+        new DiagnosticsSourceFilterItem(DiagnosticsLogSource.Audio, "音频"),
+        new DiagnosticsSourceFilterItem(DiagnosticsLogSource.Display, "显示器")
+    };
+}

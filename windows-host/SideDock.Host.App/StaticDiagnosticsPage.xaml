@@ -89,12 +89,22 @@
                     </StackPanel>
                 </Button>
                 <Button
+                    x:Name="ExportDiagnosticsPackageButton"
+                    Style="{StaticResource DiagHeaderButtonStyle}"
+                    MinWidth="142"
+                    Click="ExportDiagnosticsPackageButton_Click">
+                    <StackPanel Orientation="Horizontal" Spacing="10">
+                        <FontIcon Glyph="&#xE8A5;" FontSize="17" Foreground="#30363D" />
+                        <TextBlock x:Name="ExportDiagnosticsPackageButtonText" Text="导出诊断包" VerticalAlignment="Center" FontSize="14" Foreground="{StaticResource DiagBodyBrush}" />
+                    </StackPanel>
+                </Button>
+                <Button
                     x:Name="RefreshDiagnosticsButton"
                     Style="{StaticResource DiagHeaderButtonStyle}"
                     Click="RefreshDiagnosticsButton_Click">
                     <StackPanel Orientation="Horizontal" Spacing="10">
                         <FontIcon Glyph="&#xE72C;" FontSize="18" Foreground="#30363D" />
-                        <TextBlock Text="刷新" VerticalAlignment="Center" FontSize="14" Foreground="{StaticResource DiagBodyBrush}" />
+                        <TextBlock x:Name="RefreshDiagnosticsButtonText" Text="刷新" VerticalAlignment="Center" FontSize="14" Foreground="{StaticResource DiagBodyBrush}" />
                     </StackPanel>
                 </Button>
             </StackPanel>
@@ -310,10 +320,20 @@
                                         Width="60"
                                         Height="30"
                                         Padding="0"
-                                        CornerRadius="0,5,5,0"
+                                        CornerRadius="0"
                                         Tag="Audio"
                                         Click="LogFilterButton_Click">
                                         <TextBlock Text="音频" HorizontalAlignment="Center" VerticalAlignment="Center" FontSize="12" />
+                                    </Button>
+                                    <Button
+                                        x:Name="LogFilterDisplayButton"
+                                        Width="70"
+                                        Height="30"
+                                        Padding="0"
+                                        CornerRadius="0,5,5,0"
+                                        Tag="Display"
+                                        Click="LogFilterButton_Click">
+                                        <TextBlock Text="显示器" HorizontalAlignment="Center" VerticalAlignment="Center" FontSize="12" />
                                     </Button>
                                 </StackPanel>
 
@@ -416,16 +436,44 @@
                                 <FontIcon x:Name="AudioEndpointStatusIcon" Grid.Row="5" Grid.Column="3" Glyph="&#xE7BA;" FontSize="15" Foreground="{StaticResource DiagOrangeBrush}" VerticalAlignment="Center" />
                             </Grid>
 
-                            <Button
-                                x:Name="RecheckDiagnosticsButton"
-                                Grid.Row="2"
-                                Style="{StaticResource DiagSmallButtonStyle}"
-                                Click="RecheckDiagnosticsButton_Click">
-                                <StackPanel Orientation="Horizontal" HorizontalAlignment="Center" Spacing="8">
-                                    <FontIcon Glyph="&#xE72C;" FontSize="14" Foreground="{StaticResource DiagBodyBrush}" />
-                                    <TextBlock Text="重新检查" FontSize="13" Foreground="{StaticResource DiagBodyBrush}" VerticalAlignment="Center" />
-                                </StackPanel>
-                            </Button>
+                            <StackPanel Grid.Row="2" Orientation="Horizontal" Spacing="8" HorizontalAlignment="Center">
+                                <Button
+                                    x:Name="RecheckDiagnosticsButton"
+                                    Style="{StaticResource DiagSmallButtonStyle}"
+                                    Click="RecheckDiagnosticsButton_Click">
+                                    <StackPanel Orientation="Horizontal" HorizontalAlignment="Center" Spacing="6">
+                                        <FontIcon Glyph="&#xE72C;" FontSize="14" Foreground="{StaticResource DiagBodyBrush}" />
+                                        <TextBlock x:Name="RecheckDiagnosticsButtonText" Text="重新检查" FontSize="13" Foreground="{StaticResource DiagBodyBrush}" VerticalAlignment="Center" />
+                                    </StackPanel>
+                                </Button>
+                                <Button
+                                    x:Name="RefreshAdbDevicesButton"
+                                    Style="{StaticResource DiagSmallButtonStyle}"
+                                    Click="RefreshAdbDevicesButton_Click">
+                                    <StackPanel Orientation="Horizontal" HorizontalAlignment="Center" Spacing="6">
+                                        <FontIcon Glyph="&#xE8B7;" FontSize="14" Foreground="{StaticResource DiagBodyBrush}" />
+                                        <TextBlock x:Name="RefreshAdbDevicesButtonText" Text="刷新 ADB" FontSize="13" Foreground="{StaticResource DiagBodyBrush}" VerticalAlignment="Center" />
+                                    </StackPanel>
+                                </Button>
+                                <Button
+                                    x:Name="ConfigureAdbReverseButton"
+                                    Style="{StaticResource DiagSmallButtonStyle}"
+                                    Click="ConfigureAdbReverseButton_Click">
+                                    <StackPanel Orientation="Horizontal" HorizontalAlignment="Center" Spacing="6">
+                                        <FontIcon Glyph="&#xE71B;" FontSize="14" Foreground="{StaticResource DiagBodyBrush}" />
+                                        <TextBlock x:Name="ConfigureAdbReverseButtonText" Text="重配 reverse" FontSize="13" Foreground="{StaticResource DiagBodyBrush}" VerticalAlignment="Center" />
+                                    </StackPanel>
+                                </Button>
+                                <Button
+                                    x:Name="OpenLogDirectoryButton"
+                                    Style="{StaticResource DiagSmallButtonStyle}"
+                                    Click="OpenLogDirectoryButton_Click">
+                                    <StackPanel Orientation="Horizontal" HorizontalAlignment="Center" Spacing="6">
+                                        <FontIcon Glyph="&#xED25;" FontSize="14" Foreground="{StaticResource DiagBodyBrush}" />
+                                        <TextBlock Text="日志目录" FontSize="13" Foreground="{StaticResource DiagBodyBrush}" VerticalAlignment="Center" />
+                                    </StackPanel>
+                                </Button>
+                            </StackPanel>
                         </Grid>
                     </Border>
                 </Grid>
@@ -566,54 +614,63 @@
                                 <TextBlock Grid.Column="2" Text="本地状态" FontSize="12" Foreground="{StaticResource DiagBodyBrush}" />
                                 <TextBlock Grid.Column="3" Text="映射状态" FontSize="12" Foreground="{StaticResource DiagBodyBrush}" />
 
-                                <TextBlock Grid.Row="1" Text="27183" FontSize="13" Foreground="{StaticResource DiagBodyBrush}" />
+                                <TextBlock x:Name="ControlPortValueText" Grid.Row="1" Text="27183" FontSize="13" Foreground="{StaticResource DiagBodyBrush}" />
                                 <TextBlock Grid.Row="1" Grid.Column="1" Text="控制" FontSize="13" Foreground="{StaticResource DiagBodyBrush}" />
                                 <StackPanel Grid.Row="1" Grid.Column="2" Orientation="Horizontal" Spacing="6">
-                                    <Ellipse Width="8" Height="8" Fill="{StaticResource DiagGreenBrush}" VerticalAlignment="Center" />
-                                    <TextBlock Text="监听中" FontSize="13" Foreground="{StaticResource DiagBodyBrush}" />
+                                    <Ellipse x:Name="ControlPortLocalDot" Width="8" Height="8" Fill="{StaticResource DiagGreenBrush}" VerticalAlignment="Center" />
+                                    <TextBlock x:Name="ControlPortLocalText" Text="监听中" FontSize="13" Foreground="{StaticResource DiagBodyBrush}" />
                                 </StackPanel>
                                 <StackPanel Grid.Row="1" Grid.Column="3" Orientation="Horizontal" Spacing="6">
-                                    <Ellipse Width="8" Height="8" Fill="{StaticResource DiagGreenBrush}" VerticalAlignment="Center" />
-                                    <TextBlock Text="已映射" FontSize="13" Foreground="{StaticResource DiagBodyBrush}" />
+                                    <Ellipse x:Name="ControlPortReverseDot" Width="8" Height="8" Fill="{StaticResource DiagGreenBrush}" VerticalAlignment="Center" />
+                                    <TextBlock x:Name="ControlPortReverseText" Text="已映射" FontSize="13" Foreground="{StaticResource DiagBodyBrush}" />
                                 </StackPanel>
 
-                                <TextBlock Grid.Row="2" Text="27184" FontSize="13" Foreground="{StaticResource DiagBodyBrush}" />
+                                <TextBlock x:Name="VideoPortValueText" Grid.Row="2" Text="27184" FontSize="13" Foreground="{StaticResource DiagBodyBrush}" />
                                 <TextBlock Grid.Row="2" Grid.Column="1" Text="视频" FontSize="13" Foreground="{StaticResource DiagBodyBrush}" />
                                 <StackPanel Grid.Row="2" Grid.Column="2" Orientation="Horizontal" Spacing="6">
-                                    <Ellipse Width="8" Height="8" Fill="{StaticResource DiagGreenBrush}" VerticalAlignment="Center" />
-                                    <TextBlock Text="监听中" FontSize="13" Foreground="{StaticResource DiagBodyBrush}" />
+                                    <Ellipse x:Name="VideoPortLocalDot" Width="8" Height="8" Fill="{StaticResource DiagGreenBrush}" VerticalAlignment="Center" />
+                                    <TextBlock x:Name="VideoPortLocalText" Text="监听中" FontSize="13" Foreground="{StaticResource DiagBodyBrush}" />
                                 </StackPanel>
                                 <StackPanel Grid.Row="2" Grid.Column="3" Orientation="Horizontal" Spacing="6">
-                                    <Ellipse Width="8" Height="8" Fill="{StaticResource DiagGreenBrush}" VerticalAlignment="Center" />
-                                    <TextBlock Text="已映射" FontSize="13" Foreground="{StaticResource DiagBodyBrush}" />
+                                    <Ellipse x:Name="VideoPortReverseDot" Width="8" Height="8" Fill="{StaticResource DiagGreenBrush}" VerticalAlignment="Center" />
+                                    <TextBlock x:Name="VideoPortReverseText" Text="已映射" FontSize="13" Foreground="{StaticResource DiagBodyBrush}" />
                                 </StackPanel>
 
-                                <TextBlock Grid.Row="3" Text="27185" FontSize="13" Foreground="{StaticResource DiagBodyBrush}" />
+                                <TextBlock x:Name="AudioPortValueText" Grid.Row="3" Text="27185" FontSize="13" Foreground="{StaticResource DiagBodyBrush}" />
                                 <TextBlock Grid.Row="3" Grid.Column="1" Text="音频" FontSize="13" Foreground="{StaticResource DiagBodyBrush}" />
                                 <StackPanel Grid.Row="3" Grid.Column="2" Orientation="Horizontal" Spacing="6">
-                                    <Ellipse Width="8" Height="8" Fill="{StaticResource DiagGreenBrush}" VerticalAlignment="Center" />
-                                    <TextBlock Text="监听中" FontSize="13" Foreground="{StaticResource DiagBodyBrush}" />
+                                    <Ellipse x:Name="AudioPortLocalDot" Width="8" Height="8" Fill="{StaticResource DiagGreenBrush}" VerticalAlignment="Center" />
+                                    <TextBlock x:Name="AudioPortLocalText" Text="监听中" FontSize="13" Foreground="{StaticResource DiagBodyBrush}" />
                                 </StackPanel>
                                 <StackPanel Grid.Row="3" Grid.Column="3" Orientation="Horizontal" Spacing="6">
-                                    <Ellipse Width="8" Height="8" Fill="{StaticResource DiagGreenBrush}" VerticalAlignment="Center" />
-                                    <TextBlock Text="已映射" FontSize="13" Foreground="{StaticResource DiagBodyBrush}" />
+                                    <Ellipse x:Name="AudioPortReverseDot" Width="8" Height="8" Fill="{StaticResource DiagGreenBrush}" VerticalAlignment="Center" />
+                                    <TextBlock x:Name="AudioPortReverseText" Text="已映射" FontSize="13" Foreground="{StaticResource DiagBodyBrush}" />
                                 </StackPanel>
 
-                                <TextBlock Grid.Row="4" Text="27186" FontSize="13" Foreground="{StaticResource DiagBodyBrush}" />
+                                <TextBlock x:Name="CameraPortValueText" Grid.Row="4" Text="27186" FontSize="13" Foreground="{StaticResource DiagBodyBrush}" />
                                 <TextBlock Grid.Row="4" Grid.Column="1" Text="摄像头" FontSize="13" Foreground="{StaticResource DiagBodyBrush}" />
                                 <StackPanel Grid.Row="4" Grid.Column="2" Orientation="Horizontal" Spacing="6">
-                                    <Ellipse Width="8" Height="8" Fill="{StaticResource DiagGreenBrush}" VerticalAlignment="Center" />
-                                    <TextBlock Text="监听中" FontSize="13" Foreground="{StaticResource DiagBodyBrush}" />
+                                    <Ellipse x:Name="CameraPortLocalDot" Width="8" Height="8" Fill="{StaticResource DiagGreenBrush}" VerticalAlignment="Center" />
+                                    <TextBlock x:Name="CameraPortLocalText" Text="监听中" FontSize="13" Foreground="{StaticResource DiagBodyBrush}" />
                                 </StackPanel>
                                 <StackPanel Grid.Row="4" Grid.Column="3" Orientation="Horizontal" Spacing="6">
-                                    <Ellipse Width="8" Height="8" Fill="{StaticResource DiagGreenBrush}" VerticalAlignment="Center" />
-                                    <TextBlock Text="已映射" FontSize="13" Foreground="{StaticResource DiagBodyBrush}" />
+                                    <Ellipse x:Name="CameraPortReverseDot" Width="8" Height="8" Fill="{StaticResource DiagGreenBrush}" VerticalAlignment="Center" />
+                                    <TextBlock x:Name="CameraPortReverseText" Text="已映射" FontSize="13" Foreground="{StaticResource DiagBodyBrush}" />
                                 </StackPanel>
                             </Grid>
-                            <Grid Grid.Row="2">
-                                <TextBlock Text="查看完整端口信息" FontSize="13" Foreground="{StaticResource DiagPrimaryBrush}" VerticalAlignment="Center" />
-                                <FontIcon Glyph="&#xE72A;" FontSize="14" Foreground="{StaticResource DiagBodyBrush}" HorizontalAlignment="Right" VerticalAlignment="Center" />
-                            </Grid>
+                            <Button
+                                x:Name="ViewFullPortInfoButton"
+                                Grid.Row="2"
+                                Background="Transparent"
+                                BorderThickness="0"
+                                Padding="0"
+                                HorizontalAlignment="Stretch"
+                                Click="ViewFullPortInfoButton_Click">
+                                <Grid>
+                                    <TextBlock Text="查看完整端口信息" FontSize="13" Foreground="{StaticResource DiagPrimaryBrush}" VerticalAlignment="Center" />
+                                    <FontIcon Glyph="&#xE72A;" FontSize="14" Foreground="{StaticResource DiagBodyBrush}" HorizontalAlignment="Right" VerticalAlignment="Center" />
+                                </Grid>
+                            </Button>
                         </Grid>
                     </Border>
 
@@ -626,17 +683,26 @@
                             </Grid.RowDefinitions>
                             <TextBlock Text="最近错误" FontSize="16" FontWeight="SemiBold" Foreground="{StaticResource DiagTextBrush}" />
                             <StackPanel Grid.Row="1" HorizontalAlignment="Center" VerticalAlignment="Center" Spacing="12">
-                                <Border Width="58" Height="58" CornerRadius="29" BorderBrush="{StaticResource DiagGreenBrush}" BorderThickness="3">
-                                    <FontIcon Glyph="&#xE73E;" FontSize="29" Foreground="{StaticResource DiagGreenBrush}" />
+                                <Border x:Name="RecentErrorIconBorder" Width="58" Height="58" CornerRadius="29" BorderBrush="{StaticResource DiagGreenBrush}" BorderThickness="3">
+                                    <FontIcon x:Name="RecentErrorIcon" Glyph="&#xE73E;" FontSize="29" Foreground="{StaticResource DiagGreenBrush}" />
                                 </Border>
-                                <TextBlock Text="无严重错误" HorizontalAlignment="Center" FontSize="16" FontWeight="SemiBold" Foreground="{StaticResource DiagGreenBrush}" />
-                                <TextBlock Text="最近 24 小时内未检测到严重错误。" HorizontalAlignment="Center" FontSize="12" Foreground="{StaticResource DiagBodyBrush}" />
+                                <TextBlock x:Name="RecentErrorTitleText" Text="无严重错误" HorizontalAlignment="Center" FontSize="16" FontWeight="SemiBold" Foreground="{StaticResource DiagGreenBrush}" TextTrimming="CharacterEllipsis" />
+                                <TextBlock x:Name="RecentErrorDetailText" Text="最近 24 小时内未检测到严重错误。" HorizontalAlignment="Center" FontSize="12" Foreground="{StaticResource DiagBodyBrush}" TextWrapping="WrapWholeWords" TextAlignment="Center" MaxWidth="260" />
                             </StackPanel>
-                            <Grid Grid.Row="2">
-                                <Border Height="1" Background="{StaticResource DiagSoftStrokeBrush}" VerticalAlignment="Top" />
-                                <TextBlock Text="查看错误历史" FontSize="13" Foreground="{StaticResource DiagPrimaryBrush}" VerticalAlignment="Bottom" />
-                                <FontIcon Glyph="&#xE72A;" FontSize="14" Foreground="{StaticResource DiagBodyBrush}" HorizontalAlignment="Right" VerticalAlignment="Bottom" />
-                            </Grid>
+                            <Button
+                                x:Name="ViewErrorHistoryButton"
+                                Grid.Row="2"
+                                Background="Transparent"
+                                BorderThickness="0"
+                                Padding="0"
+                                HorizontalAlignment="Stretch"
+                                Click="ViewErrorHistoryButton_Click">
+                                <Grid>
+                                    <Border Height="1" Background="{StaticResource DiagSoftStrokeBrush}" VerticalAlignment="Top" />
+                                    <TextBlock Text="查看错误历史" FontSize="13" Foreground="{StaticResource DiagPrimaryBrush}" VerticalAlignment="Bottom" />
+                                    <FontIcon Glyph="&#xE72A;" FontSize="14" Foreground="{StaticResource DiagBodyBrush}" HorizontalAlignment="Right" VerticalAlignment="Bottom" />
+                                </Grid>
+                            </Button>
                         </Grid>
                     </Border>
                 </Grid>
