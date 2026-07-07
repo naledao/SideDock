@@ -240,15 +240,20 @@
                             </Grid.RowDefinitions>
                             <Grid>
                                 <TextBlock Text="实时日志" FontSize="16" FontWeight="SemiBold" Foreground="{StaticResource DiagTextBrush}" VerticalAlignment="Center" />
-                                <StackPanel Orientation="Horizontal" HorizontalAlignment="Right" Spacing="12" VerticalAlignment="Center">
+                                <StackPanel Orientation="Horizontal" HorizontalAlignment="Right" Spacing="10" VerticalAlignment="Center">
                                     <TextBlock Text="自动滚动" FontSize="13" Foreground="{StaticResource DiagBodyBrush}" VerticalAlignment="Center" />
-                                    <Border Width="42" Height="22" CornerRadius="11" Background="{StaticResource DiagPrimaryBrush}">
-                                        <Ellipse Width="16" Height="16" Margin="22,0,4,0" Fill="#FFFFFF" />
-                                    </Border>
-                                    <Button Style="{StaticResource DiagSmallButtonStyle}" Width="38" Padding="0">
-                                        <FontIcon Glyph="&#xE71C;" FontSize="16" Foreground="#30363D" />
-                                    </Button>
-                                    <Button Style="{StaticResource DiagSmallButtonStyle}" MinWidth="52">
+                                    <ToggleSwitch
+                                        x:Name="DiagnosticsAutoScrollSwitch"
+                                        IsOn="True"
+                                        MinWidth="56"
+                                        OnContent=""
+                                        OffContent=""
+                                        Toggled="DiagnosticsAutoScrollSwitch_Toggled" />
+                                    <Button
+                                        x:Name="ClearDiagnosticsLogsButton"
+                                        Style="{StaticResource DiagSmallButtonStyle}"
+                                        MinWidth="52"
+                                        Click="ClearDiagnosticsLogsButton_Click">
                                         <TextBlock Text="清空" FontSize="13" Foreground="{StaticResource DiagBodyBrush}" />
                                     </Button>
                                 </StackPanel>
@@ -260,95 +265,73 @@
                                     <RowDefinition Height="*" />
                                 </Grid.RowDefinitions>
                                 <StackPanel Orientation="Horizontal" Spacing="0">
-                                    <Border Width="60" CornerRadius="5,0,0,5" Background="{StaticResource DiagPrimaryBrush}">
-                                        <TextBlock Text="全部" HorizontalAlignment="Center" VerticalAlignment="Center" FontSize="12" FontWeight="SemiBold" Foreground="#FFFFFF" />
-                                    </Border>
-                                    <Border Width="60" BorderBrush="{StaticResource DiagStrokeBrush}" BorderThickness="1,1,0,1">
-                                        <TextBlock Text="Host" HorizontalAlignment="Center" VerticalAlignment="Center" FontSize="12" Foreground="{StaticResource DiagBodyBrush}" />
-                                    </Border>
-                                    <Border Width="60" BorderBrush="{StaticResource DiagStrokeBrush}" BorderThickness="1,1,0,1">
-                                        <TextBlock Text="ADB" HorizontalAlignment="Center" VerticalAlignment="Center" FontSize="12" Foreground="{StaticResource DiagBodyBrush}" />
-                                    </Border>
-                                    <Border Width="70" BorderBrush="{StaticResource DiagStrokeBrush}" BorderThickness="1,1,0,1">
-                                        <TextBlock Text="摄像头" HorizontalAlignment="Center" VerticalAlignment="Center" FontSize="12" Foreground="{StaticResource DiagBodyBrush}" />
-                                    </Border>
-                                    <Border Width="60" CornerRadius="0,5,5,0" BorderBrush="{StaticResource DiagStrokeBrush}" BorderThickness="1">
-                                        <TextBlock Text="音频" HorizontalAlignment="Center" VerticalAlignment="Center" FontSize="12" Foreground="{StaticResource DiagBodyBrush}" />
-                                    </Border>
+                                    <Button
+                                        x:Name="LogFilterAllButton"
+                                        Width="60"
+                                        Height="30"
+                                        Padding="0"
+                                        CornerRadius="5,0,0,5"
+                                        Tag="All"
+                                        Click="LogFilterButton_Click">
+                                        <TextBlock Text="全部" HorizontalAlignment="Center" VerticalAlignment="Center" FontSize="12" />
+                                    </Button>
+                                    <Button
+                                        x:Name="LogFilterHostButton"
+                                        Width="60"
+                                        Height="30"
+                                        Padding="0"
+                                        CornerRadius="0"
+                                        Tag="Host"
+                                        Click="LogFilterButton_Click">
+                                        <TextBlock Text="Host" HorizontalAlignment="Center" VerticalAlignment="Center" FontSize="12" />
+                                    </Button>
+                                    <Button
+                                        x:Name="LogFilterAdbButton"
+                                        Width="60"
+                                        Height="30"
+                                        Padding="0"
+                                        CornerRadius="0"
+                                        Tag="Adb"
+                                        Click="LogFilterButton_Click">
+                                        <TextBlock Text="ADB" HorizontalAlignment="Center" VerticalAlignment="Center" FontSize="12" />
+                                    </Button>
+                                    <Button
+                                        x:Name="LogFilterCameraButton"
+                                        Width="70"
+                                        Height="30"
+                                        Padding="0"
+                                        CornerRadius="0"
+                                        Tag="Camera"
+                                        Click="LogFilterButton_Click">
+                                        <TextBlock Text="摄像头" HorizontalAlignment="Center" VerticalAlignment="Center" FontSize="12" />
+                                    </Button>
+                                    <Button
+                                        x:Name="LogFilterAudioButton"
+                                        Width="60"
+                                        Height="30"
+                                        Padding="0"
+                                        CornerRadius="0,5,5,0"
+                                        Tag="Audio"
+                                        Click="LogFilterButton_Click">
+                                        <TextBlock Text="音频" HorizontalAlignment="Center" VerticalAlignment="Center" FontSize="12" />
+                                    </Button>
                                 </StackPanel>
 
                                 <Border Grid.Row="1" CornerRadius="6" BorderBrush="{StaticResource DiagStrokeBrush}" BorderThickness="1" Background="#FBFCFD" Padding="14,10">
                                     <Grid>
-                                        <Grid.RowDefinitions>
-                                            <RowDefinition Height="24" />
-                                            <RowDefinition Height="24" />
-                                            <RowDefinition Height="24" />
-                                            <RowDefinition Height="24" />
-                                            <RowDefinition Height="24" />
-                                            <RowDefinition Height="24" />
-                                            <RowDefinition Height="24" />
-                                            <RowDefinition Height="24" />
-                                            <RowDefinition Height="24" />
-                                            <RowDefinition Height="24" />
-                                        </Grid.RowDefinitions>
-                                        <Grid.ColumnDefinitions>
-                                            <ColumnDefinition Width="176" />
-                                            <ColumnDefinition Width="64" />
-                                            <ColumnDefinition Width="86" />
-                                            <ColumnDefinition Width="*" />
-                                        </Grid.ColumnDefinitions>
-
-                                        <TextBlock Text="2025-05-26 10:42:18.123" FontFamily="Consolas" FontSize="12" Foreground="{StaticResource DiagBodyBrush}" />
-                                        <TextBlock Grid.Column="1" Text="[INFO]" FontFamily="Consolas" FontSize="12" Foreground="{StaticResource DiagGreenBrush}" />
-                                        <TextBlock Grid.Column="2" Text="Host" FontFamily="Consolas" FontSize="12" Foreground="{StaticResource DiagBodyBrush}" />
-                                        <TextBlock Grid.Column="3" Text="Host service started, version 1.3.0" FontFamily="Consolas" FontSize="12" Foreground="{StaticResource DiagBodyBrush}" TextTrimming="CharacterEllipsis" />
-
-                                        <TextBlock Grid.Row="1" Text="2025-05-26 10:42:18.246" FontFamily="Consolas" FontSize="12" Foreground="{StaticResource DiagBodyBrush}" />
-                                        <TextBlock Grid.Row="1" Grid.Column="1" Text="[INFO]" FontFamily="Consolas" FontSize="12" Foreground="{StaticResource DiagGreenBrush}" />
-                                        <TextBlock Grid.Row="1" Grid.Column="2" Text="Connect" FontFamily="Consolas" FontSize="12" Foreground="{StaticResource DiagBodyBrush}" />
-                                        <TextBlock Grid.Row="1" Grid.Column="3" Text="Device HA1K3AX0 connected via USB" FontFamily="Consolas" FontSize="12" Foreground="{StaticResource DiagBodyBrush}" TextTrimming="CharacterEllipsis" />
-
-                                        <TextBlock Grid.Row="2" Text="2025-05-26 10:42:18.512" FontFamily="Consolas" FontSize="12" Foreground="{StaticResource DiagBodyBrush}" />
-                                        <TextBlock Grid.Row="2" Grid.Column="1" Text="[INFO]" FontFamily="Consolas" FontSize="12" Foreground="{StaticResource DiagGreenBrush}" />
-                                        <TextBlock Grid.Row="2" Grid.Column="2" Text="ADB" FontFamily="Consolas" FontSize="12" Foreground="{StaticResource DiagBodyBrush}" />
-                                        <TextBlock Grid.Row="2" Grid.Column="3" Text="ADB device authorized" FontFamily="Consolas" FontSize="12" Foreground="{StaticResource DiagBodyBrush}" TextTrimming="CharacterEllipsis" />
-
-                                        <TextBlock Grid.Row="3" Text="2025-05-26 10:42:18.784" FontFamily="Consolas" FontSize="12" Foreground="{StaticResource DiagBodyBrush}" />
-                                        <TextBlock Grid.Row="3" Grid.Column="1" Text="[INFO]" FontFamily="Consolas" FontSize="12" Foreground="{StaticResource DiagGreenBrush}" />
-                                        <TextBlock Grid.Row="3" Grid.Column="2" Text="ADB" FontFamily="Consolas" FontSize="12" Foreground="{StaticResource DiagBodyBrush}" />
-                                        <TextBlock Grid.Row="3" Grid.Column="3" Text="Reverse port forwarded: tcp:27183 -> tcp:27183" FontFamily="Consolas" FontSize="12" Foreground="{StaticResource DiagBodyBrush}" TextTrimming="CharacterEllipsis" />
-
-                                        <TextBlock Grid.Row="4" Text="2025-05-26 10:42:18.785" FontFamily="Consolas" FontSize="12" Foreground="{StaticResource DiagBodyBrush}" />
-                                        <TextBlock Grid.Row="4" Grid.Column="1" Text="[INFO]" FontFamily="Consolas" FontSize="12" Foreground="{StaticResource DiagGreenBrush}" />
-                                        <TextBlock Grid.Row="4" Grid.Column="2" Text="ADB" FontFamily="Consolas" FontSize="12" Foreground="{StaticResource DiagBodyBrush}" />
-                                        <TextBlock Grid.Row="4" Grid.Column="3" Text="Reverse port forwarded: tcp:27184 -> tcp:27184" FontFamily="Consolas" FontSize="12" Foreground="{StaticResource DiagBodyBrush}" TextTrimming="CharacterEllipsis" />
-
-                                        <TextBlock Grid.Row="5" Text="2025-05-26 10:42:18.786" FontFamily="Consolas" FontSize="12" Foreground="{StaticResource DiagBodyBrush}" />
-                                        <TextBlock Grid.Row="5" Grid.Column="1" Text="[INFO]" FontFamily="Consolas" FontSize="12" Foreground="{StaticResource DiagGreenBrush}" />
-                                        <TextBlock Grid.Row="5" Grid.Column="2" Text="ADB" FontFamily="Consolas" FontSize="12" Foreground="{StaticResource DiagBodyBrush}" />
-                                        <TextBlock Grid.Row="5" Grid.Column="3" Text="Reverse port forwarded: tcp:27185 -> tcp:27185" FontFamily="Consolas" FontSize="12" Foreground="{StaticResource DiagBodyBrush}" TextTrimming="CharacterEllipsis" />
-
-                                        <TextBlock Grid.Row="6" Text="2025-05-26 10:42:18.787" FontFamily="Consolas" FontSize="12" Foreground="{StaticResource DiagBodyBrush}" />
-                                        <TextBlock Grid.Row="6" Grid.Column="1" Text="[INFO]" FontFamily="Consolas" FontSize="12" Foreground="{StaticResource DiagGreenBrush}" />
-                                        <TextBlock Grid.Row="6" Grid.Column="2" Text="ADB" FontFamily="Consolas" FontSize="12" Foreground="{StaticResource DiagBodyBrush}" />
-                                        <TextBlock Grid.Row="6" Grid.Column="3" Text="Reverse port forwarded: tcp:27186 -> tcp:27186" FontFamily="Consolas" FontSize="12" Foreground="{StaticResource DiagBodyBrush}" TextTrimming="CharacterEllipsis" />
-
-                                        <TextBlock Grid.Row="7" Text="2025-05-26 10:42:19.102" FontFamily="Consolas" FontSize="12" Foreground="{StaticResource DiagBodyBrush}" />
-                                        <TextBlock Grid.Row="7" Grid.Column="1" Text="[INFO]" FontFamily="Consolas" FontSize="12" Foreground="{StaticResource DiagGreenBrush}" />
-                                        <TextBlock Grid.Row="7" Grid.Column="2" Text="Display" FontFamily="Consolas" FontSize="12" Foreground="{StaticResource DiagBodyBrush}" />
-                                        <TextBlock Grid.Row="7" Grid.Column="3" Text="Virtual display started (1920x1080@120Hz)" FontFamily="Consolas" FontSize="12" Foreground="{StaticResource DiagBodyBrush}" TextTrimming="CharacterEllipsis" />
-
-                                        <TextBlock Grid.Row="8" Text="2025-05-26 10:42:19.135" FontFamily="Consolas" FontSize="12" Foreground="{StaticResource DiagBodyBrush}" />
-                                        <TextBlock Grid.Row="8" Grid.Column="1" Text="[INFO]" FontFamily="Consolas" FontSize="12" Foreground="{StaticResource DiagGreenBrush}" />
-                                        <TextBlock Grid.Row="8" Grid.Column="2" Text="Camera" FontFamily="Consolas" FontSize="12" Foreground="{StaticResource DiagBodyBrush}" />
-                                        <TextBlock Grid.Row="8" Grid.Column="3" Text="Camera streaming started (1280x720@30fps)" FontFamily="Consolas" FontSize="12" Foreground="{StaticResource DiagBodyBrush}" TextTrimming="CharacterEllipsis" />
-
-                                        <TextBlock Grid.Row="9" Text="2025-05-26 10:42:21.543" FontFamily="Consolas" FontSize="12" Foreground="{StaticResource DiagBodyBrush}" />
-                                        <TextBlock Grid.Row="9" Grid.Column="1" Text="[INFO]" FontFamily="Consolas" FontSize="12" Foreground="{StaticResource DiagGreenBrush}" />
-                                        <TextBlock Grid.Row="9" Grid.Column="2" Text="Perf" FontFamily="Consolas" FontSize="12" Foreground="{StaticResource DiagBodyBrush}" />
-                                        <TextBlock Grid.Row="9" Grid.Column="3" Text="avg_latency=22ms, fps=120, bitrate=20.3Mbps" FontFamily="Consolas" FontSize="12" Foreground="{StaticResource DiagBodyBrush}" TextTrimming="CharacterEllipsis" />
-
-                                        <Rectangle Width="4" Height="210" Fill="#AEB6C0" RadiusX="2" RadiusY="2" HorizontalAlignment="Right" Margin="0,22,2,0" VerticalAlignment="Top" />
+                                        <ScrollViewer
+                                            x:Name="DiagnosticsLogScrollViewer"
+                                            VerticalScrollBarVisibility="Auto"
+                                            HorizontalScrollBarVisibility="Disabled">
+                                            <StackPanel x:Name="DiagnosticsLogPanel" Spacing="0" />
+                                        </ScrollViewer>
+                                        <TextBlock
+                                            x:Name="DiagnosticsLogEmptyText"
+                                            Text="Host 未启动，暂无实时日志。"
+                                            HorizontalAlignment="Center"
+                                            VerticalAlignment="Center"
+                                            FontSize="13"
+                                            Foreground="{StaticResource DiagMutedBrush}" />
                                     </Grid>
                                 </Border>
                             </Grid>
@@ -464,15 +447,36 @@
                             <Grid>
                                 <TextBlock Text="性能趋势" FontSize="16" FontWeight="SemiBold" Foreground="{StaticResource DiagTextBrush}" />
                                 <StackPanel HorizontalAlignment="Right" Orientation="Horizontal" Spacing="0">
-                                    <Border Width="58" Height="28" CornerRadius="5,0,0,5" Background="{StaticResource DiagPrimaryBrush}">
-                                        <TextBlock Text="1 分钟" HorizontalAlignment="Center" VerticalAlignment="Center" FontSize="12" FontWeight="SemiBold" Foreground="#FFFFFF" />
-                                    </Border>
-                                    <Border Width="58" Height="28" BorderBrush="{StaticResource DiagStrokeBrush}" BorderThickness="1,1,0,1">
-                                        <TextBlock Text="5 分钟" HorizontalAlignment="Center" VerticalAlignment="Center" FontSize="12" Foreground="{StaticResource DiagBodyBrush}" />
-                                    </Border>
-                                    <Border Width="58" Height="28" CornerRadius="0,5,5,0" BorderBrush="{StaticResource DiagStrokeBrush}" BorderThickness="1">
-                                        <TextBlock Text="15 分钟" HorizontalAlignment="Center" VerticalAlignment="Center" FontSize="12" Foreground="{StaticResource DiagBodyBrush}" />
-                                    </Border>
+                                    <Button
+                                        x:Name="TrendRangeOneMinuteButton"
+                                        Width="58"
+                                        Height="28"
+                                        Padding="0"
+                                        CornerRadius="5,0,0,5"
+                                        Tag="OneMinute"
+                                        Click="TrendRangeButton_Click">
+                                        <TextBlock Text="1 分钟" HorizontalAlignment="Center" VerticalAlignment="Center" FontSize="12" />
+                                    </Button>
+                                    <Button
+                                        x:Name="TrendRangeFiveMinutesButton"
+                                        Width="58"
+                                        Height="28"
+                                        Padding="0"
+                                        CornerRadius="0"
+                                        Tag="FiveMinutes"
+                                        Click="TrendRangeButton_Click">
+                                        <TextBlock Text="5 分钟" HorizontalAlignment="Center" VerticalAlignment="Center" FontSize="12" />
+                                    </Button>
+                                    <Button
+                                        x:Name="TrendRangeFifteenMinutesButton"
+                                        Width="58"
+                                        Height="28"
+                                        Padding="0"
+                                        CornerRadius="0,5,5,0"
+                                        Tag="FifteenMinutes"
+                                        Click="TrendRangeButton_Click">
+                                        <TextBlock Text="15 分钟" HorizontalAlignment="Center" VerticalAlignment="Center" FontSize="12" />
+                                    </Button>
                                 </StackPanel>
                             </Grid>
 
@@ -481,20 +485,20 @@
                                     <RowDefinition Height="20" />
                                     <RowDefinition Height="*" />
                                 </Grid.RowDefinitions>
-                                <StackPanel Orientation="Horizontal" Spacing="18">
-                                    <StackPanel Orientation="Horizontal" Spacing="6">
-                                        <Rectangle Width="16" Height="3" Fill="#0FA3B1" RadiusX="1" RadiusY="1" VerticalAlignment="Center" />
-                                        <TextBlock Text="CPU" FontSize="12" Foreground="{StaticResource DiagBodyBrush}" />
+                                    <StackPanel Orientation="Horizontal" Spacing="18">
+                                        <StackPanel Orientation="Horizontal" Spacing="6">
+                                            <Rectangle Width="16" Height="3" Fill="#0FA3B1" RadiusX="1" RadiusY="1" VerticalAlignment="Center" />
+                                            <TextBlock x:Name="TrendCpuValueText" Text="CPU --" FontSize="12" Foreground="{StaticResource DiagBodyBrush}" />
+                                        </StackPanel>
+                                        <StackPanel Orientation="Horizontal" Spacing="6">
+                                            <Rectangle Width="16" Height="3" Fill="#2E6DEB" RadiusX="1" RadiusY="1" VerticalAlignment="Center" />
+                                            <TextBlock x:Name="TrendMemoryValueText" Text="内存 --" FontSize="12" Foreground="{StaticResource DiagBodyBrush}" />
+                                        </StackPanel>
+                                        <StackPanel Orientation="Horizontal" Spacing="6">
+                                            <Rectangle Width="16" Height="3" Fill="#4AAE52" RadiusX="1" RadiusY="1" VerticalAlignment="Center" />
+                                            <TextBlock x:Name="TrendNetworkValueText" Text="网络 -- Mbps" FontSize="12" Foreground="{StaticResource DiagBodyBrush}" />
+                                        </StackPanel>
                                     </StackPanel>
-                                    <StackPanel Orientation="Horizontal" Spacing="6">
-                                        <Rectangle Width="16" Height="3" Fill="#2E6DEB" RadiusX="1" RadiusY="1" VerticalAlignment="Center" />
-                                        <TextBlock Text="内存" FontSize="12" Foreground="{StaticResource DiagBodyBrush}" />
-                                    </StackPanel>
-                                    <StackPanel Orientation="Horizontal" Spacing="6">
-                                        <Rectangle Width="16" Height="3" Fill="#4AAE52" RadiusX="1" RadiusY="1" VerticalAlignment="Center" />
-                                        <TextBlock Text="网络 (Mbps)" FontSize="12" Foreground="{StaticResource DiagBodyBrush}" />
-                                    </StackPanel>
-                                </StackPanel>
 
                                 <Grid Grid.Row="1">
                                     <Grid.ColumnDefinitions>
@@ -510,47 +514,27 @@
                                     <TextBlock Text="100%" FontSize="11" Foreground="{StaticResource DiagMutedBrush}" />
                                     <TextBlock Grid.Row="1" Text="50%" FontSize="11" Foreground="{StaticResource DiagMutedBrush}" VerticalAlignment="Center" />
                                     <TextBlock Grid.Row="2" Text="0%" FontSize="11" Foreground="{StaticResource DiagMutedBrush}" VerticalAlignment="Bottom" />
-                                    <TextBlock Grid.Column="2" Text="100" FontSize="11" Foreground="{StaticResource DiagMutedBrush}" HorizontalAlignment="Right" />
-                                    <TextBlock Grid.Row="1" Grid.Column="2" Text="50" FontSize="11" Foreground="{StaticResource DiagMutedBrush}" HorizontalAlignment="Right" VerticalAlignment="Center" />
-                                    <TextBlock Grid.Row="2" Grid.Column="2" Text="0" FontSize="11" Foreground="{StaticResource DiagMutedBrush}" HorizontalAlignment="Right" VerticalAlignment="Bottom" />
+                                    <TextBlock x:Name="TrendRightTopLabel" Grid.Column="2" Text="100" FontSize="11" Foreground="{StaticResource DiagMutedBrush}" HorizontalAlignment="Right" />
+                                    <TextBlock x:Name="TrendRightMiddleLabel" Grid.Row="1" Grid.Column="2" Text="50" FontSize="11" Foreground="{StaticResource DiagMutedBrush}" HorizontalAlignment="Right" VerticalAlignment="Center" />
+                                    <TextBlock x:Name="TrendRightBottomLabel" Grid.Row="2" Grid.Column="2" Text="0" FontSize="11" Foreground="{StaticResource DiagMutedBrush}" HorizontalAlignment="Right" VerticalAlignment="Bottom" />
 
-                                    <Canvas Grid.Column="1" Grid.RowSpan="3" Margin="4,6,4,12">
-                                        <Line X1="0" Y1="0" X2="360" Y2="0" Stroke="#E7EBEF" StrokeThickness="1" />
-                                        <Line X1="0" Y1="55" X2="360" Y2="55" Stroke="#E7EBEF" StrokeThickness="1" />
-                                        <Line X1="0" Y1="110" X2="360" Y2="110" Stroke="#E7EBEF" StrokeThickness="1" />
-                                        <Rectangle Canvas.Left="0" Canvas.Top="88" Width="7" Height="22" Fill="#82D896" />
-                                        <Rectangle Canvas.Left="12" Canvas.Top="82" Width="7" Height="28" Fill="#82D896" />
-                                        <Rectangle Canvas.Left="24" Canvas.Top="74" Width="7" Height="36" Fill="#82D896" />
-                                        <Rectangle Canvas.Left="36" Canvas.Top="70" Width="7" Height="40" Fill="#82D896" />
-                                        <Rectangle Canvas.Left="48" Canvas.Top="92" Width="7" Height="18" Fill="#82D896" />
-                                        <Rectangle Canvas.Left="60" Canvas.Top="76" Width="7" Height="34" Fill="#82D896" />
-                                        <Rectangle Canvas.Left="72" Canvas.Top="62" Width="7" Height="48" Fill="#82D896" />
-                                        <Rectangle Canvas.Left="84" Canvas.Top="45" Width="7" Height="65" Fill="#82D896" />
-                                        <Rectangle Canvas.Left="96" Canvas.Top="87" Width="7" Height="23" Fill="#82D896" />
-                                        <Rectangle Canvas.Left="108" Canvas.Top="93" Width="7" Height="17" Fill="#82D896" />
-                                        <Rectangle Canvas.Left="132" Canvas.Top="91" Width="7" Height="19" Fill="#82D896" />
-                                        <Rectangle Canvas.Left="144" Canvas.Top="82" Width="7" Height="28" Fill="#82D896" />
-                                        <Rectangle Canvas.Left="156" Canvas.Top="75" Width="7" Height="35" Fill="#82D896" />
-                                        <Rectangle Canvas.Left="168" Canvas.Top="82" Width="7" Height="28" Fill="#82D896" />
-                                        <Rectangle Canvas.Left="192" Canvas.Top="83" Width="7" Height="27" Fill="#82D896" />
-                                        <Rectangle Canvas.Left="216" Canvas.Top="90" Width="7" Height="20" Fill="#82D896" />
-                                        <Rectangle Canvas.Left="240" Canvas.Top="82" Width="7" Height="28" Fill="#82D896" />
-                                        <Rectangle Canvas.Left="264" Canvas.Top="66" Width="7" Height="44" Fill="#82D896" />
-                                        <Rectangle Canvas.Left="300" Canvas.Top="86" Width="7" Height="24" Fill="#82D896" />
-                                        <Rectangle Canvas.Left="312" Canvas.Top="76" Width="7" Height="34" Fill="#82D896" />
-                                        <Rectangle Canvas.Left="324" Canvas.Top="72" Width="7" Height="38" Fill="#82D896" />
-                                        <Rectangle Canvas.Left="336" Canvas.Top="80" Width="7" Height="30" Fill="#82D896" />
-                                        <Polyline Points="0,28 12,22 24,27 36,20 48,25 60,30 72,24 84,28 96,21 108,20 120,27 132,25 144,24 156,27 168,25 180,21 192,28 204,22 216,25 228,29 240,23 252,26 264,20 276,25 288,27 300,24 312,18 324,22 336,25 352,28" Stroke="#0FA3B1" StrokeThickness="2" />
-                                        <Polyline Points="0,54 12,59 24,55 36,49 48,52 60,48 72,51 84,47 96,50 108,48 120,50 132,51 144,55 156,57 168,60 180,58 192,56 204,54 216,49 228,52 240,55 252,54 264,50 276,52 288,48 300,53 312,55 324,51 336,57 352,52" Stroke="#2E6DEB" StrokeThickness="2" />
-                                    </Canvas>
+                                    <Grid Grid.Column="1" Grid.RowSpan="3" Margin="4,6,4,12">
+                                        <Canvas x:Name="DiagnosticsTrendCanvas" SizeChanged="DiagnosticsTrendCanvas_SizeChanged" />
+                                        <TextBlock
+                                            x:Name="DiagnosticsTrendEmptyText"
+                                            Text="Host 未运行，暂无性能数据。"
+                                            HorizontalAlignment="Center"
+                                            VerticalAlignment="Center"
+                                            FontSize="13"
+                                            Foreground="{StaticResource DiagMutedBrush}" />
+                                    </Grid>
                                 </Grid>
                             </Grid>
 
                             <Grid Grid.Row="2">
-                                <TextBlock Text="10:41:20" FontSize="11" Foreground="{StaticResource DiagMutedBrush}" />
-                                <TextBlock Text="10:41:35" FontSize="11" Foreground="{StaticResource DiagMutedBrush}" HorizontalAlignment="Center" />
-                                <TextBlock Text="10:41:50" FontSize="11" Foreground="{StaticResource DiagMutedBrush}" HorizontalAlignment="Right" Margin="0,0,104,0" />
-                                <TextBlock Text="10:42:05" FontSize="11" Foreground="{StaticResource DiagMutedBrush}" HorizontalAlignment="Right" Margin="0,0,36,0" />
+                                <TextBlock x:Name="TrendStartTimeText" Text="--:--:--" FontSize="11" Foreground="{StaticResource DiagMutedBrush}" />
+                                <TextBlock x:Name="TrendScaleHintText" Text="内存按当前范围工作集峰值缩放" FontSize="11" Foreground="{StaticResource DiagMutedBrush}" HorizontalAlignment="Center" />
+                                <TextBlock x:Name="TrendEndTimeText" Text="--:--:--" FontSize="11" Foreground="{StaticResource DiagMutedBrush}" HorizontalAlignment="Right" />
                             </Grid>
                         </Grid>
                     </Border>
