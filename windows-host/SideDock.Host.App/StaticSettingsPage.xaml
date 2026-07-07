@@ -268,36 +268,54 @@
                                 <TextBlock Grid.ColumnSpan="2" Text="外观" FontSize="16" FontWeight="SemiBold" Foreground="{StaticResource SettingsTextBrush}" />
 
                                 <TextBlock Grid.Row="1" Text="主题模式" VerticalAlignment="Center" FontSize="14" Foreground="#30363D" />
-                                <Grid Grid.Row="1" Grid.Column="1">
-                                    <Grid.ColumnDefinitions>
-                                        <ColumnDefinition Width="*" />
-                                        <ColumnDefinition Width="*" />
-                                        <ColumnDefinition Width="*" />
-                                    </Grid.ColumnDefinitions>
-                                    <Border Height="36" CornerRadius="5,0,0,5" Background="White" BorderBrush="{StaticResource SettingsStrokeBrush}" BorderThickness="1">
-                                        <TextBlock Text="浅色" VerticalAlignment="Center" HorizontalAlignment="Center" FontSize="13" Foreground="#30363D" />
-                                    </Border>
-                                    <Border Grid.Column="1" Height="36" Background="White" BorderBrush="{StaticResource SettingsStrokeBrush}" BorderThickness="0,1,1,1">
-                                        <TextBlock Text="深色" VerticalAlignment="Center" HorizontalAlignment="Center" FontSize="13" Foreground="#30363D" />
-                                    </Border>
-                                    <Border Grid.Column="2" Height="36" CornerRadius="0,5,5,0" Background="{StaticResource SettingsPrimaryBrush}" BorderBrush="{StaticResource SettingsPrimaryBrush}" BorderThickness="1">
-                                        <TextBlock Text="跟随系统" VerticalAlignment="Center" HorizontalAlignment="Center" FontSize="13" FontWeight="SemiBold" Foreground="White" />
-                                    </Border>
-                                </Grid>
+                                <StackPanel
+                                    x:Name="ThemeModeOptions"
+                                    Grid.Row="1"
+                                    Grid.Column="1"
+                                    Orientation="Horizontal"
+                                    Spacing="12">
+                                    <RadioButton
+                                        x:Name="LightThemeRadio"
+                                        Content="浅色"
+                                        GroupName="ThemeMode"
+                                        Tag="Light"
+                                        Checked="AppearanceOption_Checked" />
+                                    <RadioButton
+                                        x:Name="DarkThemeRadio"
+                                        Content="深色"
+                                        GroupName="ThemeMode"
+                                        Tag="Dark"
+                                        Checked="AppearanceOption_Checked" />
+                                    <RadioButton
+                                        x:Name="SystemThemeRadio"
+                                        Content="跟随系统"
+                                        GroupName="ThemeMode"
+                                        Tag="System"
+                                        IsChecked="True"
+                                        Checked="AppearanceOption_Checked" />
+                                </StackPanel>
 
                                 <TextBlock Grid.Row="2" Text="界面密度" VerticalAlignment="Center" FontSize="14" Foreground="#30363D" />
-                                <Grid Grid.Row="2" Grid.Column="1">
-                                    <Grid.ColumnDefinitions>
-                                        <ColumnDefinition Width="*" />
-                                        <ColumnDefinition Width="*" />
-                                    </Grid.ColumnDefinitions>
-                                    <Border Height="36" CornerRadius="5,0,0,5" Background="White" BorderBrush="{StaticResource SettingsStrokeBrush}" BorderThickness="1">
-                                        <TextBlock Text="紧凑" VerticalAlignment="Center" HorizontalAlignment="Center" FontSize="13" Foreground="#30363D" />
-                                    </Border>
-                                    <Border Grid.Column="1" Height="36" CornerRadius="0,5,5,0" Background="{StaticResource SettingsPrimaryBrush}" BorderBrush="{StaticResource SettingsPrimaryBrush}" BorderThickness="1">
-                                        <TextBlock Text="标准" VerticalAlignment="Center" HorizontalAlignment="Center" FontSize="13" FontWeight="SemiBold" Foreground="White" />
-                                    </Border>
-                                </Grid>
+                                <StackPanel
+                                    x:Name="InterfaceDensityOptions"
+                                    Grid.Row="2"
+                                    Grid.Column="1"
+                                    Orientation="Horizontal"
+                                    Spacing="12">
+                                    <RadioButton
+                                        x:Name="StandardDensityRadio"
+                                        Content="标准"
+                                        GroupName="InterfaceDensity"
+                                        Tag="Standard"
+                                        IsChecked="True"
+                                        Checked="AppearanceOption_Checked" />
+                                    <RadioButton
+                                        x:Name="CompactDensityRadio"
+                                        Content="紧凑"
+                                        GroupName="InterfaceDensity"
+                                        Tag="Compact"
+                                        Checked="AppearanceOption_Checked" />
+                                </StackPanel>
                             </Grid>
                         </Border>
 
@@ -404,7 +422,7 @@
                                     <Image Source="ms-appx:///Assets/SideDock.ico" Stretch="Uniform" />
                                 </Border>
                                 <StackPanel Grid.Column="1" VerticalAlignment="Center" Spacing="5">
-                                    <TextBlock Text="SideDock Host  v1.3.0" FontSize="14" FontWeight="SemiBold" Foreground="{StaticResource SettingsTextBrush}" />
+                                    <TextBlock x:Name="SettingsAboutVersionText" Text="SideDock Host" FontSize="14" FontWeight="SemiBold" Foreground="{StaticResource SettingsTextBrush}" />
                                     <TextBlock Text="Windows Host Console for Android Tablets" FontSize="12" Foreground="{StaticResource SettingsMutedBrush}" TextWrapping="Wrap" />
                                     <TextBlock Text="© 2024 SideDock. 保留所有权利。" FontSize="11" Foreground="#6B7280" />
                                 </StackPanel>
@@ -415,7 +433,7 @@
                                             <TextBlock Text="检查更新" VerticalAlignment="Center" FontSize="13" Foreground="#30363D" />
                                         </StackPanel>
                                     </Button>
-                                    <TextBlock x:Name="UpdateStatusText" Text="当前已是最新版本" FontSize="12" Foreground="{StaticResource SettingsMutedBrush}" HorizontalAlignment="Center" />
+                                    <TextBlock x:Name="UpdateStatusText" Text="未配置更新源" FontSize="12" Foreground="{StaticResource SettingsMutedBrush}" HorizontalAlignment="Center" />
                                 </StackPanel>
                             </Grid>
                         </Border>

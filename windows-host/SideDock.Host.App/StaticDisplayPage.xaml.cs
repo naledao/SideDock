@@ -49,6 +49,7 @@ public sealed partial class StaticDisplayPage : UserControl
     public StaticDisplayPage()
     {
         InitializeComponent();
+        StaticDisplaySidebarVersionText.Text = AppVersionInfo.DisplayVersion;
         AddActivityLog("等待检测虚拟显示器状态。", StaticDisplayActivityKind.Info);
         SetSelectedDisplayOptions(_selectedResolution, _selectedRefreshRate);
         SetCurrentPresentationMode(VirtualDisplayPresentationMode.Unknown);
@@ -89,6 +90,24 @@ public sealed partial class StaticDisplayPage : UserControl
         {
             _syncingSettings = false;
         }
+    }
+
+    internal void ApplyAppearance(AppAppearancePalette palette, AppInterfaceDensity density)
+    {
+        RequestedTheme = palette.Theme;
+        AppAppearance.ApplyPageResources(Resources, palette);
+        AppAppearance.SetBrushColor(_primaryBrush, palette.Primary);
+        AppAppearance.SetBrushColor(_textBrush, palette.Body);
+        AppAppearance.SetBrushColor(_mutedBrush, palette.Muted);
+        AppAppearance.SetBrushColor(_strokeBrush, palette.Stroke);
+        AppAppearance.SetBrushColor(_whiteBrush, palette.PrimaryContrast);
+        AppAppearance.SetBrushColor(_sideDockBrush, palette.Primary);
+        AppAppearance.SetBrushColor(_sideDockBackgroundBrush, palette.InfoSoft);
+        AppAppearance.SetBrushColor(_primaryDisplayBackgroundBrush, palette.InfoSoft);
+        AppAppearance.SetBrushColor(_displayBackgroundBrush, palette.PanelBackground);
+        AppAppearance.SetBrushColor(_placeholderBackgroundBrush, palette.SubtleBackground);
+        AppAppearance.ApplyPalette(this, palette);
+        AppAppearance.ApplyDensity(this, density);
     }
 
     internal void UpdateVirtualDisplayState(StaticDisplayPageState state)

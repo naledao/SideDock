@@ -30,6 +30,18 @@ public sealed partial class StaticAudioPage : UserControl
         UpdateRecentLogs(Array.Empty<string>());
     }
 
+    internal void ApplyAppearance(AppAppearancePalette palette, AppInterfaceDensity density)
+    {
+        RequestedTheme = palette.Theme;
+        AppAppearance.ApplyPageResources(Resources, palette);
+        AppAppearance.SetBrushColor(_textBrush, palette.Body);
+        AppAppearance.SetBrushColor(_mutedBrush, palette.Muted);
+        AppAppearance.SetBrushColor(_strokeBrush, palette.Stroke);
+        AppAppearance.SetBrushColor(_infoBrush, palette.Primary);
+        AppAppearance.ApplyPalette(this, palette);
+        AppAppearance.ApplyDensity(this, density);
+    }
+
     public event EventHandler? RefreshRequested;
 
     public event EventHandler? InstallVirtualAudioCableRequested;

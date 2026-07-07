@@ -4,6 +4,19 @@ using System.Text.Json.Serialization;
 
 namespace SideDock.Host.App;
 
+internal enum AppThemeMode
+{
+    System,
+    Light,
+    Dark
+}
+
+internal enum AppInterfaceDensity
+{
+    Standard,
+    Compact
+}
+
 internal sealed class AppSettings
 {
     public const int DefaultControlPort = 27183;
@@ -35,6 +48,8 @@ internal sealed class AppSettings
     public bool IncludePortInfoInDiagnostics { get; set; } = true;
     public int Nv12PoolSize { get; set; } = DefaultNv12PoolSize;
     public int EncodedPacketQueue { get; set; } = DefaultEncodedPacketQueue;
+    public AppThemeMode ThemeMode { get; set; } = AppThemeMode.System;
+    public AppInterfaceDensity InterfaceDensity { get; set; } = AppInterfaceDensity.Standard;
 
     public static AppSettings CreateDefault()
     {
@@ -62,6 +77,8 @@ internal sealed class AppSettings
             allowUnknown: true);
         Nv12PoolSize = Clamp(Nv12PoolSize, 1, 16, DefaultNv12PoolSize);
         EncodedPacketQueue = Clamp(EncodedPacketQueue, 1, 8, DefaultEncodedPacketQueue);
+        ThemeMode = NormalizeThemeMode(ThemeMode);
+        InterfaceDensity = NormalizeInterfaceDensity(InterfaceDensity);
         return this;
     }
 
@@ -78,6 +95,24 @@ internal sealed class AppSettings
     private static int Clamp(int value, int min, int max, int fallback)
     {
         return value < min || value > max ? fallback : value;
+    }
+
+    private static AppThemeMode NormalizeThemeMode(AppThemeMode value)
+    {
+        return value switch
+        {
+            AppThemeMode.Light or AppThemeMode.Dark or AppThemeMode.System => value,
+            _ => AppThemeMode.System
+        };
+    }
+
+    private static AppInterfaceDensity NormalizeInterfaceDensity(AppInterfaceDensity value)
+    {
+        return value switch
+        {
+            AppInterfaceDensity.Standard or AppInterfaceDensity.Compact => value,
+            _ => AppInterfaceDensity.Standard
+        };
     }
 
     private static string NormalizeVirtualDisplayResolution(string? value)

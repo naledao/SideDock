@@ -13,6 +13,9 @@
     <Nullable>enable</Nullable>
     <AssemblyName>SideDock.Host.App</AssemblyName>
     <RootNamespace>SideDock.Host.App</RootNamespace>
+    <Version>1.3.0</Version>
+    <FileVersion>1.3.0.0</FileVersion>
+    <InformationalVersion>1.3.0</InformationalVersion>
     <ApplicationIcon>..\..\assets\SideDock.ico</ApplicationIcon>
     <ApplicationManifest>app.manifest</ApplicationManifest>
   </PropertyGroup>

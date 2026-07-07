@@ -53,6 +53,32 @@ public sealed partial class StaticDiagnosticsPage : UserControl
         UpdateState(new DiagnosticsPageState());
     }
 
+    internal void ApplyAppearance(AppAppearancePalette palette, AppInterfaceDensity density)
+    {
+        RequestedTheme = palette.Theme;
+        AppAppearance.ApplyPageResources(Resources, palette);
+        AppAppearance.SetBrushColor(_mutedBrush, palette.Muted);
+        AppAppearance.SetBrushColor(_bodyBrush, palette.Body);
+        AppAppearance.SetBrushColor(_softStrokeBrush, palette.SoftStroke);
+        AppAppearance.SetBrushColor(_cardBrush, palette.PanelBackground);
+        AppAppearance.SetBrushColor(_primaryBrush, palette.Primary);
+        AppAppearance.SetBrushColor(_successBackgroundBrush, palette.SuccessSoft);
+        AppAppearance.SetBrushColor(_warningBackgroundBrush, palette.WarningSoft);
+        AppAppearance.SetBrushColor(_errorBackgroundBrush, palette.ErrorSoft);
+        AppAppearance.SetBrushColor(_unknownBackgroundBrush, palette.SubtleBackground);
+        AppAppearance.SetBrushColor(_successBorderBrush, palette.SuccessStroke);
+        AppAppearance.SetBrushColor(_warningBorderBrush, palette.WarningStroke);
+        AppAppearance.SetBrushColor(_errorBorderBrush, palette.ErrorStroke);
+        AppAppearance.SetBrushColor(_unknownBorderBrush, palette.Stroke);
+        AppAppearance.SetBrushColor(_whiteBrush, palette.PrimaryContrast);
+        AppAppearance.ApplyPalette(this, palette);
+        AppAppearance.ApplyDensity(this, density);
+        UpdateLogFilterButtons();
+        UpdateTrendRangeButtons();
+        RenderLogRows();
+        RenderPerformanceTrend();
+    }
+
     public event EventHandler? CopyAllRequested;
 
     public event EventHandler? ExportLogsRequested;
