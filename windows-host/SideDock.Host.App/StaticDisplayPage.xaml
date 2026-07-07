@@ -620,9 +620,14 @@
                                                     <FontIcon Glyph="&#xE713;" FontSize="19" Foreground="#30363D" />
                                                     <TextBlock Text="自动管理" FontSize="14" FontWeight="SemiBold" Foreground="{StaticResource SideDockTextBrush}" />
                                                 </StackPanel>
-                                                <Border Grid.Column="1" Width="44" Height="22" CornerRadius="11" Background="{StaticResource SideDockPrimaryBrush}">
-                                                    <Ellipse Width="18" Height="18" Fill="White" HorizontalAlignment="Right" Margin="0,2,3,2" />
-                                                </Border>
+                                                <ToggleSwitch
+                                                    x:Name="AutoManageDisplaySwitch"
+                                                    Grid.Column="1"
+                                                    MinWidth="54"
+                                                    IsOn="True"
+                                                    OnContent=""
+                                                    OffContent=""
+                                                    Toggled="AutoManageDisplaySwitch_Toggled" />
                                             </Grid>
                                         </Grid>
                                     </Grid>
@@ -951,6 +956,7 @@
                                                     <ColumnDefinition Width="Auto" />
                                                     <ColumnDefinition Width="*" />
                                                     <ColumnDefinition Width="Auto" />
+                                                    <ColumnDefinition Width="Auto" />
                                                 </Grid.ColumnDefinitions>
                                                 <FontIcon Glyph="&#xE7E8;" FontSize="18" Foreground="#30363D" />
                                                 <TextBlock Grid.Column="1" Text="开机自启" VerticalAlignment="Center" FontSize="14" Foreground="#30363D" />
@@ -961,6 +967,13 @@
                                                     VerticalAlignment="Center"
                                                     FontSize="14"
                                                     Foreground="#5B6570" />
+                                                <ToggleSwitch
+                                                    x:Name="AutostartSwitch"
+                                                    Grid.Column="3"
+                                                    MinWidth="54"
+                                                    OnContent=""
+                                                    OffContent=""
+                                                    Toggled="AutostartSwitch_Toggled" />
                                             </Grid>
                                         </Grid>
                                     </Border>

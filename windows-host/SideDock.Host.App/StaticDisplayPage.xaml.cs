@@ -33,6 +33,10 @@ public sealed partial class StaticDisplayPage : UserControl
 
     private string _selectedResolution = "1080p";
     private string _selectedRefreshRate = "120";
+    private bool _autoManageEnabled = true;
+    private bool _autostartEnabled;
+    private bool _syncingSettings;
+    private bool _syncingAutostart;
     private bool _displayOptionsEnabled = true;
     private bool _displayOptionsAvailable = true;
     private bool _displayModeApplyInProgress;
@@ -66,11 +70,34 @@ public sealed partial class StaticDisplayPage : UserControl
 
     internal event Func<object, StaticDisplayPresentationModeApplyRequestedEventArgs, Task<StaticDisplayPresentationModeApplyResult>>? PresentationModeApplyRequested;
 
+    internal event EventHandler<StaticDisplaySettingsChangedEventArgs>? SettingsChanged;
+
+    internal event Func<object, StaticDisplayAutostartChangedEventArgs, Task<StaticDisplayAutostartChangeResult>>? AutostartChangeRequested;
+
+    internal void ApplySettings(AppSettings settings)
+    {
+        _syncingSettings = true;
+        try
+        {
+            _autoManageEnabled = settings.StartVirtualDisplayWithHost;
+            _statusBannerDismissed = settings.StaticDisplayStatusBannerDismissed;
+            AutoManageDisplaySwitch.IsOn = _autoManageEnabled;
+            SetSelectedDisplayOptions(settings.VirtualDisplayResolution, settings.VirtualDisplayRefreshRate);
+            SetCurrentPresentationMode(settings.VirtualDisplayPresentationMode);
+        }
+        finally
+        {
+            _syncingSettings = false;
+        }
+    }
+
     internal void UpdateVirtualDisplayState(StaticDisplayPageState state)
     {
-        if (state.BannerSeverity is StaticDisplayBannerSeverity.Warning or StaticDisplayBannerSeverity.Error)
+        if (state.BannerSeverity is StaticDisplayBannerSeverity.Warning or StaticDisplayBannerSeverity.Error
+            && _statusBannerDismissed)
         {
             _statusBannerDismissed = false;
+            NotifySettingsChanged(StaticDisplaySettingsChangeKind.Banner);
         }
 
         StatusBanner.Visibility = _statusBannerDismissed ? Visibility.Collapsed : Visibility.Visible;
@@ -88,7 +115,10 @@ public sealed partial class StaticDisplayPage : UserControl
         DeviceToolStatusText.Foreground = state.DeviceToolStatusBrush;
         SystemPermissionStatusText.Text = state.SystemPermissionStatusText;
         SystemPermissionStatusText.Foreground = state.SystemPermissionStatusBrush;
-        AutostartStatusText.Text = state.AutostartStatusText;
+        UpdateAutostartState(
+            state.AutostartEnabled,
+            BuildAutostartStatusText(state.AutostartEnabled, state.CanChangeAutostart),
+            state.CanChangeAutostart);
 
         TopStartDisplayButton.IsEnabled = state.CanStart;
         SideStartDisplayButton.IsEnabled = state.CanStart;
@@ -137,6 +167,40 @@ public sealed partial class StaticDisplayPage : UserControl
         RenderActivityLogs();
     }
 
+    private void NotifySettingsChanged(StaticDisplaySettingsChangeKind changeKind)
+    {
+        if (_syncingSettings)
+        {
+            return;
+        }
+
+        SettingsChanged?.Invoke(
+            this,
+            new StaticDisplaySettingsChangedEventArgs(
+                _selectedResolution,
+                _selectedRefreshRate,
+                _currentPresentationMode,
+                _autoManageEnabled,
+                _statusBannerDismissed,
+                changeKind));
+    }
+
+    private void UpdateAutostartState(bool isEnabled, string statusText, bool canChange)
+    {
+        _syncingAutostart = true;
+        try
+        {
+            _autostartEnabled = isEnabled;
+            AutostartStatusText.Text = statusText;
+            AutostartSwitch.IsOn = isEnabled;
+            AutostartSwitch.IsEnabled = canChange;
+        }
+        finally
+        {
+            _syncingAutostart = false;
+        }
+    }
+
     private void StartDisplayButton_Click(object sender, RoutedEventArgs e)
     {
         AddActivityLog("已请求启动虚拟显示器。", StaticDisplayActivityKind.Info);
@@ -177,6 +241,62 @@ public sealed partial class StaticDisplayPage : UserControl
     {
         _statusBannerDismissed = true;
         StatusBanner.Visibility = Visibility.Collapsed;
+        NotifySettingsChanged(StaticDisplaySettingsChangeKind.Banner);
+        AddActivityLog("提示条已关闭，状态变为警告或错误时会自动重新显示。", StaticDisplayActivityKind.Info);
+    }
+
+    private void AutoManageDisplaySwitch_Toggled(object sender, RoutedEventArgs e)
+    {
+        if (_syncingSettings)
+        {
+            return;
+        }
+
+        _autoManageEnabled = AutoManageDisplaySwitch.IsOn;
+        NotifySettingsChanged(StaticDisplaySettingsChangeKind.AutoManage);
+        AddActivityLog(
+            _autoManageEnabled
+                ? "自动管理已开启，后续设置变更允许执行安全应用。"
+                : "自动管理已关闭，后续设置变更仅保存 UI 状态。",
+            StaticDisplayActivityKind.Info);
+    }
+
+    private async void AutostartSwitch_Toggled(object sender, RoutedEventArgs e)
+    {
+        if (_syncingAutostart)
+        {
+            return;
+        }
+
+        var requestedEnabled = AutostartSwitch.IsOn;
+        var handler = AutostartChangeRequested;
+        if (handler is null)
+        {
+            UpdateAutostartState(_autostartEnabled, AutostartStatusText.Text, canChange: true);
+            AddActivityLog("无法更新开机自启：页面尚未连接到主窗口。", StaticDisplayActivityKind.Failure);
+            return;
+        }
+
+        AutostartSwitch.IsEnabled = false;
+        AddActivityLog(
+            requestedEnabled ? "正在开启当前用户开机自启。" : "正在关闭当前用户开机自启。",
+            StaticDisplayActivityKind.Info);
+
+        try
+        {
+            var result = await handler(this, new StaticDisplayAutostartChangedEventArgs(requestedEnabled));
+            UpdateAutostartState(result.IsEnabled, result.StatusText, canChange: true);
+            AddActivityLog(
+                result.Success
+                    ? result.Message
+                    : $"开机自启更新失败：{result.Message}",
+                result.Success ? StaticDisplayActivityKind.Success : StaticDisplayActivityKind.Failure);
+        }
+        catch (Exception ex)
+        {
+            UpdateAutostartState(_autostartEnabled, AutostartStatusText.Text, canChange: true);
+            AddActivityLog($"开机自启更新失败：{ex.Message}", StaticDisplayActivityKind.Failure);
+        }
     }
 
     private async void ResolutionOption_Tapped(object sender, TappedRoutedEventArgs e)
@@ -189,6 +309,15 @@ public sealed partial class StaticDisplayPage : UserControl
         var normalized = NormalizeResolution(value);
         if (string.Equals(_selectedResolution, normalized, StringComparison.OrdinalIgnoreCase))
         {
+            return;
+        }
+
+        SetSelectedResolution(normalized);
+        NotifySettingsChanged(StaticDisplaySettingsChangeKind.Selection);
+
+        if (!_autoManageEnabled)
+        {
+            AddActivityLog($"分辨率已保存为 {ResolutionLabel(normalized)}，自动管理关闭，未修改 Windows 显示拓扑。", StaticDisplayActivityKind.Info);
             return;
         }
 
@@ -208,6 +337,15 @@ public sealed partial class StaticDisplayPage : UserControl
             return;
         }
 
+        SetSelectedRefreshRate(normalized);
+        NotifySettingsChanged(StaticDisplaySettingsChangeKind.Selection);
+
+        if (!_autoManageEnabled)
+        {
+            AddActivityLog($"刷新率已保存为 {normalized} Hz，自动管理关闭，未修改 Windows 显示拓扑。", StaticDisplayActivityKind.Info);
+            return;
+        }
+
         await RequestDisplayModeApplyAsync(_selectedResolution, normalized);
     }
 
@@ -220,19 +358,18 @@ public sealed partial class StaticDisplayPage : UserControl
             return;
         }
 
-        if (mode is VirtualDisplayPresentationMode.Mirror or VirtualDisplayPresentationMode.SecondaryOnly)
+        SetCurrentPresentationMode(mode);
+        NotifySettingsChanged(StaticDisplaySettingsChangeKind.Selection);
+
+        if (!_autoManageEnabled)
         {
-            ShowUnsupportedPresentationMode(mode);
+            AddActivityLog($"{PresentationModeLabel(mode)} saved. Auto manage is off, Windows display topology was not changed.", StaticDisplayActivityKind.Info);
             return;
         }
 
-        if (mode == VirtualDisplayPresentationMode.Extend
-            && _currentPresentationMode == VirtualDisplayPresentationMode.Extend)
+        if (mode is VirtualDisplayPresentationMode.Mirror or VirtualDisplayPresentationMode.SecondaryOnly)
         {
-            ShowPresentationModeDetail(
-                VirtualDisplayPresentationMode.Extend,
-                "当前已是扩展桌面，不需要重复切换。");
-            AddActivityLog("当前已是扩展模式。", StaticDisplayActivityKind.Info);
+            ShowUnsupportedPresentationMode(mode);
             return;
         }
 
@@ -828,6 +965,18 @@ public sealed partial class StaticDisplayPage : UserControl
         return string.IsNullOrWhiteSpace(value) ? "(空)" : value;
     }
 
+    private static string BuildAutostartStatusText(bool isEnabled, bool canChange)
+    {
+        if (!canChange)
+        {
+            return "\u8bfb\u53d6\u5931\u8d25";
+        }
+
+        return isEnabled
+            ? "\u5df2\u5f00\u542f"
+            : "\u5df2\u5173\u95ed";
+    }
+
     private static string NormalizeResolution(string? value)
     {
         var cleaned = (value ?? string.Empty).Trim();
@@ -1001,6 +1150,58 @@ internal sealed class StaticDisplayPresentationModeApplyResult
     public VirtualDisplayPresentationMode CurrentMode { get; init; } = VirtualDisplayPresentationMode.Unknown;
 }
 
+internal sealed class StaticDisplaySettingsChangedEventArgs : EventArgs
+{
+    public StaticDisplaySettingsChangedEventArgs(
+        string resolution,
+        string refreshRate,
+        VirtualDisplayPresentationMode presentationMode,
+        bool autoManageEnabled,
+        bool statusBannerDismissed,
+        StaticDisplaySettingsChangeKind changeKind)
+    {
+        Resolution = resolution;
+        RefreshRate = refreshRate;
+        PresentationMode = presentationMode;
+        AutoManageEnabled = autoManageEnabled;
+        StatusBannerDismissed = statusBannerDismissed;
+        ChangeKind = changeKind;
+    }
+
+    public string Resolution { get; }
+
+    public string RefreshRate { get; }
+
+    public VirtualDisplayPresentationMode PresentationMode { get; }
+
+    public bool AutoManageEnabled { get; }
+
+    public bool StatusBannerDismissed { get; }
+
+    public StaticDisplaySettingsChangeKind ChangeKind { get; }
+}
+
+internal sealed class StaticDisplayAutostartChangedEventArgs : EventArgs
+{
+    public StaticDisplayAutostartChangedEventArgs(bool enabled)
+    {
+        Enabled = enabled;
+    }
+
+    public bool Enabled { get; }
+}
+
+internal sealed class StaticDisplayAutostartChangeResult
+{
+    public bool Success { get; init; }
+
+    public bool IsEnabled { get; init; }
+
+    public string StatusText { get; init; } = string.Empty;
+
+    public string Message { get; init; } = string.Empty;
+}
+
 internal sealed class StaticDisplayPageState
 {
     public string StatusText { get; init; } = string.Empty;
@@ -1032,6 +1233,10 @@ internal sealed class StaticDisplayPageState
     public Brush SystemPermissionStatusBrush { get; init; } = new SolidColorBrush(Colors.Black);
 
     public string AutostartStatusText { get; init; } = "未管理";
+
+    public bool AutostartEnabled { get; init; }
+
+    public bool CanChangeAutostart { get; init; } = true;
 
     public bool CanStart { get; init; }
 
@@ -1080,6 +1285,13 @@ internal enum StaticDisplayActivityKind
     Info,
     Warning,
     Failure
+}
+
+internal enum StaticDisplaySettingsChangeKind
+{
+    Selection,
+    AutoManage,
+    Banner
 }
 
 internal enum VirtualDisplayPresentationMode

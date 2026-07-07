@@ -1,5 +1,6 @@
 using System.Text;
 using System.Text.Json;
+using System.Text.Json.Serialization;
 
 namespace SideDock.Host.App;
 
@@ -17,6 +18,13 @@ internal sealed class AppSettings
     public bool MinimizeToTrayOnClose { get; set; } = true;
     public bool StartVirtualDisplayWithHost { get; set; } = true;
     public bool ConfigureAdbReverseOnHostStart { get; set; } = true;
+    public string VirtualDisplayResolution { get; set; } = "1080p";
+    public string VirtualDisplayRefreshRate { get; set; } = "120";
+    public VirtualDisplayPresentationMode VirtualDisplayPresentationMode { get; set; } = global::SideDock.Host.App.VirtualDisplayPresentationMode.Extend;
+    public bool StaticDisplayStatusBannerDismissed { get; set; }
+    public string LastAppliedVirtualDisplayResolution { get; set; } = "1080p";
+    public string LastAppliedVirtualDisplayRefreshRate { get; set; } = "120";
+    public VirtualDisplayPresentationMode LastAppliedVirtualDisplayPresentationMode { get; set; } = global::SideDock.Host.App.VirtualDisplayPresentationMode.Unknown;
     public string? DefaultAdbSerial { get; set; } = DefaultAdbSerialValue;
     public string AdbPath { get; set; } = string.Empty;
     public int ControlPort { get; set; } = DefaultControlPort;
@@ -41,6 +49,17 @@ internal sealed class AppSettings
         VideoPort = NormalizePort(VideoPort, DefaultVideoPort);
         AudioPort = NormalizePort(AudioPort, DefaultAudioPort);
         CameraPort = NormalizePort(CameraPort, DefaultCameraPort);
+        VirtualDisplayResolution = NormalizeVirtualDisplayResolution(VirtualDisplayResolution);
+        VirtualDisplayRefreshRate = NormalizeVirtualDisplayRefreshRate(VirtualDisplayRefreshRate);
+        VirtualDisplayPresentationMode = NormalizePresentationMode(
+            VirtualDisplayPresentationMode,
+            global::SideDock.Host.App.VirtualDisplayPresentationMode.Extend);
+        LastAppliedVirtualDisplayResolution = NormalizeVirtualDisplayResolution(LastAppliedVirtualDisplayResolution);
+        LastAppliedVirtualDisplayRefreshRate = NormalizeVirtualDisplayRefreshRate(LastAppliedVirtualDisplayRefreshRate);
+        LastAppliedVirtualDisplayPresentationMode = NormalizePresentationMode(
+            LastAppliedVirtualDisplayPresentationMode,
+            global::SideDock.Host.App.VirtualDisplayPresentationMode.Unknown,
+            allowUnknown: true);
         Nv12PoolSize = Clamp(Nv12PoolSize, 1, 16, DefaultNv12PoolSize);
         EncodedPacketQueue = Clamp(EncodedPacketQueue, 1, 8, DefaultEncodedPacketQueue);
         return this;
@@ -60,6 +79,47 @@ internal sealed class AppSettings
     {
         return value < min || value > max ? fallback : value;
     }
+
+    private static string NormalizeVirtualDisplayResolution(string? value)
+    {
+        return (value ?? string.Empty).Trim().ToLowerInvariant() switch
+        {
+            "720" or "720p" => "720p",
+            "1080" or "1080p" => "1080p",
+            "2k" or "1440p" => "2k",
+            _ => "1080p"
+        };
+    }
+
+    private static string NormalizeVirtualDisplayRefreshRate(string? value)
+    {
+        var normalized = (value ?? string.Empty)
+            .Replace("Hz", string.Empty, StringComparison.OrdinalIgnoreCase)
+            .Trim();
+
+        return normalized switch
+        {
+            "30" => "30",
+            "60" => "60",
+            "120" => "120",
+            _ => "120"
+        };
+    }
+
+    private static VirtualDisplayPresentationMode NormalizePresentationMode(
+        VirtualDisplayPresentationMode value,
+        VirtualDisplayPresentationMode fallback,
+        bool allowUnknown = false)
+    {
+        return value switch
+        {
+            global::SideDock.Host.App.VirtualDisplayPresentationMode.Extend
+                or global::SideDock.Host.App.VirtualDisplayPresentationMode.Mirror
+                or global::SideDock.Host.App.VirtualDisplayPresentationMode.SecondaryOnly => value,
+            global::SideDock.Host.App.VirtualDisplayPresentationMode.Unknown when allowUnknown => value,
+            _ => fallback
+        };
+    }
 }
 
 internal static class AppSettingsStore
@@ -70,8 +130,11 @@ internal static class AppSettingsStore
     {
         WriteIndented = true,
         PropertyNamingPolicy = JsonNamingPolicy.CamelCase,
-        PropertyNameCaseInsensitive = true
+        PropertyNameCaseInsensitive = true,
+        Converters = { new JsonStringEnumConverter() }
     };
+
+    public static string? LastLoadError { get; private set; }
 
     public static string SettingsDirectory => Path.Combine(
         Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
@@ -82,6 +145,7 @@ internal static class AppSettingsStore
 
     public static AppSettings Load()
     {
+        LastLoadError = null;
         try
         {
             if (!File.Exists(SettingsPath))
@@ -92,8 +156,9 @@ internal static class AppSettingsStore
             var json = File.ReadAllText(SettingsPath, Encoding.UTF8);
             return (JsonSerializer.Deserialize<AppSettings>(json, JsonOptions) ?? AppSettings.CreateDefault()).Normalize();
         }
-        catch
+        catch (Exception ex)
         {
+            LastLoadError = ex.Message;
             return AppSettings.CreateDefault();
         }
     }

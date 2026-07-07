@@ -129,6 +129,7 @@ public sealed partial class MainWindow : Window
     private readonly Brush _overviewPreviewReceivingBadgeBrush = new SolidColorBrush(ColorHelper.FromArgb(221, 18, 132, 86));
     private readonly Brush _overviewPreviewPausedBadgeBrush = new SolidColorBrush(ColorHelper.FromArgb(221, 157, 93, 0));
     private readonly Brush _overviewPreviewErrorBadgeBrush = new SolidColorBrush(ColorHelper.FromArgb(221, 196, 43, 28));
+    private readonly AppLaunchOptions _launchOptions;
     private readonly IntPtr _windowHandle;
 
     private AppSettings _appSettings = AppSettings.CreateDefault();
@@ -235,6 +236,7 @@ public sealed partial class MainWindow : Window
     private bool _virtualDisplayOperationInProgress;
     private bool _virtualDisplayModeApplyInProgress;
     private bool _driverInstallInProgress;
+    private bool _virtualDisplayAutoRestoreInProgress;
     private bool _syncingOverviewCameraOptions;
     private bool _updatingOverviewCameraSwitch;
     private bool _updatingOverviewAudioSwitch;
@@ -250,6 +252,8 @@ public sealed partial class MainWindow : Window
     private DateTimeOffset _virtualDisplayDriverInstalledCheckedAt;
     private bool? _virtualDisplayToolAvailableCache;
     private DateTimeOffset _virtualDisplayToolAvailableCheckedAt;
+    private StartupTaskState _startupTaskState = StartupTaskState.Success(isEnabled: false, command: null);
+    private string? _lastStartupTaskError;
 
     private enum OverviewHostServiceState
     {
@@ -309,14 +313,22 @@ public sealed partial class MainWindow : Window
         Error
     }
 
-    public MainWindow()
+    public MainWindow(AppLaunchOptions? launchOptions = null)
     {
+        _launchOptions = launchOptions ?? new AppLaunchOptions(StartMinimized: false, StartInTray: false);
         InitializeComponent();
         _appSettings = AppSettingsStore.Load();
+        var settingsLoadError = AppSettingsStore.LastLoadError;
+        RefreshStartupTaskState(logErrors: false);
         WireStaticDisplayPage();
         WireStaticAudioPage();
         WireStaticDiagnosticsPage();
         WireStaticSettingsPage();
+        if (!string.IsNullOrWhiteSpace(settingsLoadError))
+        {
+            OverviewDisplayPage.AddActivityLog($"Settings load failed: {settingsLoadError}", StaticDisplayActivityKind.Failure);
+        }
+
         ApplyAppSettingsToUi(_appSettings);
         StaticOverviewShell.Visibility = StaticOverviewUi ? Visibility.Visible : Visibility.Collapsed;
         LegacyShell.Visibility = StaticOverviewUi ? Visibility.Collapsed : Visibility.Visible;
@@ -418,6 +430,26 @@ public sealed partial class MainWindow : Window
         _ = RefreshVirtualCameraStatusAsync();
         UpdateOverviewConnectionPage();
         DispatcherQueue.TryEnqueue(UpdateOverviewMainContentMinHeight);
+        if (_appSettings.StartVirtualDisplayWithHost)
+        {
+            DispatcherQueue.TryEnqueue(async () => await RestoreVirtualDisplayAutoManagementAsync("App startup"));
+        }
+    }
+
+    internal void ApplyLaunchOptions()
+    {
+        if (!_launchOptions.StartQuietly)
+        {
+            return;
+        }
+
+        DispatcherQueue.TryEnqueue(() =>
+        {
+            if (AppWindow.Presenter is OverlappedPresenter presenter)
+            {
+                presenter.Minimize();
+            }
+        });
     }
 
     private void WireStaticDisplayPage()
@@ -430,6 +462,8 @@ public sealed partial class MainWindow : Window
         OverviewDisplayPage.ShowLogsRequested += StaticDisplayPage_ShowLogsRequested;
         OverviewDisplayPage.DisplayModeApplyRequested += StaticDisplayPage_DisplayModeApplyRequested;
         OverviewDisplayPage.PresentationModeApplyRequested += StaticDisplayPage_PresentationModeApplyRequested;
+        OverviewDisplayPage.SettingsChanged += StaticDisplayPage_SettingsChanged;
+        OverviewDisplayPage.AutostartChangeRequested += StaticDisplayPage_AutostartChangeRequested;
     }
 
     private void WireStaticDiagnosticsPage()
@@ -448,7 +482,12 @@ public sealed partial class MainWindow : Window
     private void ApplyAppSettingsToUi(AppSettings settings)
     {
         _appSettings = settings.Normalize();
+        RefreshStartupTaskState(logErrors: false);
+        _appSettings.StartWithWindows = _startupTaskState.Succeeded
+            ? _startupTaskState.IsEnabled
+            : _appSettings.StartWithWindows;
         OverviewSettingsPage.ApplySettings(_appSettings);
+        OverviewDisplayPage.ApplySettings(_appSettings);
 
         _syncingOverviewConnectionControls = true;
         try
@@ -483,8 +522,73 @@ public sealed partial class MainWindow : Window
 
     private void SaveAndApplyAppSettings(AppSettings settings)
     {
+        var startupResult = StartupTaskService.SetEnabled(settings.StartWithWindows);
+        _startupTaskState = startupResult.Succeeded
+            ? startupResult
+            : StartupTaskService.GetState();
+        if (!startupResult.Succeeded)
+        {
+            throw new InvalidOperationException($"Unable to update startup item: {startupResult.Error}");
+        }
+
+        settings.StartWithWindows = startupResult.IsEnabled;
         AppSettingsStore.Save(settings);
         ApplyAppSettingsToUi(settings);
+        OverviewDisplayPage.AddActivityLog(
+            startupResult.IsEnabled ? "Startup item enabled." : "Startup item disabled.",
+            StaticDisplayActivityKind.Success);
+    }
+
+    private bool TrySaveAppSettings(string successMessage, bool logSuccess = true)
+    {
+        try
+        {
+            AppSettingsStore.Save(_appSettings);
+            if (logSuccess)
+            {
+                OverviewDisplayPage.AddActivityLog(successMessage, StaticDisplayActivityKind.Success);
+            }
+
+            return true;
+        }
+        catch (Exception ex)
+        {
+            OverviewDisplayPage.AddActivityLog($"Settings save failed: {ex.Message}", StaticDisplayActivityKind.Failure);
+            return false;
+        }
+    }
+
+    private StartupTaskState RefreshStartupTaskState(bool logErrors)
+    {
+        _startupTaskState = StartupTaskService.GetState();
+        if (_startupTaskState.Succeeded)
+        {
+            _appSettings.StartWithWindows = _startupTaskState.IsEnabled;
+            _lastStartupTaskError = null;
+            return _startupTaskState;
+        }
+
+        if (logErrors && !string.Equals(_lastStartupTaskError, _startupTaskState.Error, StringComparison.Ordinal))
+        {
+            _lastStartupTaskError = _startupTaskState.Error;
+            OverviewDisplayPage.AddActivityLog(
+                $"Startup item status read failed: {_startupTaskState.Error}",
+                StaticDisplayActivityKind.Failure);
+        }
+
+        return _startupTaskState;
+    }
+
+    private static string BuildStartupTaskStatusText(StartupTaskState state)
+    {
+        if (!state.Succeeded)
+        {
+            return "\u8bfb\u53d6\u5931\u8d25";
+        }
+
+        return state.IsEnabled
+            ? "\u5df2\u5f00\u542f"
+            : "\u5df2\u5173\u95ed";
     }
 
     private async void StaticSettingsPage_BrowseAdbPathRequested(object? sender, EventArgs e)
@@ -3270,6 +3374,75 @@ public sealed partial class MainWindow : Window
         return ApplyVirtualDisplayPresentationModeSelectionAsync(e.Mode);
     }
 
+    private void StaticDisplayPage_SettingsChanged(object? sender, StaticDisplaySettingsChangedEventArgs e)
+    {
+        _appSettings.VirtualDisplayResolution = e.Resolution;
+        _appSettings.VirtualDisplayRefreshRate = e.RefreshRate;
+        _appSettings.VirtualDisplayPresentationMode = e.PresentationMode;
+        _appSettings.StartVirtualDisplayWithHost = e.AutoManageEnabled;
+        _appSettings.StaticDisplayStatusBannerDismissed = e.StatusBannerDismissed;
+        _appSettings.Normalize();
+
+        _syncingOverviewConnectionControls = true;
+        try
+        {
+            ManageDisplaySwitch.IsOn = _appSettings.StartVirtualDisplayWithHost;
+        }
+        finally
+        {
+            _syncingOverviewConnectionControls = false;
+        }
+
+        if (TrySaveAppSettings("Virtual display settings saved."))
+        {
+            OverviewSettingsPage.ApplySettings(_appSettings);
+            SyncVirtualDisplayModeSelection(_appSettings.VirtualDisplayResolution, _appSettings.VirtualDisplayRefreshRate);
+        }
+
+        if (e.ChangeKind == StaticDisplaySettingsChangeKind.AutoManage && e.AutoManageEnabled)
+        {
+            DispatcherQueue.TryEnqueue(async () => await RestoreVirtualDisplayAutoManagementAsync("Auto manage enabled"));
+        }
+    }
+
+    private Task<StaticDisplayAutostartChangeResult> StaticDisplayPage_AutostartChangeRequested(
+        object sender,
+        StaticDisplayAutostartChangedEventArgs e)
+    {
+        var result = StartupTaskService.SetEnabled(e.Enabled);
+        _startupTaskState = result.Succeeded
+            ? result
+            : StartupTaskService.GetState();
+
+        if (result.Succeeded)
+        {
+            _appSettings.StartWithWindows = result.IsEnabled;
+            var saved = TrySaveAppSettings("Startup setting saved.");
+            OverviewSettingsPage.ApplySettings(_appSettings);
+            RefreshVirtualDisplayState();
+
+            return Task.FromResult(new StaticDisplayAutostartChangeResult
+            {
+                Success = saved,
+                IsEnabled = result.IsEnabled,
+                StatusText = BuildStartupTaskStatusText(result),
+                Message = saved
+                    ? (result.IsEnabled ? "Startup item enabled." : "Startup item disabled.")
+                    : "Startup item updated, but settings.json could not be saved."
+            });
+        }
+
+        RefreshStartupTaskState(logErrors: true);
+        RefreshVirtualDisplayState();
+        return Task.FromResult(new StaticDisplayAutostartChangeResult
+        {
+            Success = false,
+            IsEnabled = _startupTaskState.Succeeded && _startupTaskState.IsEnabled,
+            StatusText = BuildStartupTaskStatusText(_startupTaskState),
+            Message = result.Error ?? "Unknown startup item error."
+        });
+    }
+
     private async void StaticAudioPage_RefreshRequested(object? sender, EventArgs e)
     {
         await RefreshAudioEndpointsAsync(showHint: true);
@@ -4153,7 +4326,81 @@ public sealed partial class MainWindow : Window
         StopVirtualDisplay();
     }
 
-    private async Task<bool> SetOverviewVirtualDisplayEnabledAsync(bool enabled)
+    private async Task RestoreVirtualDisplayAutoManagementAsync(string reason)
+    {
+        if (_virtualDisplayAutoRestoreInProgress)
+        {
+            return;
+        }
+
+        if (!_appSettings.StartVirtualDisplayWithHost)
+        {
+            OverviewDisplayPage.AddActivityLog("Auto manage is off; startup restore skipped.", StaticDisplayActivityKind.Info);
+            return;
+        }
+
+        _virtualDisplayAutoRestoreInProgress = true;
+        try
+        {
+            OverviewDisplayPage.AddActivityLog($"Auto manage restore started: {reason}.", StaticDisplayActivityKind.Info);
+
+            if (!IsVirtualDisplayToolRunning())
+            {
+                var started = StartVirtualDisplay(showCopyableError: false, failureAction: "Auto manage could not start virtual display");
+                if (!started)
+                {
+                    OverviewDisplayPage.AddActivityLog(
+                        $"Auto manage could not start virtual display: {FailureSummary(_virtualDisplayLastError)}",
+                        StaticDisplayActivityKind.Failure);
+                    return;
+                }
+            }
+            else
+            {
+                OverviewDisplayPage.AddActivityLog("Virtual display tool is already running.", StaticDisplayActivityKind.Success);
+            }
+
+            var displayLayout = RefreshVirtualDisplayState();
+            if (!displayLayout.HasSideDockVirtualDisplay)
+            {
+                OverviewDisplayPage.AddActivityLog(
+                    "SideDock virtual display is not present yet; display mode restore skipped.",
+                    StaticDisplayActivityKind.Warning);
+                return;
+            }
+
+            var modeResult = await ApplyVirtualDisplayModeSelectionAsync(
+                _appSettings.VirtualDisplayResolution,
+                _appSettings.VirtualDisplayRefreshRate);
+            OverviewDisplayPage.AddActivityLog(
+                modeResult.Success
+                    ? $"Saved display mode restored: {modeResult.CurrentModeText ?? "current mode"}."
+                    : $"Saved display mode restore failed: {modeResult.Message}",
+                modeResult.Success ? StaticDisplayActivityKind.Success : StaticDisplayActivityKind.Failure);
+
+            if (_appSettings.VirtualDisplayPresentationMode == VirtualDisplayPresentationMode.Extend)
+            {
+                var presentationResult = await ApplyVirtualDisplayPresentationModeSelectionAsync(VirtualDisplayPresentationMode.Extend);
+                OverviewDisplayPage.AddActivityLog(
+                    presentationResult.Success
+                        ? presentationResult.Message
+                        : $"Extend mode restore failed: {presentationResult.Message}",
+                    presentationResult.Success ? StaticDisplayActivityKind.Success : StaticDisplayActivityKind.Failure);
+            }
+            else
+            {
+                OverviewDisplayPage.AddActivityLog(
+                    "Mirror and secondary-only modes are saved for UI restore only; no startup topology switch was attempted.",
+                    StaticDisplayActivityKind.Info);
+            }
+        }
+        finally
+        {
+            _virtualDisplayAutoRestoreInProgress = false;
+        }
+    }
+
+    private async Task<bool> SetOverviewVirtualDisplayEnabledAsync(bool enabled, bool showErrorDialog = true)
     {
         if (_virtualDisplayOperationInProgress || _driverInstallInProgress)
         {
@@ -4602,8 +4849,10 @@ public sealed partial class MainWindow : Window
         _syncingVirtualDisplayOptions = true;
         try
         {
-            SelectComboBoxValue(OverviewVirtualDisplayResolutionCombo, Selected(ResolutionCombo));
-            SelectComboBoxValue(OverviewVirtualDisplayRefreshRateCombo, Selected(RefreshRateCombo));
+            SelectComboBoxValue(ResolutionCombo, _appSettings.VirtualDisplayResolution);
+            SelectComboBoxValue(RefreshRateCombo, _appSettings.VirtualDisplayRefreshRate);
+            SelectComboBoxValue(OverviewVirtualDisplayResolutionCombo, _appSettings.VirtualDisplayResolution);
+            SelectComboBoxValue(OverviewVirtualDisplayRefreshRateCombo, _appSettings.VirtualDisplayRefreshRate);
         }
         finally
         {
@@ -4613,9 +4862,25 @@ public sealed partial class MainWindow : Window
 
     private async Task ApplyOverviewVirtualDisplayModeSelectionAsync()
     {
+        var resolution = Selected(OverviewVirtualDisplayResolutionCombo);
+        var refreshRate = Selected(OverviewVirtualDisplayRefreshRateCombo);
+        _appSettings.VirtualDisplayResolution = resolution;
+        _appSettings.VirtualDisplayRefreshRate = refreshRate;
+        _appSettings.Normalize();
+        TrySaveAppSettings("Virtual display settings saved.");
+        OverviewDisplayPage.ApplySettings(_appSettings);
+
+        if (!_appSettings.StartVirtualDisplayWithHost)
+        {
+            OverviewDisplayPage.AddActivityLog(
+                "Virtual display mode selection saved. Auto manage is off, so Windows display topology was not changed.",
+                StaticDisplayActivityKind.Info);
+            return;
+        }
+
         var result = await ApplyVirtualDisplayModeSelectionAsync(
-            Selected(OverviewVirtualDisplayResolutionCombo),
-            Selected(OverviewVirtualDisplayRefreshRateCombo));
+            resolution,
+            refreshRate);
 
         OverviewDisplayPage.AddActivityLog(
             result.Success
@@ -4652,6 +4917,7 @@ public sealed partial class MainWindow : Window
             if (serviceResult.Success)
             {
                 SyncVirtualDisplayModeSelection(request.Resolution, request.RefreshRateValue);
+                SaveLastAppliedVirtualDisplayMode(request);
             }
 
             return BuildStaticDisplayModeApplyResult(
@@ -4703,6 +4969,11 @@ public sealed partial class MainWindow : Window
         try
         {
             var serviceResult = await Task.Run(() => VirtualDisplayModeService.ApplyPresentationMode(mode));
+            if (serviceResult.Success)
+            {
+                SaveLastAppliedPresentationMode(serviceResult.CurrentMode);
+            }
+
             return new StaticDisplayPresentationModeApplyResult
             {
                 Success = serviceResult.Success,
@@ -4741,6 +5012,21 @@ public sealed partial class MainWindow : Window
         {
             _syncingVirtualDisplayOptions = false;
         }
+    }
+
+    private void SaveLastAppliedVirtualDisplayMode(VirtualDisplayModeRequest request)
+    {
+        _appSettings.LastAppliedVirtualDisplayResolution = request.Resolution;
+        _appSettings.LastAppliedVirtualDisplayRefreshRate = request.RefreshRateValue;
+        _appSettings.Normalize();
+        TrySaveAppSettings("Last applied display mode saved.", logSuccess: false);
+    }
+
+    private void SaveLastAppliedPresentationMode(VirtualDisplayPresentationMode mode)
+    {
+        _appSettings.LastAppliedVirtualDisplayPresentationMode = mode;
+        _appSettings.Normalize();
+        TrySaveAppSettings("Last applied presentation mode saved.", logSuccess: false);
     }
 
     private void RollBackOverviewVirtualDisplaySelection(StaticDisplayModeApplyResult result)
@@ -4789,9 +5075,9 @@ public sealed partial class MainWindow : Window
         out string error)
     {
         var normalizedResolution = NormalizeVirtualDisplayResolutionSelection(resolution)
-            ?? NormalizeVirtualDisplayResolutionSelection(Selected(ResolutionCombo));
+            ?? NormalizeVirtualDisplayResolutionSelection(_appSettings.VirtualDisplayResolution);
         var normalizedRefreshRate = NormalizeVirtualDisplayRefreshRateSelection(refreshRate)
-            ?? NormalizeVirtualDisplayRefreshRateSelection(Selected(RefreshRateCombo));
+            ?? NormalizeVirtualDisplayRefreshRateSelection(_appSettings.VirtualDisplayRefreshRate);
 
         request = new VirtualDisplayModeRequest("1080p", 1920, 1080, "120", 120);
         if (normalizedResolution is null)
@@ -7434,11 +7720,6 @@ public sealed partial class MainWindow : Window
                     $"{failureAction}：{ex.Message}。下面是详细诊断信息，点“复制详情”可一键复制。",
                     details);
             }
-            else
-            {
-                ShowError("无法启动虚拟显示器", ex.Message);
-            }
-
             return false;
         }
         finally
@@ -8293,6 +8574,7 @@ public sealed partial class MainWindow : Window
 
     private DisplayLayoutSnapshot RefreshVirtualDisplayState()
     {
+        var startupTaskState = RefreshStartupTaskState(logErrors: true);
         var running = IsVirtualDisplayToolRunning();
         var displayLayout = DisplayLayoutQuery.GetCurrent();
         var state = DetermineVirtualDisplayOverviewState(running, out var driverInstalled, out var toolAvailable);
@@ -8334,7 +8616,8 @@ public sealed partial class MainWindow : Window
             subtext,
             statusBrush,
             displayOperationEnabled,
-            displayLayout);
+            displayLayout,
+            startupTaskState);
         UpdateStaticDiagnosticsPage();
 
         return displayLayout;
@@ -8349,7 +8632,8 @@ public sealed partial class MainWindow : Window
         string subtext,
         Brush statusBrush,
         bool displayOperationEnabled,
-        DisplayLayoutSnapshot displayLayout)
+        DisplayLayoutSnapshot displayLayout,
+        StartupTaskState startupTaskState)
     {
         var (bannerBackground, bannerBorder, bannerGlyph, bannerIconBackground, bannerSeverity) = BuildStaticDisplayBannerView(state);
         var (driverStatusText, driverStatusBrush) = BuildStaticDisplayDriverStatus(state, running, driverInstalled);
@@ -8358,8 +8642,12 @@ public sealed partial class MainWindow : Window
         var footer = BuildOverviewFooterSnapshot();
         var currentMode = CurrentSideDockModeFromLayout(displayLayout);
         var presentationState = VirtualDisplayModeService.GetPresentationState();
-        var canChangeDisplayOptions = displayOperationEnabled
-            && (running || displayLayout.HasSideDockVirtualDisplay);
+        var canChangeDisplayOptions = displayOperationEnabled;
+        var displayResolution = DisplayResolutionValueFromMode(currentMode) ?? _appSettings.VirtualDisplayResolution;
+        var displayRefreshRate = DisplayRefreshRateValueFromMode(currentMode) ?? _appSettings.VirtualDisplayRefreshRate;
+        var displayPresentationMode = presentationState.Mode == VirtualDisplayPresentationMode.Unknown
+            ? _appSettings.VirtualDisplayPresentationMode
+            : presentationState.Mode;
 
         OverviewDisplayPage.UpdateVirtualDisplayState(new StaticDisplayPageState
         {
@@ -8378,6 +8666,8 @@ public sealed partial class MainWindow : Window
             SystemPermissionStatusText = permissionStatusText,
             SystemPermissionStatusBrush = permissionStatusBrush,
             AutostartStatusText = "未管理",
+            AutostartEnabled = startupTaskState.Succeeded && startupTaskState.IsEnabled,
+            CanChangeAutostart = startupTaskState.Succeeded,
             CanStart = displayOperationEnabled && !running,
             CanStop = displayOperationEnabled && running,
             CanInstallDriver = displayOperationEnabled,
@@ -8386,10 +8676,10 @@ public sealed partial class MainWindow : Window
             CanChangeDisplayOptions = canChangeDisplayOptions,
             VirtualDisplayRunning = running,
             DisplayLayout = displayLayout,
-            PresentationMode = presentationState.Mode,
+            PresentationMode = displayPresentationMode,
             PresentationModeMessage = presentationState.Summary,
-            Resolution = DisplayResolutionValueFromMode(currentMode) ?? Selected(ResolutionCombo),
-            RefreshRate = DisplayRefreshRateValueFromMode(currentMode) ?? Selected(RefreshRateCombo),
+            Resolution = displayResolution,
+            RefreshRate = displayRefreshRate,
             FooterHostText = footer.HostText,
             FooterOsText = footer.OsText,
             FooterNetworkText = footer.NetworkText,
@@ -8595,8 +8885,7 @@ public sealed partial class MainWindow : Window
     {
         var enabled = !_virtualDisplayOperationInProgress
             && !_virtualDisplayModeApplyInProgress
-            && !_driverInstallInProgress
-            && (virtualDisplayRunning || hasSideDockDisplay);
+            && !_driverInstallInProgress;
 
         OverviewVirtualDisplayResolutionCombo.IsEnabled = enabled;
         OverviewVirtualDisplayRefreshRateCombo.IsEnabled = enabled;
