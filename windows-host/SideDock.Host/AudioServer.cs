@@ -35,23 +35,41 @@ internal static partial class Program
         private readonly TcpListener _listener = new(address, options.AudioPort);
         private readonly object _connectionLock = new();
         private readonly IAudioBridgeBackend _audioBackend = CreateAudioBackend(options);
+        private readonly AudioRuntimeTelemetryState _telemetryState = new(options.AudioPort);
         private CancellationTokenSource? _activeConnectionCts;
         private Task? _activeConnectionTask;
         private int _connectionSerial;
+        private long _reconnectCount;
+        private long _disconnectCount;
 
         public async Task RunAsync(CancellationToken cancellationToken)
         {
-            if (!options.AudioDeviceEnabled || (!options.MicrophoneEnabled && !options.SpeakerEnabled))
-            {
-                Log("AUDIO", "mic-state=disabled speaker-state=disabled reason=disabled_by_options");
-                await PublishMicStatusAsync("disabled", "SideDock 麦克风已关闭。", cancellationToken);
-                await PublishSpeakerStatusAsync("disabled", "SideDock 音响已关闭。", cancellationToken);
-                await WaitUntilCanceledAsync(cancellationToken);
-                return;
-            }
+            InitializeTelemetryState();
+            using var telemetryCts = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
+            var telemetryTask = Task.Run(() => PublishTelemetryLoopAsync(telemetryCts.Token), CancellationToken.None);
 
             try
             {
+                if (!options.AudioDeviceEnabled || (!options.MicrophoneEnabled && !options.SpeakerEnabled))
+                {
+                    Log("AUDIO", "mic-state=disabled speaker-state=disabled reason=disabled_by_options");
+                    UpdateDirectionTelemetry(
+                        AudioRuntimeDirection.Microphone,
+                        state: "disabled",
+                        message: "SideDock 麦克风已关闭。",
+                        endpointReady: false);
+                    UpdateDirectionTelemetry(
+                        AudioRuntimeDirection.Speaker,
+                        state: "disabled",
+                        message: "SideDock 音响已关闭。",
+                        endpointReady: false);
+                    await PublishMicStatusAsync("disabled", "SideDock 麦克风已关闭。", cancellationToken);
+                    await PublishSpeakerStatusAsync("disabled", "SideDock 音响已关闭。", cancellationToken);
+                    await PublishAudioRuntimeTelemetryAsync(cancellationToken);
+                    await WaitUntilCanceledAsync(cancellationToken);
+                    return;
+                }
+
                 _listener.Start();
                 Log("AUDIO", $"listening address={address} port={options.AudioPort}");
                 await PublishInitialStatusAsync(cancellationToken);
@@ -74,6 +92,8 @@ internal static partial class Program
 
                     if (previousConnectionCts is not null)
                     {
+                        var reconnectCount = Interlocked.Increment(ref _reconnectCount);
+                        UpdateReconnectCount(reconnectCount);
                         Log("AUDIO", "检测到新的音频连接，关闭旧连接。");
                         await CancelPreviousConnectionAsync(previousConnectionCts);
                         await WaitForPreviousConnectionAsync(previousConnectionTask, cancellationToken);
@@ -98,17 +118,45 @@ internal static partial class Program
             catch (SocketException ex)
             {
                 Log("AUDIO", $"mic-state=unavailable speaker-state=unavailable reason=listen_failed message={ex.Message}");
+                UpdateDirectionTelemetry(
+                    AudioRuntimeDirection.Microphone,
+                    state: "unavailable",
+                    message: $"SideDock 麦克风监听失败：{ex.Message}",
+                    endpointReady: false,
+                    lastError: ex.Message);
+                UpdateDirectionTelemetry(
+                    AudioRuntimeDirection.Speaker,
+                    state: "unavailable",
+                    message: $"SideDock 音响监听失败：{ex.Message}",
+                    endpointReady: false,
+                    lastError: ex.Message);
                 await PublishMicStatusAsync("unavailable", $"SideDock 麦克风监听失败：{ex.Message}", CancellationToken.None);
                 await PublishSpeakerStatusAsync("unavailable", $"SideDock 音响监听失败：{ex.Message}", CancellationToken.None);
+                await PublishAudioRuntimeTelemetryAsync(CancellationToken.None);
             }
             catch (Exception ex)
             {
                 Log("AUDIO", $"mic-state=unavailable speaker-state=unavailable reason=run_failed exception={ex.GetType().Name} message={LogValue(ex.Message)}");
+                UpdateDirectionTelemetry(
+                    AudioRuntimeDirection.Microphone,
+                    state: "unavailable",
+                    message: $"SideDock 麦克风服务失败：{ex.Message}",
+                    endpointReady: false,
+                    lastError: ex.Message);
+                UpdateDirectionTelemetry(
+                    AudioRuntimeDirection.Speaker,
+                    state: "unavailable",
+                    message: $"SideDock 音响服务失败：{ex.Message}",
+                    endpointReady: false,
+                    lastError: ex.Message);
                 await PublishMicStatusAsync("unavailable", $"SideDock 麦克风服务失败：{ex.Message}", CancellationToken.None);
                 await PublishSpeakerStatusAsync("unavailable", $"SideDock 音响服务失败：{ex.Message}", CancellationToken.None);
+                await PublishAudioRuntimeTelemetryAsync(CancellationToken.None);
             }
             finally
             {
+                await telemetryCts.CancelAsync();
+                await WaitForTelemetryLoopAsync(telemetryTask);
                 _listener.Stop();
                 _audioBackend.Dispose();
             }
@@ -124,6 +172,12 @@ internal static partial class Program
                     $"mic-state={(micReady ? "available" : "unavailable")} backend={_audioBackend.Name} port={options.AudioPort} format=pcm_s16le/{AudioDefaults.SampleRate}/mono system-endpoint={(micReady ? "ready" : "missing")}"
                     + $" systemEndpointMessage={LogValue(micMessage)}"
                     + (micReady ? string.Empty : $" message={micMessage}"));
+                UpdateDirectionTelemetry(
+                    AudioRuntimeDirection.Microphone,
+                    state: micReady ? "available" : "unavailable",
+                    message: micReady ? "等待 Android 麦克风采集。" : micMessage,
+                    endpointReady: micReady,
+                    lastError: micReady ? null : micMessage);
                 await PublishMicStatusAsync(
                     micReady ? "available" : "unavailable",
                     micReady ? "SideDock 麦克风可在 Windows 或应用中选择。" : micMessage,
@@ -132,6 +186,11 @@ internal static partial class Program
             else
             {
                 Log("AUDIO", "mic-state=disabled reason=disabled_by_options");
+                UpdateDirectionTelemetry(
+                    AudioRuntimeDirection.Microphone,
+                    state: "disabled",
+                    message: "SideDock 麦克风已关闭。",
+                    endpointReady: false);
                 await PublishMicStatusAsync("disabled", "SideDock 麦克风已关闭。", cancellationToken);
             }
 
@@ -143,6 +202,12 @@ internal static partial class Program
                     $"speaker-state={(speakerReady ? "available" : "unavailable")} backend={_audioBackend.Name} port={options.AudioPort} format=pcm_s16le/{AudioDefaults.SampleRate}/stereo system-endpoint={(speakerReady ? "ready" : "missing")}"
                     + $" systemEndpointMessage={LogValue(speakerMessage)}"
                     + (speakerReady ? string.Empty : $" message={speakerMessage}"));
+                UpdateDirectionTelemetry(
+                    AudioRuntimeDirection.Speaker,
+                    state: speakerReady ? "available" : "unavailable",
+                    message: speakerReady ? "等待所选 Windows 输出设备产生声音。" : speakerMessage,
+                    endpointReady: speakerReady,
+                    lastError: speakerReady ? null : speakerMessage);
                 await PublishSpeakerStatusAsync(
                     speakerReady ? "available" : "unavailable",
                     speakerReady ? "电脑声音 loopback 捕获已准备，等待 Android 播放。" : speakerMessage,
@@ -151,8 +216,15 @@ internal static partial class Program
             else
             {
                 Log("AUDIO", "speaker-state=disabled reason=disabled_by_options");
+                UpdateDirectionTelemetry(
+                    AudioRuntimeDirection.Speaker,
+                    state: "disabled",
+                    message: "SideDock 音响已关闭。",
+                    endpointReady: false);
                 await PublishSpeakerStatusAsync("disabled", "SideDock 音响已关闭。", cancellationToken);
             }
+
+            await PublishAudioRuntimeTelemetryAsync(cancellationToken);
         }
 
         private async Task HandleClientAsync(
@@ -217,8 +289,21 @@ internal static partial class Program
                         else if (firstCompletion.Kind is not AudioDirectionEndKind.OperationCanceled)
                         {
                             var message = $"音频连接已关闭：{firstCompletion.TaskName} {firstCompletion.Kind} {firstCompletion.Message}";
+                            UpdateDirectionTelemetry(
+                                AudioRuntimeDirection.Microphone,
+                                state: "unavailable",
+                                message: message,
+                                endpointReady: _audioBackend.IsMicrophoneReady,
+                                lastError: firstCompletion.Message);
+                            UpdateDirectionTelemetry(
+                                AudioRuntimeDirection.Speaker,
+                                state: "unavailable",
+                                message: message,
+                                endpointReady: _audioBackend.IsSpeakerReady,
+                                lastError: firstCompletion.Message);
                             await PublishMicStatusAsync("unavailable", message, CancellationToken.None);
                             await PublishSpeakerStatusAsync("unavailable", message, CancellationToken.None);
+                            await PublishAudioRuntimeTelemetryAsync(CancellationToken.None);
                         }
                     }
                 }
@@ -251,11 +336,26 @@ internal static partial class Program
                     Log(
                         $"AUDIO {connectionId}",
                         $"audio-state=unavailable task=HandleClientAsync endType=Exception exception={ex.GetType().Name} message={ex.Message}");
+                    UpdateDirectionTelemetry(
+                        AudioRuntimeDirection.Microphone,
+                        state: "unavailable",
+                        message: $"SideDock 麦克风暂不可用：{ex.Message}",
+                        endpointReady: _audioBackend.IsMicrophoneReady,
+                        lastError: ex.Message);
+                    UpdateDirectionTelemetry(
+                        AudioRuntimeDirection.Speaker,
+                        state: "unavailable",
+                        message: $"SideDock 音响暂不可用：{ex.Message}",
+                        endpointReady: _audioBackend.IsSpeakerReady,
+                        lastError: ex.Message);
                     await PublishMicStatusAsync("unavailable", $"SideDock 麦克风暂不可用：{ex.Message}", CancellationToken.None);
                     await PublishSpeakerStatusAsync("unavailable", $"SideDock 音响暂不可用：{ex.Message}", CancellationToken.None);
+                    await PublishAudioRuntimeTelemetryAsync(CancellationToken.None);
                 }
                 finally
                 {
+                    var disconnectCount = Interlocked.Increment(ref _disconnectCount);
+                    UpdateDisconnectCount(disconnectCount);
                     Log($"AUDIO {connectionId}", $"准备关闭音频 socket beforeCancel={DescribeSocket(client)}");
                     await connectionCts.CancelAsync();
                     Log($"AUDIO {connectionId}", $"关闭音频 socket 前状态 {DescribeSocket(client)}");
@@ -285,6 +385,12 @@ internal static partial class Program
                 endpointReady ? "available" : "unavailable",
                 endpointReady ? "等待 Android 麦克风采集。" : endpointMessage,
                 cancellationToken);
+            UpdateDirectionTelemetry(
+                AudioRuntimeDirection.Microphone,
+                state: endpointReady ? "available" : "unavailable",
+                message: endpointReady ? "等待 Android 麦克风采集。" : endpointMessage,
+                endpointReady: endpointReady,
+                lastError: endpointReady ? null : endpointMessage);
 
             var header = ArrayPool<byte>.Shared.Rent(HeaderSize);
             var payload = ArrayPool<byte>.Shared.Rent(MaxMicPayloadBytes);
@@ -323,9 +429,21 @@ internal static partial class Program
                     byteCount += payloadLength;
 
                     var now = DateTimeOffset.UtcNow;
+                    var sourceAgeMs = Math.Max(0, now.ToUnixTimeMilliseconds() - timestampMs);
+                    UpdateDirectionTelemetry(
+                        AudioRuntimeDirection.Microphone,
+                        state: endpointReady ? "capturing" : "unavailable",
+                        message: endpointReady ? "Android 麦克风正在采集并写入 Windows。" : endpointMessage,
+                        packets: packetCount,
+                        bytes: byteCount,
+                        levelPercent: CalculatePcm16LevelPercent(payload, payloadLength),
+                        lastPacketUnixMs: now.ToUnixTimeMilliseconds(),
+                        sourceAgeMs: sourceAgeMs,
+                        approximateLatencyMs: sourceAgeMs,
+                        endpointReady: endpointReady,
+                        lastError: endpointReady ? null : endpointMessage);
                     if (packetCount == 1 || now - lastStatsAt >= TimeSpan.FromSeconds(1))
                     {
-                        var sourceAgeMs = Math.Max(0, now.ToUnixTimeMilliseconds() - timestampMs);
                         Log(
                             "AUDIO",
                             $"mic-state={(endpointReady ? "capturing" : "unavailable")} packets={packetCount} bytes={byteCount} lastSeq={sequence} sourceAgeMs={sourceAgeMs} system-endpoint={(endpointReady ? "ready" : "missing")}"
@@ -387,6 +505,12 @@ internal static partial class Program
                         {
                             lastUnavailableAt = unavailableNow;
                             Log("AUDIO", $"speaker-state=unavailable backend={_audioBackend.Name} system-endpoint=missing message={readResult.Message}");
+                            UpdateDirectionTelemetry(
+                                AudioRuntimeDirection.Speaker,
+                                state: "unavailable",
+                                message: readResult.Message,
+                                endpointReady: false,
+                                lastError: readResult.Message);
                             await PublishSpeakerStatusAsync("unavailable", readResult.Message, cancellationToken, packetCount, byteCount);
                         }
 
@@ -397,10 +521,19 @@ internal static partial class Program
                     var bytesRead = readResult.BytesRead;
                     if (bytesRead <= 0)
                     {
-                        if (packetCount == 0 && lastStatsAt == DateTimeOffset.MinValue)
+                        var waitingNow = DateTimeOffset.UtcNow;
+                        if (lastStatsAt == DateTimeOffset.MinValue || waitingNow - lastStatsAt >= TimeSpan.FromSeconds(1))
                         {
-                            lastStatsAt = DateTimeOffset.UtcNow;
+                            lastStatsAt = waitingNow;
                             Log("AUDIO", $"speaker-state=available backend={_audioBackend.Name} system-endpoint=ready");
+                            UpdateDirectionTelemetry(
+                                AudioRuntimeDirection.Speaker,
+                                state: "available",
+                                message: "等待所选 Windows 输出设备产生声音。",
+                                packets: packetCount,
+                                bytes: byteCount,
+                                levelPercent: 0,
+                                endpointReady: true);
                             await PublishSpeakerStatusAsync("available", "等待所选 Windows 输出设备产生声音。", cancellationToken);
                         }
 
@@ -417,6 +550,17 @@ internal static partial class Program
                     await stream.FlushAsync(cancellationToken);
 
                     var now = DateTimeOffset.UtcNow;
+                    UpdateDirectionTelemetry(
+                        AudioRuntimeDirection.Speaker,
+                        state: "playing",
+                        message: "电脑输出正在发送到 Android 播放。",
+                        packets: packetCount,
+                        bytes: byteCount,
+                        levelPercent: CalculatePcm16LevelPercent(payload, bytesRead),
+                        lastPacketUnixMs: now.ToUnixTimeMilliseconds(),
+                        sourceAgeMs: 0,
+                        approximateLatencyMs: 0,
+                        endpointReady: true);
                     if (packetCount == 1 || now - lastStatsAt >= TimeSpan.FromSeconds(1))
                     {
                         Log("AUDIO", $"speaker-state=playing backend={_audioBackend.Name} packets={packetCount} bytes={byteCount} system-endpoint=ready");
@@ -607,6 +751,152 @@ internal static partial class Program
                 : value.Replace('\r', ' ').Replace('\n', ' ').Trim();
         }
 
+        private void InitializeTelemetryState()
+        {
+            UpdateDirectionTelemetry(
+                AudioRuntimeDirection.Microphone,
+                state: options.AudioDeviceEnabled && options.MicrophoneEnabled ? "preparing" : "disabled",
+                message: options.AudioDeviceEnabled && options.MicrophoneEnabled
+                    ? "正在准备 Android 麦克风写入 Windows。"
+                    : "SideDock 麦克风已关闭。",
+                endpointReady: _audioBackend.IsMicrophoneReady);
+            UpdateDirectionTelemetry(
+                AudioRuntimeDirection.Speaker,
+                state: options.AudioDeviceEnabled && options.SpeakerEnabled ? "preparing" : "disabled",
+                message: options.AudioDeviceEnabled && options.SpeakerEnabled
+                    ? "正在准备电脑声音发送到 Android。"
+                    : "SideDock 音响已关闭。",
+                endpointReady: _audioBackend.IsSpeakerReady);
+        }
+
+        private async Task PublishTelemetryLoopAsync(CancellationToken cancellationToken)
+        {
+            using var timer = new PeriodicTimer(TimeSpan.FromSeconds(1));
+            try
+            {
+                await PublishAudioRuntimeTelemetryAsync(cancellationToken);
+                while (await timer.WaitForNextTickAsync(cancellationToken))
+                {
+                    await PublishAudioRuntimeTelemetryAsync(cancellationToken);
+                }
+            }
+            catch (OperationCanceledException)
+            {
+                // Normal shutdown.
+            }
+        }
+
+        private static async Task WaitForTelemetryLoopAsync(Task telemetryTask)
+        {
+            try
+            {
+                await telemetryTask.WaitAsync(TimeSpan.FromSeconds(2));
+            }
+            catch (Exception ex) when (ex is OperationCanceledException or TimeoutException)
+            {
+                // Best effort during shutdown.
+            }
+        }
+
+        private ValueTask PublishAudioRuntimeTelemetryAsync(CancellationToken cancellationToken)
+        {
+            return controlPublisher.PublishAsync(
+                "audio_runtime_telemetry",
+                _telemetryState.CreatePayload(_audioBackend),
+                cancellationToken);
+        }
+
+        private void UpdateDirectionTelemetry(
+            AudioRuntimeDirection direction,
+            string state,
+            string message,
+            long? packets = null,
+            long? bytes = null,
+            int? levelPercent = null,
+            long? lastPacketUnixMs = null,
+            long? sourceAgeMs = null,
+            long? approximateLatencyMs = null,
+            bool? endpointReady = null,
+            string? lastError = null)
+        {
+            _telemetryState.Update(
+                direction,
+                entry =>
+                {
+                    entry.State = state;
+                    entry.Message = message;
+                    entry.SampleRate = AudioDefaults.SampleRate;
+                    entry.BitsPerSample = AudioDefaults.BitsPerSample;
+                    entry.Channels = direction == AudioRuntimeDirection.Microphone
+                        ? AudioDefaults.MicChannels
+                        : AudioDefaults.SpeakerChannels;
+                    entry.Backend = _audioBackend.Name;
+                    entry.EndpointReady = endpointReady ?? (direction == AudioRuntimeDirection.Microphone
+                        ? _audioBackend.IsMicrophoneReady
+                        : _audioBackend.IsSpeakerReady);
+                    entry.EndpointId = direction == AudioRuntimeDirection.Microphone
+                        ? _audioBackend.MicrophoneEndpointId
+                        : _audioBackend.SpeakerEndpointId;
+                    entry.EndpointName = direction == AudioRuntimeDirection.Microphone
+                        ? _audioBackend.MicrophoneEndpointName
+                        : _audioBackend.SpeakerEndpointName;
+                    entry.LastError = string.IsNullOrWhiteSpace(lastError) ? null : lastError;
+                    entry.ReconnectCount = Interlocked.Read(ref _reconnectCount);
+                    entry.DisconnectCount = Interlocked.Read(ref _disconnectCount);
+
+                    if (packets.HasValue)
+                    {
+                        entry.Packets = packets.Value;
+                    }
+
+                    if (bytes.HasValue)
+                    {
+                        entry.Bytes = bytes.Value;
+                    }
+
+                    if (levelPercent.HasValue)
+                    {
+                        entry.LevelPercent = Math.Clamp(levelPercent.Value, 0, 100);
+                    }
+
+                    if (lastPacketUnixMs.HasValue)
+                    {
+                        entry.LastPacketUnixMs = lastPacketUnixMs.Value;
+                    }
+
+                    entry.SourceAgeMs = sourceAgeMs;
+                    entry.ApproximateLatencyMs = approximateLatencyMs;
+                });
+        }
+
+        private void UpdateReconnectCount(long reconnectCount)
+        {
+            _telemetryState.UpdateAll(entry => entry.ReconnectCount = reconnectCount);
+        }
+
+        private void UpdateDisconnectCount(long disconnectCount)
+        {
+            _telemetryState.UpdateAll(entry => entry.DisconnectCount = disconnectCount);
+        }
+
+        private static int CalculatePcm16LevelPercent(byte[] buffer, int byteCount)
+        {
+            var boundedByteCount = Math.Min(buffer.Length, byteCount);
+            boundedByteCount -= boundedByteCount % 2;
+            var peak = 0;
+            for (var offset = 0; offset < boundedByteCount; offset += 2)
+            {
+                var sample = BinaryPrimitives.ReadInt16LittleEndian(buffer.AsSpan(offset, 2));
+                var absolute = sample == short.MinValue ? short.MaxValue : Math.Abs(sample);
+                if (absolute > peak)
+                {
+                    peak = absolute;
+                }
+            }
+
+            return Math.Clamp((int)Math.Round(peak * 100.0 / short.MaxValue), 0, 100);
+        }
+
         private async Task PublishMicStatusAsync(
             string state,
             string message,
@@ -696,9 +986,17 @@ internal static partial class Program
 
             string MicrophoneStatusMessage { get; }
 
+            string? MicrophoneEndpointId { get; }
+
+            string? MicrophoneEndpointName { get; }
+
             bool IsSpeakerReady { get; }
 
             string SpeakerStatusMessage { get; }
+
+            string? SpeakerEndpointId { get; }
+
+            string? SpeakerEndpointName { get; }
 
             bool EnsureMicrophoneReady(out string message);
 
@@ -710,6 +1008,214 @@ internal static partial class Program
         }
 
         private sealed record AudioReadResult(bool EndpointReady, int BytesRead, string Message);
+
+        private enum AudioRuntimeDirection
+        {
+            Microphone,
+            Speaker
+        }
+
+        private sealed class AudioRuntimeTelemetryState(int audioPort)
+        {
+            private readonly object _lock = new();
+            private readonly AudioRuntimeDirectionEntry _microphone = new("microphone");
+            private readonly AudioRuntimeDirectionEntry _speaker = new("speaker");
+
+            public void Update(AudioRuntimeDirection direction, Action<AudioRuntimeDirectionEntry> update)
+            {
+                lock (_lock)
+                {
+                    update(EntryFor(direction));
+                }
+            }
+
+            public void UpdateAll(Action<AudioRuntimeDirectionEntry> update)
+            {
+                lock (_lock)
+                {
+                    update(_microphone);
+                    update(_speaker);
+                }
+            }
+
+            public JsonObject CreatePayload(IAudioBridgeBackend backend)
+            {
+                lock (_lock)
+                {
+                    var now = DateTimeOffset.UtcNow;
+                    RefreshRates(_microphone, now);
+                    RefreshRates(_speaker, now);
+                    RefreshEndpoint(_microphone, backend, AudioRuntimeDirection.Microphone);
+                    RefreshEndpoint(_speaker, backend, AudioRuntimeDirection.Speaker);
+
+                    return new JsonObject
+                    {
+                        ["origin"] = "host",
+                        ["telemetryUnixMs"] = now.ToUnixTimeMilliseconds(),
+                        ["audioPort"] = audioPort,
+                        ["backend"] = backend.Name,
+                        ["sampleRate"] = AudioDefaults.SampleRate,
+                        ["bitsPerSample"] = AudioDefaults.BitsPerSample,
+                        ["microphone"] = ToJson(_microphone, now),
+                        ["speaker"] = ToJson(_speaker, now)
+                    };
+                }
+            }
+
+            private AudioRuntimeDirectionEntry EntryFor(AudioRuntimeDirection direction)
+            {
+                return direction == AudioRuntimeDirection.Microphone ? _microphone : _speaker;
+            }
+
+            private static void RefreshRates(AudioRuntimeDirectionEntry entry, DateTimeOffset now)
+            {
+                if (entry.LastRateAt == DateTimeOffset.MinValue)
+                {
+                    entry.LastRateAt = now;
+                    entry.LastRatePackets = entry.Packets;
+                    entry.LastRateBytes = entry.Bytes;
+                    entry.PacketsPerSecond = 0;
+                    entry.BytesPerSecond = 0;
+                    return;
+                }
+
+                var elapsedSeconds = (now - entry.LastRateAt).TotalSeconds;
+                if (elapsedSeconds <= 0)
+                {
+                    return;
+                }
+
+                entry.PacketsPerSecond = Math.Max(0, (entry.Packets - entry.LastRatePackets) / elapsedSeconds);
+                entry.BytesPerSecond = Math.Max(0, (entry.Bytes - entry.LastRateBytes) / elapsedSeconds);
+                entry.LastRateAt = now;
+                entry.LastRatePackets = entry.Packets;
+                entry.LastRateBytes = entry.Bytes;
+            }
+
+            private static void RefreshEndpoint(
+                AudioRuntimeDirectionEntry entry,
+                IAudioBridgeBackend backend,
+                AudioRuntimeDirection direction)
+            {
+                if (direction == AudioRuntimeDirection.Microphone)
+                {
+                    entry.EndpointReady = backend.IsMicrophoneReady;
+                    entry.EndpointId = backend.MicrophoneEndpointId;
+                    entry.EndpointName = backend.MicrophoneEndpointName;
+                    entry.Backend = backend.Name;
+                    if (string.IsNullOrWhiteSpace(entry.Message))
+                    {
+                        entry.Message = backend.MicrophoneStatusMessage;
+                    }
+                }
+                else
+                {
+                    entry.EndpointReady = backend.IsSpeakerReady;
+                    entry.EndpointId = backend.SpeakerEndpointId;
+                    entry.EndpointName = backend.SpeakerEndpointName;
+                    entry.Backend = backend.Name;
+                    if (string.IsNullOrWhiteSpace(entry.Message))
+                    {
+                        entry.Message = backend.SpeakerStatusMessage;
+                    }
+                }
+            }
+
+            private static JsonObject ToJson(AudioRuntimeDirectionEntry entry, DateTimeOffset now)
+            {
+                var lastPacketAgeMs = entry.LastPacketUnixMs.HasValue
+                    ? Math.Max(0, now.ToUnixTimeMilliseconds() - entry.LastPacketUnixMs.Value)
+                    : (long?)null;
+
+                return new JsonObject
+                {
+                    ["direction"] = entry.Direction,
+                    ["state"] = entry.State,
+                    ["message"] = entry.Message,
+                    ["packets"] = entry.Packets,
+                    ["bytes"] = entry.Bytes,
+                    ["packetsPerSecond"] = Math.Round(entry.PacketsPerSecond, 2),
+                    ["bytesPerSecond"] = Math.Round(entry.BytesPerSecond, 2),
+                    ["levelPercent"] = entry.LevelPercent,
+                    ["peakLevel"] = entry.LevelPercent,
+                    ["lastPacketUnixMs"] = NumberOrNull(entry.LastPacketUnixMs),
+                    ["lastPacketAgeMs"] = NumberOrNull(lastPacketAgeMs),
+                    ["sourceAgeMs"] = NumberOrNull(entry.SourceAgeMs),
+                    ["approximateLatencyMs"] = NumberOrNull(entry.ApproximateLatencyMs),
+                    ["endpointId"] = StringOrNull(entry.EndpointId),
+                    ["endpointName"] = StringOrNull(entry.EndpointName),
+                    ["endpointReady"] = entry.EndpointReady,
+                    ["sampleRate"] = entry.SampleRate,
+                    ["channels"] = entry.Channels,
+                    ["bitsPerSample"] = entry.BitsPerSample,
+                    ["backend"] = entry.Backend,
+                    ["lastError"] = StringOrNull(entry.LastError),
+                    ["reconnectCount"] = entry.ReconnectCount,
+                    ["disconnectCount"] = entry.DisconnectCount
+                };
+            }
+
+            private static JsonNode? NumberOrNull(long? value)
+            {
+                return value.HasValue ? JsonValue.Create(value.Value) : null;
+            }
+
+            private static JsonNode? StringOrNull(string? value)
+            {
+                return string.IsNullOrWhiteSpace(value) ? null : JsonValue.Create(value);
+            }
+        }
+
+        private sealed class AudioRuntimeDirectionEntry(string direction)
+        {
+            public string Direction { get; } = direction;
+
+            public string State { get; set; } = "preparing";
+
+            public string Message { get; set; } = "";
+
+            public long Packets { get; set; }
+
+            public long Bytes { get; set; }
+
+            public double PacketsPerSecond { get; set; }
+
+            public double BytesPerSecond { get; set; }
+
+            public int LevelPercent { get; set; }
+
+            public long? LastPacketUnixMs { get; set; }
+
+            public long? SourceAgeMs { get; set; }
+
+            public long? ApproximateLatencyMs { get; set; }
+
+            public string? EndpointId { get; set; }
+
+            public string? EndpointName { get; set; }
+
+            public bool EndpointReady { get; set; }
+
+            public string? LastError { get; set; }
+
+            public long ReconnectCount { get; set; }
+
+            public long DisconnectCount { get; set; }
+
+            public int SampleRate { get; set; } = AudioDefaults.SampleRate;
+
+            public int Channels { get; set; }
+
+            public int BitsPerSample { get; set; } = AudioDefaults.BitsPerSample;
+
+            public string Backend { get; set; } = "";
+
+            public DateTimeOffset LastRateAt { get; set; } = DateTimeOffset.MinValue;
+
+            public long LastRatePackets { get; set; }
+
+            public long LastRateBytes { get; set; }
+        }
 
         private sealed class LegacySharedMemoryAudioBackend : IAudioBridgeBackend
         {
@@ -723,9 +1229,17 @@ internal static partial class Program
 
             public string MicrophoneStatusMessage => _micRing.StatusMessage;
 
+            public string? MicrophoneEndpointId => "legacy-shared-memory-microphone";
+
+            public string? MicrophoneEndpointName => "SideDock legacy microphone shared ring";
+
             public bool IsSpeakerReady => _speakerRing.IsReady;
 
             public string SpeakerStatusMessage => _speakerRing.StatusMessage;
+
+            public string? SpeakerEndpointId => "legacy-shared-memory-speaker";
+
+            public string? SpeakerEndpointName => "SideDock legacy speaker shared ring";
 
             public bool EnsureMicrophoneReady(out string message)
             {
@@ -821,6 +1335,19 @@ internal static partial class Program
                 }
             }
 
+            public string? MicrophoneEndpointId => _microphoneRenderEndpointId;
+
+            public string? MicrophoneEndpointName
+            {
+                get
+                {
+                    lock (_microphoneLock)
+                    {
+                        return _microphoneRenderDevice?.FriendlyName;
+                    }
+                }
+            }
+
             public bool IsSpeakerReady
             {
                 get
@@ -839,6 +1366,19 @@ internal static partial class Program
                     lock (_speakerLock)
                     {
                         return _speakerStatusMessage;
+                    }
+                }
+            }
+
+            public string? SpeakerEndpointId => _speakerOutputLoopbackEndpointId;
+
+            public string? SpeakerEndpointName
+            {
+                get
+                {
+                    lock (_speakerLock)
+                    {
+                        return _speakerCaptureDevice?.FriendlyName;
                     }
                 }
             }

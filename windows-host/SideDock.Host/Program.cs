@@ -691,6 +691,16 @@ internal static partial class Program
                 connection = _activeConnection;
             }
 
+            if (type == "audio_runtime_telemetry" && payload is not null)
+            {
+                if (payload is JsonObject telemetryPayload)
+                {
+                    telemetryPayload["androidControlConnected"] = connection is not null;
+                }
+
+                Log("CONTROL", $"publish {type} payload={payload.ToJsonString(JsonOptions)}");
+            }
+
             return connection is null
                 ? ValueTask.CompletedTask
                 : connection.SendAsync(type, payload, cancellationToken);
@@ -1491,6 +1501,7 @@ internal static partial class Program
                 case "log":
                 case "audio_mic_status":
                 case "audio_speaker_status":
+                case "audio_runtime_telemetry":
                 case "camera_status":
                 case "input_stats":
                 case "input_error":

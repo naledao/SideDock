@@ -102,6 +102,8 @@ public sealed partial class StaticAudioPage : UserControl
         MicrophoneTargetDeviceText.Text = state.CurrentDeviceText;
         SpeakerLevelText.Text = state.SpeakerLevelText;
         MicrophoneLevelText.Text = state.MicrophoneLevelText;
+        SpeakerLevelBar.Value = Math.Clamp(state.SpeakerLevelPercent, 0, 100);
+        MicrophoneLevelBar.Value = Math.Clamp(state.MicrophoneLevelPercent, 0, 100);
         SpeakerLatencyText.Text = state.SpeakerLatencyText;
         MicrophoneLatencyText.Text = state.MicrophoneLatencyText;
         SpeakerCardStatusText.Text = state.SpeakerStatusText;
@@ -514,7 +516,11 @@ internal sealed class StaticAudioPageState
 
     public string SpeakerLevelText { get; init; } = "暂无实时数据";
 
+    public double SpeakerLevelPercent { get; init; }
+
     public string MicrophoneLevelText { get; init; } = "暂无实时数据";
+
+    public double MicrophoneLevelPercent { get; init; }
 
     public string SpeakerLatencyText { get; init; } = "暂无数据";
 

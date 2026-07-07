@@ -199,9 +199,24 @@ public final class MainActivity extends Activity implements ControlClient.Listen
     private long microphoneBytesSent;
     private int microphonePeakSample;
     private long microphoneSilentPackets;
+    private long microphoneLastPacketUnixMs;
+    private long microphoneLastRateAtMs;
+    private long microphoneLastRatePackets;
+    private long microphoneLastRateBytes;
+    private double microphonePacketsPerSecond;
+    private double microphoneBytesPerSecond;
     private String microphoneAudioSource = "";
     private long speakerPacketsReceived;
     private long speakerBytesReceived;
+    private int speakerPeakSample;
+    private long speakerSourceAgeMs;
+    private long speakerLastPacketUnixMs;
+    private long speakerLastRateAtMs;
+    private long speakerLastRatePackets;
+    private long speakerLastRateBytes;
+    private double speakerPacketsPerSecond;
+    private double speakerBytesPerSecond;
+    private int speakerPlayState;
     private String cameraRuntimeState = "disconnected";
     private String lastCameraHint = "Waiting for camera configuration.";
     private long cameraPacketsSent;
@@ -483,6 +498,8 @@ public final class MainActivity extends Activity implements ControlClient.Listen
                 microphonePeakSample = peakSample;
                 microphoneSilentPackets = silentPackets;
                 microphoneAudioSource = audioSourceName == null ? "" : audioSourceName;
+                microphoneLastPacketUnixMs = System.currentTimeMillis();
+                updateAudioRateCounters(true, microphoneLastPacketUnixMs);
                 publishAudioMicrophoneStatus("capturing", "麦克风正在采集中。");
             }
         });
@@ -504,12 +521,17 @@ public final class MainActivity extends Activity implements ControlClient.Listen
     }
 
     @Override
-    public void onAudioPlaybackStats(long packetsReceived, long bytesReceived) {
+    public void onAudioPlaybackStats(long packetsReceived, long bytesReceived, int peakSample, long sourceAgeMs, int playState) {
         mainHandler.post(new Runnable() {
             @Override
             public void run() {
                 speakerPacketsReceived = packetsReceived;
                 speakerBytesReceived = bytesReceived;
+                speakerPeakSample = peakSample;
+                speakerSourceAgeMs = sourceAgeMs;
+                speakerPlayState = playState;
+                speakerLastPacketUnixMs = System.currentTimeMillis();
+                updateAudioRateCounters(false, speakerLastPacketUnixMs);
                 publishAudioSpeakerStatus(speakerMuted ? "muted" : "playing",
                     speakerMuted ? "本机音响已静音。" : "正在播放电脑声音。");
             }
@@ -1617,6 +1639,10 @@ public final class MainActivity extends Activity implements ControlClient.Listen
             return;
         }
 
+        if (state != null && !state.isEmpty()) {
+            microphoneRuntimeState = state;
+        }
+
         controlClient.sendAudioMicrophoneStatus(
             state,
             micMuted,
@@ -1632,11 +1658,16 @@ public final class MainActivity extends Activity implements ControlClient.Listen
             microphoneSilentPackets,
             microphoneAudioSource
         );
+        publishAudioRuntimeTelemetry();
     }
 
     private void publishAudioSpeakerStatus(String state, String message) {
         if (controlClient == null) {
             return;
+        }
+
+        if (state != null && !state.isEmpty()) {
+            speakerRuntimeState = state;
         }
 
         controlClient.sendAudioSpeakerStatus(
@@ -1650,6 +1681,74 @@ public final class MainActivity extends Activity implements ControlClient.Listen
             speakerBytesReceived,
             message
         );
+        publishAudioRuntimeTelemetry();
+    }
+
+    private void publishAudioRuntimeTelemetry() {
+        if (controlClient == null) {
+            return;
+        }
+
+        controlClient.sendAudioRuntimeTelemetry(
+            microphoneRuntimeState,
+            micMuted,
+            audioStopped,
+            hasRecordAudioPermission(),
+            audioPort,
+            audioSampleRate,
+            audioChannels,
+            microphonePacketsSent,
+            microphoneBytesSent,
+            microphonePacketsPerSecond,
+            microphoneBytesPerSecond,
+            microphonePeakSample,
+            microphoneSilentPackets,
+            microphoneLastPacketUnixMs,
+            microphoneAudioSource,
+            audioLastError(microphoneRuntimeState),
+            speakerRuntimeState,
+            speakerMuted,
+            audioSampleRate,
+            audioSpeakerChannels,
+            speakerPacketsReceived,
+            speakerBytesReceived,
+            speakerPacketsPerSecond,
+            speakerBytesPerSecond,
+            speakerPeakSample,
+            speakerSourceAgeMs,
+            speakerLastPacketUnixMs,
+            speakerPlayState,
+            audioLastError(speakerRuntimeState)
+        );
+    }
+
+    private void updateAudioRateCounters(boolean microphone, long nowMs) {
+        if (microphone) {
+            if (microphoneLastRateAtMs > 0L && nowMs > microphoneLastRateAtMs) {
+                double elapsedSeconds = (nowMs - microphoneLastRateAtMs) / 1000.0d;
+                microphonePacketsPerSecond = Math.max(0.0d, (microphonePacketsSent - microphoneLastRatePackets) / elapsedSeconds);
+                microphoneBytesPerSecond = Math.max(0.0d, (microphoneBytesSent - microphoneLastRateBytes) / elapsedSeconds);
+            }
+            microphoneLastRateAtMs = nowMs;
+            microphoneLastRatePackets = microphonePacketsSent;
+            microphoneLastRateBytes = microphoneBytesSent;
+            return;
+        }
+
+        if (speakerLastRateAtMs > 0L && nowMs > speakerLastRateAtMs) {
+            double elapsedSeconds = (nowMs - speakerLastRateAtMs) / 1000.0d;
+            speakerPacketsPerSecond = Math.max(0.0d, (speakerPacketsReceived - speakerLastRatePackets) / elapsedSeconds);
+            speakerBytesPerSecond = Math.max(0.0d, (speakerBytesReceived - speakerLastRateBytes) / elapsedSeconds);
+        }
+        speakerLastRateAtMs = nowMs;
+        speakerLastRatePackets = speakerPacketsReceived;
+        speakerLastRateBytes = speakerBytesReceived;
+    }
+
+    private String audioLastError(String state) {
+        return "unavailable".equals(state) || "authorization_required".equals(state)
+            ? lastAudioHint
+            : "";
     }
 
     private void applyCameraCaptureIntent(String message) {
