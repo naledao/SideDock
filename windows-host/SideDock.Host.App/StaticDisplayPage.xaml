@@ -245,7 +245,7 @@
                         <StackPanel Grid.Column="1" Spacing="5">
                             <TextBlock Text="主机服务" FontSize="13" Foreground="#5B6570" />
                             <TextBlock Text="正在运行" FontSize="13" Foreground="#30363D" />
-                            <TextBlock Text="v1.3.0" Margin="0,7,0,0" FontSize="12" Foreground="#6B7280" />
+                            <TextBlock x:Name="StaticDisplaySidebarVersionText" Margin="0,7,0,0" FontSize="12" Foreground="#6B7280" />
                         </StackPanel>
                     </Grid>
                     <Button

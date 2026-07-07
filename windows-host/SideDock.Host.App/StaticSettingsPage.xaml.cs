@@ -6,10 +6,14 @@ namespace SideDock.Host.App;
 public sealed partial class StaticSettingsPage : UserControl
 {
     public event EventHandler? BrowseAdbPathRequested;
+    internal event EventHandler<AppearanceSettingsChangedEventArgs>? AppearanceChanged;
+
+    private bool _syncingAppearanceOptions;
 
     public StaticSettingsPage()
     {
         InitializeComponent();
+        SettingsAboutVersionText.Text = $"SideDock Host  {AppVersionInfo.DisplayVersion}";
         Loaded += StaticSettingsPage_Loaded;
     }
 
@@ -20,6 +24,17 @@ public sealed partial class StaticSettingsPage : UserControl
 
     internal void ApplySettings(AppSettings settings)
     {
+        _syncingAppearanceOptions = true;
+        try
+        {
+            SelectThemeMode(settings.ThemeMode);
+            SelectInterfaceDensity(settings.InterfaceDensity);
+        }
+        finally
+        {
+            _syncingAppearanceOptions = false;
+        }
+
         StartWithWindowsSwitch.IsOn = settings.StartWithWindows;
         MinimizeToTraySwitch.IsOn = settings.MinimizeToTrayOnClose;
         AutoDisplaySwitch.IsOn = settings.StartVirtualDisplayWithHost;
@@ -34,6 +49,14 @@ public sealed partial class StaticSettingsPage : UserControl
         IncludePortInfoSwitch.IsOn = settings.IncludePortInfoInDiagnostics;
         Nv12ThreadsBox.Value = settings.Nv12PoolSize;
         EncoderQueueBox.Value = settings.EncodedPacketQueue;
+    }
+
+    internal void ApplyAppearance(AppAppearancePalette palette, AppInterfaceDensity density)
+    {
+        RequestedTheme = palette.Theme;
+        AppAppearance.ApplyPageResources(Resources, palette);
+        AppAppearance.ApplyPalette(this, palette);
+        AppAppearance.ApplyDensity(this, density);
     }
 
     internal bool TryBuildSettings(out AppSettings settings)
@@ -73,7 +96,9 @@ public sealed partial class StaticSettingsPage : UserControl
             RetainRecentLogs = RecentLogsSwitch.IsOn,
             IncludePortInfoInDiagnostics = IncludePortInfoSwitch.IsOn,
             Nv12PoolSize = nv12PoolSize,
-            EncodedPacketQueue = encodedPacketQueue
+            EncodedPacketQueue = encodedPacketQueue,
+            ThemeMode = SelectedThemeMode(),
+            InterfaceDensity = SelectedInterfaceDensity()
         };
         return true;
     }
@@ -153,8 +178,20 @@ public sealed partial class StaticSettingsPage : UserControl
 
     private void CheckUpdateButton_Click(object sender, RoutedEventArgs e)
     {
-        UpdateStatusText.Text = "检查更新暂未接入";
-        ShowBanner("检查更新暂未接入", "更新检查会在后续阶段接入真实更新源。");
+        UpdateStatusText.Text = "未配置更新源";
+        ShowBanner("未配置更新源", "当前没有配置 GitHub Releases、更新 manifest 或其它真实发布源，因此不会执行假的更新检查。");
+    }
+
+    private void AppearanceOption_Checked(object sender, RoutedEventArgs e)
+    {
+        if (_syncingAppearanceOptions)
+        {
+            return;
+        }
+
+        AppearanceChanged?.Invoke(
+            this,
+            new AppearanceSettingsChangedEventArgs(SelectedThemeMode(), SelectedInterfaceDensity()));
     }
 
     private void DismissSavedBannerButton_Click(object sender, RoutedEventArgs e)
@@ -219,6 +256,41 @@ public sealed partial class StaticSettingsPage : UserControl
             null => string.Empty,
             _ => item.ToString() ?? string.Empty
         };
+    }
+
+    private void SelectThemeMode(AppThemeMode themeMode)
+    {
+        LightThemeRadio.IsChecked = themeMode == AppThemeMode.Light;
+        DarkThemeRadio.IsChecked = themeMode == AppThemeMode.Dark;
+        SystemThemeRadio.IsChecked = themeMode == AppThemeMode.System;
+    }
+
+    private AppThemeMode SelectedThemeMode()
+    {
+        if (LightThemeRadio.IsChecked == true)
+        {
+            return AppThemeMode.Light;
+        }
+
+        if (DarkThemeRadio.IsChecked == true)
+        {
+            return AppThemeMode.Dark;
+        }
+
+        return AppThemeMode.System;
+    }
+
+    private void SelectInterfaceDensity(AppInterfaceDensity density)
+    {
+        StandardDensityRadio.IsChecked = density == AppInterfaceDensity.Standard;
+        CompactDensityRadio.IsChecked = density == AppInterfaceDensity.Compact;
+    }
+
+    private AppInterfaceDensity SelectedInterfaceDensity()
+    {
+        return CompactDensityRadio.IsChecked == true
+            ? AppInterfaceDensity.Compact
+            : AppInterfaceDensity.Standard;
     }
 
     private static bool TryReadInt(
@@ -353,4 +425,17 @@ public sealed partial class StaticSettingsPage : UserControl
         SettingsSavedDetailText.Text = detail;
         SettingsSavedBanner.Visibility = Visibility.Visible;
     }
+}
+
+internal sealed class AppearanceSettingsChangedEventArgs : EventArgs
+{
+    public AppearanceSettingsChangedEventArgs(AppThemeMode themeMode, AppInterfaceDensity interfaceDensity)
+    {
+        ThemeMode = themeMode;
+        InterfaceDensity = interfaceDensity;
+    }
+
+    public AppThemeMode ThemeMode { get; }
+
+    public AppInterfaceDensity InterfaceDensity { get; }
 }

@@ -8,7 +8,7 @@
     mc:Ignorable="d"
     Title="SideDock Host">
 
-    <Grid Background="#F6F8FA">
+    <Grid x:Name="RootShell" Background="#F6F8FA">
         <Grid x:Name="StaticOverviewShell" Background="#F6F8FA">
             <Grid.ColumnDefinitions>
                 <ColumnDefinition x:Name="OverviewSidebarColumn" Width="238" />
@@ -253,7 +253,7 @@
                                     Text="未启动"
                                     FontSize="13"
                                     Foreground="#30363D" />
-                                <TextBlock x:Name="OverviewSidebarVersionText" Text="v1.3.0" Margin="0,7,0,0" FontSize="12" Foreground="#6B7280" />
+                                <TextBlock x:Name="OverviewSidebarVersionText" Margin="0,7,0,0" FontSize="12" Foreground="#6B7280" />
                             </StackPanel>
                         </Grid>
                         <Button
@@ -3023,6 +3023,7 @@
                     Visibility="Collapsed" />
 
                 <Border
+                    x:Name="OverviewFooterBorder"
                     Grid.Row="2"
                     Background="#F8FAFC"
                     BorderBrush="#D4DCE3"

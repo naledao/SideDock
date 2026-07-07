@@ -94,6 +94,8 @@ public sealed partial class MainWindow : Window
     private static readonly string DeviceToolProcessName = Path.GetFileNameWithoutExtension(DeviceToolExe);
     private static readonly UIntPtr WindowSubclassId = new(1);
     private static readonly bool StaticOverviewUi = true;
+    private AppAppearancePalette _currentPalette = AppAppearance.GetPalette(ElementTheme.Light);
+    private AppInterfaceDensity _currentDensity = AppInterfaceDensity.Standard;
 
     private readonly DispatcherTimer _displayStatusTimer = new();
     private readonly DispatcherTimer _cameraPreviewTimer = new();
@@ -332,6 +334,7 @@ public sealed partial class MainWindow : Window
     {
         _launchOptions = launchOptions ?? new AppLaunchOptions(StartMinimized: false, StartInTray: false);
         InitializeComponent();
+        OverviewSidebarVersionText.Text = AppVersionInfo.DisplayVersion;
         _appSettings = AppSettingsStore.Load();
         var settingsLoadError = AppSettingsStore.LastLoadError;
         RefreshStartupTaskState(logErrors: false);
@@ -492,6 +495,7 @@ public sealed partial class MainWindow : Window
     private void WireStaticSettingsPage()
     {
         OverviewSettingsPage.BrowseAdbPathRequested += StaticSettingsPage_BrowseAdbPathRequested;
+        OverviewSettingsPage.AppearanceChanged += StaticSettingsPage_AppearanceChanged;
     }
 
     private void ApplyAppSettingsToUi(AppSettings settings)
@@ -503,6 +507,7 @@ public sealed partial class MainWindow : Window
             : _appSettings.StartWithWindows;
         OverviewSettingsPage.ApplySettings(_appSettings);
         OverviewDisplayPage.ApplySettings(_appSettings);
+        ApplyAppearanceSettings(_appSettings.ThemeMode, _appSettings.InterfaceDensity);
 
         _syncingOverviewConnectionControls = true;
         try
@@ -533,6 +538,85 @@ public sealed partial class MainWindow : Window
             UpdateOverviewConnectionPage();
             RefreshVirtualDisplayState();
         }
+    }
+
+    private void ApplyAppearanceSettings(AppThemeMode themeMode, AppInterfaceDensity density)
+    {
+        var effectiveTheme = AppAppearance.ResolveElementTheme(themeMode);
+        _currentPalette = AppAppearance.GetPalette(effectiveTheme);
+        _currentDensity = density;
+
+        RootShell.RequestedTheme = effectiveTheme;
+        ApplyOverviewChromePalette();
+        OverviewDisplayPage.ApplyAppearance(_currentPalette, density);
+        OverviewSettingsPage.ApplyAppearance(_currentPalette, density);
+        OverviewAudioPage.ApplyAppearance(_currentPalette, density);
+        OverviewDiagnosticsPage.ApplyAppearance(_currentPalette, density);
+        AppAppearance.ApplyPalette(RootShell, _currentPalette);
+        AppAppearance.ApplyDensity(RootShell, density);
+        ApplyOverviewChromeDensity();
+        UpdateOverviewSidebarLayout();
+        SetOverviewNavigationItem(_overviewNavigationItem);
+        DispatcherQueue.TryEnqueue(UpdateOverviewMainContentMinHeight);
+    }
+
+    private void ApplyOverviewChromePalette()
+    {
+        AppAppearance.SetBrushColor(_secondaryBrush, _currentPalette.Muted);
+        AppAppearance.SetBrushColor(_overviewPrimaryBrush, _currentPalette.Primary);
+        AppAppearance.SetBrushColor(_overviewNeutralBrush, _currentPalette.Muted);
+        AppAppearance.SetBrushColor(_overviewMutedBrush, _currentPalette.Disabled);
+        AppAppearance.SetBrushColor(_overviewNavActiveBackgroundBrush, _currentPalette.NavActiveBackground);
+        AppAppearance.SetBrushColor(_overviewReadyBackgroundBrush, _currentPalette.SuccessSoft);
+        AppAppearance.SetBrushColor(_overviewReadyBorderBrush, _currentPalette.SuccessStroke);
+        AppAppearance.SetBrushColor(_overviewNeutralBackgroundBrush, _currentPalette.SubtleBackground);
+        AppAppearance.SetBrushColor(_overviewNeutralBorderBrush, _currentPalette.Stroke);
+        AppAppearance.SetBrushColor(_overviewWarningBackgroundBrush, _currentPalette.WarningSoft);
+        AppAppearance.SetBrushColor(_overviewWarningBorderBrush, _currentPalette.WarningStroke);
+        AppAppearance.SetBrushColor(_overviewErrorBackgroundBrush, _currentPalette.ErrorSoft);
+        AppAppearance.SetBrushColor(_overviewErrorBorderBrush, _currentPalette.ErrorStroke);
+
+        RootShell.Background = AppAppearance.Brush(_currentPalette.PageBackground);
+        StaticOverviewShell.Background = AppAppearance.Brush(_currentPalette.PageBackground);
+        OverviewRightShell.Background = AppAppearance.Brush(_currentPalette.PageBackground);
+        OverviewSidebarBorder.Background = AppAppearance.Brush(_currentPalette.SidebarBackground);
+        OverviewSidebarBorder.BorderBrush = AppAppearance.Brush(_currentPalette.Stroke);
+        OverviewFooterBorder.Background = AppAppearance.Brush(_currentPalette.SubtleBackground);
+        OverviewFooterBorder.BorderBrush = AppAppearance.Brush(_currentPalette.Stroke);
+        OverviewAppTitleText.Foreground = AppAppearance.Brush(_currentPalette.Text);
+        OverviewPageTitleText.Foreground = AppAppearance.Brush(_currentPalette.Text);
+        OverviewSidebarHostLabelText.Foreground = AppAppearance.Brush(_currentPalette.Muted);
+        OverviewSidebarVersionText.Foreground = AppAppearance.Brush(_currentPalette.Muted);
+        OverviewSidebarToggleIcon.Foreground = AppAppearance.Brush(_currentPalette.Body);
+        OverviewSidebarToggleText.Foreground = AppAppearance.Brush(_currentPalette.Body);
+    }
+
+    private void ApplyOverviewChromeDensity()
+    {
+        if (!StaticOverviewUi)
+        {
+            return;
+        }
+
+        var compact = _currentDensity == AppInterfaceDensity.Compact;
+        OverviewRightShell.RowDefinitions[0].Height = new GridLength(compact ? 62 : 72);
+        OverviewRightShell.RowDefinitions[2].Height = new GridLength(compact ? 34 : 38);
+        OverviewMainScrollViewer.Padding = compact
+            ? new Thickness(20, 0, 20, 0)
+            : new Thickness(26, 0, 26, 0);
+        OverviewMainContentGrid.RowSpacing = compact ? 8 : 10;
+
+        if (OverviewFooterBorder.Child is Grid footerGrid)
+        {
+            footerGrid.Padding = compact
+                ? new Thickness(20, 0, 20, 0)
+                : new Thickness(26, 0, 26, 0);
+        }
+    }
+
+    private void StaticSettingsPage_AppearanceChanged(object? sender, AppearanceSettingsChangedEventArgs e)
+    {
+        ApplyAppearanceSettings(e.ThemeMode, e.InterfaceDensity);
     }
 
     private void SaveAndApplyAppSettings(AppSettings settings)
@@ -692,10 +776,13 @@ public sealed partial class MainWindow : Window
             return;
         }
 
-        OverviewSidebarColumn.Width = new GridLength(_overviewSidebarCollapsed ? 76 : 238);
+        var compact = _currentDensity == AppInterfaceDensity.Compact;
+        OverviewSidebarColumn.Width = new GridLength(_overviewSidebarCollapsed
+            ? compact ? 70 : 76
+            : compact ? 222 : 238);
         OverviewSidebarContent.Padding = _overviewSidebarCollapsed
-            ? new Thickness(12, 18, 12, 22)
-            : new Thickness(18, 18, 18, 22);
+            ? compact ? new Thickness(10, 14, 10, 18) : new Thickness(12, 18, 12, 22)
+            : compact ? new Thickness(14, 14, 14, 18) : new Thickness(18, 18, 18, 22);
 
         var textVisibility = _overviewSidebarCollapsed ? Visibility.Collapsed : Visibility.Visible;
         OverviewAppTitleText.Visibility = textVisibility;
@@ -706,9 +793,10 @@ public sealed partial class MainWindow : Window
 
         foreach (var (_, container, _, _, text) in OverviewNavigationVisuals())
         {
+            container.Height = compact ? 38 : 44;
             container.Padding = _overviewSidebarCollapsed
-                ? new Thickness(10, 0, 10, 0)
-                : new Thickness(14, 0, 14, 0);
+                ? compact ? new Thickness(8, 0, 8, 0) : new Thickness(10, 0, 10, 0)
+                : compact ? new Thickness(12, 0, 12, 0) : new Thickness(14, 0, 14, 0);
             text.Visibility = textVisibility;
         }
     }
@@ -740,8 +828,8 @@ public sealed partial class MainWindow : Window
             var active = navItem == item;
             container.Background = active ? _overviewNavActiveBackgroundBrush : _overviewTransparentBrush;
             indicator.Opacity = active ? 1 : 0;
-            icon.Foreground = active ? _overviewPrimaryBrush : new SolidColorBrush(ColorHelper.FromArgb(255, 48, 54, 61));
-            text.Foreground = active ? new SolidColorBrush(ColorHelper.FromArgb(255, 17, 24, 39)) : new SolidColorBrush(ColorHelper.FromArgb(255, 48, 54, 61));
+            icon.Foreground = active ? _overviewPrimaryBrush : AppAppearance.Brush(_currentPalette.Body);
+            text.Foreground = active ? AppAppearance.Brush(_currentPalette.Text) : AppAppearance.Brush(_currentPalette.Body);
             text.FontWeight = active ? FontWeights.SemiBold : FontWeights.Normal;
         }
 
@@ -2168,7 +2256,7 @@ public sealed partial class MainWindow : Window
         var refreshing = _overviewRefreshInProgress || _adbRefreshInProgress;
         OverviewRefreshAdbDevicesButton.IsEnabled = !refreshing;
         OverviewRefreshButtonText.Text = refreshing ? "刷新中" : "刷新";
-        OverviewRefreshIcon.Foreground = refreshing ? _overviewNeutralBrush : new SolidColorBrush(ColorHelper.FromArgb(255, 17, 24, 39));
+        OverviewRefreshIcon.Foreground = refreshing ? _overviewNeutralBrush : AppAppearance.Brush(_currentPalette.Text);
         UpdateOverviewActionMenuItems();
     }
 
