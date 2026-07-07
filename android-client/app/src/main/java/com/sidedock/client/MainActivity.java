@@ -72,6 +72,7 @@ public final class MainActivity extends Activity implements ControlClient.Listen
     private static final String AUDIO_PREF_MIC_MUTED = "mic_muted";
     private static final String AUDIO_PREF_SPEAKER_MUTED = "speaker_muted";
     private static final String AUDIO_PREF_STOPPED = "stopped";
+    private static final long CAMERA_CONFIG_DEBOUNCE_MS = 250L;
 
     private ControlClient controlClient;
     private VideoClient videoClient;
@@ -79,6 +80,12 @@ public final class MainActivity extends Activity implements ControlClient.Listen
     private CameraCaptureClient cameraCaptureClient;
     private InputCollector inputCollector;
     private final Handler mainHandler = new Handler(Looper.getMainLooper());
+    private final Runnable applyPendingCameraConfigRunnable = new Runnable() {
+        @Override
+        public void run() {
+            applyPendingCameraConfig();
+        }
+    };
     private final Runnable pointerAbsFlushRunnable = new Runnable() {
         @Override
         public void run() {
@@ -224,6 +231,16 @@ public final class MainActivity extends Activity implements ControlClient.Listen
     private long cameraBytesSent;
     private long cameraKeyFramesSent;
     private long cameraCodecConfigPacketsSent;
+    private long cameraReconnectCount;
+    private long cameraRecoveryAttemptCount;
+    private long cameraConsecutiveFailureCount;
+    private long cameraLastRecoveryDurationMs;
+    private String cameraLastDisconnectReason = "";
+    private double cameraActualFps;
+    private double cameraActualKbps;
+    private double cameraFpsJitter;
+    private double cameraBitrateJitter;
+    private ControlClient.CameraConfig pendingCameraConfig;
 
     @Override
     protected void onCreate(Bundle savedInstanceState) {
@@ -324,6 +341,7 @@ public final class MainActivity extends Activity implements ControlClient.Listen
     @Override
     protected void onDestroy() {
         mainHandler.removeCallbacks(pointerAbsFlushRunnable);
+        mainHandler.removeCallbacks(applyPendingCameraConfigRunnable);
         stopDisplayFrameSampling();
         clearDisplayTimingHints();
         cameraCaptureClient.stop();
@@ -381,6 +399,8 @@ public final class MainActivity extends Activity implements ControlClient.Listen
             applyAudioCaptureIntent("电脑音频已连接。");
             applyCameraCaptureIntent("Control channel connected.");
         } else {
+            pendingCameraConfig = null;
+            mainHandler.removeCallbacks(applyPendingCameraConfigRunnable);
             cameraCaptureClient.stop();
             cameraRuntimeState = "disconnected";
             lastCameraHint = state == ConnectionState.RECONNECTING ? "Control channel reconnecting." : "Control channel disconnected.";
@@ -466,6 +486,27 @@ public final class MainActivity extends Activity implements ControlClient.Listen
 
     @Override
     public void onCameraConfig(ControlClient.CameraConfig config) {
+        pendingCameraConfig = config;
+        boolean nextEnabled = config != null && config.enabled;
+        cameraRuntimeState = nextEnabled && controlConnectionState == ConnectionState.CONNECTED
+            ? "applying_config"
+            : "disabled";
+        lastCameraHint = nextEnabled
+            ? "Camera config queued; applying the latest request."
+            : "Host camera uplink is disabled.";
+        publishCameraStatus(cameraRuntimeState, lastCameraHint);
+        mainHandler.removeCallbacks(applyPendingCameraConfigRunnable);
+        mainHandler.postDelayed(applyPendingCameraConfigRunnable, CAMERA_CONFIG_DEBOUNCE_MS);
+        updateOverlay();
+    }
+
+    private void applyPendingCameraConfig() {
+        ControlClient.CameraConfig config = pendingCameraConfig;
+        pendingCameraConfig = null;
+        if (config == null) {
+            return;
+        }
+
         hostCameraEnabled = config.enabled;
         cameraPort = config.port > 0 ? config.port : DEFAULT_CAMERA_PORT;
         cameraWidth = config.width > 0 ? config.width : DEFAULT_CAMERA_WIDTH;
@@ -588,11 +629,24 @@ public final class MainActivity extends Activity implements ControlClient.Listen
     }
 
     @Override
-    public void onCameraCaptureState(String state, String message) {
+    public void onCameraCaptureState(
+        String state,
+        String message,
+        long reconnectCount,
+        long recoveryAttemptCount,
+        long consecutiveFailureCount,
+        long lastRecoveryDurationMs,
+        String lastDisconnectReason
+    ) {
         mainHandler.post(new Runnable() {
             @Override
             public void run() {
                 cameraRuntimeState = state == null ? "unavailable" : state;
+                cameraReconnectCount = reconnectCount;
+                cameraRecoveryAttemptCount = recoveryAttemptCount;
+                cameraConsecutiveFailureCount = consecutiveFailureCount;
+                cameraLastRecoveryDurationMs = lastRecoveryDurationMs;
+                cameraLastDisconnectReason = lastDisconnectReason == null ? "" : lastDisconnectReason;
                 if (message != null && !message.isEmpty()) {
                     lastCameraHint = message;
                 }
@@ -630,7 +684,21 @@ public final class MainActivity extends Activity implements ControlClient.Listen
     }
 
     @Override
-    public void onCameraCaptureStats(long packetsSent, long bytesSent, long keyFrames, long codecConfigPackets) {
+    public void onCameraCaptureStats(
+        long packetsSent,
+        long bytesSent,
+        long keyFrames,
+        long codecConfigPackets,
+        long reconnectCount,
+        long recoveryAttemptCount,
+        long consecutiveFailureCount,
+        long lastRecoveryDurationMs,
+        String lastDisconnectReason,
+        double actualFps,
+        double actualKbps,
+        double fpsJitter,
+        double bitrateJitter
+    ) {
         mainHandler.post(new Runnable() {
             @Override
             public void run() {
@@ -638,6 +706,15 @@ public final class MainActivity extends Activity implements ControlClient.Listen
                 cameraBytesSent = bytesSent;
                 cameraKeyFramesSent = keyFrames;
                 cameraCodecConfigPacketsSent = codecConfigPackets;
+                cameraReconnectCount = reconnectCount;
+                cameraRecoveryAttemptCount = recoveryAttemptCount;
+                cameraConsecutiveFailureCount = consecutiveFailureCount;
+                cameraLastRecoveryDurationMs = lastRecoveryDurationMs;
+                cameraLastDisconnectReason = lastDisconnectReason == null ? "" : lastDisconnectReason;
+                cameraActualFps = actualFps;
+                cameraActualKbps = actualKbps;
+                cameraFpsJitter = fpsJitter;
+                cameraBitrateJitter = bitrateJitter;
                 publishCameraStatus("capturing", "Camera capture is running.");
                 updateOverlay();
             }
@@ -1868,7 +1945,16 @@ public final class MainActivity extends Activity implements ControlClient.Listen
             cameraPacketsSent,
             cameraBytesSent,
             cameraKeyFramesSent,
-            cameraCodecConfigPacketsSent
+            cameraCodecConfigPacketsSent,
+            cameraReconnectCount,
+            cameraRecoveryAttemptCount,
+            cameraConsecutiveFailureCount,
+            cameraLastRecoveryDurationMs,
+            cameraLastDisconnectReason,
+            cameraActualFps,
+            cameraActualKbps,
+            cameraFpsJitter,
+            cameraBitrateJitter
         );
     }
 
@@ -2619,7 +2705,18 @@ public final class MainActivity extends Activity implements ControlClient.Listen
             .append("  bytes ").append(cameraBytesSent)
             .append("  key ").append(cameraKeyFramesSent)
             .append("  cfg ").append(cameraCodecConfigPacketsSent)
+            .append("  rec ").append(cameraReconnectCount)
+            .append("  fail ").append(cameraConsecutiveFailureCount)
+            .append("  fps ").append(String.format(Locale.ROOT, "%.1f", cameraActualFps))
+            .append("  jitter ").append(String.format(Locale.ROOT, "%.0f%%", cameraFpsJitter))
             .append('\n');
+        if (cameraLastDisconnectReason.length() > 0) {
+            builder
+                .append("Camera recovery: attempts ").append(cameraRecoveryAttemptCount)
+                .append("  last ").append(cameraLastRecoveryDurationMs).append("ms")
+                .append("  reason ").append(cameraLastDisconnectReason)
+                .append('\n');
+        }
         builder.append("吞吐FPS: ");
         appendFpsFields(builder);
         builder.append('\n');
