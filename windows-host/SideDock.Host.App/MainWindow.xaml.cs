@@ -13367,90 +13367,127 @@ public sealed partial class MainWindow : Window
 
     private IEnumerable<string> EnumerateVirtualCameraToolCandidates()
     {
-        var baseDirectory = AppContext.BaseDirectory;
-        yield return Path.Combine(baseDirectory, VirtualCameraToolExe);
-        yield return Path.Combine(baseDirectory, "SideDock.VirtualCamera.Tool", VirtualCameraToolExe);
-
-        if (_payloadRoot is not null)
+        foreach (var searchRoot in EnumerateVirtualCameraSearchRoots())
         {
-            yield return Path.Combine(_payloadRoot, VirtualCameraToolExe);
-            yield return Path.Combine(_payloadRoot, "SideDock.VirtualCamera.Tool", VirtualCameraToolExe);
+            yield return Path.Combine(searchRoot, VirtualCameraToolExe);
+            yield return Path.Combine(searchRoot, "SideDock.VirtualCamera.Tool", VirtualCameraToolExe);
+            yield return Path.Combine(searchRoot, "SideDock.Host.App", "SideDock.VirtualCamera.Tool", VirtualCameraToolExe);
         }
 
         foreach (var configuration in new[] { "Release", "Debug" })
         {
-            yield return Path.GetFullPath(Path.Combine(
-                baseDirectory,
-                "..",
-                "..",
-                "..",
-                "..",
-                "..",
-                "SideDock.VirtualCamera.Tool",
-                "bin",
-                configuration,
-                "net8.0-windows10.0.22000.0",
-                "win-x64",
-                VirtualCameraToolExe));
-            yield return Path.GetFullPath(Path.Combine(
-                baseDirectory,
-                "..",
-                "..",
-                "..",
-                "..",
-                "..",
-                "..",
-                "windows-host",
-                "SideDock.VirtualCamera.Tool",
-                "bin",
-                configuration,
-                "net8.0-windows10.0.22000.0",
-                "win-x64",
-                VirtualCameraToolExe));
+            foreach (var searchRoot in EnumerateVirtualCameraSearchRoots())
+            {
+                yield return Path.GetFullPath(Path.Combine(
+                    searchRoot,
+                    "..",
+                    "..",
+                    "..",
+                    "..",
+                    "..",
+                    "SideDock.VirtualCamera.Tool",
+                    "bin",
+                    configuration,
+                    "net8.0-windows10.0.22000.0",
+                    "win-x64",
+                    VirtualCameraToolExe));
+                yield return Path.GetFullPath(Path.Combine(
+                    searchRoot,
+                    "..",
+                    "..",
+                    "..",
+                    "..",
+                    "..",
+                    "..",
+                    "windows-host",
+                    "SideDock.VirtualCamera.Tool",
+                    "bin",
+                    configuration,
+                    "net8.0-windows10.0.22000.0",
+                    "win-x64",
+                    VirtualCameraToolExe));
+            }
         }
     }
 
     private IEnumerable<string> EnumerateVirtualCameraMediaSourceCandidates()
     {
-        var baseDirectory = AppContext.BaseDirectory;
-        yield return Path.Combine(baseDirectory, VirtualCameraMediaSourceDll);
-        if (!string.IsNullOrWhiteSpace(_virtualCameraToolPath))
+        foreach (var searchRoot in EnumerateVirtualCameraSearchRoots())
         {
-            yield return Path.Combine(Path.GetDirectoryName(_virtualCameraToolPath) ?? baseDirectory, VirtualCameraMediaSourceDll);
+            yield return Path.Combine(searchRoot, VirtualCameraMediaSourceDll);
+            yield return Path.Combine(searchRoot, "SideDock.VirtualCamera.Tool", VirtualCameraMediaSourceDll);
+            yield return Path.Combine(searchRoot, "SideDock.VirtualCamera.MediaSource", VirtualCameraMediaSourceDll);
+            yield return Path.Combine(searchRoot, "SideDock.Host.App", "SideDock.VirtualCamera.Tool", VirtualCameraMediaSourceDll);
+            yield return Path.Combine(searchRoot, "SideDock.Host.App", "SideDock.VirtualCamera.MediaSource", VirtualCameraMediaSourceDll);
         }
 
-        if (_payloadRoot is not null)
+        if (!string.IsNullOrWhiteSpace(_virtualCameraToolPath))
         {
-            yield return Path.Combine(_payloadRoot, VirtualCameraMediaSourceDll);
-            yield return Path.Combine(_payloadRoot, "SideDock.VirtualCamera.MediaSource", VirtualCameraMediaSourceDll);
+            yield return Path.Combine(Path.GetDirectoryName(_virtualCameraToolPath) ?? AppContext.BaseDirectory, VirtualCameraMediaSourceDll);
         }
 
         foreach (var configuration in new[] { "Release", "Debug" })
         {
-            yield return Path.GetFullPath(Path.Combine(
-                baseDirectory,
-                "..",
-                "..",
-                "..",
-                "..",
-                "..",
-                "SideDock.VirtualCamera.MediaSource",
-                "x64",
-                configuration,
-                VirtualCameraMediaSourceDll));
-            yield return Path.GetFullPath(Path.Combine(
-                baseDirectory,
-                "..",
-                "..",
-                "..",
-                "..",
-                "..",
-                "..",
-                "windows-host",
-                "SideDock.VirtualCamera.MediaSource",
-                "x64",
-                configuration,
-                VirtualCameraMediaSourceDll));
+            foreach (var searchRoot in EnumerateVirtualCameraSearchRoots())
+            {
+                yield return Path.GetFullPath(Path.Combine(
+                    searchRoot,
+                    "..",
+                    "..",
+                    "..",
+                    "..",
+                    "..",
+                    "SideDock.VirtualCamera.MediaSource",
+                    "x64",
+                    configuration,
+                    VirtualCameraMediaSourceDll));
+                yield return Path.GetFullPath(Path.Combine(
+                    searchRoot,
+                    "..",
+                    "..",
+                    "..",
+                    "..",
+                    "..",
+                    "..",
+                    "windows-host",
+                    "SideDock.VirtualCamera.MediaSource",
+                    "x64",
+                    configuration,
+                    VirtualCameraMediaSourceDll));
+            }
+        }
+    }
+
+    private IEnumerable<string> EnumerateVirtualCameraSearchRoots()
+    {
+        var roots = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        foreach (var candidate in new[]
+        {
+            AppContext.BaseDirectory,
+            Path.GetDirectoryName(Environment.ProcessPath),
+            Environment.CurrentDirectory,
+            _payloadRoot
+        })
+        {
+            if (string.IsNullOrWhiteSpace(candidate))
+            {
+                continue;
+            }
+
+            string fullPath;
+            try
+            {
+                fullPath = Path.GetFullPath(candidate);
+            }
+            catch (Exception ex) when (ex is ArgumentException or NotSupportedException or PathTooLongException)
+            {
+                continue;
+            }
+
+            if (roots.Add(fullPath))
+            {
+                yield return fullPath;
+            }
         }
     }
 
