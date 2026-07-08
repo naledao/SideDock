@@ -215,6 +215,11 @@ jobs:
             -p:EnableCompressionInSingleFile=true `
             -p:IncludeNativeLibrariesForSelfExtract=true `
             --output $appOut
+          Copy-Item -Recurse -Force $virtualCameraToolOut (Join-Path $appOut "SideDock.VirtualCamera.Tool")
+          $bundledVirtualCameraToolExe = Join-Path $appOut "SideDock.VirtualCamera.Tool\SideDock.VirtualCamera.Tool.exe"
+          if (-not (Test-Path -LiteralPath $bundledVirtualCameraToolExe)) {
+            throw "Virtual camera tool was not bundled with the host app payload: $bundledVirtualCameraToolExe"
+          }
 
           $launcherPayloadRoot = Join-Path $env:RUNNER_TEMP "sidedock-host-launcher-payload"
           New-Item -ItemType Directory -Force $launcherPayloadRoot | Out-Null
