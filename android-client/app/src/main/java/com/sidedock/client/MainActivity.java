@@ -7,6 +7,9 @@ import android.content.Context;
 import android.content.SharedPreferences;
 import android.content.pm.PackageManager;
 import android.content.res.Configuration;
+import android.graphics.Canvas;
+import android.graphics.Paint;
+import android.graphics.Path;
 import android.graphics.drawable.GradientDrawable;
 import android.media.AudioManager;
 import android.media.MediaCodecInfo;
@@ -15,6 +18,7 @@ import android.os.Build;
 import android.os.Handler;
 import android.os.Bundle;
 import android.os.Looper;
+import android.os.SystemClock;
 import android.util.Log;
 import android.view.Choreographer;
 import android.view.Display;
@@ -22,6 +26,7 @@ import android.view.Gravity;
 import android.view.InputDevice;
 import android.view.KeyEvent;
 import android.view.MotionEvent;
+import android.view.PointerIcon;
 import android.view.Surface;
 import android.view.SurfaceHolder;
 import android.view.SurfaceView;
@@ -60,6 +65,7 @@ public final class MainActivity extends Activity implements ControlClient.Listen
     private static final int OVERLAY_MODE_DETAILED = 0;
     private static final int OVERLAY_MODE_COMPACT = 1;
     private static final int OVERLAY_MODE_HIDDEN = 2;
+    private static final float CURSOR_OVERLAY_SCALE = 0.72f;
     private static final long OVERLAY_TAP_MAX_DURATION_MS = 500L;
     private static final String[] RESOLUTION_LABELS = new String[] { "720p", "1080p", "2K" };
     private static final int[][] RESOLUTION_PRESETS = new int[][] {
@@ -89,6 +95,7 @@ public final class MainActivity extends Activity implements ControlClient.Listen
     private final Runnable pointerAbsFlushRunnable = new Runnable() {
         @Override
         public void run() {
+            pointerAbsFlushScheduledAtMs = 0L;
             flushPendingPointerAbs();
         }
     };
@@ -107,6 +114,10 @@ public final class MainActivity extends Activity implements ControlClient.Listen
     };
     private FrameLayout rootView;
     private SurfaceView surfaceView;
+    private CursorOverlayView cursorOverlayView;
+    private PointerIcon hiddenPointerIcon;
+    private boolean hiddenPointerIconLogged;
+    private boolean pointerCaptureLogged;
     private TextView overlayText;
     private TextView modeToggleText;
     private LinearLayout modePanel;
@@ -162,6 +173,8 @@ public final class MainActivity extends Activity implements ControlClient.Listen
     private ControlClient.DisplayModeChanged lastDisplayModeChanged;
     private ControlClient.CursorState lastCursorState;
     private String cursorKind = "arrow";
+    private long cursorOverlayUpdates;
+    private long lastCursorOverlayLogAtMs;
     private int videoRectLeft;
     private int videoRectTop;
     private int videoRectWidth = DEFAULT_VIDEO_WIDTH;
@@ -180,6 +193,13 @@ public final class MainActivity extends Activity implements ControlClient.Listen
     private float overlayTapDownY;
     private long overlayTapDownAtMs;
     private long lastCursorDebugAtMs;
+    private long pointerAbsFlushScheduledAtMs;
+    private long pointerAbsFlushRequests;
+    private long pointerAbsFlushScheduled;
+    private long pointerAbsFlushKept;
+    private long pointerAbsFlushCanceled;
+    private long pointerAbsFlushRuns;
+    private long pointerAbsFlushSent;
     private boolean overlayTapCandidate;
     private boolean audioStopped;
     private boolean micMuted;
@@ -258,6 +278,7 @@ public final class MainActivity extends Activity implements ControlClient.Listen
         setContentView(buildContentView());
         enterImmersiveMode();
         useNativePointerIcon(getWindow().getDecorView());
+        requestNativePointerCapture();
         controlClient.start();
     }
 
@@ -283,6 +304,7 @@ public final class MainActivity extends Activity implements ControlClient.Listen
     protected void onResume() {
         super.onResume();
         enterImmersiveMode();
+        requestNativePointerCapture();
         startDisplayFrameSampling();
         applyDisplayTimingHints();
         maybeStartVideo();
@@ -300,8 +322,22 @@ public final class MainActivity extends Activity implements ControlClient.Listen
         if (hasFocus) {
             enterImmersiveMode();
             useNativePointerIcon(getWindow().getDecorView());
+            requestNativePointerCapture();
             updateDisplayRefreshHz();
             applyDisplayTimingHints();
+        }
+    }
+
+    @Override
+    public void onPointerCaptureChanged(boolean hasCapture) {
+        super.onPointerCaptureChanged(hasCapture);
+        if (!hasCapture && rootView != null && rootView.hasWindowFocus()) {
+            rootView.postDelayed(new Runnable() {
+                @Override
+                public void run() {
+                    requestNativePointerCapture();
+                }
+            }, 250L);
         }
     }
 
@@ -341,6 +377,7 @@ public final class MainActivity extends Activity implements ControlClient.Listen
     @Override
     protected void onDestroy() {
         mainHandler.removeCallbacks(pointerAbsFlushRunnable);
+        pointerAbsFlushScheduledAtMs = 0L;
         mainHandler.removeCallbacks(applyPendingCameraConfigRunnable);
         stopDisplayFrameSampling();
         clearDisplayTimingHints();
@@ -828,12 +865,20 @@ public final class MainActivity extends Activity implements ControlClient.Listen
     @Override
     public void onCursorShape(String kind, boolean visible) {
         cursorKind = kind == null || kind.length() == 0 ? "arrow" : kind;
+        if (cursorOverlayView != null) {
+            cursorOverlayView.invalidate();
+        }
         updateOverlay();
     }
 
     @Override
     public void onCursorState(ControlClient.CursorState state) {
         lastCursorState = state;
+        cursorOverlayUpdates += 1;
+        if (cursorOverlayView != null) {
+            cursorOverlayView.invalidate();
+        }
+        logCursorOverlayStatsIfNeeded(state);
         updateCursorDebugOverlay();
     }
 
@@ -950,6 +995,18 @@ public final class MainActivity extends Activity implements ControlClient.Listen
     @Override
     public void onInputStats(InputCollector.InputStats stats) {
         lastInputStats = stats;
+        long flushRequests = pointerAbsFlushRequests;
+        long flushScheduled = pointerAbsFlushScheduled;
+        long flushKept = pointerAbsFlushKept;
+        long flushCanceled = pointerAbsFlushCanceled;
+        long flushRuns = pointerAbsFlushRuns;
+        long flushSent = pointerAbsFlushSent;
+        pointerAbsFlushRequests = 0L;
+        pointerAbsFlushScheduled = 0L;
+        pointerAbsFlushKept = 0L;
+        pointerAbsFlushCanceled = 0L;
+        pointerAbsFlushRuns = 0L;
+        pointerAbsFlushSent = 0L;
         controlClient.sendInputStats(
             stats.keyboardEvents,
             stats.pointerAbsEvents,
@@ -957,7 +1014,13 @@ public final class MainActivity extends Activity implements ControlClient.Listen
             stats.localPointerUpdates,
             stats.mouseButtonEvents,
             stats.mouseWheelEvents,
-            stats.lastInputType
+            stats.lastInputType,
+            flushRequests,
+            flushScheduled,
+            flushKept,
+            flushCanceled,
+            flushRuns,
+            flushSent
         );
         updateOverlay();
     }
@@ -1144,7 +1207,7 @@ public final class MainActivity extends Activity implements ControlClient.Listen
     private View buildContentView() {
         float density = getResources().getDisplayMetrics().density;
 
-        rootView = new FrameLayout(this);
+        rootView = new PointerHidingFrameLayout(this);
         rootView.setBackgroundColor(0xFF050607);
         rootView.setLayoutParams(new ViewGroup.LayoutParams(
             ViewGroup.LayoutParams.MATCH_PARENT,
@@ -1175,7 +1238,7 @@ public final class MainActivity extends Activity implements ControlClient.Listen
             }
         });
 
-        surfaceView = new SurfaceView(this);
+        surfaceView = new PointerHidingSurfaceView(this);
         surfaceView.setZOrderOnTop(false);
         surfaceView.setZOrderMediaOverlay(false);
         applySurfaceFixedSize(videoWidth, videoHeight);
@@ -1185,6 +1248,16 @@ public final class MainActivity extends Activity implements ControlClient.Listen
         useNativePointerIcon(surfaceView);
         surfaceView.requestFocus();
         rootView.addView(surfaceView, new FrameLayout.LayoutParams(
+            ViewGroup.LayoutParams.MATCH_PARENT,
+            ViewGroup.LayoutParams.MATCH_PARENT
+        ));
+
+        cursorOverlayView = new CursorOverlayView(this);
+        cursorOverlayView.setImportantForAccessibility(View.IMPORTANT_FOR_ACCESSIBILITY_NO);
+        cursorOverlayView.setFocusable(false);
+        cursorOverlayView.setClickable(false);
+        useNativePointerIcon(cursorOverlayView);
+        rootView.addView(cursorOverlayView, new FrameLayout.LayoutParams(
             ViewGroup.LayoutParams.MATCH_PARENT,
             ViewGroup.LayoutParams.MATCH_PARENT
         ));
@@ -2448,6 +2521,9 @@ public final class MainActivity extends Activity implements ControlClient.Listen
         applyVideoSurfaceLayout();
         updateContentRectFromMetrics();
         inputCollector.setVideoRect(contentRectLeft, contentRectTop, contentRectWidth, contentRectHeight);
+        if (cursorOverlayView != null) {
+            cursorOverlayView.invalidate();
+        }
     }
 
     private void applyVideoSurfaceLayout() {
@@ -2541,17 +2617,46 @@ public final class MainActivity extends Activity implements ControlClient.Listen
         updateOverlay();
     }
 
+    private void logCursorOverlayStatsIfNeeded(ControlClient.CursorState state) {
+        long now = System.currentTimeMillis();
+        if (now - lastCursorOverlayLogAtMs < 1000L) {
+            return;
+        }
+
+        lastCursorOverlayLogAtMs = now;
+        Log.i(TAG, "cursor overlay updates=" + cursorOverlayUpdates
+            + " visible=" + (state != null && state.visible)
+            + " display=" + (state == null ? "0x0" : state.displayWidth + "x" + state.displayHeight)
+            + " pos=" + (state == null ? "0,0" : state.x + "," + state.y)
+            + " contentRect=" + contentRectLeft + "," + contentRectTop + " "
+            + contentRectWidth + "x" + contentRectHeight);
+    }
+
     private void schedulePointerAbsFlush() {
         if (inputCollector == null) {
             return;
         }
 
-        mainHandler.removeCallbacks(pointerAbsFlushRunnable);
+        pointerAbsFlushRequests += 1;
         if (!inputCollector.hasPendingPointerAbs()) {
+            if (pointerAbsFlushScheduledAtMs != 0L) {
+                mainHandler.removeCallbacks(pointerAbsFlushRunnable);
+                pointerAbsFlushScheduledAtMs = 0L;
+                pointerAbsFlushCanceled += 1;
+            }
             return;
         }
 
         long delayMs = inputCollector.millisUntilNextPointerAbsFlush();
+        long targetMs = SystemClock.uptimeMillis() + delayMs;
+        if (pointerAbsFlushScheduledAtMs != 0L && pointerAbsFlushScheduledAtMs <= targetMs) {
+            pointerAbsFlushKept += 1;
+            return;
+        }
+
+        mainHandler.removeCallbacks(pointerAbsFlushRunnable);
+        pointerAbsFlushScheduledAtMs = targetMs;
+        pointerAbsFlushScheduled += 1;
         mainHandler.postDelayed(pointerAbsFlushRunnable, delayMs);
     }
 
@@ -2560,7 +2665,10 @@ public final class MainActivity extends Activity implements ControlClient.Listen
             return;
         }
 
-        inputCollector.flushPendingPointerAbs();
+        pointerAbsFlushRuns += 1;
+        if (inputCollector.flushPendingPointerAbs()) {
+            pointerAbsFlushSent += 1;
+        }
         if (inputCollector.hasPendingPointerAbs()) {
             schedulePointerAbsFlush();
         }
@@ -2579,12 +2687,41 @@ public final class MainActivity extends Activity implements ControlClient.Listen
         useNativePointerIcon(decorView);
     }
 
+    private void requestNativePointerCapture() {
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.O || rootView == null || !rootView.hasWindowFocus()) {
+            return;
+        }
+
+        rootView.setFocusable(true);
+        rootView.setFocusableInTouchMode(true);
+        rootView.requestFocus();
+        useNativePointerIcon(rootView);
+        if (!rootView.hasPointerCapture()) {
+            rootView.requestPointerCapture();
+        }
+        if (!pointerCaptureLogged) {
+            pointerCaptureLogged = true;
+            Log.i(TAG, "native pointer capture requested; system cursor should stay hidden");
+        }
+    }
+
     private void useNativePointerIcon(View view) {
         if (view == null) {
             return;
         }
 
-        view.setPointerIcon(null);
+        view.setPointerIcon(hiddenPointerIcon());
+        if (!hiddenPointerIconLogged) {
+            hiddenPointerIconLogged = true;
+            Log.i(TAG, "native pointer icon hidden; drawing cursor in Android overlay");
+        }
+    }
+
+    private PointerIcon hiddenPointerIcon() {
+        if (hiddenPointerIcon == null) {
+            hiddenPointerIcon = PointerIcon.getSystemIcon(this, PointerIcon.TYPE_NULL);
+        }
+        return hiddenPointerIcon;
     }
 
     private void startDisplayFrameSampling() {
@@ -3160,6 +3297,121 @@ public final class MainActivity extends Activity implements ControlClient.Listen
 
     private int clampInt(int value, int min, int max) {
         return Math.max(min, Math.min(max, value));
+    }
+
+    private final class PointerHidingFrameLayout extends FrameLayout {
+        PointerHidingFrameLayout(Context context) {
+            super(context);
+            useNativePointerIcon(this);
+        }
+
+        @Override
+        public PointerIcon onResolvePointerIcon(MotionEvent event, int pointerIndex) {
+            return hiddenPointerIcon();
+        }
+
+        @Override
+        public boolean onCapturedPointerEvent(MotionEvent event) {
+            if (inputCollector != null && inputCollector.handleCapturedPointerEvent(event)) {
+                return true;
+            }
+
+            return super.onCapturedPointerEvent(event);
+        }
+    }
+
+    private final class PointerHidingSurfaceView extends SurfaceView {
+        PointerHidingSurfaceView(Context context) {
+            super(context);
+            useNativePointerIcon(this);
+        }
+
+        @Override
+        public PointerIcon onResolvePointerIcon(MotionEvent event, int pointerIndex) {
+            return hiddenPointerIcon();
+        }
+    }
+
+    private final class CursorOverlayView extends View {
+        private final Paint fillPaint = new Paint(Paint.ANTI_ALIAS_FLAG);
+        private final Paint strokePaint = new Paint(Paint.ANTI_ALIAS_FLAG);
+        private final Path arrowPath = new Path();
+        private final float density;
+
+        CursorOverlayView(Context context) {
+            super(context);
+            density = context.getResources().getDisplayMetrics().density;
+            setWillNotDraw(false);
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.LOLLIPOP) {
+                setTranslationZ(dp(2, density));
+            }
+
+            fillPaint.setStyle(Paint.Style.FILL);
+            fillPaint.setColor(0xFFFFFFFF);
+            strokePaint.setStyle(Paint.Style.STROKE);
+            strokePaint.setStrokeJoin(Paint.Join.ROUND);
+            strokePaint.setStrokeCap(Paint.Cap.ROUND);
+            strokePaint.setStrokeWidth(1.5f);
+            strokePaint.setColor(0xE0000000);
+
+            arrowPath.moveTo(0f, 0f);
+            arrowPath.lineTo(0f, 22f);
+            arrowPath.lineTo(6f, 16f);
+            arrowPath.lineTo(10f, 28f);
+            arrowPath.lineTo(15f, 26f);
+            arrowPath.lineTo(11f, 15f);
+            arrowPath.lineTo(20f, 15f);
+            arrowPath.close();
+        }
+
+        @Override
+        public PointerIcon onResolvePointerIcon(MotionEvent event, int pointerIndex) {
+            return hiddenPointerIcon();
+        }
+
+        @Override
+        protected void onDraw(Canvas canvas) {
+            super.onDraw(canvas);
+            ControlClient.CursorState state = lastCursorState;
+            if (state == null || !state.visible || contentRectWidth <= 0 || contentRectHeight <= 0) {
+                return;
+            }
+
+            float nx = normalizedCursorCoordinate(state.nx, state.x, state.displayWidth);
+            float ny = normalizedCursorCoordinate(state.ny, state.y, state.displayHeight);
+            if (Float.isNaN(nx) || Float.isNaN(ny)) {
+                return;
+            }
+
+            float x = contentRectLeft + nx * Math.max(0, contentRectWidth - 1);
+            float y = contentRectTop + ny * Math.max(0, contentRectHeight - 1);
+            if (x < contentRectLeft - 48f * density
+                || x > contentRectLeft + contentRectWidth + 48f * density
+                || y < contentRectTop - 48f * density
+                || y > contentRectTop + contentRectHeight + 48f * density) {
+                return;
+            }
+
+            canvas.save();
+            canvas.translate(x, y);
+            float cursorScale = density * CURSOR_OVERLAY_SCALE;
+            canvas.scale(cursorScale, cursorScale);
+            canvas.drawPath(arrowPath, strokePaint);
+            canvas.drawPath(arrowPath, fillPaint);
+            canvas.restore();
+        }
+
+        private float normalizedCursorCoordinate(double normalized, int value, int basis) {
+            if (!Double.isNaN(normalized) && !Double.isInfinite(normalized)) {
+                return Math.max(0f, Math.min(1f, (float) normalized));
+            }
+
+            if (basis <= 1) {
+                return Float.NaN;
+            }
+
+            return Math.max(0f, Math.min(1f, value / (float) (basis - 1)));
+        }
     }
 
     private String labelFor(ConnectionState state) {

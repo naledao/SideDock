@@ -446,6 +446,8 @@ public final class VideoClient {
         MediaCodec codec = null;
         MediaCodec.BufferInfo bufferInfo = new MediaCodec.BufferInfo();
         long submittedPackets = 0L;
+        long lastDecodeSeq = -1L;
+        boolean waitingForKeyFrame = false;
         boolean decodeDisabled = false;
         boolean forceSoftwareDecoder = false;
         String decoderName = "";
@@ -467,6 +469,26 @@ public final class VideoClient {
                     continue;
                 }
 
+                boolean sequenceGap = lastDecodeSeq >= 0L && !isNextSequence(lastDecodeSeq, packet.seq);
+                lastDecodeSeq = packet.seq;
+                if (sequenceGap) {
+                    pendingPackets.clear();
+                    if (!waitingForKeyFrame) {
+                        emitLog("Video packet gap detected; waiting for key frame");
+                    }
+                    waitingForKeyFrame = true;
+                }
+
+                if (waitingForKeyFrame && !packet.isKeyFrame) {
+                    droppedFrames += 1;
+                    continue;
+                }
+
+                if (waitingForKeyFrame) {
+                    waitingForKeyFrame = false;
+                    emitLog("Video key frame received; decoder stream recovered");
+                }
+
                 codecConfig.scan(packet.payload);
                 pendingPackets.add(packet);
 
@@ -479,8 +501,16 @@ public final class VideoClient {
                     }
 
                     while (codec != null && !pendingPackets.isEmpty()) {
-                        submittedPackets += 1L;
-                        queuePacket(codec, bufferInfo, pendingPackets.removeFirst(), submittedPackets);
+                        long nextSubmittedPacket = submittedPackets + 1L;
+                        if (queuePacket(codec, bufferInfo, pendingPackets.removeFirst(), nextSubmittedPacket)) {
+                            submittedPackets = nextSubmittedPacket;
+                        } else {
+                            pendingPackets.clear();
+                            if (!waitingForKeyFrame) {
+                                emitLog("MediaCodec input queue dropped a packet; waiting for key frame");
+                            }
+                            waitingForKeyFrame = true;
+                        }
                     }
                 } catch (Exception ex) {
                     decodeErrors += 1;
@@ -632,7 +662,7 @@ public final class VideoClient {
         return format;
     }
 
-    private void queuePacket(
+    private boolean queuePacket(
         MediaCodec codec,
         MediaCodec.BufferInfo bufferInfo,
         VideoPacket packet,
@@ -650,7 +680,7 @@ public final class VideoClient {
 
         if (inputIndex < 0) {
             droppedFrames += 1;
-            return;
+            return false;
         }
 
         ByteBuffer inputBuffer = codec.getInputBuffer(inputIndex);
@@ -672,6 +702,7 @@ public final class VideoClient {
             trimPacketTimingsLocked();
         }
         drainOutput(codec, bufferInfo, 0L);
+        return true;
     }
 
     private void drainOutput(MediaCodec codec, MediaCodec.BufferInfo bufferInfo, long timeoutUs) {
@@ -752,6 +783,7 @@ public final class VideoClient {
             throw new IllegalStateException("unsupported video packet version: " + version);
         }
 
+        boolean isKeyFrame = (header[5] & 0xFF) != 0;
         long seq = readUInt32Le(header, 8);
         long timestampMs = readInt64Le(header, 12);
         int length = readInt32Le(header, 20);
@@ -779,6 +811,7 @@ public final class VideoClient {
             seq,
             timestampMs,
             payload,
+            isKeyFrame,
             frameKind,
             sourceSeq,
             sourceAgeMs,
@@ -813,6 +846,10 @@ public final class VideoClient {
 
     private static long readUInt32Le(byte[] data, int offset) {
         return readInt32Le(data, offset) & 0xFFFFFFFFL;
+    }
+
+    private static boolean isNextSequence(long previous, long current) {
+        return (((previous + 1L) & 0xFFFFFFFFL) == (current & 0xFFFFFFFFL));
     }
 
     private static long readInt64Le(byte[] data, int offset) {
@@ -1247,6 +1284,7 @@ public final class VideoClient {
         private final long seq;
         private final long timestampMs;
         private final byte[] payload;
+        private final boolean isKeyFrame;
         private final int frameKind;
         private final long sourceSeq;
         private final int sourceAgeMs;
@@ -1258,6 +1296,7 @@ public final class VideoClient {
             long seq,
             long timestampMs,
             byte[] payload,
+            boolean isKeyFrame,
             int frameKind,
             long sourceSeq,
             int sourceAgeMs,
@@ -1268,6 +1307,7 @@ public final class VideoClient {
             this.seq = seq;
             this.timestampMs = timestampMs;
             this.payload = payload;
+            this.isKeyFrame = isKeyFrame;
             this.frameKind = frameKind;
             this.sourceSeq = sourceSeq;
             this.sourceAgeMs = sourceAgeMs;

@@ -2,6 +2,59 @@
 #include <stdio.h>
 #include <windows.h>
 #include <swdevice.h>
+#include <sddl.h>
+
+constexpr wchar_t kStopEventName[] = L"Local\\SideDockIddDeviceToolStop";
+
+HANDLE CreateStopEvent()
+{
+    PSECURITY_DESCRIPTOR securityDescriptor = nullptr;
+    SECURITY_ATTRIBUTES securityAttributes = {};
+    securityAttributes.nLength = sizeof(securityAttributes);
+
+    if (ConvertStringSecurityDescriptorToSecurityDescriptorW(
+            L"D:(A;;GA;;;WD)S:(ML;;NW;;;LW)",
+            SDDL_REVISION_1,
+            &securityDescriptor,
+            nullptr))
+    {
+        securityAttributes.lpSecurityDescriptor = securityDescriptor;
+    }
+
+    HANDLE eventHandle = CreateEventW(
+        securityDescriptor == nullptr ? nullptr : &securityAttributes,
+        TRUE,
+        FALSE,
+        kStopEventName);
+
+    if (securityDescriptor != nullptr)
+    {
+        LocalFree(securityDescriptor);
+    }
+
+    return eventHandle;
+}
+
+int RequestStop()
+{
+    HANDLE eventHandle = OpenEventW(EVENT_MODIFY_STATE, FALSE, kStopEventName);
+    if (eventHandle == nullptr)
+    {
+        printf("Open stop event failed: %lu\n", GetLastError());
+        return 2;
+    }
+
+    if (!SetEvent(eventHandle))
+    {
+        printf("Set stop event failed: %lu\n", GetLastError());
+        CloseHandle(eventHandle);
+        return 3;
+    }
+
+    CloseHandle(eventHandle);
+    printf("Stop request sent.\n");
+    return 0;
+}
 
 VOID WINAPI CreationCallback(
     _In_ HSWDEVICE softwareDevice,
@@ -24,18 +77,37 @@ VOID WINAPI CreationCallback(
 int __cdecl wmain(int argc, wchar_t* argv[])
 {
     bool waitUntilKeyPress = true;
+    bool stopRequested = false;
     for (int i = 1; i < argc; ++i)
     {
         if (_wcsicmp(argv[i], L"--oneshot") == 0)
         {
             waitUntilKeyPress = false;
         }
+        else if (_wcsicmp(argv[i], L"--stop") == 0)
+        {
+            stopRequested = true;
+        }
     }
+
+    if (stopRequested)
+    {
+        return RequestStop();
+    }
+
+    HANDLE stopEventHandle = CreateStopEvent();
+    if (stopEventHandle == nullptr)
+    {
+        printf("Create stop event failed: %lu\n", GetLastError());
+        return 1;
+    }
+    ResetEvent(stopEventHandle);
 
     HANDLE eventHandle = CreateEvent(nullptr, FALSE, FALSE, nullptr);
     if (eventHandle == nullptr)
     {
         printf("CreateEvent failed: %lu\n", GetLastError());
+        CloseHandle(stopEventHandle);
         return 1;
     }
 
@@ -65,6 +137,7 @@ int __cdecl wmain(int argc, wchar_t* argv[])
     {
         printf("SwDeviceCreate failed: 0x%08lx\n", hr);
         CloseHandle(eventHandle);
+        CloseHandle(stopEventHandle);
         return 1;
     }
 
@@ -76,6 +149,7 @@ int __cdecl wmain(int argc, wchar_t* argv[])
     {
         printf("Timed out waiting for SideDockIdd software device creation.\n");
         SwDeviceClose(softwareDevice);
+        CloseHandle(stopEventHandle);
         return 1;
     }
 
@@ -83,18 +157,29 @@ int __cdecl wmain(int argc, wchar_t* argv[])
 
     if (waitUntilKeyPress)
     {
-        printf("Keep this process running while testing. Press x to remove the software device.\n");
+        printf("Keep this process running while testing. Press x to remove the software device, or run with --stop.\n");
         for (;;)
         {
-            int key = _getch();
-            if (key == 'x' || key == 'X')
+            DWORD stopWait = WaitForSingleObject(stopEventHandle, 100);
+            if (stopWait == WAIT_OBJECT_0)
             {
+                printf("Stop request received.\n");
                 break;
+            }
+
+            if (_kbhit())
+            {
+                int key = _getch();
+                if (key == 'x' || key == 'X')
+                {
+                    break;
+                }
             }
         }
     }
 
     SwDeviceClose(softwareDevice);
+    CloseHandle(stopEventHandle);
     printf("SideDock Virtual Display device removed.\n");
     return 0;
 }

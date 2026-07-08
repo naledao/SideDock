@@ -177,6 +177,28 @@ public final class InputCollector {
         return handled;
     }
 
+    public boolean handleCapturedPointerEvent(MotionEvent event) {
+        if (!isCapturedMouseEvent(event)) {
+            return false;
+        }
+
+        boolean handled = false;
+        int action = event.getActionMasked();
+        if (action == MotionEvent.ACTION_MOVE || action == MotionEvent.ACTION_HOVER_MOVE) {
+            handled |= handleCapturedMouseMove(event);
+        } else if (action == MotionEvent.ACTION_BUTTON_PRESS || action == MotionEvent.ACTION_BUTTON_RELEASE) {
+            handled |= handleCapturedButtonState(event);
+        } else if (action == MotionEvent.ACTION_DOWN || action == MotionEvent.ACTION_UP) {
+            handled |= handleCapturedButtonState(event);
+        }
+
+        handled |= handleCapturedMouseWheel(event);
+        if (handled) {
+            emitStatsIfNeeded();
+        }
+        return handled;
+    }
+
     public boolean handleTouchEvent(MotionEvent event) {
         if (!isMouseEvent(event)) {
             return false;
@@ -255,6 +277,19 @@ public final class InputCollector {
         return true;
     }
 
+    private boolean handleCapturedMouseMove(MotionEvent event) {
+        int dx = Math.round(capturedRelativeAxis(event, MotionEvent.AXIS_RELATIVE_X, 0));
+        int dy = Math.round(capturedRelativeAxis(event, MotionEvent.AXIS_RELATIVE_Y, 1));
+        if (dx == 0 && dy == 0) {
+            return true;
+        }
+
+        mouseMoveEvents += 1;
+        lastInputType = "mouse_move";
+        listener.onMouseMoveInput(dx, dy);
+        return true;
+    }
+
     private boolean handleButtonState(MotionEvent event) {
         int nextButtonState = event.getButtonState();
         int changed = lastButtonState ^ nextButtonState;
@@ -275,6 +310,28 @@ public final class InputCollector {
         lastButtonState = nextButtonState;
         rememberMousePosition(event);
         emitPointerAbsIfNeeded(event, true);
+        return handled;
+    }
+
+    private boolean handleCapturedButtonState(MotionEvent event) {
+        int nextButtonState = event.getButtonState();
+        int changed = lastButtonState ^ nextButtonState;
+        boolean handled = false;
+
+        handled |= emitButtonIfChanged(changed, nextButtonState, MotionEvent.BUTTON_PRIMARY, "left");
+        handled |= emitButtonIfChanged(changed, nextButtonState, MotionEvent.BUTTON_SECONDARY, "right");
+        handled |= emitButtonIfChanged(changed, nextButtonState, MotionEvent.BUTTON_TERTIARY, "middle");
+
+        if (!handled) {
+            String button = buttonNameForActionButton(event.getActionButton());
+            if (button != null) {
+                int action = event.getActionMasked();
+                recordMouseButton(button, action == MotionEvent.ACTION_BUTTON_RELEASE || action == MotionEvent.ACTION_UP ? "up" : "down");
+                handled = true;
+            }
+        }
+
+        lastButtonState = nextButtonState;
         return handled;
     }
 
@@ -312,6 +369,28 @@ public final class InputCollector {
         mouseWheelEvents += 1;
         lastInputType = "mouse_wheel";
         emitPointerAbsIfNeeded(event, true);
+        listener.onMouseWheelInput(dx, dy);
+        return true;
+    }
+
+    private boolean handleCapturedMouseWheel(MotionEvent event) {
+        float vertical = event.getAxisValue(MotionEvent.AXIS_VSCROLL);
+        float horizontal = event.getAxisValue(MotionEvent.AXIS_HSCROLL);
+        if (vertical == 0f && horizontal == 0f) {
+            return false;
+        }
+
+        int dx = Math.round(horizontal * WHEEL_DELTA);
+        int dy = Math.round(vertical * WHEEL_DELTA);
+        if (dx == 0 && horizontal != 0f) {
+            dx = horizontal > 0f ? WHEEL_DELTA : -WHEEL_DELTA;
+        }
+        if (dy == 0 && vertical != 0f) {
+            dy = vertical > 0f ? WHEEL_DELTA : -WHEEL_DELTA;
+        }
+
+        mouseWheelEvents += 1;
+        lastInputType = "mouse_wheel";
         listener.onMouseWheelInput(dx, dy);
         return true;
     }
@@ -419,6 +498,22 @@ public final class InputCollector {
         }
 
         return event.getToolType(0) == MotionEvent.TOOL_TYPE_MOUSE;
+    }
+
+    private boolean isCapturedMouseEvent(MotionEvent event) {
+        int source = event.getSource();
+        return (source & InputDevice.SOURCE_MOUSE_RELATIVE) == InputDevice.SOURCE_MOUSE_RELATIVE
+            || (source & InputDevice.SOURCE_MOUSE) == InputDevice.SOURCE_MOUSE
+            || (source & InputDevice.SOURCE_TOUCHPAD) == InputDevice.SOURCE_TOUCHPAD;
+    }
+
+    private float capturedRelativeAxis(MotionEvent event, int axis, int coordinateIndex) {
+        float value = event.getAxisValue(axis);
+        if (value != 0f) {
+            return value;
+        }
+
+        return coordinateIndex == 0 ? event.getX() : event.getY();
     }
 
     private String buttonNameForActionButton(int actionButton) {

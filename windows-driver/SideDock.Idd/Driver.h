@@ -51,8 +51,8 @@ namespace SideDock::Idd
     inline constexpr DWORD VirtualDisplayRefreshRate = VirtualDisplayModes[0].RefreshRate;
     inline constexpr DWORD MaxVirtualDisplayWidth = 2560;
     inline constexpr DWORD MaxVirtualDisplayHeight = 1440;
-    inline constexpr UINT MaxHardwareCursorWidth = 256;
-    inline constexpr UINT MaxHardwareCursorHeight = 256;
+    inline constexpr UINT MaxHardwareCursorWidth = 512;
+    inline constexpr UINT MaxHardwareCursorHeight = 512;
     inline constexpr UINT MaxHardwareCursorShapeBytes = MaxHardwareCursorWidth * MaxHardwareCursorHeight * 4;
     inline constexpr UINT VirtualMonitorConnectorIndex = 0;
     inline constexpr UINT SharedFrameSlotCount = 3;

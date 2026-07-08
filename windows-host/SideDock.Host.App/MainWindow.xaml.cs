@@ -34,6 +34,9 @@ public sealed partial class MainWindow : Window
 {
     private const string HostExe = "SideDock.Host.exe";
     private const string DeviceToolExe = "SideDock.Idd.DeviceTool.exe";
+    private const string DeviceToolStopArgument = "--stop";
+    private const string DeviceToolOneshotArgument = "--oneshot";
+    private const string DeviceToolStopArguments = DeviceToolStopArgument + " " + DeviceToolOneshotArgument;
     private const string SideDockDriverInf = "SideDock.Idd.inf";
     private const string SideDockDriverBinary = "SideDock.Idd.dll";
     private const string VirtualCameraToolExe = "SideDock.VirtualCamera.Tool.exe";
@@ -87,6 +90,7 @@ public sealed partial class MainWindow : Window
     private const int MaxRecentCameraLogLines = 80;
     private const int CameraPreviewIntervalMs = 33;
     private const int OverviewPreviewIntervalMs = 33;
+    private const string OverviewPreviewConsumerAliveName = @"Local\SideDockOverviewPreviewConsumerAlive";
     private const int MaxOverviewDiagnosticsSamples = 11;
     private const int AudioPlaybackTestDurationMs = 1600;
     private const int AudioRecordingTestDurationMs = 2500;
@@ -248,6 +252,8 @@ public sealed partial class MainWindow : Window
     private long _lastCameraPreviewSequence;
     private DateTimeOffset? _lastCameraPreviewAt;
     private OverviewPreviewFrameReader? _overviewPreviewReader;
+    private EventWaitHandle? _overviewPreviewConsumerAlive;
+    private bool? _overviewPreviewConsumerAliveState;
     private WriteableBitmap? _overviewPreviewBitmap;
     private long _lastOverviewPreviewSequence;
     private DateTimeOffset? _lastOverviewPreviewAt;
@@ -438,10 +444,14 @@ public sealed partial class MainWindow : Window
             _cameraRuntimeConfigDebounceCts?.Cancel();
             _cameraRuntimeConfigDebounceCts?.Dispose();
             _cameraPreviewReader?.Dispose();
+            SetOverviewPreviewConsumerAlive(false);
+            _overviewPreviewConsumerAlive?.Dispose();
+            _overviewPreviewConsumerAlive = null;
             ResetOverviewPreview(clearImage: true);
             DisposeTrayIcon();
             RestorePendingVirtualDisplayPresentationOnExit();
             StopHost();
+            StopVirtualDisplay();
         };
 
         InitializeAdbDeviceCombo();
@@ -474,7 +484,12 @@ public sealed partial class MainWindow : Window
         _overviewPreviewTimer.Tick += (_, _) => UpdateOverviewPreview();
         if (StaticOverviewUi && _overviewPreviewEnabled)
         {
+            SetOverviewPreviewConsumerAlive(true);
             _overviewPreviewTimer.Start();
+        }
+        else
+        {
+            SetOverviewPreviewConsumerAlive(false);
         }
 
         UpdateOverviewPreviewChrome();
@@ -5632,7 +5647,6 @@ public sealed partial class MainWindow : Window
 
             if (ShouldManageVirtualDisplayWithHost())
             {
-                var displayWasRunning = IsVirtualDisplayToolRunning();
                 if (!StartVirtualDisplay(failureAction: "启动主机时无法启动虚拟显示器"))
                 {
                     SetRunningState(false);
@@ -5640,7 +5654,7 @@ public sealed partial class MainWindow : Window
                     return;
                 }
 
-                _hostOwnsVirtualDisplay = !displayWasRunning && IsVirtualDisplayToolRunning();
+                _hostOwnsVirtualDisplay = IsVirtualDisplayToolRunning();
             }
 
             hostPath = _hostPath ??= ResolveHostPath();
@@ -10079,6 +10093,9 @@ public sealed partial class MainWindow : Window
 
     private void StopVirtualDisplay()
     {
+        RequestVirtualDisplayToolStop();
+        WaitForVirtualDisplayToolsToExit(TimeSpan.FromMilliseconds(2500));
+
         var processes = GetVirtualDisplayToolProcesses();
         foreach (var process in processes)
         {
@@ -10102,6 +10119,60 @@ public sealed partial class MainWindow : Window
         _deviceToolProcess = null;
         _virtualDisplayLastError = null;
         RefreshVirtualDisplayState();
+    }
+
+    private bool RequestVirtualDisplayToolStop()
+    {
+        try
+        {
+            _deviceToolPath ??= ResolveDeviceToolPath();
+            var startInfo = new ProcessStartInfo
+            {
+                FileName = _deviceToolPath,
+                Arguments = DeviceToolStopArguments,
+                WorkingDirectory = Path.GetDirectoryName(_deviceToolPath) ?? Environment.CurrentDirectory,
+                UseShellExecute = false,
+                CreateNoWindow = true,
+                RedirectStandardOutput = true,
+                RedirectStandardError = true,
+                StandardOutputEncoding = Encoding.UTF8,
+                StandardErrorEncoding = Encoding.UTF8
+            };
+
+            using var process = Process.Start(startInfo);
+            if (process is null)
+            {
+                return false;
+            }
+
+            if (!process.WaitForExit(2500))
+            {
+                TryKill(process);
+                return false;
+            }
+
+            return process.ExitCode == 0;
+        }
+        catch
+        {
+            return false;
+        }
+    }
+
+    private static bool WaitForVirtualDisplayToolsToExit(TimeSpan timeout)
+    {
+        var stopwatch = Stopwatch.StartNew();
+        while (stopwatch.Elapsed < timeout)
+        {
+            if (!IsVirtualDisplayToolRunning())
+            {
+                return true;
+            }
+
+            Thread.Sleep(100);
+        }
+
+        return !IsVirtualDisplayToolRunning();
     }
 
     private void StopHostOwnedVirtualDisplay()
@@ -10592,14 +10663,6 @@ public sealed partial class MainWindow : Window
         yield return Path.Combine(baseDirectory, "SideDock.Idd.DeviceTool", "x64", "Release", DeviceToolExe);
         yield return Path.Combine(baseDirectory, "SideDock.Idd.DeviceTool", "x64", "Debug", DeviceToolExe);
 
-        if (_payloadRoot is not null)
-        {
-            yield return Path.Combine(_payloadRoot, DeviceToolExe);
-            yield return Path.Combine(_payloadRoot, "SideDock.Idd.DeviceTool", DeviceToolExe);
-            yield return Path.Combine(_payloadRoot, "SideDock.Idd.DeviceTool", "x64", "Release", DeviceToolExe);
-            yield return Path.Combine(_payloadRoot, "SideDock.Idd.DeviceTool", "x64", "Debug", DeviceToolExe);
-        }
-
         yield return Path.GetFullPath(Path.Combine(
             baseDirectory,
             "..",
@@ -10624,6 +10687,14 @@ public sealed partial class MainWindow : Window
             "x64",
             "Debug",
             DeviceToolExe));
+
+        if (_payloadRoot is not null)
+        {
+            yield return Path.Combine(_payloadRoot, DeviceToolExe);
+            yield return Path.Combine(_payloadRoot, "SideDock.Idd.DeviceTool", DeviceToolExe);
+            yield return Path.Combine(_payloadRoot, "SideDock.Idd.DeviceTool", "x64", "Release", DeviceToolExe);
+            yield return Path.Combine(_payloadRoot, "SideDock.Idd.DeviceTool", "x64", "Debug", DeviceToolExe);
+        }
     }
 
     private IEnumerable<string> EnumerateDeviceToolSearchRoots()
@@ -10768,7 +10839,7 @@ public sealed partial class MainWindow : Window
             var startInfo = new ProcessStartInfo
             {
                 FileName = deviceToolPath,
-                Arguments = "--oneshot",
+                Arguments = DeviceToolOneshotArgument,
                 WorkingDirectory = workingDirectory,
                 UseShellExecute = false,
                 CreateNoWindow = true,
@@ -11561,11 +11632,13 @@ public sealed partial class MainWindow : Window
         {
             if (enabled)
             {
+                SetOverviewPreviewConsumerAlive(true);
                 _overviewPreviewTimer.Start();
                 UpdateOverviewPreview();
             }
             else
             {
+                SetOverviewPreviewConsumerAlive(false);
                 ResetOverviewPreview(clearImage: true);
                 SetOverviewPreviewState(OverviewPreviewState.Disabled);
             }
@@ -11577,6 +11650,7 @@ public sealed partial class MainWindow : Window
         _overviewPreviewEnabled = enabled;
         if (enabled)
         {
+            SetOverviewPreviewConsumerAlive(true);
             SetOverviewPreviewState(IsHostRunningForPreview()
                 ? OverviewPreviewState.WaitingSource
                 : OverviewPreviewState.HostNotStarted);
@@ -11586,11 +11660,52 @@ public sealed partial class MainWindow : Window
         else
         {
             _overviewPreviewTimer.Stop();
+            SetOverviewPreviewConsumerAlive(false);
             ResetOverviewPreview(clearImage: true);
             SetOverviewPreviewState(OverviewPreviewState.Disabled);
         }
 
         UpdateOverviewPreviewChrome();
+    }
+
+    private void SetOverviewPreviewConsumerAlive(bool alive)
+    {
+        if (!StaticOverviewUi)
+        {
+            alive = false;
+        }
+
+        try
+        {
+            _overviewPreviewConsumerAlive ??= new EventWaitHandle(
+                false,
+                EventResetMode.ManualReset,
+                OverviewPreviewConsumerAliveName);
+            if (alive)
+            {
+                _overviewPreviewConsumerAlive.Set();
+            }
+            else
+            {
+                _overviewPreviewConsumerAlive.Reset();
+            }
+
+            if (_overviewPreviewConsumerAliveState != alive)
+            {
+                _overviewPreviewConsumerAliveState = alive;
+                AppendStaticDiagnosticsLog(
+                    DiagnosticsLogSource.Host,
+                    $"overview preview consumer alive={alive.ToString().ToLowerInvariant()}",
+                    DiagnosticsLogSeverity.Info);
+            }
+        }
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException or ObjectDisposedException or InvalidOperationException)
+        {
+            AppendStaticDiagnosticsLog(
+                DiagnosticsLogSource.Host,
+                $"总览预览消费者状态更新失败: {ex.Message}",
+                DiagnosticsLogSeverity.Warning);
+        }
     }
 
     private void ResetOverviewPreview(bool clearImage, bool keepReader = false)

@@ -1564,7 +1564,7 @@
                                         </Button>
                                     </Grid>
 
-                                    <Grid Grid.Row="1" Margin="0,8,0,6" RowSpacing="4">
+                                    <Grid Grid.Row="1" Margin="0,8,0,6" RowSpacing="4" ColumnSpacing="10">
                                         <Grid.RowDefinitions>
                                             <RowDefinition Height="*" />
                                             <RowDefinition Height="*" />
@@ -1572,7 +1572,7 @@
                                             <RowDefinition Height="*" />
                                         </Grid.RowDefinitions>
                                         <Grid.ColumnDefinitions>
-                                            <ColumnDefinition Width="54" />
+                                            <ColumnDefinition Width="Auto" MinWidth="54" />
                                             <ColumnDefinition Width="60" />
                                             <ColumnDefinition Width="*" />
                                         </Grid.ColumnDefinitions>

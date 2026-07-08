@@ -18,6 +18,7 @@ using SharpGen.Runtime;
 using Vortice.Direct3D;
 using Vortice.Direct3D11;
 using Vortice.DXGI;
+using Vortice.Mathematics;
 
 namespace SideDock.Host;
 
@@ -112,7 +113,7 @@ internal static partial class Program
         var cameraRuntimeState = new CameraRuntimeState(CameraRuntimeConfig.FromOptions(options));
         var controlServer = new ControlServer(IPAddress.Loopback, options, videoModeState, controlPublisher, displayLayoutProvider, cameraRuntimeState, audioTestCoordinator);
         var cameraCommandServer = new CameraCommandServer(IPAddress.Loopback, DefaultCameraCommandPort, options, controlPublisher, cameraRuntimeState, audioTestCoordinator);
-        var videoServer = new VideoServer(IPAddress.Loopback, options, videoModeState, controlPublisher);
+        var videoServer = new VideoServer(IPAddress.Loopback, options, videoModeState, controlPublisher, displayLayoutProvider);
         var audioServer = new AudioServer(IPAddress.Loopback, options, controlPublisher, audioTestCoordinator);
         var cameraServer = new CameraServer(IPAddress.Loopback, options, controlPublisher, cameraRuntimeState);
         if (!string.IsNullOrWhiteSpace(options.CameraReplayFilePath))
@@ -2305,18 +2306,25 @@ internal static partial class Program
                 case "input_error":
                     if (message.Payload is not null)
                     {
-                        Log(Scope, $"{message.Type} payload={message.Payload}");
-                        if (message.Type == "audio_mic_status")
+                        if (message.Type == "input_stats")
                         {
-                            LogAudioMicrophoneStatus(message.Payload);
+                            LogAndroidInputStats(message.Payload);
                         }
-                        else if (message.Type == "audio_speaker_status")
+                        else
                         {
-                            LogAudioSpeakerStatus(message.Payload);
-                        }
-                        else if (message.Type == "camera_status")
-                        {
-                            LogCameraStatus(message.Payload);
+                            Log(Scope, $"{message.Type} payload={message.Payload}");
+                            if (message.Type == "audio_mic_status")
+                            {
+                                LogAudioMicrophoneStatus(message.Payload);
+                            }
+                            else if (message.Type == "audio_speaker_status")
+                            {
+                                LogAudioSpeakerStatus(message.Payload);
+                            }
+                            else if (message.Type == "camera_status")
+                            {
+                                LogCameraStatus(message.Payload);
+                            }
                         }
                     }
 
@@ -2371,6 +2379,41 @@ internal static partial class Program
                 + $"androidP95 queueOutput={ReadDouble(payload, "p95QueueToOutputMs"):F1}ms outputRender={ReadDouble(payload, "p95OutputToRenderMs"):F1}ms queueRender={ReadDouble(payload, "p95QueueToRenderMs"):F1}ms "
                 + $"androidP99 queueOutput={ReadDouble(payload, "p99QueueToOutputMs"):F1}ms outputRender={ReadDouble(payload, "p99OutputToRenderMs"):F1}ms queueRender={ReadDouble(payload, "p99QueueToRenderMs"):F1}ms "
                 + $"decodeErrors={ReadLong(payload, "decodeErrors")} reconnects={ReadLong(payload, "videoReconnects")}");
+        }
+
+        private void LogAndroidInputStats(JsonNode payloadNode)
+        {
+            if (payloadNode is not JsonObject payload)
+            {
+                return;
+            }
+
+            Log(
+                Scope,
+                "android input stats 1s "
+                + $"generated pointerAbs={ReadLong(payload, "pointerAbsEvents")} "
+                + $"localPreview={ReadLong(payload, "localPointerUpdates")} "
+                + $"mouseMove={ReadLong(payload, "mouseMoveEvents")} "
+                + $"button={ReadLong(payload, "mouseButtonEvents")} "
+                + $"wheel={ReadLong(payload, "mouseWheelEvents")} "
+                + $"keyboard={ReadLong(payload, "keyboardEvents")} "
+                + $"flush request={ReadLong(payload, "pointerAbsFlushRequests")} "
+                + $"scheduled={ReadLong(payload, "pointerAbsFlushScheduled")} "
+                + $"kept={ReadLong(payload, "pointerAbsFlushKept")} "
+                + $"canceled={ReadLong(payload, "pointerAbsFlushCanceled")} "
+                + $"runs={ReadLong(payload, "pointerAbsFlushRuns")} "
+                + $"sent={ReadLong(payload, "pointerAbsFlushSent")} "
+                + $"control request={ReadLong(payload, "pointerAbsControlRequests")} "
+                + $"sendAttempt={ReadLong(payload, "pointerAbsControlSendAttempts")} "
+                + $"coalesced={ReadLong(payload, "pointerAbsControlCoalesced")} "
+                + $"drains={ReadLong(payload, "pointerAbsControlDrainRuns")} "
+                + $"rejects={ReadLong(payload, "pointerAbsControlQueueRejects")} "
+                + $"totalReq={ReadLong(payload, "pointerAbsControlTotalRequests")} "
+                + $"totalSend={ReadLong(payload, "pointerAbsControlTotalSendAttempts")} "
+                + $"totalCoalesced={ReadLong(payload, "pointerAbsControlTotalCoalesced")} "
+                + $"queued={ReadBool(payload, "pointerAbsControlQueued")} "
+                + $"pendingLatest={ReadBool(payload, "pointerAbsControlPendingLatest")} "
+                + $"last={SanitizeLogValue(ReadString(payload, "lastInputType"))}");
         }
 
         private void LogAudioMicrophoneStatus(JsonNode payloadNode)
@@ -5083,12 +5126,18 @@ internal static partial class Program
             || InputErrors > 0;
     }
 
-    private sealed class VideoServer(IPAddress address, HostOptions options, VideoModeState videoModeState, ControlMessagePublisher controlPublisher)
+    private sealed class VideoServer(
+        IPAddress address,
+        HostOptions options,
+        VideoModeState videoModeState,
+        ControlMessagePublisher controlPublisher,
+        DisplayLayoutProvider displayLayoutProvider)
     {
         private readonly TcpListener _listener = new(address, options.VideoPort);
         private readonly HostOptions _options = options;
         private readonly VideoModeState _videoModeState = videoModeState;
         private readonly ControlMessagePublisher _controlPublisher = controlPublisher;
+        private readonly DisplayLayoutProvider _displayLayoutProvider = displayLayoutProvider;
         private readonly object _connectionLock = new();
         private CancellationTokenSource? _activeConnectionCts;
         private Task? _activeConnectionTask;
@@ -5250,6 +5299,7 @@ internal static partial class Program
                         connectionId,
                         videoOptions,
                         _controlPublisher,
+                        _displayLayoutProvider,
                         new IddGpuFrameSource(videoOptions, message => Log($"CAPTURE {connectionId}", message))),
                     () => new MediaFoundationBgraVideoSource(
                         connectionId,
@@ -7724,6 +7774,7 @@ internal static partial class Program
         private readonly int _connectionId;
         private readonly HostOptions _options;
         private readonly ControlMessagePublisher _controlPublisher;
+        private readonly DisplayLayoutProvider _displayLayoutProvider;
         private readonly IGpuFrameSource _frameSource;
         private readonly RealtimeEncoderStats _stats;
         private readonly CaptureStats _captureStats = new();
@@ -7763,11 +7814,13 @@ internal static partial class Program
             int connectionId,
             HostOptions options,
             ControlMessagePublisher controlPublisher,
+            DisplayLayoutProvider displayLayoutProvider,
             IGpuFrameSource frameSource)
         {
             _connectionId = connectionId;
             _options = options;
             _controlPublisher = controlPublisher;
+            _displayLayoutProvider = displayLayoutProvider;
             _frameSource = frameSource;
             _stats = new RealtimeEncoderStats(options.VideoFps);
             var queueCapacity = Math.Max(1, options.Nv12PoolSize);
@@ -7796,7 +7849,6 @@ internal static partial class Program
                 _encoderFallbackReason = probe.FallbackReason;
                 _encoderMftName = probe.EncoderMftName;
                 _converter = new GpuBgraToNv12Converter(_frameSource.Device, _frameSource.Context, _options.VideoWidth, _options.VideoHeight, _options.VideoFps, _options.Nv12PoolSize);
-
                 if (_encoderUsesD3DInput)
                 {
                     try
@@ -8811,6 +8863,260 @@ internal static partial class Program
     }
 
     [SupportedOSPlatform("windows")]
+    private sealed class GpuCursorFrameScrubber : IDisposable
+    {
+        private const int MaxCursorSamples = 20;
+        private const double MaxSampleAgeSeconds = 0.35;
+        private const int ScrubLeft = 96;
+        private const int ScrubTop = 64;
+        private const int ScrubRight = 128;
+        private const int ScrubBottom = 160;
+
+        private readonly ID3D11Device _device;
+        private readonly ID3D11DeviceContext _context;
+        private readonly DisplayLayoutProvider _displayLayoutProvider;
+        private readonly Action<string> _log;
+        private readonly object _sampleLock = new();
+        private readonly CursorSample[] _samples = new CursorSample[MaxCursorSamples];
+        private int _sampleCount;
+        private int _nextSampleIndex;
+        private ID3D11Texture2D? _scratchTexture;
+        private ID3D11Texture2D? _previousTexture;
+        private int _textureWidth;
+        private int _textureHeight;
+        private Format _textureFormat;
+        private bool _previousReady;
+        private long _scrubbedFrames;
+        private long _patchesCopied;
+        private long _lastLogTicks;
+
+        public GpuCursorFrameScrubber(
+            ID3D11Device device,
+            ID3D11DeviceContext context,
+            DisplayLayoutProvider displayLayoutProvider,
+            Action<string> log)
+        {
+            _device = device;
+            _context = context;
+            _displayLayoutProvider = displayLayoutProvider;
+            _log = log;
+        }
+
+        public void RecordCursorSample()
+        {
+            DpiAwareness.TryEnableCurrentThreadPerMonitorV2();
+            var layout = _displayLayoutProvider.GetLayout(force: false);
+            if (layout is null || !DisplayNative.GetCursorPos(out var point))
+            {
+                return;
+            }
+
+            if (point.X < layout.X
+                || point.X >= layout.X + layout.Width
+                || point.Y < layout.Y
+                || point.Y >= layout.Y + layout.Height)
+            {
+                return;
+            }
+
+            var sample = new CursorSample(
+                Math.Clamp(point.X - layout.X, 0, Math.Max(0, layout.Width - 1)),
+                Math.Clamp(point.Y - layout.Y, 0, Math.Max(0, layout.Height - 1)),
+                layout.Width,
+                layout.Height,
+                Stopwatch.GetTimestamp());
+
+            lock (_sampleLock)
+            {
+                if (_sampleCount > 0)
+                {
+                    var previousIndex = (_nextSampleIndex - 1 + MaxCursorSamples) % MaxCursorSamples;
+                    var previous = _samples[previousIndex];
+                    if (previous.IsValid
+                        && Math.Abs(previous.X - sample.X) <= 1
+                        && Math.Abs(previous.Y - sample.Y) <= 1
+                        && previous.DisplayWidth == sample.DisplayWidth
+                        && previous.DisplayHeight == sample.DisplayHeight)
+                    {
+                        _samples[previousIndex] = sample;
+                        return;
+                    }
+                }
+
+                _samples[_nextSampleIndex] = sample;
+                _nextSampleIndex = (_nextSampleIndex + 1) % MaxCursorSamples;
+                _sampleCount = Math.Min(MaxCursorSamples, _sampleCount + 1);
+            }
+        }
+
+        public ID3D11Texture2D Scrub(ID3D11Texture2D sourceTexture)
+        {
+            var description = sourceTexture.Description;
+            if (description.Format != Format.B8G8R8A8_UNorm)
+            {
+                return sourceTexture;
+            }
+
+            EnsureTextures(description);
+            var previousTexture = _previousTexture ?? throw new InvalidOperationException("Previous cursor scrub texture is not initialized.");
+            var scratchTexture = _scratchTexture ?? throw new InvalidOperationException("Scratch cursor scrub texture is not initialized.");
+            var samples = SnapshotRecentSamples(Stopwatch.GetTimestamp());
+            if (!_previousReady || samples.Length == 0)
+            {
+                _context.CopyResource(previousTexture, sourceTexture);
+                _context.Flush();
+                _previousReady = true;
+                return sourceTexture;
+            }
+
+            _context.CopyResource(scratchTexture, sourceTexture);
+            var patches = 0;
+            foreach (var sample in samples)
+            {
+                if (!TryBuildPatchBox(sample, checked((int)description.Width), checked((int)description.Height), out var box))
+                {
+                    continue;
+                }
+
+                _context.CopySubresourceRegion(
+                    scratchTexture,
+                    0,
+                    checked((uint)box.Left),
+                    checked((uint)box.Top),
+                    0,
+                    previousTexture,
+                    0,
+                    box);
+                patches += 1;
+            }
+
+            if (patches == 0)
+            {
+                _context.CopyResource(previousTexture, sourceTexture);
+                _context.Flush();
+                return sourceTexture;
+            }
+
+            _context.CopyResource(previousTexture, scratchTexture);
+            _context.Flush();
+            Interlocked.Increment(ref _scrubbedFrames);
+            Interlocked.Add(ref _patchesCopied, patches);
+            LogIfNeeded(samples.Length, patches);
+            return scratchTexture;
+        }
+
+        private void EnsureTextures(Texture2DDescription sourceDescription)
+        {
+            var width = checked((int)sourceDescription.Width);
+            var height = checked((int)sourceDescription.Height);
+            if (_scratchTexture is not null
+                && _previousTexture is not null
+                && _textureWidth == width
+                && _textureHeight == height
+                && _textureFormat == sourceDescription.Format)
+            {
+                return;
+            }
+
+            _scratchTexture?.Dispose();
+            _previousTexture?.Dispose();
+            var textureDescription = sourceDescription;
+            textureDescription.Usage = ResourceUsage.Default;
+            textureDescription.CPUAccessFlags = CpuAccessFlags.None;
+            textureDescription.MiscFlags = ResourceOptionFlags.None;
+            if ((textureDescription.BindFlags & BindFlags.ShaderResource) == 0)
+            {
+                textureDescription.BindFlags |= BindFlags.ShaderResource;
+            }
+
+            _scratchTexture = _device.CreateTexture2D(in textureDescription);
+            _previousTexture = _device.CreateTexture2D(in textureDescription);
+            _textureWidth = width;
+            _textureHeight = height;
+            _textureFormat = sourceDescription.Format;
+            _previousReady = false;
+            _log($"cursor scrub initialized texture={width}x{height} format={sourceDescription.Format} history={MaxCursorSamples} patch={ScrubLeft + ScrubRight}x{ScrubTop + ScrubBottom}");
+        }
+
+        private CursorSample[] SnapshotRecentSamples(long nowTicks)
+        {
+            var cutoffTicks = nowTicks - (long)(Stopwatch.Frequency * MaxSampleAgeSeconds);
+            lock (_sampleLock)
+            {
+                if (_sampleCount == 0)
+                {
+                    return [];
+                }
+
+                var output = new List<CursorSample>(_sampleCount);
+                for (var i = 0; i < _sampleCount; i++)
+                {
+                    var sample = _samples[i];
+                    if (sample.IsValid && sample.Ticks >= cutoffTicks)
+                    {
+                        output.Add(sample);
+                    }
+                }
+
+                return output.ToArray();
+            }
+        }
+
+        private static bool TryBuildPatchBox(CursorSample sample, int textureWidth, int textureHeight, out Box box)
+        {
+            box = default;
+            if (!sample.IsValid || textureWidth <= 0 || textureHeight <= 0)
+            {
+                return false;
+            }
+
+            var x = sample.DisplayWidth <= 1
+                ? 0
+                : (int)Math.Round(sample.X * (textureWidth - 1) / (double)(sample.DisplayWidth - 1));
+            var y = sample.DisplayHeight <= 1
+                ? 0
+                : (int)Math.Round(sample.Y * (textureHeight - 1) / (double)(sample.DisplayHeight - 1));
+            var left = Math.Clamp(x - ScrubLeft, 0, textureWidth);
+            var top = Math.Clamp(y - ScrubTop, 0, textureHeight);
+            var right = Math.Clamp(x + ScrubRight, 0, textureWidth);
+            var bottom = Math.Clamp(y + ScrubBottom, 0, textureHeight);
+            if (right <= left || bottom <= top)
+            {
+                return false;
+            }
+
+            box = new Box(left, top, 0, right, bottom, 1);
+            return true;
+        }
+
+        private void LogIfNeeded(int samples, int patches)
+        {
+            var nowTicks = Stopwatch.GetTimestamp();
+            var previousTicks = Interlocked.Read(ref _lastLogTicks);
+            if (previousTicks != 0 && (nowTicks - previousTicks) / (double)Stopwatch.Frequency < 1.0)
+            {
+                return;
+            }
+
+            Interlocked.Exchange(ref _lastLogTicks, nowTicks);
+            _log($"cursor scrub frames={Interlocked.Read(ref _scrubbedFrames)} patches={Interlocked.Read(ref _patchesCopied)} recentSamples={samples} framePatches={patches}");
+        }
+
+        public void Dispose()
+        {
+            _scratchTexture?.Dispose();
+            _previousTexture?.Dispose();
+            _scratchTexture = null;
+            _previousTexture = null;
+        }
+
+        private readonly record struct CursorSample(int X, int Y, int DisplayWidth, int DisplayHeight, long Ticks)
+        {
+            public bool IsValid => DisplayWidth > 0 && DisplayHeight > 0;
+        }
+    }
+
+    [SupportedOSPlatform("windows")]
     private sealed class GpuBgraToNv12Converter : IDisposable
     {
         private readonly ID3D11Device _device;
@@ -9216,6 +9522,7 @@ internal static partial class Program
     private sealed class OverviewPreviewFramePublisher : IDisposable
     {
         private const string MapName = @"Local\SideDockOverviewPreviewFrame";
+        private const string ConsumerAliveName = @"Local\SideDockOverviewPreviewConsumerAlive";
         private const int HeaderSize = 128;
         private const int Magic = 0x50464453; // SDFP
         private const int Version = 1;
@@ -9223,18 +9530,23 @@ internal static partial class Program
         private const int MaxFrameBytes = 3840 * 2160 * 4;
         private const int MaxPreviewFps = 15;
         private static readonly TimeSpan ErrorLogInterval = TimeSpan.FromSeconds(5);
+        private static readonly TimeSpan ConsumerProbeInterval = TimeSpan.FromSeconds(1);
 
         private readonly Action<string> _log;
         private readonly long _minPublishTicks = Stopwatch.Frequency / MaxPreviewFps;
+        private readonly long _consumerProbeTicks = Stopwatch.Frequency * (long)ConsumerProbeInterval.TotalSeconds;
         private MemoryMappedFile? _mapping;
         private MemoryMappedViewAccessor? _view;
+        private EventWaitHandle? _consumerAlive;
         private ID3D11Texture2D? _stagingTexture;
         private byte[]? _rowBuffer;
         private int _stagingWidth;
         private int _stagingHeight;
         private long _frameSequence;
         private long _lastPublishTicks;
+        private long _lastConsumerProbeTicks;
         private long _lastErrorLogTicks;
+        private bool? _lastConsumerAlive;
 
         public OverviewPreviewFramePublisher(Action<string> log)
         {
@@ -9342,6 +9654,8 @@ internal static partial class Program
         {
             _stagingTexture?.Dispose();
             _stagingTexture = null;
+            _consumerAlive?.Dispose();
+            _consumerAlive = null;
             _view?.Dispose();
             _view = null;
             _mapping?.Dispose();
@@ -9350,6 +9664,13 @@ internal static partial class Program
 
         private bool ShouldPublish()
         {
+            var consumerAlive = IsConsumerAlive();
+            LogConsumerAliveIfChanged(consumerAlive);
+            if (!consumerAlive)
+            {
+                return false;
+            }
+
             var now = Stopwatch.GetTimestamp();
             var previous = Interlocked.Read(ref _lastPublishTicks);
             if (previous != 0 && now - previous < _minPublishTicks)
@@ -9359,6 +9680,61 @@ internal static partial class Program
 
             Interlocked.Exchange(ref _lastPublishTicks, now);
             return true;
+        }
+
+        private bool IsConsumerAlive()
+        {
+            if (!OperatingSystem.IsWindows())
+            {
+                return false;
+            }
+
+            if (_consumerAlive is not null)
+            {
+                try
+                {
+                    return _consumerAlive.WaitOne(0);
+                }
+                catch (Exception ex) when (ex is ObjectDisposedException or InvalidOperationException)
+                {
+                    _consumerAlive.Dispose();
+                    _consumerAlive = null;
+                }
+            }
+
+            var now = Stopwatch.GetTimestamp();
+            var previous = Interlocked.Read(ref _lastConsumerProbeTicks);
+            if (previous != 0 && now - previous < _consumerProbeTicks)
+            {
+                return false;
+            }
+
+            Interlocked.Exchange(ref _lastConsumerProbeTicks, now);
+            try
+            {
+                _consumerAlive = EventWaitHandle.OpenExisting(ConsumerAliveName);
+                return _consumerAlive.WaitOne(0);
+            }
+            catch (WaitHandleCannotBeOpenedException)
+            {
+                return false;
+            }
+            catch (Exception ex) when (ex is IOException or UnauthorizedAccessException or ObjectDisposedException or InvalidOperationException)
+            {
+                LogThrottled($"overview preview consumer check skipped: {FormatPublishException(ex)}");
+                return false;
+            }
+        }
+
+        private void LogConsumerAliveIfChanged(bool alive)
+        {
+            if (_lastConsumerAlive == alive)
+            {
+                return;
+            }
+
+            _lastConsumerAlive = alive;
+            _log($"overview preview consumer alive={alive.ToString().ToLowerInvariant()} publish={(alive ? "enabled" : "skipped")}");
         }
 
         private MemoryMappedViewAccessor EnsureView()

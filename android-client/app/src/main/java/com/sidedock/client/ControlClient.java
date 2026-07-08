@@ -457,6 +457,7 @@ public final class ControlClient {
     private final ScheduledExecutorService heartbeatExecutor = Executors.newSingleThreadScheduledExecutor(new NamedThreadFactory("SideDock-Heartbeat"));
     private final AtomicLong seq = new AtomicLong();
     private final Object writeLock = new Object();
+    private final Object pointerAbsLock = new Object();
 
     private Socket socket;
     private BufferedWriter writer;
@@ -468,6 +469,18 @@ public final class ControlClient {
     private long sentCount;
     private long receivedCount;
     private long lastStatsEmitAtMs;
+    private JSONObject pendingPointerAbsPayload;
+    private boolean pointerAbsSendQueued;
+    private long pointerAbsRequests;
+    private long pointerAbsSendAttempts;
+    private long pointerAbsCoalesced;
+    private long pointerAbsDrainRuns;
+    private long pointerAbsQueueRejects;
+    private long pointerAbsWindowRequests;
+    private long pointerAbsWindowSendAttempts;
+    private long pointerAbsWindowCoalesced;
+    private long pointerAbsWindowDrainRuns;
+    private long pointerAbsWindowQueueRejects;
 
     public ControlClient(Listener listener) {
         this("127.0.0.1", 27183, listener);
@@ -896,7 +909,7 @@ public final class ControlClient {
     }
 
     public void sendPointerAbsInput(float nx, float ny, int buttons) {
-        sendFromAnyThread("input_pointer_abs", payload(
+        sendLatestPointerAbs(payload(
             "nx", nx,
             "ny", ny,
             "buttons", buttons
@@ -924,8 +937,15 @@ public final class ControlClient {
         long localPointerUpdates,
         long mouseButtonEvents,
         long mouseWheelEvents,
-        String lastInputType
+        String lastInputType,
+        long pointerAbsFlushRequests,
+        long pointerAbsFlushScheduled,
+        long pointerAbsFlushKept,
+        long pointerAbsFlushCanceled,
+        long pointerAbsFlushRuns,
+        long pointerAbsFlushSent
     ) {
+        PointerAbsSendStats pointerStats = snapshotAndResetPointerAbsSendStats();
         sendFromAnyThread("input_stats", payload(
             "keyboardEvents", keyboardEvents,
             "pointerAbsEvents", pointerAbsEvents,
@@ -934,7 +954,23 @@ public final class ControlClient {
             "mouseButtonEvents", mouseButtonEvents,
             "mouseWheelEvents", mouseWheelEvents,
             "inputErrors", 0,
-            "lastInputType", lastInputType == null ? "none" : lastInputType
+            "lastInputType", lastInputType == null ? "none" : lastInputType,
+            "pointerAbsFlushRequests", pointerAbsFlushRequests,
+            "pointerAbsFlushScheduled", pointerAbsFlushScheduled,
+            "pointerAbsFlushKept", pointerAbsFlushKept,
+            "pointerAbsFlushCanceled", pointerAbsFlushCanceled,
+            "pointerAbsFlushRuns", pointerAbsFlushRuns,
+            "pointerAbsFlushSent", pointerAbsFlushSent,
+            "pointerAbsControlRequests", pointerStats.requests,
+            "pointerAbsControlSendAttempts", pointerStats.sendAttempts,
+            "pointerAbsControlCoalesced", pointerStats.coalesced,
+            "pointerAbsControlDrainRuns", pointerStats.drainRuns,
+            "pointerAbsControlQueueRejects", pointerStats.queueRejects,
+            "pointerAbsControlTotalRequests", pointerStats.totalRequests,
+            "pointerAbsControlTotalSendAttempts", pointerStats.totalSendAttempts,
+            "pointerAbsControlTotalCoalesced", pointerStats.totalCoalesced,
+            "pointerAbsControlQueued", pointerStats.queued,
+            "pointerAbsControlPendingLatest", pointerStats.pendingLatest
         ));
     }
 
@@ -1316,6 +1352,94 @@ public final class ControlClient {
         }
     }
 
+    private void sendLatestPointerAbs(JSONObject payload) {
+        synchronized (pointerAbsLock) {
+            pointerAbsRequests += 1;
+            pointerAbsWindowRequests += 1;
+            if (pendingPointerAbsPayload != null) {
+                pointerAbsCoalesced += 1;
+                pointerAbsWindowCoalesced += 1;
+            }
+            pendingPointerAbsPayload = payload;
+            if (pointerAbsSendQueued) {
+                return;
+            }
+
+            pointerAbsSendQueued = true;
+        }
+
+        try {
+            heartbeatExecutor.execute(new Runnable() {
+                @Override
+                public void run() {
+                    drainPointerAbsMessages();
+                }
+            });
+        } catch (RejectedExecutionException ex) {
+            synchronized (pointerAbsLock) {
+                pendingPointerAbsPayload = null;
+                pointerAbsSendQueued = false;
+                pointerAbsQueueRejects += 1;
+                pointerAbsWindowQueueRejects += 1;
+            }
+            log("丢弃发送 input_pointer_abs: " + ex.getMessage());
+        }
+    }
+
+    private void drainPointerAbsMessages() {
+        synchronized (pointerAbsLock) {
+            pointerAbsDrainRuns += 1;
+            pointerAbsWindowDrainRuns += 1;
+        }
+        while (true) {
+            JSONObject payload;
+            synchronized (pointerAbsLock) {
+                payload = pendingPointerAbsPayload;
+                pendingPointerAbsPayload = null;
+                if (payload == null) {
+                    pointerAbsSendQueued = false;
+                    return;
+                }
+            }
+
+            send("input_pointer_abs", payload);
+            synchronized (pointerAbsLock) {
+                pointerAbsSendAttempts += 1;
+                pointerAbsWindowSendAttempts += 1;
+            }
+
+            synchronized (pointerAbsLock) {
+                if (pendingPointerAbsPayload == null) {
+                    pointerAbsSendQueued = false;
+                    return;
+                }
+            }
+        }
+    }
+
+    private PointerAbsSendStats snapshotAndResetPointerAbsSendStats() {
+        synchronized (pointerAbsLock) {
+            PointerAbsSendStats stats = new PointerAbsSendStats(
+                pointerAbsWindowRequests,
+                pointerAbsWindowSendAttempts,
+                pointerAbsWindowCoalesced,
+                pointerAbsWindowDrainRuns,
+                pointerAbsWindowQueueRejects,
+                pointerAbsRequests,
+                pointerAbsSendAttempts,
+                pointerAbsCoalesced,
+                pointerAbsSendQueued,
+                pendingPointerAbsPayload != null
+            );
+            pointerAbsWindowRequests = 0;
+            pointerAbsWindowSendAttempts = 0;
+            pointerAbsWindowCoalesced = 0;
+            pointerAbsWindowDrainRuns = 0;
+            pointerAbsWindowQueueRejects = 0;
+            return stats;
+        }
+    }
+
     private void emitStatsForType(String type) {
         if (!isInputMessage(type)) {
             emitStats();
@@ -1354,6 +1478,43 @@ public final class ControlClient {
             }
         }
         return json;
+    }
+
+    private static final class PointerAbsSendStats {
+        final long requests;
+        final long sendAttempts;
+        final long coalesced;
+        final long drainRuns;
+        final long queueRejects;
+        final long totalRequests;
+        final long totalSendAttempts;
+        final long totalCoalesced;
+        final boolean queued;
+        final boolean pendingLatest;
+
+        PointerAbsSendStats(
+            long requests,
+            long sendAttempts,
+            long coalesced,
+            long drainRuns,
+            long queueRejects,
+            long totalRequests,
+            long totalSendAttempts,
+            long totalCoalesced,
+            boolean queued,
+            boolean pendingLatest
+        ) {
+            this.requests = requests;
+            this.sendAttempts = sendAttempts;
+            this.coalesced = coalesced;
+            this.drainRuns = drainRuns;
+            this.queueRejects = queueRejects;
+            this.totalRequests = totalRequests;
+            this.totalSendAttempts = totalSendAttempts;
+            this.totalCoalesced = totalCoalesced;
+            this.queued = queued;
+            this.pendingLatest = pendingLatest;
+        }
     }
 
     private void sleepQuietly(long delayMs) {

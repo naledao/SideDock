@@ -746,6 +746,7 @@ bool SharedGpuFrameRing::WriteFrame(Direct3DDevice& device, ID3D11Texture2D* sou
     const UINT64 seq = m_writeSeq + 1;
 
     device.DeviceContext->CopyResource(texture.Get(), sourceTexture);
+    device.DeviceContext->Flush();
     MemoryBarrier();
 
     auto& slot = m_metadata->Slots[slotIndex];
@@ -1077,10 +1078,7 @@ void SwapChainProcessor::RunCore()
             {
                 if (m_monitorContext != nullptr)
                 {
-                    if (m_monitorContext->HandleHardwareCursorUpdate())
-                    {
-                        ExportLatestCursorFrame();
-                    }
+                    m_monitorContext->HandleHardwareCursorUpdate();
                 }
                 continue;
             }
@@ -1387,6 +1385,16 @@ bool SwapChainProcessor::TryComposeCursor(ID3D11Texture2D* cleanTexture, ID3D11T
     }
 
     *outputTexture = cleanTexture;
+
+    // Cursor motion is published through the host control channel and rendered
+    // by the Android client. Keep video frames cursor-free so cursor-only
+    // movement does not depend on IddCx swap-chain frame delivery.
+    const bool renderHardwareCursorInVideo = false;
+    if (!renderHardwareCursorInVideo)
+    {
+        return true;
+    }
+
     if (!m_monitorContext)
     {
         return true;
@@ -1856,11 +1864,6 @@ MonitorContext::~MonitorContext()
 
 bool MonitorContext::EnableHardwareCursor()
 {
-    if (m_hardwareCursorEnabled)
-    {
-        return true;
-    }
-
     if (!m_hardwareCursorEvent)
     {
         m_hardwareCursorEvent = CreateEvent(nullptr, FALSE, FALSE, nullptr);
@@ -1873,25 +1876,32 @@ bool MonitorContext::EnableHardwareCursor()
 
     IDARG_IN_SETUP_HWCURSOR setup = {};
     setup.CursorInfo.Size = sizeof(setup.CursorInfo);
-    // SideDock streams the desktop at low latency, so let Windows draw XOR/monochrome
-    // cursors into the desktop image instead of using IddCx's alpha emulation. The
-    // emulated path adds a solid border around cursors such as the I-beam, which shows
-    // up on Android as the black square seen over text fields.
-    setup.CursorInfo.ColorXorCursorSupport = IDDCX_XOR_CURSOR_SUPPORT_NONE;
+    // SideDock renders the pointer on Android from the host cursor_state stream, so
+    // keep all cursor shapes out of the desktop image. If this is NONE, Windows draws
+    // masked/XOR cursors into frames, which can show the native pointer while dragging.
+    setup.CursorInfo.ColorXorCursorSupport = IDDCX_XOR_CURSOR_SUPPORT_FULL;
     setup.CursorInfo.AlphaCursorSupport = TRUE;
     setup.CursorInfo.MaxX = MaxHardwareCursorWidth;
     setup.CursorInfo.MaxY = MaxHardwareCursorHeight;
     setup.hNewCursorDataAvailable = m_hardwareCursorEvent;
 
+    const bool wasEnabled = m_hardwareCursorEnabled;
     NTSTATUS status = IddCxMonitorSetupHardwareCursor(m_monitor, &setup);
     if (!NT_SUCCESS(status))
     {
+        m_hardwareCursorEnabled = false;
         TraceEvents(TRACE_LEVEL_WARNING, TRACE_MONITOR, "%!FUNC! IddCxMonitorSetupHardwareCursor failed: 0x%08x", status);
         return false;
     }
 
     m_hardwareCursorEnabled = true;
-    TraceEvents(TRACE_LEVEL_INFORMATION, TRACE_MONITOR, "%!FUNC! hardware cursor enabled");
+    TraceEvents(
+        TRACE_LEVEL_INFORMATION,
+        TRACE_MONITOR,
+        "%!FUNC! hardware cursor configured alpha=1 colorXor=full max=%ux%u videoCursor=0 refreshed=%u",
+        MaxHardwareCursorWidth,
+        MaxHardwareCursorHeight,
+        wasEnabled ? 1 : 0);
     HandleHardwareCursorUpdate();
     return true;
 }
