@@ -67,13 +67,13 @@ public final class MainActivity extends Activity implements ControlClient.Listen
     private static final int OVERLAY_MODE_HIDDEN = 2;
     private static final float CURSOR_OVERLAY_SCALE = 0.72f;
     private static final long OVERLAY_TAP_MAX_DURATION_MS = 500L;
-    private static final String[] RESOLUTION_LABELS = new String[] { "720p", "1080p", "2K" };
+    private static final String[] RESOLUTION_LABELS = new String[] { "720p", "1080p", "2k" };
     private static final int[][] RESOLUTION_PRESETS = new int[][] {
         { 1280, 720 },
         { 1920, 1080 },
         { 2560, 1440 }
     };
-    private static final int[] REFRESH_PRESETS = new int[] { 30, 60, 120 };
+    private static final int[] REFRESH_PRESETS = new int[] { 60, 120 };
     private static final String AUDIO_PREFS_NAME = "audio_controls";
     private static final String AUDIO_PREF_MIC_MUTED = "mic_muted";
     private static final String AUDIO_PREF_SPEAKER_MUTED = "speaker_muted";
@@ -122,6 +122,16 @@ public final class MainActivity extends Activity implements ControlClient.Listen
     private TextView modeToggleText;
     private LinearLayout modePanel;
     private LinearLayout audioPanel;
+    private View topStatusPill;
+    private View topStatusDot;
+    private LinearLayout topMetricsPills;
+    private TextView topStatusText;
+    private TextView topLatencyText;
+    private TextView panelTitleText;
+    private TextView panelSubtitleText;
+    private TextView transportStatusText;
+    private TextView panelLatencyText;
+    private TextView panelHintText;
     private TextView audioMicStatusText;
     private TextView audioSpeakerStatusText;
     private TextView audioPermissionText;
@@ -1116,7 +1126,10 @@ public final class MainActivity extends Activity implements ControlClient.Listen
     }
 
     private boolean isModeControlTouch(MotionEvent event) {
-        return isPointInsideView(modeToggleText, event) || isPointInsideView(modePanel, event);
+        return isPointInsideView(topStatusPill, event)
+            || isPointInsideView(topMetricsPills, event)
+            || isPointInsideView(modeToggleText, event)
+            || isPointInsideView(modePanel, event);
     }
 
     private boolean handleOverlayToggleTouch(MotionEvent event) {
@@ -1208,7 +1221,7 @@ public final class MainActivity extends Activity implements ControlClient.Listen
         float density = getResources().getDisplayMetrics().density;
 
         rootView = new PointerHidingFrameLayout(this);
-        rootView.setBackgroundColor(0xFF050607);
+        rootView.setBackgroundColor(0xFF061A25);
         rootView.setLayoutParams(new ViewGroup.LayoutParams(
             ViewGroup.LayoutParams.MATCH_PARENT,
             ViewGroup.LayoutParams.MATCH_PARENT
@@ -1262,39 +1275,33 @@ public final class MainActivity extends Activity implements ControlClient.Listen
             ViewGroup.LayoutParams.MATCH_PARENT
         ));
 
-        connectionStatusLayer = createConnectionStatusLayer(density);
-        rootView.addView(connectionStatusLayer, new FrameLayout.LayoutParams(
-            ViewGroup.LayoutParams.MATCH_PARENT,
-            ViewGroup.LayoutParams.MATCH_PARENT
-        ));
+        topStatusPill = createTopStatusPill(density);
+        FrameLayout.LayoutParams statusPillParams = new FrameLayout.LayoutParams(
+            ViewGroup.LayoutParams.WRAP_CONTENT,
+            dp(44, density),
+            Gravity.START | Gravity.TOP
+        );
+        statusPillParams.setMargins(dp(24, density), dp(22, density), dp(24, density), dp(12, density));
+        rootView.addView(topStatusPill, statusPillParams);
 
-        modeToggleText = createModeToggle(density);
-        FrameLayout.LayoutParams modeToggleParams = new FrameLayout.LayoutParams(
+        topMetricsPills = createTopMetricsPills(density);
+        FrameLayout.LayoutParams metricsPillParams = new FrameLayout.LayoutParams(
             ViewGroup.LayoutParams.WRAP_CONTENT,
             dp(44, density),
             Gravity.END | Gravity.TOP
         );
-        modeToggleParams.setMargins(dp(12, density), dp(12, density), dp(12, density), dp(12, density));
-        rootView.addView(modeToggleText, modeToggleParams);
+        metricsPillParams.setMargins(dp(24, density), dp(22, density), dp(24, density), dp(12, density));
+        rootView.addView(topMetricsPills, metricsPillParams);
 
         modePanel = createModePanel(density);
         FrameLayout.LayoutParams modePanelParams = new FrameLayout.LayoutParams(
-            dp(268, density),
+            ViewGroup.LayoutParams.MATCH_PARENT,
             ViewGroup.LayoutParams.WRAP_CONTENT,
-            Gravity.END | Gravity.TOP
+            Gravity.CENTER
         );
-        modePanelParams.setMargins(dp(12, density), dp(64, density), dp(12, density), dp(12, density));
+        modePanelParams.setMargins(dp(28, density), dp(86, density), dp(28, density), dp(28, density));
         rootView.addView(modePanel, modePanelParams);
         updateModeControls();
-
-        audioPanel = createAudioPanel(density);
-        FrameLayout.LayoutParams audioPanelParams = new FrameLayout.LayoutParams(
-            dp(316, density),
-            ViewGroup.LayoutParams.WRAP_CONTENT,
-            Gravity.START | Gravity.BOTTOM
-        );
-        audioPanelParams.setMargins(dp(12, density), dp(12, density), dp(12, density), dp(12, density));
-        rootView.addView(audioPanel, audioPanelParams);
         updateAudioPanel();
 
         updateOverlay();
@@ -1305,6 +1312,81 @@ public final class MainActivity extends Activity implements ControlClient.Listen
             }
         });
         return rootView;
+    }
+
+    private LinearLayout createTopStatusPill(float density) {
+        LinearLayout pill = new LinearLayout(this);
+        pill.setOrientation(LinearLayout.HORIZONTAL);
+        pill.setGravity(Gravity.CENTER_VERTICAL);
+        pill.setPadding(dp(14, density), 0, dp(18, density), 0);
+        pill.setBackground(makeRoundedBackground(0xD90A1620, 0x22000000, dp(9, density)));
+        useNativePointerIcon(pill);
+
+        topStatusDot = new View(this);
+        topStatusDot.setBackground(makeRoundedBackground(0xFF12B33F, 0xFF12B33F, dp(6, density)));
+        LinearLayout.LayoutParams dotParams = new LinearLayout.LayoutParams(
+            dp(12, density),
+            dp(12, density)
+        );
+        pill.addView(topStatusDot, dotParams);
+
+        topStatusText = new TextView(this);
+        topStatusText.setTextColor(0xFFFFFFFF);
+        topStatusText.setTextSize(15f);
+        topStatusText.setGravity(Gravity.CENTER_VERTICAL);
+        topStatusText.setSingleLine(true);
+        topStatusText.setPadding(dp(10, density), 0, 0, 0);
+        useNativePointerIcon(topStatusText);
+        pill.addView(topStatusText, new LinearLayout.LayoutParams(
+            ViewGroup.LayoutParams.WRAP_CONTENT,
+            ViewGroup.LayoutParams.MATCH_PARENT
+        ));
+
+        return pill;
+    }
+
+    private LinearLayout createTopMetricsPills(float density) {
+        LinearLayout row = new LinearLayout(this);
+        row.setOrientation(LinearLayout.HORIZONTAL);
+        row.setGravity(Gravity.CENTER_VERTICAL);
+        useNativePointerIcon(row);
+
+        modeToggleText = createMetricPill("2K 120Hz", density);
+        modeToggleText.setMinWidth(dp(132, density));
+        modeToggleText.setOnClickListener(new View.OnClickListener() {
+            @Override
+            public void onClick(View view) {
+                overlayMode = OVERLAY_MODE_DETAILED;
+                updateOverlay();
+            }
+        });
+        row.addView(modeToggleText, new LinearLayout.LayoutParams(
+            ViewGroup.LayoutParams.WRAP_CONTENT,
+            ViewGroup.LayoutParams.MATCH_PARENT
+        ));
+
+        topLatencyText = createMetricPill("18 ms", density);
+        LinearLayout.LayoutParams latencyParams = new LinearLayout.LayoutParams(
+            ViewGroup.LayoutParams.WRAP_CONTENT,
+            ViewGroup.LayoutParams.MATCH_PARENT
+        );
+        latencyParams.leftMargin = dp(10, density);
+        row.addView(topLatencyText, latencyParams);
+
+        return row;
+    }
+
+    private TextView createMetricPill(String label, float density) {
+        TextView view = new TextView(this);
+        view.setText(label);
+        view.setTextColor(0xFFFFFFFF);
+        view.setTextSize(14f);
+        view.setGravity(Gravity.CENTER);
+        view.setSingleLine(true);
+        view.setPadding(dp(16, density), 0, dp(16, density), 0);
+        view.setBackground(makeRoundedBackground(0xD90A1620, 0x22000000, dp(9, density)));
+        useNativePointerIcon(view);
+        return view;
     }
 
     private FrameLayout createConnectionStatusLayer(float density) {
@@ -1376,69 +1458,27 @@ public final class MainActivity extends Activity implements ControlClient.Listen
     private LinearLayout createAudioPanel(float density) {
         LinearLayout panel = new LinearLayout(this);
         panel.setOrientation(LinearLayout.VERTICAL);
-        panel.setPadding(dp(10, density), dp(10, density), dp(10, density), dp(10, density));
-        panel.setBackground(makeRoundedBackground(0xE6111820, 0xFF46657A, dp(8, density)));
         useNativePointerIcon(panel);
 
-        TextView title = new TextView(this);
-        title.setText("电脑音频");
-        title.setTextColor(0xFFFFFFFF);
-        title.setTextSize(14f);
-        title.setGravity(Gravity.START);
-        title.setPadding(0, 0, 0, dp(8, density));
-        useNativePointerIcon(title);
-        panel.addView(title, new LinearLayout.LayoutParams(
-            ViewGroup.LayoutParams.MATCH_PARENT,
-            ViewGroup.LayoutParams.WRAP_CONTENT
-        ));
+        audioPermissionText = createAudioValueText();
+        audioPermissionText.setVisibility(View.GONE);
 
         audioMicStatusText = createAudioValueText();
-        panel.addView(createAudioStatusRow("麦克风", audioMicStatusText, density), new LinearLayout.LayoutParams(
+        micMuteButton = createSwitchButton(density);
+        panel.addView(createAudioControlRow("麦克风", audioMicStatusText, micMuteButton, density), new LinearLayout.LayoutParams(
             ViewGroup.LayoutParams.MATCH_PARENT,
-            ViewGroup.LayoutParams.WRAP_CONTENT
+            dp(46, density)
         ));
 
         audioSpeakerStatusText = createAudioValueText();
-        LinearLayout.LayoutParams speakerParams = new LinearLayout.LayoutParams(
+        speakerMuteButton = createSwitchButton(density);
+        LinearLayout.LayoutParams speakerRowParams = new LinearLayout.LayoutParams(
             ViewGroup.LayoutParams.MATCH_PARENT,
-            ViewGroup.LayoutParams.WRAP_CONTENT
+            dp(46, density)
         );
-        speakerParams.topMargin = dp(4, density);
-        panel.addView(createAudioStatusRow("音响", audioSpeakerStatusText, density), speakerParams);
+        speakerRowParams.topMargin = dp(1, density);
+        panel.addView(createAudioControlRow("音响", audioSpeakerStatusText, speakerMuteButton, density), speakerRowParams);
 
-        audioPermissionText = createAudioValueText();
-        audioPermissionText.setOnClickListener(new View.OnClickListener() {
-            @Override
-            public void onClick(View view) {
-                requestRecordAudioPermissionIfNeeded();
-            }
-        });
-        LinearLayout.LayoutParams permissionParams = new LinearLayout.LayoutParams(
-            ViewGroup.LayoutParams.MATCH_PARENT,
-            ViewGroup.LayoutParams.WRAP_CONTENT
-        );
-        permissionParams.topMargin = dp(4, density);
-        panel.addView(createAudioStatusRow("权限", audioPermissionText, density), permissionParams);
-
-        audioHintText = createAudioValueText();
-        audioHintText.setTextColor(0xFFB9C6CC);
-        LinearLayout.LayoutParams hintParams = new LinearLayout.LayoutParams(
-            ViewGroup.LayoutParams.MATCH_PARENT,
-            ViewGroup.LayoutParams.WRAP_CONTENT
-        );
-        hintParams.topMargin = dp(8, density);
-        panel.addView(audioHintText, hintParams);
-
-        LinearLayout controls = createSegmentRow();
-        LinearLayout.LayoutParams controlsParams = new LinearLayout.LayoutParams(
-            ViewGroup.LayoutParams.MATCH_PARENT,
-            dp(38, density)
-        );
-        controlsParams.topMargin = dp(10, density);
-        panel.addView(controls, controlsParams);
-
-        micMuteButton = createSegmentButton("麦克风静音", density);
-        controls.addView(micMuteButton, segmentParams(0, 2, density));
         micMuteButton.setOnClickListener(new View.OnClickListener() {
             @Override
             public void onClick(View view) {
@@ -1450,8 +1490,6 @@ public final class MainActivity extends Activity implements ControlClient.Listen
             }
         });
 
-        speakerMuteButton = createSegmentButton("音响静音", density);
-        controls.addView(speakerMuteButton, segmentParams(1, 2, density));
         speakerMuteButton.setOnClickListener(new View.OnClickListener() {
             @Override
             public void onClick(View view) {
@@ -1463,27 +1501,54 @@ public final class MainActivity extends Activity implements ControlClient.Listen
             }
         });
 
-        stopAudioButton = createActionButton("停止音频", density);
-        LinearLayout.LayoutParams stopParams = new LinearLayout.LayoutParams(
-            ViewGroup.LayoutParams.MATCH_PARENT,
-            dp(40, density)
-        );
-        stopParams.topMargin = dp(8, density);
-        panel.addView(stopAudioButton, stopParams);
-        stopAudioButton.setOnClickListener(new View.OnClickListener() {
-            @Override
-            public void onClick(View view) {
-                audioStopped = !audioStopped;
-                lastAudioHint = audioStopped
-                    ? "音频已停止，副屏仍在运行。"
-                    : "音频控制已恢复，正在准备音频状态。";
-                saveAudioPreferences();
-                applyAudioCaptureIntent(lastAudioHint);
-                updateOverlay();
-            }
-        });
-
         return panel;
+    }
+
+    private LinearLayout createAudioControlRow(String label, TextView value, TextView toggle, float density) {
+        LinearLayout row = new LinearLayout(this);
+        row.setOrientation(LinearLayout.HORIZONTAL);
+        row.setGravity(Gravity.CENTER_VERTICAL);
+        row.setPadding(dp(18, density), 0, dp(18, density), 0);
+        row.setBackground(makeRoundedBackground(0x4DFFFFFF, 0xFFD5DCE2, dp(8, density)));
+        useNativePointerIcon(row);
+
+        TextView icon = new TextView(this);
+        icon.setText(label.length() > 0 ? label.substring(0, 1) : "");
+        icon.setTextColor(0xFF111820);
+        icon.setTextSize(16f);
+        icon.setGravity(Gravity.CENTER);
+        useNativePointerIcon(icon);
+        row.addView(icon, new LinearLayout.LayoutParams(
+            dp(28, density),
+            ViewGroup.LayoutParams.MATCH_PARENT
+        ));
+
+        TextView labelView = new TextView(this);
+        labelView.setText(label);
+        labelView.setTextColor(0xFF111820);
+        labelView.setTextSize(15f);
+        labelView.setGravity(Gravity.CENTER_VERTICAL);
+        labelView.setPadding(dp(10, density), 0, 0, 0);
+        useNativePointerIcon(labelView);
+        row.addView(labelView, new LinearLayout.LayoutParams(
+            0,
+            ViewGroup.LayoutParams.MATCH_PARENT,
+            1f
+        ));
+
+        value.setGravity(Gravity.CENTER_VERTICAL | Gravity.END);
+        row.addView(value, new LinearLayout.LayoutParams(
+            dp(64, density),
+            ViewGroup.LayoutParams.MATCH_PARENT
+        ));
+
+        LinearLayout.LayoutParams toggleParams = new LinearLayout.LayoutParams(
+            dp(50, density),
+            dp(28, density)
+        );
+        toggleParams.leftMargin = dp(10, density);
+        row.addView(toggle, toggleParams);
+        return row;
     }
 
     private LinearLayout createAudioStatusRow(String label, TextView value, float density) {
@@ -1513,8 +1578,8 @@ public final class MainActivity extends Activity implements ControlClient.Listen
 
     private TextView createAudioValueText() {
         TextView view = new TextView(this);
-        view.setTextColor(0xFFE9F0F2);
-        view.setTextSize(12f);
+        view.setTextColor(0xFF5C6770);
+        view.setTextSize(14f);
         view.setGravity(Gravity.START);
         view.setLineSpacing(2f, 1.0f);
         useNativePointerIcon(view);
@@ -1541,50 +1606,186 @@ public final class MainActivity extends Activity implements ControlClient.Listen
     }
 
     private LinearLayout createModePanel(float density) {
-        LinearLayout panel = new LinearLayout(this);
+        LinearLayout panel = new MaxWidthLinearLayout(this, dp(620, density));
         panel.setOrientation(LinearLayout.VERTICAL);
-        panel.setVisibility(View.GONE);
-        panel.setPadding(dp(10, density), dp(10, density), dp(10, density), dp(10, density));
-        panel.setBackground(makeRoundedBackground(0xE6111820, 0xFF46657A, dp(8, density)));
+        panel.setGravity(Gravity.CENTER_HORIZONTAL);
+        panel.setPadding(dp(24, density), dp(14, density), dp(24, density), dp(18, density));
+        panel.setBackground(makeRoundedBackground(0xF2FFFFFF, 0xE8FFFFFF, dp(18, density)));
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.LOLLIPOP) {
+            panel.setElevation(dp(18, density));
+        }
         useNativePointerIcon(panel);
 
-        TextView resolutionLabel = createPanelLabel("Resolution");
-        panel.addView(resolutionLabel, new LinearLayout.LayoutParams(
+        View handle = new View(this);
+        handle.setBackground(makeRoundedBackground(0xFFB9B9B9, 0xFFB9B9B9, dp(3, density)));
+        LinearLayout.LayoutParams handleParams = new LinearLayout.LayoutParams(
+            dp(52, density),
+            dp(5, density)
+        );
+        handleParams.bottomMargin = dp(16, density);
+        panel.addView(handle, handleParams);
+
+        panelTitleText = new TextView(this);
+        panelTitleText.setText("副屏运行中");
+        panelTitleText.setTextColor(0xFF111820);
+        panelTitleText.setTextSize(26f);
+        panelTitleText.setGravity(Gravity.START);
+        panelTitleText.setTypeface(android.graphics.Typeface.DEFAULT_BOLD);
+        useNativePointerIcon(panelTitleText);
+        panel.addView(panelTitleText, new LinearLayout.LayoutParams(
             ViewGroup.LayoutParams.MATCH_PARENT,
             ViewGroup.LayoutParams.WRAP_CONTENT
         ));
-        panel.addView(createResolutionRow(density), new LinearLayout.LayoutParams(
-            ViewGroup.LayoutParams.MATCH_PARENT,
-            dp(40, density)
-        ));
 
-        TextView refreshLabel = createPanelLabel("Refresh");
-        LinearLayout.LayoutParams refreshLabelParams = new LinearLayout.LayoutParams(
+        panelSubtitleText = new TextView(this);
+        panelSubtitleText.setText("常用控制可在平板端快速切换，完整设置请在 Windows 端管理");
+        panelSubtitleText.setTextColor(0xFF2F3A42);
+        panelSubtitleText.setTextSize(14f);
+        panelSubtitleText.setGravity(Gravity.START);
+        panelSubtitleText.setSingleLine(false);
+        useNativePointerIcon(panelSubtitleText);
+        LinearLayout.LayoutParams subtitleParams = new LinearLayout.LayoutParams(
             ViewGroup.LayoutParams.MATCH_PARENT,
             ViewGroup.LayoutParams.WRAP_CONTENT
         );
-        refreshLabelParams.topMargin = dp(10, density);
-        panel.addView(refreshLabel, refreshLabelParams);
-        panel.addView(createRefreshRow(density), new LinearLayout.LayoutParams(
+        subtitleParams.topMargin = dp(6, density);
+        panel.addView(panelSubtitleText, subtitleParams);
+
+        LinearLayout statusRow = new LinearLayout(this);
+        statusRow.setOrientation(LinearLayout.HORIZONTAL);
+        statusRow.setGravity(Gravity.CENTER_VERTICAL);
+        useNativePointerIcon(statusRow);
+        LinearLayout.LayoutParams statusRowParams = new LinearLayout.LayoutParams(
             ViewGroup.LayoutParams.MATCH_PARENT,
-            dp(40, density)
+            dp(52, density)
+        );
+        statusRowParams.topMargin = dp(14, density);
+        panel.addView(statusRow, statusRowParams);
+
+        transportStatusText = createStatusValueText(density);
+        statusRow.addView(createStatusCard("USB 连接", transportStatusText, density), segmentParams(0, 2, density));
+
+        panelLatencyText = createStatusValueText(density);
+        statusRow.addView(createStatusCard("端到端延迟", panelLatencyText, density), segmentParams(1, 2, density));
+
+        TextView quickControlLabel = createPanelLabel("快速控制");
+        LinearLayout.LayoutParams quickLabelParams = new LinearLayout.LayoutParams(
+            ViewGroup.LayoutParams.MATCH_PARENT,
+            ViewGroup.LayoutParams.WRAP_CONTENT
+        );
+        quickLabelParams.topMargin = dp(16, density);
+        panel.addView(quickControlLabel, quickLabelParams);
+
+        panel.addView(createSettingRow("画质", createResolutionRow(density), density), new LinearLayout.LayoutParams(
+            ViewGroup.LayoutParams.MATCH_PARENT,
+            dp(52, density)
         ));
 
-        TextView applyButton = createActionButton("Apply", density);
+        panel.addView(createSettingRow("刷新率", createRefreshRow(density), density), new LinearLayout.LayoutParams(
+            ViewGroup.LayoutParams.MATCH_PARENT,
+            dp(52, density)
+        ));
+
+        audioPanel = createAudioPanel(density);
+        LinearLayout.LayoutParams audioPanelParams = new LinearLayout.LayoutParams(
+            ViewGroup.LayoutParams.MATCH_PARENT,
+            ViewGroup.LayoutParams.WRAP_CONTENT
+        );
+        audioPanelParams.topMargin = dp(8, density);
+        panel.addView(audioPanel, audioPanelParams);
+
+        panelHintText = createPanelLabel("");
+        panelHintText.setTextColor(0xFF4C565E);
+        panelHintText.setTextSize(12f);
+        panelHintText.setPadding(0, dp(10, density), 0, 0);
+        audioHintText = panelHintText;
+        panel.addView(panelHintText, new LinearLayout.LayoutParams(
+            ViewGroup.LayoutParams.MATCH_PARENT,
+            ViewGroup.LayoutParams.WRAP_CONTENT
+        ));
+
+        stopAudioButton = createActionButton("隐藏面板", density);
         LinearLayout.LayoutParams applyParams = new LinearLayout.LayoutParams(
             ViewGroup.LayoutParams.MATCH_PARENT,
             dp(42, density)
         );
-        applyParams.topMargin = dp(12, density);
-        panel.addView(applyButton, applyParams);
-        applyButton.setOnClickListener(new View.OnClickListener() {
+        applyParams.topMargin = dp(14, density);
+        panel.addView(stopAudioButton, applyParams);
+        stopAudioButton.setOnClickListener(new View.OnClickListener() {
             @Override
             public void onClick(View view) {
-                applySelectedDisplayMode();
+                overlayMode = OVERLAY_MODE_HIDDEN;
+                updateOverlay();
             }
         });
 
         return panel;
+    }
+
+    private TextView createStatusValueText(float density) {
+        TextView view = new TextView(this);
+        view.setTextColor(0xFF087D1F);
+        view.setTextSize(14f);
+        view.setGravity(Gravity.CENTER_VERTICAL | Gravity.END);
+        view.setSingleLine(true);
+        useNativePointerIcon(view);
+        return view;
+    }
+
+    private LinearLayout createStatusCard(String label, TextView value, float density) {
+        LinearLayout card = new LinearLayout(this);
+        card.setOrientation(LinearLayout.HORIZONTAL);
+        card.setGravity(Gravity.CENTER_VERTICAL);
+        card.setPadding(dp(16, density), 0, dp(16, density), 0);
+        card.setBackground(makeRoundedBackground(0x66FFFFFF, 0xFFD5DCE2, dp(8, density)));
+        useNativePointerIcon(card);
+
+        TextView labelView = new TextView(this);
+        labelView.setText(label);
+        labelView.setTextColor(0xFF111820);
+        labelView.setTextSize(14f);
+        labelView.setGravity(Gravity.CENTER_VERTICAL);
+        labelView.setSingleLine(true);
+        useNativePointerIcon(labelView);
+        card.addView(labelView, new LinearLayout.LayoutParams(
+            0,
+            ViewGroup.LayoutParams.MATCH_PARENT,
+            1f
+        ));
+
+        card.addView(value, new LinearLayout.LayoutParams(
+            ViewGroup.LayoutParams.WRAP_CONTENT,
+            ViewGroup.LayoutParams.MATCH_PARENT
+        ));
+        return card;
+    }
+
+    private LinearLayout createSettingRow(String label, View control, float density) {
+        LinearLayout row = new LinearLayout(this);
+        row.setOrientation(LinearLayout.HORIZONTAL);
+        row.setGravity(Gravity.CENTER_VERTICAL);
+        row.setPadding(dp(16, density), 0, dp(16, density), 0);
+        row.setBackground(makeRoundedBackground(0x4DFFFFFF, 0xFFD5DCE2, dp(8, density)));
+        useNativePointerIcon(row);
+
+        TextView labelView = new TextView(this);
+        labelView.setText(label);
+        labelView.setTextColor(0xFF111820);
+        labelView.setTextSize(15f);
+        labelView.setGravity(Gravity.CENTER_VERTICAL);
+        labelView.setSingleLine(true);
+        useNativePointerIcon(labelView);
+        row.addView(labelView, new LinearLayout.LayoutParams(
+            dp(150, density),
+            ViewGroup.LayoutParams.MATCH_PARENT
+        ));
+
+        row.addView(control, new LinearLayout.LayoutParams(
+            0,
+            dp(32, density),
+            1f
+        ));
+        return row;
     }
 
     private LinearLayout createResolutionRow(float density) {
@@ -1599,7 +1800,7 @@ public final class MainActivity extends Activity implements ControlClient.Listen
                 public void onClick(View view) {
                     selectedModeWidth = RESOLUTION_PRESETS[buttonIndex][0];
                     selectedModeHeight = RESOLUTION_PRESETS[buttonIndex][1];
-                    updateModeControls();
+                    applySelectedDisplayMode();
                 }
             });
         }
@@ -1611,14 +1812,14 @@ public final class MainActivity extends Activity implements ControlClient.Listen
         LinearLayout row = createSegmentRow();
         for (int index = 0; index < REFRESH_PRESETS.length; index++) {
             final int refreshHz = REFRESH_PRESETS[index];
-            TextView button = createSegmentButton(refreshHz + "Hz", density);
+            TextView button = createSegmentButton(refreshHz + " Hz", density);
             refreshButtons[index] = button;
             row.addView(button, segmentParams(index, REFRESH_PRESETS.length, density));
             button.setOnClickListener(new View.OnClickListener() {
                 @Override
                 public void onClick(View view) {
                     selectedModeRefresh = refreshHz;
-                    updateModeControls();
+                    applySelectedDisplayMode();
                 }
             });
         }
@@ -1636,8 +1837,8 @@ public final class MainActivity extends Activity implements ControlClient.Listen
     private TextView createPanelLabel(String label) {
         TextView view = new TextView(this);
         view.setText(label);
-        view.setTextColor(0xFFB9C6CC);
-        view.setTextSize(11f);
+        view.setTextColor(0xFF111820);
+        view.setTextSize(14f);
         view.setGravity(Gravity.START);
         useNativePointerIcon(view);
         return view;
@@ -1646,7 +1847,7 @@ public final class MainActivity extends Activity implements ControlClient.Listen
     private TextView createSegmentButton(String label, float density) {
         TextView button = new TextView(this);
         button.setText(label);
-        button.setTextColor(0xFFE9F0F2);
+        button.setTextColor(0xFF111820);
         button.setTextSize(13f);
         button.setGravity(Gravity.CENTER);
         button.setPadding(dp(4, density), 0, dp(4, density), 0);
@@ -1656,8 +1857,19 @@ public final class MainActivity extends Activity implements ControlClient.Listen
 
     private TextView createActionButton(String label, float density) {
         TextView button = createSegmentButton(label, density);
-        button.setTextColor(0xFFFFFFFF);
-        button.setBackground(makeRoundedBackground(0xFF2678C9, 0xFF72AEEB, dp(6, density)));
+        button.setTextColor(0xFF0A7888);
+        button.setTextSize(16f);
+        button.setBackground(makeRoundedBackground(0x00FFFFFF, 0xFF0A7888, dp(6, density)));
+        return button;
+    }
+
+    private TextView createSwitchButton(float density) {
+        TextView button = new TextView(this);
+        button.setGravity(Gravity.CENTER);
+        button.setTextSize(16f);
+        button.setSingleLine(true);
+        button.setPadding(dp(5, density), 0, dp(5, density), 0);
+        useNativePointerIcon(button);
         return button;
     }
 
@@ -1696,9 +1908,6 @@ public final class MainActivity extends Activity implements ControlClient.Listen
         selectedModeRefresh = normalizeSelectedRefresh(selectedModeRefresh);
         controlClient.sendDisplayModeChange(selectedModeWidth, selectedModeHeight, selectedModeRefresh);
         addLog("Request display mode " + selectedModeWidth + "x" + selectedModeHeight + "@" + selectedModeRefresh);
-        if (modePanel != null) {
-            modePanel.setVisibility(View.GONE);
-        }
         updateModeControls();
     }
 
@@ -1733,19 +1942,25 @@ public final class MainActivity extends Activity implements ControlClient.Listen
 
     private void updateModeControlVisibility() {
         boolean visible = overlayMode != OVERLAY_MODE_HIDDEN;
+        if (topStatusPill != null) {
+            topStatusPill.setVisibility(visible ? View.VISIBLE : View.GONE);
+        }
+        if (topMetricsPills != null) {
+            topMetricsPills.setVisibility(visible ? View.VISIBLE : View.GONE);
+        }
         if (modeToggleText != null) {
             modeToggleText.setVisibility(visible ? View.VISIBLE : View.GONE);
         }
-        if (!visible && modePanel != null) {
-            modePanel.setVisibility(View.GONE);
+        if (modePanel != null) {
+            modePanel.setVisibility(visible ? View.VISIBLE : View.GONE);
         }
     }
 
     private void styleSegmentButton(TextView button, boolean selected, float density) {
-        button.setTextColor(selected ? 0xFFFFFFFF : 0xFFE9F0F2);
+        button.setTextColor(selected ? 0xFFFFFFFF : 0xFF111820);
         button.setBackground(makeRoundedBackground(
-            selected ? 0xFF2678C9 : 0x551B2630,
-            selected ? 0xFF72AEEB : 0xFF314555,
+            selected ? 0xFF0A7888 : 0x18FFFFFF,
+            selected ? 0xFF0A7888 : 0xFFD5DCE2,
             dp(6, density)
         ));
     }
@@ -2097,23 +2312,53 @@ public final class MainActivity extends Activity implements ControlClient.Listen
         AudioStatus micStatus = currentMicrophoneAudioStatus();
         AudioStatus speakerStatus = currentSpeakerAudioStatus();
 
-        audioMicStatusText.setText(audioStatusText(AudioEndpoint.MICROPHONE, micStatus));
+        audioMicStatusText.setText(audioControlLabel(micStatus));
         audioMicStatusText.setTextColor(audioStatusColor(micStatus));
-        audioSpeakerStatusText.setText(audioStatusText(AudioEndpoint.SPEAKER, speakerStatus));
+        audioSpeakerStatusText.setText(audioControlLabel(speakerStatus));
         audioSpeakerStatusText.setTextColor(audioStatusColor(speakerStatus));
         audioPermissionText.setText(hasRecordAudioPermission()
             ? "麦克风权限已允许"
             : "需要允许麦克风权限后才能作为电脑麦克风");
         audioPermissionText.setTextColor(hasRecordAudioPermission() ? 0xFF77D59B : 0xFFFFB86B);
-        audioHintText.setText(audioStopped ? "音频已停止，副屏仍在运行。" : lastAudioHint);
+        audioHintText.setText(hasRecordAudioPermission()
+            ? "分辨率、摄像头与高级音频配置仍在桌面端 SideDock Host 中设置。"
+            : "需要麦克风权限时可点按麦克风状态授权。");
+        audioHintText.setOnClickListener(new View.OnClickListener() {
+            @Override
+            public void onClick(View view) {
+                requestRecordAudioPermissionIfNeeded();
+            }
+        });
 
-        micMuteButton.setText(micMuted ? "取消麦克风静音" : "麦克风静音");
-        speakerMuteButton.setText(speakerMuted ? "取消音响静音" : "音响静音");
-        stopAudioButton.setText(audioStopped ? "恢复音频" : "停止音频");
+        micMuteButton.setText(micMuted ? "●  " : "  ●");
+        speakerMuteButton.setText(speakerMuted ? "●  " : "  ●");
+        stopAudioButton.setText("隐藏面板");
 
-        styleAudioToggleButton(micMuteButton, micMuted, canToggleMicrophoneMute(), density);
-        styleAudioToggleButton(speakerMuteButton, speakerMuted, canToggleSpeakerMute(), density);
-        styleAudioStopButton(stopAudioButton, audioStopped, density);
+        styleSwitchButton(micMuteButton, !micMuted, canToggleMicrophoneMute(), density);
+        styleSwitchButton(speakerMuteButton, !speakerMuted, canToggleSpeakerMute(), density);
+        stylePanelHideButton(stopAudioButton, density);
+    }
+
+    private String audioControlLabel(AudioStatus status) {
+        switch (status) {
+            case AVAILABLE:
+            case CAPTURING:
+                return "开启";
+            case MUTED:
+            case DISABLED:
+                return "关闭";
+            case AUTHORIZATION_REQUIRED:
+                return "授权";
+            case PREPARING:
+            case RECONNECTING:
+                return "准备";
+            case ERROR:
+            case NOT_IMPLEMENTED:
+                return "异常";
+            case WAITING_DEVICE:
+            default:
+                return "等待";
+        }
     }
 
     private AudioStatus currentMicrophoneAudioStatus() {
@@ -2229,7 +2474,7 @@ public final class MainActivity extends Activity implements ControlClient.Listen
             case ERROR:
                 return 0xFFFF8A80;
             default:
-                return 0xFFE9F0F2;
+                return 0xFF5C6770;
         }
     }
 
@@ -2252,22 +2497,24 @@ public final class MainActivity extends Activity implements ControlClient.Listen
         return checkSelfPermission(Manifest.permission.RECORD_AUDIO) == PackageManager.PERMISSION_GRANTED;
     }
 
-    private void styleAudioToggleButton(TextView button, boolean active, boolean enabled, float density) {
+    private void styleSwitchButton(TextView button, boolean on, boolean enabled, float density) {
         button.setEnabled(enabled);
         button.setAlpha(enabled ? 1.0f : 0.5f);
-        button.setTextColor(active ? 0xFFFFFFFF : 0xFFE9F0F2);
+        button.setTextColor(0xFFFFFFFF);
         button.setBackground(makeRoundedBackground(
-            active ? 0xFF9D5D00 : 0x551B2630,
-            active ? 0xFFFFB86B : 0xFF314555,
-            dp(6, density)
+            on ? 0xFF0A7888 : 0xFF9AA3A9,
+            on ? 0xFF0A7888 : 0xFF9AA3A9,
+            dp(14, density)
         ));
     }
 
-    private void styleAudioStopButton(TextView button, boolean stopped, float density) {
-        button.setTextColor(0xFFFFFFFF);
+    private void stylePanelHideButton(TextView button, float density) {
+        button.setEnabled(true);
+        button.setAlpha(1.0f);
+        button.setTextColor(0xFF0A7888);
         button.setBackground(makeRoundedBackground(
-            stopped ? 0xFF2678C9 : 0xFF8C2D24,
-            stopped ? 0xFF72AEEB : 0xFFFF8A80,
+            0x00FFFFFF,
+            0xFF0A7888,
             dp(6, density)
         ));
     }
@@ -2806,6 +3053,7 @@ public final class MainActivity extends Activity implements ControlClient.Listen
     private void updateOverlay() {
         updateModeControlVisibility();
         updateConnectionStatusLayer();
+        updateDashboardStatus();
         updateAudioPanel();
 
         if (overlayText == null) {
@@ -3005,6 +3253,132 @@ public final class MainActivity extends Activity implements ControlClient.Listen
             builder.append(line).append('\n');
         }
         overlayText.setText(builder.toString().trim());
+    }
+
+    private void updateDashboardStatus() {
+        float density = getResources().getDisplayMetrics().density;
+        int statusColor = dashboardStatusColor();
+        String latencyText = currentLatencyMs() + " ms";
+
+        if (topStatusDot != null) {
+            topStatusDot.setBackground(makeRoundedBackground(statusColor, statusColor, dp(6, density)));
+        }
+        if (topStatusText != null) {
+            topStatusText.setText("SideDock · " + dashboardConnectionLabel());
+        }
+        if (topLatencyText != null) {
+            topLatencyText.setText(latencyText);
+        }
+        if (panelTitleText != null) {
+            panelTitleText.setText(dashboardTitle());
+        }
+        if (panelSubtitleText != null) {
+            panelSubtitleText.setText(dashboardSubtitle());
+        }
+        if (transportStatusText != null) {
+            transportStatusText.setText(dashboardTransportLabel());
+            transportStatusText.setTextColor(statusColor);
+        }
+        if (panelLatencyText != null) {
+            panelLatencyText.setText(latencyText);
+            panelLatencyText.setTextColor(controlConnectionState == ConnectionState.CONNECTED ? 0xFF087D1F : 0xFF76828B);
+        }
+    }
+
+    private int dashboardStatusColor() {
+        if (isDashboardConnected()) {
+            return 0xFF12B33F;
+        }
+        if (isDashboardError()) {
+            return 0xFFE53935;
+        }
+        if (controlConnectionState == ConnectionState.DISCONNECTED) {
+            return 0xFF8B98A3;
+        }
+
+        return 0xFFFFA726;
+    }
+
+    private String dashboardConnectionLabel() {
+        if (isDashboardConnected()) {
+            return "已连接";
+        }
+        if (lastCaptureStatus != null && "ERROR".equals(lastCaptureStatus.state)) {
+            return "采集异常";
+        }
+        if (lastVideoError.length() > 0) {
+            return "视频异常";
+        }
+        if (!surfaceReady) {
+            return "准备显示层";
+        }
+        if (controlConnectionState != ConnectionState.CONNECTED) {
+            return controlState;
+        }
+        if (!"CONNECTED".equals(videoState)) {
+            return "等待视频";
+        }
+        if (isReceiveOnlyVideoMode()) {
+            return "解码异常";
+        }
+        if (waitingForVideoFrame || lastRenderedFramesSeen == 0L) {
+            return "等待画面";
+        }
+
+        return "已连接";
+    }
+
+    private String dashboardTitle() {
+        if (isDashboardConnected()) {
+            return "副屏运行中";
+        }
+        if (isDashboardError()) {
+            return "连接需要检查";
+        }
+        if (controlConnectionState == ConnectionState.CONNECTING) {
+            return "正在连接副屏";
+        }
+        if (controlConnectionState == ConnectionState.RECONNECTING) {
+            return "副屏重连中";
+        }
+
+        return "等待副屏连接";
+    }
+
+    private String dashboardSubtitle() {
+        if (isDashboardConnected()) {
+            return "常用控制可在平板端快速切换，完整设置请在 Windows 端管理";
+        }
+        if (controlConnectionState == ConnectionState.CONNECTED) {
+            return "控制通道已连接，正在等待视频通道和首帧画面";
+        }
+        return "请确认 Windows 端 SideDock Host 已启动，并完成 USB 调试端口映射";
+    }
+
+    private String dashboardTransportLabel() {
+        if (controlConnectionState == ConnectionState.CONNECTED) {
+            return "正常";
+        }
+
+        return controlState;
+    }
+
+    private boolean isDashboardConnected() {
+        return surfaceReady
+            && controlConnectionState == ConnectionState.CONNECTED
+            && "CONNECTED".equals(videoState)
+            && !waitingForVideoFrame
+            && lastRenderedFramesSeen > 0L
+            && lastVideoError.length() == 0
+            && !isReceiveOnlyVideoMode()
+            && (lastCaptureStatus == null || !"ERROR".equals(lastCaptureStatus.state));
+    }
+
+    private boolean isDashboardError() {
+        return controlConnectionState == ConnectionState.FAILED
+            || lastVideoError.length() > 0
+            || isReceiveOnlyVideoMode()
+            || (lastCaptureStatus != null && "ERROR".equals(lastCaptureStatus.state));
     }
 
     private void updateConnectionStatusLayer() {
@@ -3297,6 +3671,25 @@ public final class MainActivity extends Activity implements ControlClient.Listen
 
     private int clampInt(int value, int min, int max) {
         return Math.max(min, Math.min(max, value));
+    }
+
+    private final class MaxWidthLinearLayout extends LinearLayout {
+        private final int maxWidthPx;
+
+        MaxWidthLinearLayout(Context context, int maxWidthPx) {
+            super(context);
+            this.maxWidthPx = maxWidthPx;
+        }
+
+        @Override
+        protected void onMeasure(int widthMeasureSpec, int heightMeasureSpec) {
+            int width = MeasureSpec.getSize(widthMeasureSpec);
+            int mode = MeasureSpec.getMode(widthMeasureSpec);
+            if (maxWidthPx > 0 && width > maxWidthPx) {
+                widthMeasureSpec = MeasureSpec.makeMeasureSpec(maxWidthPx, mode == MeasureSpec.UNSPECIFIED ? MeasureSpec.AT_MOST : mode);
+            }
+            super.onMeasure(widthMeasureSpec, heightMeasureSpec);
+        }
     }
 
     private final class PointerHidingFrameLayout extends FrameLayout {
