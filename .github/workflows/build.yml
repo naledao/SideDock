@@ -89,11 +89,45 @@ jobs:
         with:
           dotnet-version: "8.0.x"
 
+      - name: Set up MSBuild
+        uses: microsoft/setup-msbuild@v2
+
+      - name: Set up NuGet
+        uses: NuGet/setup-nuget@v2
+
+      - name: Ensure Windows SDK is available
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+
+          function Test-WindowsSdk {
+            $sdkHeader = Get-ChildItem "${env:ProgramFiles(x86)}\Windows Kits\10\Include\$env:WDK_VERSION.*\um\mfvirtualcamera.h" -ErrorAction SilentlyContinue
+            $sdkLib = Get-ChildItem "${env:ProgramFiles(x86)}\Windows Kits\10\Lib\$env:WDK_VERSION.*\um\x64\Mfsensorgroup.lib" -ErrorAction SilentlyContinue
+            return ($sdkHeader.Count -gt 0 -and $sdkLib.Count -gt 0)
+          }
+
+          if (Test-WindowsSdk) {
+            Write-Host "Windows SDK $env:WDK_VERSION is already available."
+            exit 0
+          }
+
+          Write-Host "Installing Windows SDK $env:WDK_VERSION."
+          winget install --id Microsoft.WindowsSDK.$env:WDK_VERSION --source winget --silent --accept-package-agreements --accept-source-agreements
+
+          if (-not (Test-WindowsSdk)) {
+            Get-ChildItem "${env:ProgramFiles(x86)}\Windows Kits\10\Include" -ErrorAction SilentlyContinue |
+              Select-Object FullName |
+              Format-Table -AutoSize
+            throw "Windows SDK $env:WDK_VERSION was not found after installation."
+          }
+
       - name: Restore
         run: |
           dotnet restore .\windows-host\SideDock.Host\SideDock.Host.csproj
           dotnet restore .\windows-host\SideDock.Host.App\SideDock.Host.App.csproj
           dotnet restore .\windows-host\SideDock.Host.Launcher\SideDock.Host.Launcher.csproj
+          dotnet restore .\windows-host\SideDock.VirtualCamera.Tool\SideDock.VirtualCamera.Tool.csproj
+          nuget restore .\windows-host\SideDock.VirtualCamera.MediaSource\packages.config -PackagesDirectory .\windows-host\SideDock.VirtualCamera.MediaSource\packages -NonInteractive
 
       - name: Download driver installer
         uses: actions/download-artifact@v4
@@ -115,6 +149,35 @@ jobs:
           $payloadRoot = Join-Path $env:RUNNER_TEMP "sidedock-host-payload"
           New-Item -ItemType Directory -Force $payloadRoot | Out-Null
           Copy-Item -Recurse -Force $out (Join-Path $payloadRoot "SideDock.Host")
+
+          $virtualCameraMediaSourceOut = Join-Path $env:RUNNER_TEMP "sidedock-virtual-camera-mediasource"
+          New-Item -ItemType Directory -Force $virtualCameraMediaSourceOut | Out-Null
+          msbuild .\windows-host\SideDock.VirtualCamera.MediaSource\SideDock.VirtualCamera.MediaSource.vcxproj `
+            /m `
+            /p:Configuration=$env:BUILD_CONFIGURATION `
+            /p:Platform=x64 `
+            "/p:OutDir=$virtualCameraMediaSourceOut\"
+          $virtualCameraMediaSourceDll = Join-Path $virtualCameraMediaSourceOut "SideDock.VirtualCamera.MediaSource.dll"
+          if (-not (Test-Path -LiteralPath $virtualCameraMediaSourceDll)) {
+            throw "Virtual camera media source DLL was not produced: $virtualCameraMediaSourceDll"
+          }
+
+          $virtualCameraToolOut = Join-Path $env:RUNNER_TEMP "sidedock-virtual-camera-tool"
+          dotnet publish .\windows-host\SideDock.VirtualCamera.Tool\SideDock.VirtualCamera.Tool.csproj `
+            --configuration $env:BUILD_CONFIGURATION `
+            --runtime win-x64 `
+            --self-contained true `
+            -p:PublishSingleFile=true `
+            -p:EnableCompressionInSingleFile=true `
+            -p:IncludeNativeLibrariesForSelfExtract=true `
+            --output $virtualCameraToolOut
+          $virtualCameraToolExe = Join-Path $virtualCameraToolOut "SideDock.VirtualCamera.Tool.exe"
+          if (-not (Test-Path -LiteralPath $virtualCameraToolExe)) {
+            throw "Virtual camera tool executable was not produced: $virtualCameraToolExe"
+          }
+          Copy-Item -Force $virtualCameraMediaSourceDll $virtualCameraToolOut
+          Copy-Item -Recurse -Force $virtualCameraToolOut (Join-Path $payloadRoot "SideDock.VirtualCamera.Tool")
+
           Compress-Archive -Path (Join-Path $payloadRoot "*") -DestinationPath .\windows-host\SideDock.Host.App\HostPayload.zip -Force
 
           $platformToolsZip = Join-Path $env:RUNNER_TEMP "platform-tools-latest-windows.zip"

@@ -275,7 +275,6 @@ public sealed partial class MainWindow : Window
     private bool _virtualDisplayModeApplyInProgress;
     private VirtualDisplayModeService.PresentationRollbackToken? _pendingVirtualDisplayPresentationRollback;
     private bool _driverInstallInProgress;
-    private bool _virtualDisplayAutoRestoreInProgress;
     private bool _syncingOverviewCameraOptions;
     private CameraConfigSelection? _deferredCameraCapabilityOptionsRefresh;
     private bool _updatingOverviewCameraSwitch;
@@ -516,10 +515,6 @@ public sealed partial class MainWindow : Window
         _ = RefreshVirtualCameraStatusAsync();
         UpdateOverviewConnectionPage();
         DispatcherQueue.TryEnqueue(UpdateOverviewMainContentMinHeight);
-        if (_appSettings.StartVirtualDisplayWithHost)
-        {
-            DispatcherQueue.TryEnqueue(async () => await RestoreVirtualDisplayAutoManagementAsync("App startup"));
-        }
     }
 
     internal void ApplyLaunchOptions()
@@ -4197,10 +4192,6 @@ public sealed partial class MainWindow : Window
             SyncVirtualDisplayModeSelection(_appSettings.VirtualDisplayResolution, _appSettings.VirtualDisplayRefreshRate);
         }
 
-        if (e.ChangeKind == StaticDisplaySettingsChangeKind.AutoManage && e.AutoManageEnabled)
-        {
-            DispatcherQueue.TryEnqueue(async () => await RestoreVirtualDisplayAutoManagementAsync("Auto manage enabled"));
-        }
     }
 
     private Task<StaticDisplayAutostartChangeResult> StaticDisplayPage_AutostartChangeRequested(
@@ -5328,80 +5319,6 @@ public sealed partial class MainWindow : Window
         }
 
         StopVirtualDisplay();
-    }
-
-    private async Task RestoreVirtualDisplayAutoManagementAsync(string reason)
-    {
-        if (_virtualDisplayAutoRestoreInProgress)
-        {
-            return;
-        }
-
-        if (!_appSettings.StartVirtualDisplayWithHost)
-        {
-            OverviewDisplayPage.AddActivityLog("Auto manage is off; startup restore skipped.", StaticDisplayActivityKind.Info);
-            return;
-        }
-
-        _virtualDisplayAutoRestoreInProgress = true;
-        try
-        {
-            OverviewDisplayPage.AddActivityLog($"Auto manage restore started: {reason}.", StaticDisplayActivityKind.Info);
-
-            if (!IsVirtualDisplayToolRunning())
-            {
-                var started = StartVirtualDisplay(showCopyableError: false, failureAction: "Auto manage could not start virtual display");
-                if (!started)
-                {
-                    OverviewDisplayPage.AddActivityLog(
-                        $"Auto manage could not start virtual display: {FailureSummary(_virtualDisplayLastError)}",
-                        StaticDisplayActivityKind.Failure);
-                    return;
-                }
-            }
-            else
-            {
-                OverviewDisplayPage.AddActivityLog("Virtual display tool is already running.", StaticDisplayActivityKind.Success);
-            }
-
-            var displayLayout = RefreshVirtualDisplayState();
-            if (!displayLayout.HasSideDockVirtualDisplay)
-            {
-                OverviewDisplayPage.AddActivityLog(
-                    "SideDock virtual display is not present yet; display mode restore skipped.",
-                    StaticDisplayActivityKind.Warning);
-                return;
-            }
-
-            var modeResult = await ApplyVirtualDisplayModeSelectionAsync(
-                _appSettings.VirtualDisplayResolution,
-                _appSettings.VirtualDisplayRefreshRate);
-            OverviewDisplayPage.AddActivityLog(
-                modeResult.Success
-                    ? $"Saved display mode restored: {modeResult.CurrentModeText ?? "current mode"}."
-                    : $"Saved display mode restore failed: {modeResult.Message}",
-                modeResult.Success ? StaticDisplayActivityKind.Success : StaticDisplayActivityKind.Failure);
-
-            if (_appSettings.VirtualDisplayPresentationMode == VirtualDisplayPresentationMode.Extend)
-            {
-                var presentationResult = await ApplyVirtualDisplayPresentationModeSelectionAsync(VirtualDisplayPresentationMode.Extend);
-                OverviewDisplayPage.AddActivityLog(
-                    presentationResult.Success
-                        ? presentationResult.Message
-                        : $"Extend mode restore failed: {presentationResult.Message}",
-                    presentationResult.Success ? StaticDisplayActivityKind.Success : StaticDisplayActivityKind.Failure);
-            }
-            else
-            {
-                OverviewDisplayPage.AddActivityLog(
-                    "Mirror and secondary-only modes are not restored automatically at startup; no high-risk topology switch was attempted.",
-                    StaticDisplayActivityKind.Info);
-            }
-        }
-        finally
-        {
-            _virtualDisplayAutoRestoreInProgress = false;
-        }
     }
 
     private async Task<bool> SetOverviewVirtualDisplayEnabledAsync(bool enabled, bool showErrorDialog = true)
