@@ -3,11 +3,13 @@ package com.sidedock.client;
 import android.Manifest;
 import android.content.Context;
 import android.content.pm.PackageManager;
+import android.media.AudioAttributes;
 import android.media.AudioFormat;
 import android.media.AudioManager;
 import android.media.AudioRecord;
 import android.media.AudioTrack;
 import android.media.MediaRecorder;
+import android.os.Build;
 import android.os.Process;
 import java.io.InputStream;
 import java.io.OutputStream;
@@ -29,7 +31,7 @@ public final class AudioCaptureClient {
         void onAudioCaptureState(String state, String message);
         void onAudioCaptureStats(long packetsSent, long bytesSent, int peakSample, long silentPackets, String audioSourceName);
         void onAudioPlaybackState(String state, String message);
-        void onAudioPlaybackStats(long packetsReceived, long bytesReceived, int peakSample, long sourceAgeMs, int playState);
+        void onAudioPlaybackStats(AudioPlaybackStats stats);
         void onAudioTestStatus(AudioTestStatus status);
     }
 
@@ -81,6 +83,79 @@ public final class AudioCaptureClient {
             this.playState = session.playState;
             this.writeErrors = session.writeErrors;
             this.error = error == null ? "" : error;
+        }
+    }
+
+    public static final class AudioPlaybackStats {
+        public final long packetsReceived;
+        public final long bytesReceived;
+        public final int peakSample;
+        public final long sourceAgeMs;
+        public final int playState;
+        public final int trackState;
+        public final int trackSampleRate;
+        public final int trackPlaybackRate;
+        public final int nativeOutputSampleRate;
+        public final int trackBufferSizeFrames;
+        public final int minBufferBytes;
+        public final int playbackBufferBytes;
+        public final int underrunCount;
+        public final int audioSessionId;
+        public final int playbackRateSetResult;
+        public final long writePackets;
+        public final long writeCalls;
+        public final long writeBytes;
+        public final int lastWriteBytes;
+        public final double lastWriteMs;
+        public final double averageWriteMs;
+        public final double maxWriteMs;
+
+        private AudioPlaybackStats(
+            long packetsReceived,
+            long bytesReceived,
+            int peakSample,
+            long sourceAgeMs,
+            int playState,
+            int trackState,
+            int trackSampleRate,
+            int trackPlaybackRate,
+            int nativeOutputSampleRate,
+            int trackBufferSizeFrames,
+            int minBufferBytes,
+            int playbackBufferBytes,
+            int underrunCount,
+            int audioSessionId,
+            int playbackRateSetResult,
+            long writePackets,
+            long writeCalls,
+            long writeBytes,
+            int lastWriteBytes,
+            double lastWriteMs,
+            double averageWriteMs,
+            double maxWriteMs
+        ) {
+            this.packetsReceived = packetsReceived;
+            this.bytesReceived = bytesReceived;
+            this.peakSample = peakSample;
+            this.sourceAgeMs = sourceAgeMs;
+            this.playState = playState;
+            this.trackState = trackState;
+            this.trackSampleRate = trackSampleRate;
+            this.trackPlaybackRate = trackPlaybackRate;
+            this.nativeOutputSampleRate = nativeOutputSampleRate;
+            this.trackBufferSizeFrames = trackBufferSizeFrames;
+            this.minBufferBytes = minBufferBytes;
+            this.playbackBufferBytes = playbackBufferBytes;
+            this.underrunCount = underrunCount;
+            this.audioSessionId = audioSessionId;
+            this.playbackRateSetResult = playbackRateSetResult;
+            this.writePackets = writePackets;
+            this.writeCalls = writeCalls;
+            this.writeBytes = writeBytes;
+            this.lastWriteBytes = lastWriteBytes;
+            this.lastWriteMs = lastWriteMs;
+            this.averageWriteMs = averageWriteMs;
+            this.maxWriteMs = maxWriteMs;
         }
     }
 
@@ -468,14 +543,20 @@ public final class AudioCaptureClient {
             throw new IllegalStateException("Unsupported speaker format; " + generationDetails(runGeneration));
         }
 
-        int playbackBufferBytes = Math.max(minBufferBytes * 2, (sampleRate / 5) * speakerChannels * (BITS_PER_SAMPLE / 8));
-        AudioTrack track = new AudioTrack(
-            AudioManager.STREAM_MUSIC,
-            sampleRate,
-            channelConfig,
-            AudioFormat.ENCODING_PCM_16BIT,
-            playbackBufferBytes,
-            AudioTrack.MODE_STREAM);
+        int lowLatencyBufferBytes = (sampleRate * 60 / 1000) * speakerChannels * (BITS_PER_SAMPLE / 8);
+        int playbackBufferBytes = Math.max(minBufferBytes, lowLatencyBufferBytes);
+        AudioTrack track = createPlaybackTrack(channelConfig, playbackBufferBytes);
+        if (track.getState() != AudioTrack.STATE_INITIALIZED) {
+            int trackState = track.getState();
+            track.release();
+            throw new IllegalStateException("AudioTrack initialization failed: state=" + trackState + "; " + generationDetails(runGeneration));
+        }
+
+        int nativeOutputSampleRate = AudioTrack.getNativeOutputSampleRate(AudioManager.STREAM_MUSIC);
+        int playbackRateSetResult = AudioTrack.SUCCESS;
+        if (track.getPlaybackRate() != sampleRate) {
+            playbackRateSetResult = track.setPlaybackRate(sampleRate);
+        }
 
         byte[] header = new byte[HEADER_SIZE];
         byte[] pcm = new byte[Math.max(MAX_SPEAKER_PAYLOAD_BYTES, playbackBufferBytes)];
@@ -485,6 +566,13 @@ public final class AudioCaptureClient {
         int peakSample = 0;
         long lastSourceAgeMs = 0L;
         boolean playbackStarted = false;
+        long writePackets = 0L;
+        long writeCalls = 0L;
+        long writeBytes = 0L;
+        long totalWriteNanos = 0L;
+        long maxWriteNanos = 0L;
+        int lastWriteBytes = 0;
+        long lastWriteNanos = 0L;
 
         try {
             emitPlaybackState(speakerMuted ? "muted" : "available",
@@ -515,12 +603,19 @@ public final class AudioCaptureClient {
                 peakSample = Math.max(peakSample, calculatePeakSample(pcm, payloadLength));
 
                 if (!speakerMuted) {
-                    if (!playbackStarted) {
-                        track.play();
-                        playbackStarted = true;
-                    }
                     try {
-                        writeTrack(track, pcm, payloadLength, runGeneration);
+                        if (!playbackStarted) {
+                            track.play();
+                            playbackStarted = true;
+                        }
+                        WriteTrackResult writeResult = writeTrack(track, pcm, payloadLength, runGeneration);
+                        writePackets += 1L;
+                        writeCalls += writeResult.writeCalls;
+                        writeBytes += writeResult.bytesWritten;
+                        totalWriteNanos += writeResult.durationNanos;
+                        maxWriteNanos = Math.max(maxWriteNanos, writeResult.durationNanos);
+                        lastWriteBytes = writeResult.bytesWritten;
+                        lastWriteNanos = writeResult.durationNanos;
                         recordPlaybackTestPacket(payloadLength, calculatePeakSample(pcm, payloadLength), track.getPlayState());
                     } catch (Exception ex) {
                         failPlaybackTest("audio_track_write_failed", "AudioTrack write failed: " + exceptionSummary(ex));
@@ -533,12 +628,29 @@ public final class AudioCaptureClient {
                 }
 
                 long now = System.currentTimeMillis();
-                lastSourceAgeMs = Math.max(0L, now - timestampMs);
+                long sourceAgeMs = now - timestampMs;
+                lastSourceAgeMs = sourceAgeMs >= 0L && sourceAgeMs <= 5000L ? sourceAgeMs : 0L;
                 if (packetsReceived == 1L || now - lastStatsAtMs >= 1000L) {
                     lastStatsAtMs = now;
                     emitPlaybackState(speakerMuted ? "muted" : "playing",
                         speakerMuted ? "本机音响已静音。" : "正在播放电脑声音。");
-                    emitPlaybackStats(packetsReceived, bytesReceived, peakSample, lastSourceAgeMs, track.getPlayState());
+                    emitPlaybackStats(createPlaybackStats(
+                        track,
+                        packetsReceived,
+                        bytesReceived,
+                        peakSample,
+                        lastSourceAgeMs,
+                        nativeOutputSampleRate,
+                        minBufferBytes,
+                        playbackBufferBytes,
+                        playbackRateSetResult,
+                        writePackets,
+                        writeCalls,
+                        writeBytes,
+                        lastWriteBytes,
+                        lastWriteNanos,
+                        totalWriteNanos,
+                        maxWriteNanos));
                 }
             }
         } finally {
@@ -547,6 +659,38 @@ public final class AudioCaptureClient {
             } catch (Exception ignored) {
             }
             track.release();
+        }
+    }
+
+    private AudioTrack createPlaybackTrack(int channelConfig, int playbackBufferBytes) {
+        AudioAttributes attributes = new AudioAttributes.Builder()
+            .setUsage(AudioAttributes.USAGE_MEDIA)
+            .setContentType(AudioAttributes.CONTENT_TYPE_MUSIC)
+            .build();
+        AudioFormat format = new AudioFormat.Builder()
+            .setSampleRate(sampleRate)
+            .setChannelMask(channelConfig)
+            .setEncoding(AudioFormat.ENCODING_PCM_16BIT)
+            .build();
+        try {
+            AudioTrack.Builder builder = new AudioTrack.Builder()
+                .setAudioAttributes(attributes)
+                .setAudioFormat(format)
+                .setTransferMode(AudioTrack.MODE_STREAM)
+                .setBufferSizeInBytes(playbackBufferBytes);
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                builder.setPerformanceMode(AudioTrack.PERFORMANCE_MODE_LOW_LATENCY);
+            }
+
+            return builder.build();
+        } catch (RuntimeException ex) {
+            return new AudioTrack(
+                AudioManager.STREAM_MUSIC,
+                sampleRate,
+                channelConfig,
+                AudioFormat.ENCODING_PCM_16BIT,
+                playbackBufferBytes,
+                AudioTrack.MODE_STREAM);
         }
     }
 
@@ -843,12 +987,14 @@ public final class AudioCaptureClient {
         }
     }
 
-    private void writeTrack(AudioTrack track, byte[] pcm, int byteCount, long runGeneration) {
+    private WriteTrackResult writeTrack(AudioTrack track, byte[] pcm, int byteCount, long runGeneration) {
         int offset = 0;
+        int writeCalls = 0;
+        long startedAtNanos = System.nanoTime();
         while (offset < byteCount) {
             int written;
             try {
-                written = track.write(pcm, offset, byteCount - offset);
+                written = track.write(pcm, offset, byteCount - offset, AudioTrack.WRITE_BLOCKING);
             } catch (Exception ex) {
                 throw phaseException("write playback AudioTrack", ex, runGeneration);
             }
@@ -856,7 +1002,10 @@ public final class AudioCaptureClient {
                 throw new IllegalStateException("AudioTrack write failed: " + written + "; " + generationDetails(runGeneration));
             }
             offset += written;
+            writeCalls += 1;
         }
+
+        return new WriteTrackResult(offset, writeCalls, System.nanoTime() - startedAtNanos);
     }
 
     private boolean isCurrentGeneration(long runGeneration) {
@@ -960,8 +1109,56 @@ public final class AudioCaptureClient {
         listener.onAudioPlaybackState(state, message);
     }
 
-    private void emitPlaybackStats(long packetsReceived, long bytesReceived, int peakSample, long sourceAgeMs, int playState) {
-        listener.onAudioPlaybackStats(packetsReceived, bytesReceived, peakSample, sourceAgeMs, playState);
+    private void emitPlaybackStats(AudioPlaybackStats stats) {
+        listener.onAudioPlaybackStats(stats);
+    }
+
+    private AudioPlaybackStats createPlaybackStats(
+        AudioTrack track,
+        long packetsReceived,
+        long bytesReceived,
+        int peakSample,
+        long sourceAgeMs,
+        int nativeOutputSampleRate,
+        int minBufferBytes,
+        int playbackBufferBytes,
+        int playbackRateSetResult,
+        long writePackets,
+        long writeCalls,
+        long writeBytes,
+        int lastWriteBytes,
+        long lastWriteNanos,
+        long totalWriteNanos,
+        long maxWriteNanos
+    ) {
+        double averageWriteMs = writePackets <= 0L ? 0.0d : nanosToMillis(totalWriteNanos) / writePackets;
+        return new AudioPlaybackStats(
+            packetsReceived,
+            bytesReceived,
+            peakSample,
+            sourceAgeMs,
+            track.getPlayState(),
+            track.getState(),
+            track.getSampleRate(),
+            track.getPlaybackRate(),
+            nativeOutputSampleRate,
+            track.getBufferSizeInFrames(),
+            minBufferBytes,
+            playbackBufferBytes,
+            track.getUnderrunCount(),
+            track.getAudioSessionId(),
+            playbackRateSetResult,
+            writePackets,
+            writeCalls,
+            writeBytes,
+            lastWriteBytes,
+            nanosToMillis(lastWriteNanos),
+            averageWriteMs,
+            nanosToMillis(maxWriteNanos));
+    }
+
+    private static double nanosToMillis(long nanos) {
+        return Math.max(0.0d, nanos / 1_000_000.0d);
     }
 
     private static final class WorkerFailure {
@@ -971,6 +1168,18 @@ public final class AudioCaptureClient {
         private WorkerFailure(String worker, Exception exception) {
             this.worker = worker;
             this.exception = exception;
+        }
+    }
+
+    private static final class WriteTrackResult {
+        private final int bytesWritten;
+        private final int writeCalls;
+        private final long durationNanos;
+
+        private WriteTrackResult(int bytesWritten, int writeCalls, long durationNanos) {
+            this.bytesWritten = bytesWritten;
+            this.writeCalls = writeCalls;
+            this.durationNanos = durationNanos;
         }
     }
 
