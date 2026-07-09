@@ -1107,6 +1107,8 @@ internal static partial class Program
         private AudioConnectionSnapshot _connection = AudioConnectionSnapshot.Disconnected;
         private AudioDirectionSnapshot _microphone = AudioDirectionSnapshot.Unknown("microphone");
         private AudioDirectionSnapshot _speaker = AudioDirectionSnapshot.Unknown("speaker");
+        private Func<CancellationToken, Task>? _playbackTonePump;
+        private long _playbackTonePumpVersion;
 
         public async Task<AudioTestCommandResult> RunCommandAsync(JsonObject payload, CancellationToken cancellationToken)
         {
@@ -1157,9 +1159,14 @@ internal static partial class Program
         {
             lock (_lock)
             {
-                _connection = connected
-                    ? new AudioConnectionSnapshot(true, connectionId, microphoneEnabled, speakerEnabled)
-                    : AudioConnectionSnapshot.Disconnected;
+                if (connected)
+                {
+                    _connection = new AudioConnectionSnapshot(true, connectionId, microphoneEnabled, speakerEnabled);
+                }
+                else if (_connection.ConnectionId == connectionId)
+                {
+                    _connection = AudioConnectionSnapshot.Disconnected;
+                }
             }
         }
 
@@ -1180,6 +1187,44 @@ internal static partial class Program
                 else
                 {
                     _speaker = snapshot;
+                }
+            }
+        }
+
+        public long RegisterPlaybackTonePump(Func<CancellationToken, Task> pump)
+        {
+            ArgumentNullException.ThrowIfNull(pump);
+            bool startPump = false;
+            long version;
+            lock (_lock)
+            {
+                _playbackTonePump = pump;
+                _playbackTonePumpVersion += 1;
+                version = _playbackTonePumpVersion;
+                if (_activeSession is { Kind: AudioTestKind.Playback, IsHostPlaybackComplete: false } session
+                    && HasRunningAndroidPlaybackStatus(session))
+                {
+                    session.PlaybackPumpStarted = true;
+                    startPump = true;
+                }
+            }
+
+            if (startPump)
+            {
+                Log("AUDIO TEST", $"playback tone pump starting after registration version={version}");
+                _ = Task.Run(() => RunPlaybackTonePumpAsync(pump), CancellationToken.None);
+            }
+
+            return version;
+        }
+
+        public void UnregisterPlaybackTonePump(long version)
+        {
+            lock (_lock)
+            {
+                if (version == _playbackTonePumpVersion)
+                {
+                    _playbackTonePump = null;
                 }
             }
         }
@@ -1267,6 +1312,7 @@ internal static partial class Program
 
             AudioTestSession? session;
             AudioTestCommandResult? result = null;
+            Func<CancellationToken, Task>? playbackTonePump = null;
             lock (_lock)
             {
                 session = _activeSession;
@@ -1278,6 +1324,17 @@ internal static partial class Program
                 session.AndroidPayload = CloneJsonObject(payload);
                 session.AndroidUpdatedAtUnixMs = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds();
                 var status = ReadString(payload, "status");
+                if (session.Kind == AudioTestKind.Playback
+                    && !session.PlaybackPumpStarted
+                    && status.Equals("running", StringComparison.OrdinalIgnoreCase))
+                {
+                    playbackTonePump = _playbackTonePump;
+                    if (playbackTonePump is not null)
+                    {
+                        session.PlaybackPumpStarted = true;
+                    }
+                }
+
                 if (IsTerminalStatus(status))
                 {
                     session.HostStats.CompletedAtUnixMs ??= DateTimeOffset.UtcNow.ToUnixTimeMilliseconds();
@@ -1286,12 +1343,52 @@ internal static partial class Program
                 }
             }
 
+            if (playbackTonePump is not null)
+            {
+                _ = Task.Run(() => RunPlaybackTonePumpAsync(playbackTonePump), CancellationToken.None);
+            }
+            else if (session.Kind == AudioTestKind.Playback
+                && !session.IsHostPlaybackComplete
+                && ReadString(payload, "status").Equals("running", StringComparison.OrdinalIgnoreCase))
+            {
+                Log("AUDIO TEST", $"playback tone pump unavailable testId={session.TestId}");
+            }
+
             if (result is not null)
             {
                 Log(
                     "AUDIO TEST",
                     $"complete kind={result.Kind} testId={result.TestId} status={result.Status} ok={result.Ok} message={result.Message}");
             }
+        }
+
+        private static async Task RunPlaybackTonePumpAsync(Func<CancellationToken, Task> playbackTonePump)
+        {
+            try
+            {
+                await playbackTonePump(CancellationToken.None);
+            }
+            catch (OperationCanceledException)
+            {
+                // The active audio connection was replaced or stopped while the test was ending.
+            }
+            catch (Exception ex)
+            {
+                Log("AUDIO TEST", $"playback tone pump failed exception={ex.GetType().Name} message={CleanLogValue(ex.Message)}");
+            }
+        }
+
+        private static string CleanLogValue(string? value)
+        {
+            return string.IsNullOrWhiteSpace(value)
+                ? "(none)"
+                : value.Replace('\r', ' ').Replace('\n', ' ').Trim();
+        }
+
+        private static bool HasRunningAndroidPlaybackStatus(AudioTestSession session)
+        {
+            return session.AndroidPayload is not null
+                && ReadString(session.AndroidPayload, "status").Equals("running", StringComparison.OrdinalIgnoreCase);
         }
 
         private bool TryCreateSession(
@@ -1710,6 +1807,8 @@ internal static partial class Program
             public long? AndroidUpdatedAtUnixMs { get; set; }
 
             public long PlaybackFramesGenerated { get; set; }
+
+            public bool PlaybackPumpStarted { get; set; }
 
             public bool IsHostPlaybackComplete { get; set; }
         }

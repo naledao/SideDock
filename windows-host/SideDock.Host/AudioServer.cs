@@ -100,7 +100,6 @@ internal static partial class Program
                         UpdateReconnectCount(reconnectCount);
                         Log("AUDIO", "检测到新的音频连接，关闭旧连接。");
                         await CancelPreviousConnectionAsync(previousConnectionCts);
-                        await WaitForPreviousConnectionAsync(previousConnectionTask, cancellationToken);
                     }
 
                     var connectionTask = Task.Run(
@@ -112,6 +111,13 @@ internal static partial class Program
                         {
                             _activeConnectionTask = connectionTask;
                         }
+                    }
+
+                    if (previousConnectionTask is not null)
+                    {
+                        _ = Task.Run(
+                            () => WaitForPreviousConnectionAsync(previousConnectionTask, cancellationToken),
+                            CancellationToken.None);
                     }
                 }
             }
@@ -238,6 +244,7 @@ internal static partial class Program
             CancellationToken appToken)
         {
             var directionTasks = new List<Task<AudioDirectionCompletion>>(2);
+            long playbackPumpRegistration = 0;
             using (client)
             using (connectionCts)
             {
@@ -260,19 +267,24 @@ internal static partial class Program
                 {
                     client.NoDelay = true;
                     var stream = client.GetStream();
+                    SpeakerConnectionState? speakerConnection = null;
+                    if (options.SpeakerEnabled)
+                    {
+                        speakerConnection = new SpeakerConnectionState();
+                        playbackPumpRegistration = audioTestCoordinator.RegisterPlaybackTonePump(
+                            _ => PumpPlaybackToneAsync(connectionId, stream, speakerConnection, connectionCts.Token));
+                        Log($"AUDIO {connectionId}", $"playback-test-pump registered version={playbackPumpRegistration}");
+                        directionTasks.Add(MonitorAudioDirectionAsync(
+                            "SendSpeakerAsync",
+                            token => SendSpeakerAsync(connectionId, stream, speakerConnection, token),
+                            connectionCts.Token));
+                    }
+
                     if (options.MicrophoneEnabled)
                     {
                         directionTasks.Add(MonitorAudioDirectionAsync(
                             "ReceiveMicrophoneAsync",
                             token => ReceiveMicrophoneAsync(connectionId, stream, token),
-                            connectionCts.Token));
-                    }
-
-                    if (options.SpeakerEnabled)
-                    {
-                        directionTasks.Add(MonitorAudioDirectionAsync(
-                            "SendSpeakerAsync",
-                            token => SendSpeakerAsync(connectionId, stream, token),
                             connectionCts.Token));
                     }
 
@@ -363,6 +375,12 @@ internal static partial class Program
                 }
                 finally
                 {
+                    if (playbackPumpRegistration != 0)
+                    {
+                        audioTestCoordinator.UnregisterPlaybackTonePump(playbackPumpRegistration);
+                        Log($"AUDIO {connectionId}", $"playback-test-pump unregistered version={playbackPumpRegistration}");
+                    }
+
                     var disconnectCount = Interlocked.Increment(ref _disconnectCount);
                     UpdateDisconnectCount(disconnectCount);
                     Log($"AUDIO {connectionId}", $"准备关闭音频 socket beforeCancel={DescribeSocket(client)}");
@@ -500,12 +518,14 @@ internal static partial class Program
             }
         }
 
-        private async Task SendSpeakerAsync(int connectionId, Stream stream, CancellationToken cancellationToken)
+        private async Task SendSpeakerAsync(
+            int connectionId,
+            Stream stream,
+            SpeakerConnectionState speakerConnection,
+            CancellationToken cancellationToken)
         {
             var header = ArrayPool<byte>.Shared.Rent(HeaderSize);
             var payload = ArrayPool<byte>.Shared.Rent(SpeakerChunkBytes);
-            long packetCount = 0;
-            long byteCount = 0;
             var lastStatsAt = DateTimeOffset.MinValue;
             var lastUnavailableAt = DateTimeOffset.MinValue;
 
@@ -515,20 +535,22 @@ internal static partial class Program
                 {
                     if (audioTestCoordinator.TryReadPlaybackTone(payload, SpeakerChunkBytes, out var testBytesRead))
                     {
-                        packetCount += 1;
-                        byteCount += testBytesRead;
                         var testNowMs = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds();
-                        WriteHeader(header, SpeakerMagic, packetCount, testNowMs, AudioDefaults.SpeakerChannels, testBytesRead);
-                        await stream.WriteAsync(header.AsMemory(0, HeaderSize), cancellationToken);
-                        await stream.WriteAsync(payload.AsMemory(0, testBytesRead), cancellationToken);
-                        await stream.FlushAsync(cancellationToken);
+                        var testSent = await WriteSpeakerPacketAsync(
+                            stream,
+                            speakerConnection,
+                            header,
+                            payload,
+                            testBytesRead,
+                            testNowMs,
+                            cancellationToken);
 
                         UpdateDirectionTelemetry(
                             AudioRuntimeDirection.Speaker,
                             state: "playing",
                             message: "正在发送播放测试音到 Android。",
-                            packets: packetCount,
-                            bytes: byteCount,
+                            packets: testSent.PacketCount,
+                            bytes: testSent.ByteCount,
                             levelPercent: CalculatePcm16LevelPercent(payload, testBytesRead),
                             lastPacketUnixMs: testNowMs,
                             sourceAgeMs: 0,
@@ -538,8 +560,8 @@ internal static partial class Program
                             "playing",
                             "正在发送播放测试音到 Android。",
                             cancellationToken,
-                            packetCount,
-                            byteCount);
+                            testSent.PacketCount,
+                            testSent.ByteCount);
                         await Task.Delay(20, cancellationToken);
                         continue;
                     }
@@ -558,7 +580,13 @@ internal static partial class Program
                                 message: readResult.Message,
                                 endpointReady: false,
                                 lastError: readResult.Message);
-                            await PublishSpeakerStatusAsync("unavailable", readResult.Message, cancellationToken, packetCount, byteCount);
+                            var snapshot = speakerConnection.Snapshot();
+                            await PublishSpeakerStatusAsync(
+                                "unavailable",
+                                readResult.Message,
+                                cancellationToken,
+                                snapshot.PacketCount,
+                                snapshot.ByteCount);
                         }
 
                         await Task.Delay(250, cancellationToken);
@@ -571,52 +599,60 @@ internal static partial class Program
                         var waitingNow = DateTimeOffset.UtcNow;
                         if (lastStatsAt == DateTimeOffset.MinValue || waitingNow - lastStatsAt >= TimeSpan.FromSeconds(1))
                         {
+                            var snapshot = speakerConnection.Snapshot();
                             lastStatsAt = waitingNow;
                             Log("AUDIO", $"speaker-state=available backend={_audioBackend.Name} system-endpoint=ready");
                             UpdateDirectionTelemetry(
                                 AudioRuntimeDirection.Speaker,
                                 state: "available",
                                 message: "等待所选 Windows 输出设备产生声音。",
-                                packets: packetCount,
-                                bytes: byteCount,
+                                packets: snapshot.PacketCount,
+                                bytes: snapshot.ByteCount,
                                 levelPercent: 0,
                                 endpointReady: true);
-                            await PublishSpeakerStatusAsync("available", "等待所选 Windows 输出设备产生声音。", cancellationToken);
+                            await PublishSpeakerStatusAsync(
+                                "available",
+                                "等待所选 Windows 输出设备产生声音。",
+                                cancellationToken,
+                                snapshot.PacketCount,
+                                snapshot.ByteCount);
                         }
 
                         await Task.Delay(10, cancellationToken);
                         continue;
                     }
 
-                    packetCount += 1;
-                    byteCount += bytesRead;
                     var nowMs = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds();
-                    WriteHeader(header, SpeakerMagic, packetCount, nowMs, AudioDefaults.SpeakerChannels, bytesRead);
-                    await stream.WriteAsync(header.AsMemory(0, HeaderSize), cancellationToken);
-                    await stream.WriteAsync(payload.AsMemory(0, bytesRead), cancellationToken);
-                    await stream.FlushAsync(cancellationToken);
+                    var sent = await WriteSpeakerPacketAsync(
+                        stream,
+                        speakerConnection,
+                        header,
+                        payload,
+                        bytesRead,
+                        nowMs,
+                        cancellationToken);
 
                     var now = DateTimeOffset.UtcNow;
                     UpdateDirectionTelemetry(
                         AudioRuntimeDirection.Speaker,
                         state: "playing",
                         message: "电脑输出正在发送到 Android 播放。",
-                        packets: packetCount,
-                        bytes: byteCount,
+                        packets: sent.PacketCount,
+                        bytes: sent.ByteCount,
                         levelPercent: CalculatePcm16LevelPercent(payload, bytesRead),
                         lastPacketUnixMs: now.ToUnixTimeMilliseconds(),
                         sourceAgeMs: 0,
                         approximateLatencyMs: 0,
                         endpointReady: true);
-                    if (packetCount == 1 || now - lastStatsAt >= TimeSpan.FromSeconds(1))
+                    if (sent.PacketCount == 1 || now - lastStatsAt >= TimeSpan.FromSeconds(1))
                     {
-                        Log("AUDIO", $"speaker-state=playing backend={_audioBackend.Name} packets={packetCount} bytes={byteCount} system-endpoint=ready");
+                        Log("AUDIO", $"speaker-state=playing backend={_audioBackend.Name} packets={sent.PacketCount} bytes={sent.ByteCount} system-endpoint=ready");
                         await PublishSpeakerStatusAsync(
                             "playing",
                             "电脑输出正在发送到 Android 播放。",
                             cancellationToken,
-                            packetCount,
-                            byteCount);
+                            sent.PacketCount,
+                            sent.ByteCount);
                         lastStatsAt = now;
                     }
                 }
@@ -647,6 +683,95 @@ internal static partial class Program
             }
         }
 
+        private async Task PumpPlaybackToneAsync(
+            int connectionId,
+            Stream stream,
+            SpeakerConnectionState speakerConnection,
+            CancellationToken cancellationToken)
+        {
+            var header = ArrayPool<byte>.Shared.Rent(HeaderSize);
+            var payload = ArrayPool<byte>.Shared.Rent(SpeakerChunkBytes);
+
+            try
+            {
+                Log($"AUDIO {connectionId}", "playback-test-pump started");
+                while (!cancellationToken.IsCancellationRequested
+                    && audioTestCoordinator.TryReadPlaybackTone(payload, SpeakerChunkBytes, out var bytesRead))
+                {
+                    var nowMs = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds();
+                    var sent = await WriteSpeakerPacketAsync(
+                        stream,
+                        speakerConnection,
+                        header,
+                        payload,
+                        bytesRead,
+                        nowMs,
+                        cancellationToken);
+
+                    UpdateDirectionTelemetry(
+                        AudioRuntimeDirection.Speaker,
+                        state: "playing",
+                        message: "正在发送播放测试音到 Android。",
+                        packets: sent.PacketCount,
+                        bytes: sent.ByteCount,
+                        levelPercent: CalculatePcm16LevelPercent(payload, bytesRead),
+                        lastPacketUnixMs: nowMs,
+                        sourceAgeMs: 0,
+                        approximateLatencyMs: 0,
+                        endpointReady: true);
+                    await PublishSpeakerStatusAsync(
+                        "playing",
+                        "正在发送播放测试音到 Android。",
+                        cancellationToken,
+                        sent.PacketCount,
+                        sent.ByteCount);
+
+                    await Task.Delay(20, cancellationToken);
+                }
+
+                Log($"AUDIO {connectionId}", "playback-test-pump completed");
+            }
+            catch (OperationCanceledException)
+            {
+                throw;
+            }
+            catch (Exception ex)
+            {
+                Log($"AUDIO {connectionId}", $"playback-test-pump failed exception={ex.GetType().Name} message={LogValue(ex.Message)}");
+                throw;
+            }
+            finally
+            {
+                ArrayPool<byte>.Shared.Return(header);
+                ArrayPool<byte>.Shared.Return(payload);
+            }
+        }
+
+        private static async Task<SpeakerSendSnapshot> WriteSpeakerPacketAsync(
+            Stream stream,
+            SpeakerConnectionState speakerConnection,
+            byte[] header,
+            byte[] payload,
+            int byteCount,
+            long timestampMs,
+            CancellationToken cancellationToken)
+        {
+            await speakerConnection.WriteLock.WaitAsync(cancellationToken);
+            try
+            {
+                var snapshot = speakerConnection.AddPacket(byteCount);
+                WriteHeader(header, SpeakerMagic, snapshot.PacketCount, timestampMs, AudioDefaults.SpeakerChannels, byteCount);
+                await stream.WriteAsync(header.AsMemory(0, HeaderSize), cancellationToken);
+                await stream.WriteAsync(payload.AsMemory(0, byteCount), cancellationToken);
+                await stream.FlushAsync(cancellationToken);
+                return snapshot;
+            }
+            finally
+            {
+                speakerConnection.WriteLock.Release();
+            }
+        }
+
         private enum AudioDirectionEndKind
         {
             Normal,
@@ -662,6 +787,30 @@ internal static partial class Program
             AudioDirectionEndKind Kind,
             string ExceptionType,
             string Message);
+
+        private sealed class SpeakerConnectionState
+        {
+            private long _packetCount;
+            private long _byteCount;
+
+            public SemaphoreSlim WriteLock { get; } = new(1, 1);
+
+            public SpeakerSendSnapshot AddPacket(int byteCount)
+            {
+                var packetCount = Interlocked.Increment(ref _packetCount);
+                var totalBytes = Interlocked.Add(ref _byteCount, Math.Max(0, byteCount));
+                return new SpeakerSendSnapshot(packetCount, totalBytes);
+            }
+
+            public SpeakerSendSnapshot Snapshot()
+            {
+                return new SpeakerSendSnapshot(
+                    Interlocked.Read(ref _packetCount),
+                    Interlocked.Read(ref _byteCount));
+            }
+        }
+
+        private sealed record SpeakerSendSnapshot(long PacketCount, long ByteCount);
 
         private static async Task<AudioDirectionCompletion> MonitorAudioDirectionAsync(
             string taskName,
@@ -747,6 +896,10 @@ internal static partial class Program
             {
                 return $"socket-error:{ex.SocketErrorCode}";
             }
+            catch (NullReferenceException)
+            {
+                return "socket-null";
+            }
         }
 
         private static string DescribeSocket(TcpClient client)
@@ -768,15 +921,20 @@ internal static partial class Program
             {
                 return $"socket-invalid={LogValue(ex.Message)}";
             }
+            catch (NullReferenceException)
+            {
+                return "socket-null";
+            }
         }
 
         private static void CloseAudioSocket(TcpClient client)
         {
             try
             {
-                client.Client.Shutdown(SocketShutdown.Both);
+                var socket = client.Client;
+                socket?.Shutdown(SocketShutdown.Both);
             }
-            catch (Exception ex) when (ex is ObjectDisposedException or SocketException or InvalidOperationException)
+            catch (Exception ex) when (ex is ObjectDisposedException or SocketException or InvalidOperationException or NullReferenceException)
             {
                 // The socket may already be closed by Android or by the opposite audio worker.
             }
