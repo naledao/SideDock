@@ -255,6 +255,23 @@ public final class MainActivity extends Activity implements ControlClient.Listen
     private double speakerPacketsPerSecond;
     private double speakerBytesPerSecond;
     private int speakerPlayState;
+    private int speakerTrackState;
+    private int speakerTrackSampleRate;
+    private int speakerTrackPlaybackRate;
+    private int speakerNativeOutputSampleRate;
+    private int speakerTrackBufferSizeFrames;
+    private int speakerMinBufferBytes;
+    private int speakerPlaybackBufferBytes;
+    private int speakerUnderrunCount;
+    private int speakerAudioSessionId;
+    private int speakerPlaybackRateSetResult;
+    private long speakerWritePackets;
+    private long speakerWriteCalls;
+    private long speakerWriteBytes;
+    private int speakerLastWriteBytes;
+    private double speakerLastWriteMs;
+    private double speakerAverageWriteMs;
+    private double speakerMaxWriteMs;
     private String cameraRuntimeState = "disconnected";
     private String lastCameraHint = "Waiting for camera configuration.";
     private long cameraPacketsSent;
@@ -626,15 +643,32 @@ public final class MainActivity extends Activity implements ControlClient.Listen
     }
 
     @Override
-    public void onAudioPlaybackStats(long packetsReceived, long bytesReceived, int peakSample, long sourceAgeMs, int playState) {
+    public void onAudioPlaybackStats(AudioCaptureClient.AudioPlaybackStats stats) {
         mainHandler.post(new Runnable() {
             @Override
             public void run() {
-                speakerPacketsReceived = packetsReceived;
-                speakerBytesReceived = bytesReceived;
-                speakerPeakSample = peakSample;
-                speakerSourceAgeMs = sourceAgeMs;
-                speakerPlayState = playState;
+                speakerPacketsReceived = stats.packetsReceived;
+                speakerBytesReceived = stats.bytesReceived;
+                speakerPeakSample = stats.peakSample;
+                speakerSourceAgeMs = stats.sourceAgeMs;
+                speakerPlayState = stats.playState;
+                speakerTrackState = stats.trackState;
+                speakerTrackSampleRate = stats.trackSampleRate;
+                speakerTrackPlaybackRate = stats.trackPlaybackRate;
+                speakerNativeOutputSampleRate = stats.nativeOutputSampleRate;
+                speakerTrackBufferSizeFrames = stats.trackBufferSizeFrames;
+                speakerMinBufferBytes = stats.minBufferBytes;
+                speakerPlaybackBufferBytes = stats.playbackBufferBytes;
+                speakerUnderrunCount = stats.underrunCount;
+                speakerAudioSessionId = stats.audioSessionId;
+                speakerPlaybackRateSetResult = stats.playbackRateSetResult;
+                speakerWritePackets = stats.writePackets;
+                speakerWriteCalls = stats.writeCalls;
+                speakerWriteBytes = stats.writeBytes;
+                speakerLastWriteBytes = stats.lastWriteBytes;
+                speakerLastWriteMs = stats.lastWriteMs;
+                speakerAverageWriteMs = stats.averageWriteMs;
+                speakerMaxWriteMs = stats.maxWriteMs;
                 speakerLastPacketUnixMs = System.currentTimeMillis();
                 updateAudioRateCounters(false, speakerLastPacketUnixMs);
                 publishAudioSpeakerStatus(speakerMuted ? "muted" : "playing",
@@ -2133,6 +2167,23 @@ public final class MainActivity extends Activity implements ControlClient.Listen
             speakerSourceAgeMs,
             speakerLastPacketUnixMs,
             speakerPlayState,
+            speakerTrackState,
+            speakerTrackSampleRate,
+            speakerTrackPlaybackRate,
+            speakerNativeOutputSampleRate,
+            speakerTrackBufferSizeFrames,
+            speakerMinBufferBytes,
+            speakerPlaybackBufferBytes,
+            speakerUnderrunCount,
+            speakerAudioSessionId,
+            speakerPlaybackRateSetResult,
+            speakerWritePackets,
+            speakerWriteCalls,
+            speakerWriteBytes,
+            speakerLastWriteBytes,
+            speakerLastWriteMs,
+            speakerAverageWriteMs,
+            speakerMaxWriteMs,
             audioLastError(speakerRuntimeState)
         );
     }

@@ -2411,7 +2411,7 @@ internal static partial class Program
                         }
                         else
                         {
-                            Log(Scope, $"{message.Type} payload={message.Payload}");
+                            Log(Scope, $"{message.Type} payload={FormatJsonPayloadForLog(message.Payload)}");
                             if (message.Type == "audio_mic_status")
                             {
                                 LogAudioMicrophoneStatus(message.Payload);
@@ -2419,6 +2419,10 @@ internal static partial class Program
                             else if (message.Type == "audio_speaker_status")
                             {
                                 LogAudioSpeakerStatus(message.Payload);
+                            }
+                            else if (message.Type == "audio_runtime_telemetry")
+                            {
+                                LogAudioRuntimeTelemetry(message.Payload);
                             }
                             else if (message.Type == "camera_status")
                             {
@@ -2432,7 +2436,7 @@ internal static partial class Program
                 case "audio_test_status":
                     if (message.Payload is JsonObject audioTestPayload)
                     {
-                        Log(Scope, $"audio_test_status payload={audioTestPayload}");
+                        Log(Scope, $"audio_test_status payload={FormatJsonPayloadForLog(audioTestPayload)}");
                         _audioTestCoordinator.HandleAndroidStatus(audioTestPayload);
                     }
 
@@ -2513,6 +2517,56 @@ internal static partial class Program
                 + $"queued={ReadBool(payload, "pointerAbsControlQueued")} "
                 + $"pendingLatest={ReadBool(payload, "pointerAbsControlPendingLatest")} "
                 + $"last={SanitizeLogValue(ReadString(payload, "lastInputType"))}");
+        }
+
+        private void LogAudioRuntimeTelemetry(JsonNode payloadNode)
+        {
+            if (payloadNode is not JsonObject payload)
+            {
+                return;
+            }
+
+            var microphone = ReadObject(payload, "microphone");
+            var speaker = ReadObject(payload, "speaker");
+            var origin = ReadString(payload, "origin");
+            if (string.IsNullOrWhiteSpace(origin))
+            {
+                origin = "unknown";
+            }
+
+            var androidControlConnected = payload.TryGetPropertyValue("androidControlConnected", out _)
+                ? ReadBool(payload, "androidControlConnected")
+                : origin.Equals("android", StringComparison.OrdinalIgnoreCase);
+
+            Log(
+                "AUDIO",
+                "runtime-telemetry"
+                + $" origin={origin}"
+                + $" audioPort={ReadLong(payload, "audioPort")}"
+                + $" androidControlConnected={androidControlConnected}"
+                + $" micState={ReadStringOrEmpty(microphone, "state")}"
+                + $" micMuted={ReadBoolOrFalse(microphone, "muted")}"
+                + $" micPermission={ReadBoolOrFalse(microphone, "permissionGranted")}"
+                + $" micPackets={ReadLongOrZero(microphone, "packets")}"
+                + $" micBytes={ReadLongOrZero(microphone, "bytes")}"
+                + $" micPps={ReadDoubleOrZero(microphone, "packetsPerSecond"):F2}"
+                + $" micLevel={ReadLongOrZero(microphone, "levelPercent")}"
+                + $" micPeak={ReadLongOrZero(microphone, "peakSample")}"
+                + $" micSilentPackets={ReadLongOrZero(microphone, "silentPackets")}"
+                + $" micLastPacketAgeMs={ReadLongOrZero(microphone, "lastPacketAgeMs")}"
+                + $" micSource={SanitizeLogValue(ReadStringOrEmpty(microphone, "audioSource"))}"
+                + $" micError={SanitizeLogValue(ReadStringOrEmpty(microphone, "lastError"))}"
+                + $" speakerState={ReadStringOrEmpty(speaker, "state")}"
+                + $" speakerMuted={ReadBoolOrFalse(speaker, "muted")}"
+                + $" speakerPackets={ReadLongOrZero(speaker, "packets")}"
+                + $" speakerBytes={ReadLongOrZero(speaker, "bytes")}"
+                + $" speakerPps={ReadDoubleOrZero(speaker, "packetsPerSecond"):F2}"
+                + $" speakerLevel={ReadLongOrZero(speaker, "levelPercent")}"
+                + $" speakerSourceAgeMs={ReadLongOrZero(speaker, "sourceAgeMs")}"
+                + $" speakerLastPacketAgeMs={ReadLongOrZero(speaker, "lastPacketAgeMs")}"
+                + $" speakerPlayState={ReadLongOrZero(speaker, "playState")}"
+                + $" speakerUnderruns={ReadLongOrZero(speaker, "underrunCount")}"
+                + $" speakerError={SanitizeLogValue(ReadStringOrEmpty(speaker, "lastError"))}");
         }
 
         private void LogAudioMicrophoneStatus(JsonNode payloadNode)
@@ -2626,7 +2680,7 @@ internal static partial class Program
                 return ValueTask.CompletedTask;
             }
 
-            Log(Scope, $"video_error payload={payload}");
+            Log(Scope, $"video_error payload={FormatJsonPayloadForLog(payload)}");
             var code = ReadString(payload, "code");
             if (!string.Equals(code, "DECODER_UNSUPPORTED", StringComparison.OrdinalIgnoreCase))
             {
@@ -2653,6 +2707,36 @@ internal static partial class Program
             }
 
             return 60;
+        }
+
+        private static string FormatJsonPayloadForLog(JsonNode payloadNode)
+        {
+            return payloadNode.ToJsonString(JsonOptions);
+        }
+
+        private static JsonObject? ReadObject(JsonObject payload, string name)
+        {
+            return payload.TryGetPropertyValue(name, out var node) ? node as JsonObject : null;
+        }
+
+        private static long ReadLongOrZero(JsonObject? payload, string name)
+        {
+            return payload is null ? 0 : ReadLong(payload, name);
+        }
+
+        private static bool ReadBoolOrFalse(JsonObject? payload, string name)
+        {
+            return payload is not null && ReadBool(payload, name);
+        }
+
+        private static double ReadDoubleOrZero(JsonObject? payload, string name)
+        {
+            return payload is null ? 0 : ReadDouble(payload, name);
+        }
+
+        private static string ReadStringOrEmpty(JsonObject? payload, string name)
+        {
+            return payload is null ? string.Empty : ReadString(payload, name);
         }
 
         private static long ReadLong(JsonObject payload, string name)

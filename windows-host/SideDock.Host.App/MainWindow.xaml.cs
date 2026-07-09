@@ -14020,6 +14020,7 @@ public sealed partial class MainWindow : Window
         var payloadText = line[(payloadIndex + payloadMarker.Length)..].Trim();
         if (!TryExtractJsonObject(payloadText, out var json))
         {
+            AppendRecentAudioLogLine($"audio_runtime_telemetry parse skipped: incomplete JSON payload; line={TrimLogLineForDiagnostics(line, 320)}");
             return false;
         }
 
@@ -14031,9 +14032,17 @@ public sealed partial class MainWindow : Window
         }
         catch (JsonException ex)
         {
-            AppendRecentAudioLogLine($"audio_runtime_telemetry parse failed: {ex.Message}");
+            AppendRecentAudioLogLine($"audio_runtime_telemetry parse failed: {ex.Message}; line={TrimLogLineForDiagnostics(line, 320)}");
             return false;
         }
+    }
+
+    private static string TrimLogLineForDiagnostics(string value, int maxLength)
+    {
+        var normalized = value.Replace('\r', ' ').Replace('\n', ' ');
+        return normalized.Length <= maxLength
+            ? normalized
+            : normalized[..maxLength] + "...";
     }
 
     private void ApplyAudioRuntimeTelemetry(JsonElement root)
