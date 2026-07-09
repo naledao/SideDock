@@ -9,7 +9,6 @@ using System.Runtime.InteropServices;
 using System.Text.Json.Nodes;
 using NAudio.CoreAudioApi;
 using NAudio.Wave;
-using NAudio.Wave.SampleProviders;
 
 namespace SideDock.Host;
 
@@ -33,6 +32,9 @@ internal static partial class Program
     {
         private const int HeaderSize = 36;
         private const int MaxMicPayloadBytes = AudioDefaults.SampleRate * AudioDefaults.MicFrameBytes;
+        private const int MicrophoneRealtimeQueueMilliseconds = 250;
+        private const int MaxMicrophoneRealtimeQueueBytes = AudioDefaults.SampleRate * AudioDefaults.MicFrameBytes * MicrophoneRealtimeQueueMilliseconds / 1000;
+        private const double MicrophoneSlowWriteWarningMilliseconds = 20.0;
         private const int SpeakerChunkMilliseconds = 10;
         private const int SpeakerChunkBytes = AudioDefaults.SampleRate * SpeakerChunkMilliseconds / 1000 * AudioDefaults.SpeakerFrameBytes;
         private const int SpeakerBurstPacketLimit = 12;
@@ -434,12 +436,27 @@ internal static partial class Program
             long packetCount = 0;
             long byteCount = 0;
             var lastStatsAt = DateTimeOffset.UtcNow;
+            long lastStatsPackets = 0;
+            long lastStatsBytes = 0;
+            long lastPacketReadAt = 0;
+            double maxReadGapMs = 0;
+            double maxHeaderReadMs = 0;
+            double maxPayloadReadMs = 0;
+            double maxEnqueueMs = 0;
+            double maxLevelMs = 0;
+            double maxRecordMs = 0;
+            double maxTelemetryMs = 0;
+            double maxPacketLoopMs = 0;
+            long slowEnqueues = 0;
 
             try
             {
                 while (!cancellationToken.IsCancellationRequested)
                 {
+                    var packetStartedAt = Stopwatch.GetTimestamp();
+                    var headerReadStartedAt = Stopwatch.GetTimestamp();
                     await stream.ReadExactlyAsync(header.AsMemory(0, HeaderSize), cancellationToken);
+                    maxHeaderReadMs = Math.Max(maxHeaderReadMs, Stopwatch.GetElapsedTime(headerReadStartedAt).TotalMilliseconds);
                     ValidateHeader(header, MicMagic, "microphone");
                     var sequence = BinaryPrimitives.ReadInt64LittleEndian(header.AsSpan(8, 8));
                     var timestampMs = BinaryPrimitives.ReadInt64LittleEndian(header.AsSpan(16, 8));
@@ -460,15 +477,37 @@ internal static partial class Program
                         throw new InvalidDataException($"Unsupported microphone format: {sampleRate}/{channels}/{bitsPerSample}.");
                     }
 
+                    var payloadReadStartedAt = Stopwatch.GetTimestamp();
                     await stream.ReadExactlyAsync(payload.AsMemory(0, payloadLength), cancellationToken);
+                    var readCompletedAt = Stopwatch.GetTimestamp();
+                    maxPayloadReadMs = Math.Max(maxPayloadReadMs, Stopwatch.GetElapsedTime(payloadReadStartedAt).TotalMilliseconds);
+                    if (lastPacketReadAt != 0)
+                    {
+                        maxReadGapMs = Math.Max(maxReadGapMs, Stopwatch.GetElapsedTime(lastPacketReadAt, readCompletedAt).TotalMilliseconds);
+                    }
+
+                    lastPacketReadAt = readCompletedAt;
+                    var enqueueStartedAt = Stopwatch.GetTimestamp();
                     endpointReady = _audioBackend.WriteMicrophone(payload, payloadLength, timestampMs, out endpointMessage);
+                    var enqueueMs = Stopwatch.GetElapsedTime(enqueueStartedAt).TotalMilliseconds;
+                    maxEnqueueMs = Math.Max(maxEnqueueMs, enqueueMs);
+                    if (enqueueMs > MicrophoneSlowWriteWarningMilliseconds)
+                    {
+                        slowEnqueues++;
+                    }
+
                     packetCount += 1;
                     byteCount += payloadLength;
 
                     var now = DateTimeOffset.UtcNow;
                     var sourceAgeMs = Math.Max(0, now.ToUnixTimeMilliseconds() - timestampMs);
+                    var levelStartedAt = Stopwatch.GetTimestamp();
                     var levelPercent = CalculatePcm16LevelPercent(payload, payloadLength);
+                    maxLevelMs = Math.Max(maxLevelMs, Stopwatch.GetElapsedTime(levelStartedAt).TotalMilliseconds);
+                    var recordStartedAt = Stopwatch.GetTimestamp();
                     audioTestCoordinator.RecordMicrophonePacket(payloadLength, levelPercent, endpointReady, endpointMessage);
+                    maxRecordMs = Math.Max(maxRecordMs, Stopwatch.GetElapsedTime(recordStartedAt).TotalMilliseconds);
+                    var telemetryStartedAt = Stopwatch.GetTimestamp();
                     UpdateDirectionTelemetry(
                         AudioRuntimeDirection.Microphone,
                         state: endpointReady ? "capturing" : "unavailable",
@@ -480,20 +519,40 @@ internal static partial class Program
                         sourceAgeMs: sourceAgeMs,
                         approximateLatencyMs: sourceAgeMs,
                         endpointReady: endpointReady,
-                        lastError: endpointReady ? null : endpointMessage);
+                        lastError: endpointReady ? null : endpointMessage,
+                        refreshEndpoint: false);
+                    maxTelemetryMs = Math.Max(maxTelemetryMs, Stopwatch.GetElapsedTime(telemetryStartedAt).TotalMilliseconds);
+                    maxPacketLoopMs = Math.Max(maxPacketLoopMs, Stopwatch.GetElapsedTime(packetStartedAt).TotalMilliseconds);
                     if (packetCount == 1 || now - lastStatsAt >= TimeSpan.FromSeconds(1))
                     {
+                        var statsElapsedSeconds = Math.Max(0.001, (now - lastStatsAt).TotalSeconds);
+                        var readPackets = packetCount - lastStatsPackets;
+                        var readBytes = byteCount - lastStatsBytes;
                         Log(
                             "AUDIO",
                             $"mic-state={(endpointReady ? "capturing" : "unavailable")} packets={packetCount} bytes={byteCount} lastSeq={sequence} sourceAgeMs={sourceAgeMs} system-endpoint={(endpointReady ? "ready" : "missing")}"
+                            + $" readPps={readPackets / statsElapsedSeconds:F2} readBytesPerSecond={readBytes / statsElapsedSeconds:F0}"
+                            + $" maxReadGapMs={maxReadGapMs:F2} maxHeaderReadMs={maxHeaderReadMs:F2} maxPayloadReadMs={maxPayloadReadMs:F2}"
+                            + $" enqueueMs={enqueueMs:F2} maxEnqueueMs={maxEnqueueMs:F2} slowEnqueues={slowEnqueues}"
+                            + $" maxLevelMs={maxLevelMs:F2} maxRecordMs={maxRecordMs:F2} maxTelemetryMs={maxTelemetryMs:F2} maxPacketLoopMs={maxPacketLoopMs:F2}"
                             + (endpointReady ? string.Empty : $" message={endpointMessage}"));
-                        await PublishMicStatusAsync(
+                        PublishMicStatusBestEffort(
                             endpointReady ? "capturing" : "unavailable",
                             endpointReady ? "Android 麦克风正在采集中。" : endpointMessage,
-                            cancellationToken,
                             packetCount,
                             byteCount);
                         lastStatsAt = now;
+                        lastStatsPackets = packetCount;
+                        lastStatsBytes = byteCount;
+                        maxReadGapMs = 0;
+                        maxHeaderReadMs = 0;
+                        maxPayloadReadMs = 0;
+                        maxEnqueueMs = 0;
+                        maxLevelMs = 0;
+                        maxRecordMs = 0;
+                        maxTelemetryMs = 0;
+                        maxPacketLoopMs = 0;
+                        slowEnqueues = 0;
                     }
                 }
             }
@@ -1428,7 +1487,8 @@ internal static partial class Program
             long? sourceAgeMs = null,
             long? approximateLatencyMs = null,
             bool? endpointReady = null,
-            string? lastError = null)
+            string? lastError = null,
+            bool refreshEndpoint = true)
         {
             _telemetryState.Update(
                 direction,
@@ -1446,12 +1506,15 @@ internal static partial class Program
                         : AudioDefaults.SpeakerChannels;
                     entry.Backend = _audioBackend.Name;
                     entry.EndpointReady = effectiveEndpointReady;
-                    entry.EndpointId = direction == AudioRuntimeDirection.Microphone
-                        ? _audioBackend.MicrophoneEndpointId
-                        : _audioBackend.SpeakerEndpointId;
-                    entry.EndpointName = direction == AudioRuntimeDirection.Microphone
-                        ? _audioBackend.MicrophoneEndpointName
-                        : _audioBackend.SpeakerEndpointName;
+                    if (refreshEndpoint)
+                    {
+                        entry.EndpointId = direction == AudioRuntimeDirection.Microphone
+                            ? _audioBackend.MicrophoneEndpointId
+                            : _audioBackend.SpeakerEndpointId;
+                        entry.EndpointName = direction == AudioRuntimeDirection.Microphone
+                            ? _audioBackend.MicrophoneEndpointName
+                            : _audioBackend.SpeakerEndpointName;
+                    }
                     entry.LastError = string.IsNullOrWhiteSpace(lastError) ? null : lastError;
                     entry.ReconnectCount = Interlocked.Read(ref _reconnectCount);
                     entry.DisconnectCount = Interlocked.Read(ref _disconnectCount);
@@ -1538,6 +1601,30 @@ internal static partial class Program
                 ["systemEndpoint"] = _audioBackend.IsMicrophoneReady,
                 ["systemEndpointMessage"] = _audioBackend.MicrophoneStatusMessage
             }, cancellationToken);
+        }
+
+        private void PublishMicStatusBestEffort(
+            string state,
+            string message,
+            long packets = 0,
+            long bytes = 0)
+        {
+            if (!controlPublisher.HasActiveConnection)
+            {
+                return;
+            }
+
+            _ = Task.Run(async () =>
+            {
+                try
+                {
+                    await PublishMicStatusAsync(state, message, CancellationToken.None, packets, bytes);
+                }
+                catch (Exception ex) when (ex is not OperationCanceledException)
+                {
+                    Log("AUDIO", $"mic-status-publish-failed exception={ex.GetType().Name} message={LogValue(ex.Message)}");
+                }
+            });
         }
 
         private async Task PublishSpeakerStatusAsync(
@@ -1886,6 +1973,457 @@ internal static partial class Program
             public long LastRateBytes { get; set; }
         }
 
+        private sealed class MicrophonePacket(byte[] buffer, int byteCount, long timestampMs) : IDisposable
+        {
+            public byte[] Buffer { get; } = buffer;
+
+            public int ByteCount { get; } = byteCount;
+
+            public long TimestampMs { get; } = timestampMs;
+
+            public void Dispose()
+            {
+                ArrayPool<byte>.Shared.Return(Buffer);
+            }
+        }
+
+        private readonly record struct MicrophoneQueueSnapshot(
+            bool Accepted,
+            int QueuedPackets,
+            int QueuedBytes,
+            long DroppedPackets,
+            long DroppedBytes,
+            long LastDroppedPackets,
+            long LastDroppedBytes,
+            long? LastDroppedSourceAgeMs);
+
+        private sealed class MicrophonePacketQueue(int maxQueuedBytes) : IDisposable
+        {
+            private readonly object _lock = new();
+            private readonly Queue<MicrophonePacket> _packets = new();
+            private readonly SemaphoreSlim _available = new(0);
+            private int _queuedBytes;
+            private long _droppedPackets;
+            private long _droppedBytes;
+            private bool _completed;
+
+            public MicrophoneQueueSnapshot Enqueue(MicrophonePacket packet)
+            {
+                lock (_lock)
+                {
+                    if (_completed)
+                    {
+                        var sourceAgeMs = CalculateSourceAgeMs(packet.TimestampMs);
+                        packet.Dispose();
+                        return CreateSnapshot(accepted: false, lastDroppedPackets: 1, lastDroppedBytes: packet.ByteCount, sourceAgeMs);
+                    }
+
+                    long lastDroppedPackets = 0;
+                    long lastDroppedBytes = 0;
+                    long? lastDroppedSourceAgeMs = null;
+                    if (packet.ByteCount > maxQueuedBytes)
+                    {
+                        lastDroppedSourceAgeMs = CalculateSourceAgeMs(packet.TimestampMs);
+                        packet.Dispose();
+                        _droppedPackets++;
+                        _droppedBytes += packet.ByteCount;
+                        return CreateSnapshot(accepted: false, lastDroppedPackets: 1, lastDroppedBytes: packet.ByteCount, lastDroppedSourceAgeMs);
+                    }
+
+                    while (_packets.Count > 0 && _queuedBytes + packet.ByteCount > maxQueuedBytes)
+                    {
+                        var dropped = _packets.Dequeue();
+                        _queuedBytes -= dropped.ByteCount;
+                        lastDroppedPackets++;
+                        lastDroppedBytes += dropped.ByteCount;
+                        lastDroppedSourceAgeMs = MaxSourceAge(lastDroppedSourceAgeMs, dropped.TimestampMs);
+                        dropped.Dispose();
+                        _available.Wait(0);
+                    }
+
+                    _droppedPackets += lastDroppedPackets;
+                    _droppedBytes += lastDroppedBytes;
+                    _packets.Enqueue(packet);
+                    _queuedBytes += packet.ByteCount;
+                    _available.Release();
+                    return CreateSnapshot(accepted: true, lastDroppedPackets, lastDroppedBytes, lastDroppedSourceAgeMs);
+                }
+            }
+
+            public async ValueTask<MicrophonePacket?> DequeueAsync(CancellationToken cancellationToken)
+            {
+                while (true)
+                {
+                    await _available.WaitAsync(cancellationToken);
+                    lock (_lock)
+                    {
+                        if (_packets.Count > 0)
+                        {
+                            var packet = _packets.Dequeue();
+                            _queuedBytes -= packet.ByteCount;
+                            return packet;
+                        }
+
+                        if (_completed)
+                        {
+                            return null;
+                        }
+                    }
+                }
+            }
+
+            public MicrophoneQueueSnapshot Snapshot()
+            {
+                lock (_lock)
+                {
+                    return CreateSnapshot(accepted: true, lastDroppedPackets: 0, lastDroppedBytes: 0, lastDroppedSourceAgeMs: null);
+                }
+            }
+
+            public MicrophoneQueueSnapshot Clear()
+            {
+                lock (_lock)
+                {
+                    long lastDroppedPackets = 0;
+                    long lastDroppedBytes = 0;
+                    long? lastDroppedSourceAgeMs = null;
+                    while (_packets.Count > 0)
+                    {
+                        var packet = _packets.Dequeue();
+                        _queuedBytes -= packet.ByteCount;
+                        lastDroppedPackets++;
+                        lastDroppedBytes += packet.ByteCount;
+                        lastDroppedSourceAgeMs = MaxSourceAge(lastDroppedSourceAgeMs, packet.TimestampMs);
+                        packet.Dispose();
+                        _available.Wait(0);
+                    }
+
+                    _queuedBytes = 0;
+                    _droppedPackets += lastDroppedPackets;
+                    _droppedBytes += lastDroppedBytes;
+                    return CreateSnapshot(accepted: true, lastDroppedPackets, lastDroppedBytes, lastDroppedSourceAgeMs);
+                }
+            }
+
+            public void Complete()
+            {
+                lock (_lock)
+                {
+                    if (_completed)
+                    {
+                        return;
+                    }
+
+                    _completed = true;
+                    Clear();
+                    _available.Release();
+                }
+            }
+
+            public void Dispose()
+            {
+                Complete();
+                _available.Dispose();
+            }
+
+            private MicrophoneQueueSnapshot CreateSnapshot(bool accepted, long lastDroppedPackets, long lastDroppedBytes, long? lastDroppedSourceAgeMs)
+            {
+                return new MicrophoneQueueSnapshot(
+                    accepted,
+                    _packets.Count,
+                    _queuedBytes,
+                    _droppedPackets,
+                    _droppedBytes,
+                    lastDroppedPackets,
+                    lastDroppedBytes,
+                    lastDroppedSourceAgeMs);
+            }
+
+            private static long? MaxSourceAge(long? current, long timestampMs)
+            {
+                var sourceAgeMs = CalculateSourceAgeMs(timestampMs);
+                if (!sourceAgeMs.HasValue)
+                {
+                    return current;
+                }
+
+                return current.HasValue ? Math.Max(current.Value, sourceAgeMs.Value) : sourceAgeMs.Value;
+            }
+
+            private static long? CalculateSourceAgeMs(long timestampMs)
+            {
+                return timestampMs > 0
+                    ? Math.Max(0, DateTimeOffset.UtcNow.ToUnixTimeMilliseconds() - timestampMs)
+                    : null;
+            }
+        }
+
+        private readonly record struct MicrophoneRenderBufferSnapshot(
+            bool Accepted,
+            int BufferedFrames,
+            int BufferedBytes,
+            double BufferedMilliseconds,
+            long DroppedEvents,
+            long DroppedFrames,
+            long DroppedBytes,
+            long LastDroppedEvents,
+            long LastDroppedFrames,
+            long LastDroppedBytes,
+            long? LastDroppedSourceAgeMs,
+            long UnderflowFrames);
+
+        private sealed class RealtimeMicrophoneRenderProvider : IWaveProvider
+        {
+            private readonly object _lock = new();
+            private readonly short[] _samples;
+            private readonly long[] _timestampsMs;
+            private readonly int _channels;
+            private readonly bool _outputFloat;
+            private readonly int _capacityFrames;
+            private long _readFrame;
+            private long _writeFrame;
+            private long _droppedEvents;
+            private long _droppedFrames;
+            private long _droppedBytes;
+            private long _underflowFrames;
+
+            public RealtimeMicrophoneRenderProvider(WaveFormat waveFormat, int bufferMilliseconds)
+            {
+                if (waveFormat.SampleRate != AudioDefaults.SampleRate)
+                {
+                    throw new InvalidOperationException(
+                        $"Android microphone realtime render does not resample; unsupported render sample rate {waveFormat.SampleRate}.");
+                }
+
+                if (waveFormat.Channels != AudioDefaults.MicChannels
+                    && waveFormat.Channels != AudioDefaults.SpeakerChannels)
+                {
+                    throw new InvalidOperationException(
+                        $"Android microphone realtime render does not support {waveFormat.Channels} output channels.");
+                }
+
+                if (waveFormat.Encoding == WaveFormatEncoding.Pcm && waveFormat.BitsPerSample == AudioDefaults.BitsPerSample)
+                {
+                    _outputFloat = false;
+                }
+                else if (waveFormat.Encoding == WaveFormatEncoding.IeeeFloat && waveFormat.BitsPerSample == 32)
+                {
+                    _outputFloat = true;
+                }
+                else
+                {
+                    throw new InvalidOperationException(
+                        $"Android microphone realtime render does not support {waveFormat.Encoding}/{waveFormat.BitsPerSample}-bit output.");
+                }
+
+                WaveFormat = waveFormat;
+                _channels = waveFormat.Channels;
+                _capacityFrames = Math.Max(
+                    AudioDefaults.SampleRate / 100,
+                    AudioDefaults.SampleRate * Math.Max(1, bufferMilliseconds) / 1000);
+                _samples = new short[_capacityFrames];
+                _timestampsMs = new long[_capacityFrames];
+            }
+
+            public WaveFormat WaveFormat { get; }
+
+            public MicrophoneRenderBufferSnapshot Write(byte[] buffer, int offset, int byteCount, long timestampMs)
+            {
+                if (buffer is null || byteCount <= 0 || offset < 0 || offset >= buffer.Length)
+                {
+                    return Snapshot(accepted: false, lastDroppedEvents: 0, lastDroppedFrames: 0, lastDroppedBytes: 0, lastDroppedSourceAgeMs: null);
+                }
+
+                var availableBytes = Math.Min(byteCount, buffer.Length - offset);
+                availableBytes -= availableBytes % AudioDefaults.MicFrameBytes;
+                if (availableBytes <= 0)
+                {
+                    return Snapshot(accepted: true, lastDroppedEvents: 0, lastDroppedFrames: 0, lastDroppedBytes: 0, lastDroppedSourceAgeMs: null);
+                }
+
+                var sourceFrames = availableBytes / AudioDefaults.MicFrameBytes;
+                var sourceFrameOffset = 0;
+                long lastDroppedEvents = 0;
+                long lastDroppedFrames = 0;
+                long lastDroppedBytes = 0;
+                long? lastDroppedSourceAgeMs = null;
+
+                if (sourceFrames > _capacityFrames)
+                {
+                    sourceFrameOffset = sourceFrames - _capacityFrames;
+                    sourceFrames = _capacityFrames;
+                    lastDroppedEvents++;
+                    lastDroppedFrames += sourceFrameOffset;
+                    lastDroppedBytes += sourceFrameOffset * AudioDefaults.MicFrameBytes;
+                    lastDroppedSourceAgeMs = CalculateSourceAgeMs(timestampMs);
+                    timestampMs += sourceFrameOffset * 1000L / AudioDefaults.SampleRate;
+                }
+
+                lock (_lock)
+                {
+                    var bufferedFrames = _writeFrame - _readFrame;
+                    var overflowFrames = Math.Max(0, bufferedFrames + sourceFrames - _capacityFrames);
+                    if (overflowFrames > 0)
+                    {
+                        lastDroppedEvents++;
+                        lastDroppedFrames += overflowFrames;
+                        lastDroppedBytes += overflowFrames * AudioDefaults.MicFrameBytes;
+                        lastDroppedSourceAgeMs = MaxSourceAge(lastDroppedSourceAgeMs, TimestampAtFrame(_readFrame));
+                        _readFrame += overflowFrames;
+                    }
+
+                    for (var frame = 0; frame < sourceFrames; frame++)
+                    {
+                        var sourceOffset = offset + (sourceFrameOffset + frame) * AudioDefaults.MicFrameBytes;
+                        var slot = (int)((_writeFrame + frame) % _capacityFrames);
+                        _samples[slot] = BinaryPrimitives.ReadInt16LittleEndian(buffer.AsSpan(sourceOffset, AudioDefaults.MicFrameBytes));
+                        _timestampsMs[slot] = timestampMs + frame * 1000L / AudioDefaults.SampleRate;
+                    }
+
+                    _writeFrame += sourceFrames;
+                    if (lastDroppedFrames > 0)
+                    {
+                        _droppedEvents += lastDroppedEvents;
+                        _droppedFrames += lastDroppedFrames;
+                        _droppedBytes += lastDroppedBytes;
+                    }
+
+                    return CreateSnapshotLocked(true, lastDroppedEvents, lastDroppedFrames, lastDroppedBytes, lastDroppedSourceAgeMs);
+                }
+            }
+
+            public MicrophoneRenderBufferSnapshot Snapshot()
+            {
+                return Snapshot(accepted: true, lastDroppedEvents: 0, lastDroppedFrames: 0, lastDroppedBytes: 0, lastDroppedSourceAgeMs: null);
+            }
+
+            public int Read(byte[] buffer, int offset, int count)
+            {
+                if (buffer is null || count <= 0 || offset < 0 || offset >= buffer.Length)
+                {
+                    return 0;
+                }
+
+                count = Math.Min(count, buffer.Length - offset);
+                buffer.AsSpan(offset, count).Clear();
+
+                var outputFrameBytes = WaveFormat.BlockAlign;
+                if (outputFrameBytes <= 0)
+                {
+                    return count;
+                }
+
+                var outputFrames = count / outputFrameBytes;
+                if (outputFrames <= 0)
+                {
+                    return count;
+                }
+
+                lock (_lock)
+                {
+                    var frame = 0;
+                    for (; frame < outputFrames && _readFrame < _writeFrame; frame++)
+                    {
+                        var sample = _samples[(int)(_readFrame % _capacityFrames)];
+                        WriteOutputFrame(buffer, offset + frame * outputFrameBytes, sample);
+                        _readFrame++;
+                    }
+
+                    if (frame < outputFrames)
+                    {
+                        _underflowFrames += outputFrames - frame;
+                    }
+                }
+
+                return count;
+            }
+
+            private MicrophoneRenderBufferSnapshot Snapshot(
+                bool accepted,
+                long lastDroppedEvents,
+                long lastDroppedFrames,
+                long lastDroppedBytes,
+                long? lastDroppedSourceAgeMs)
+            {
+                lock (_lock)
+                {
+                    return CreateSnapshotLocked(accepted, lastDroppedEvents, lastDroppedFrames, lastDroppedBytes, lastDroppedSourceAgeMs);
+                }
+            }
+
+            private MicrophoneRenderBufferSnapshot CreateSnapshotLocked(
+                bool accepted,
+                long lastDroppedEvents,
+                long lastDroppedFrames,
+                long lastDroppedBytes,
+                long? lastDroppedSourceAgeMs)
+            {
+                var bufferedFrames = (int)Math.Max(0, Math.Min(int.MaxValue, _writeFrame - _readFrame));
+                return new MicrophoneRenderBufferSnapshot(
+                    accepted,
+                    bufferedFrames,
+                    bufferedFrames * AudioDefaults.MicFrameBytes,
+                    bufferedFrames * 1000.0 / AudioDefaults.SampleRate,
+                    _droppedEvents,
+                    _droppedFrames,
+                    _droppedBytes,
+                    lastDroppedEvents,
+                    lastDroppedFrames,
+                    lastDroppedBytes,
+                    lastDroppedSourceAgeMs,
+                    _underflowFrames);
+            }
+
+            private void WriteOutputFrame(byte[] buffer, int offset, short sample)
+            {
+                if (_outputFloat)
+                {
+                    var value = sample / 32768f;
+                    for (var channel = 0; channel < _channels; channel++)
+                    {
+                        BitConverter.TryWriteBytes(buffer.AsSpan(offset + channel * sizeof(float), sizeof(float)), value);
+                    }
+
+                    return;
+                }
+
+                for (var channel = 0; channel < _channels; channel++)
+                {
+                    BinaryPrimitives.WriteInt16LittleEndian(
+                        buffer.AsSpan(offset + channel * AudioDefaults.MicFrameBytes, AudioDefaults.MicFrameBytes),
+                        sample);
+                }
+            }
+
+            private long TimestampAtFrame(long frame)
+            {
+                if (frame < 0 || frame >= _writeFrame || frame < _writeFrame - _capacityFrames)
+                {
+                    return 0;
+                }
+
+                return _timestampsMs[(int)(frame % _capacityFrames)];
+            }
+
+            private static long? MaxSourceAge(long? current, long timestampMs)
+            {
+                var sourceAgeMs = CalculateSourceAgeMs(timestampMs);
+                if (!sourceAgeMs.HasValue)
+                {
+                    return current;
+                }
+
+                return current.HasValue ? Math.Max(current.Value, sourceAgeMs.Value) : sourceAgeMs.Value;
+            }
+
+            private static long? CalculateSourceAgeMs(long timestampMs)
+            {
+                return timestampMs > 0
+                    ? Math.Max(0, DateTimeOffset.UtcNow.ToUnixTimeMilliseconds() - timestampMs)
+                    : null;
+            }
+        }
+
         private sealed class LegacySharedMemoryAudioBackend : IAudioBridgeBackend
         {
             private readonly AudioMicSharedRing _micRing = new();
@@ -2000,9 +2538,12 @@ internal static partial class Program
 
             private MMDeviceEnumerator? _deviceEnumerator;
             private MMDevice? _microphoneRenderDevice;
-            private BufferedWaveProvider? _microphoneSourceBuffer;
+            private RealtimeMicrophoneRenderProvider? _microphoneRenderProvider;
             private WasapiOut? _microphoneRenderOutput;
             private WaveFormat? _microphoneRenderFormat;
+            private readonly MicrophonePacketQueue _microphoneRenderQueue = new(MaxMicrophoneRealtimeQueueBytes);
+            private readonly CancellationTokenSource _microphoneRenderQueueCts = new();
+            private readonly Task _microphoneRenderQueueTask;
             private DateTimeOffset _lastMicrophoneOpenFailureLoggedAt = DateTimeOffset.MinValue;
             private string? _lastMicrophoneOpenFailureLogMessage;
             private string _microphoneStatusMessage = "Android 麦克风写入端点未初始化。";
@@ -2036,6 +2577,9 @@ internal static partial class Program
             {
                 _speakerOutputLoopbackEndpointId = NormalizeEndpointId(speakerOutputLoopbackEndpointId);
                 _microphoneRenderEndpointId = NormalizeEndpointId(microphoneRenderEndpointId);
+                _microphoneRenderQueueTask = Task.Run(
+                    () => PumpMicrophoneRenderQueueAsync(_microphoneRenderQueueCts.Token),
+                    CancellationToken.None);
             }
 
             private sealed class LowLatencyWasapiLoopbackCapture(MMDevice captureDevice, int bufferMilliseconds)
@@ -2055,7 +2599,7 @@ internal static partial class Program
                 {
                     lock (_microphoneLock)
                     {
-                        return _microphoneRenderOutput is not null && _microphoneSourceBuffer is not null;
+                        return _microphoneRenderOutput is not null && _microphoneRenderProvider is not null;
                     }
                 }
             }
@@ -2124,7 +2668,7 @@ internal static partial class Program
                 lock (_microphoneLock)
                 {
                     ThrowIfDisposed();
-                    if (_microphoneRenderOutput is not null && _microphoneSourceBuffer is not null)
+                    if (_microphoneRenderOutput is not null && _microphoneRenderProvider is not null)
                     {
                         message = _microphoneStatusMessage;
                         return true;
@@ -2151,13 +2695,7 @@ internal static partial class Program
                         var mixFormat = device.AudioClient.MixFormat;
                         var renderFormat = SelectMicrophoneRenderFormat(device);
                         var sourceFormat = new WaveFormat(AudioDefaults.SampleRate, AudioDefaults.BitsPerSample, AudioDefaults.MicChannels);
-                        var sourceBuffer = new BufferedWaveProvider(sourceFormat)
-                        {
-                            BufferDuration = TimeSpan.FromMilliseconds(500),
-                            DiscardOnBufferOverflow = true,
-                            ReadFully = true
-                        };
-                        var renderProvider = CreateMicrophoneRenderProvider(sourceBuffer, renderFormat);
+                        var renderProvider = CreateMicrophoneRenderProvider(renderFormat);
                         var output = new WasapiOut(device, AudioClientShareMode.Shared, true, WasapiLatencyMilliseconds);
                         output.PlaybackStopped += (_, args) =>
                         {
@@ -2174,7 +2712,7 @@ internal static partial class Program
                         output.Play();
 
                         _microphoneRenderDevice = device;
-                        _microphoneSourceBuffer = sourceBuffer;
+                        _microphoneRenderProvider = renderProvider;
                         _microphoneRenderOutput = output;
                         _microphoneRenderFormat = renderFormat;
                         _lastMicrophoneOpenFailureLogMessage = null;
@@ -2204,35 +2742,210 @@ internal static partial class Program
                     return IsMicrophoneReady;
                 }
 
+                var boundedByteCount = byteCount - (byteCount % AudioDefaults.MicFrameBytes);
+                if (boundedByteCount <= 0)
+                {
+                    message = MicrophoneStatusMessage;
+                    return IsMicrophoneReady;
+                }
+
+                try
+                {
+                    lock (_microphoneLock)
+                    {
+                        if ((_microphoneRenderOutput is null || _microphoneRenderProvider is null || _microphoneRenderFormat is null)
+                            && !EnsureMicrophoneReady(out message))
+                        {
+                            return false;
+                        }
+
+                        if (_microphoneRenderProvider is null || _microphoneRenderFormat is null)
+                        {
+                            message = _microphoneStatusMessage;
+                            return false;
+                        }
+                    }
+
+                    var queueSnapshot = EnqueueMicrophoneRenderPacket(buffer, boundedByteCount, timestampMs);
+                    if (queueSnapshot.LastDroppedPackets > 0)
+                    {
+                        Log(
+                            "AUDIO",
+                            $"mic-render-queue-drop packets={queueSnapshot.LastDroppedPackets} bytes={queueSnapshot.LastDroppedBytes} "
+                            + $"totalDroppedPackets={queueSnapshot.DroppedPackets} totalDroppedBytes={queueSnapshot.DroppedBytes} "
+                            + $"queuePackets={queueSnapshot.QueuedPackets} queueBytes={queueSnapshot.QueuedBytes}"
+                            + (queueSnapshot.LastDroppedSourceAgeMs.HasValue
+                                ? $" sourceAgeBeforeDrop={queueSnapshot.LastDroppedSourceAgeMs.Value}"
+                                : string.Empty));
+                    }
+
+                    lock (_microphoneLock)
+                    {
+                        _microphoneStatusMessage = "Android 麦克风正在写入 Windows 虚拟线缆。";
+                        message = _microphoneStatusMessage;
+                    }
+
+                    return true;
+                }
+                catch (Exception ex) when (ex is InvalidOperationException or COMException)
+                {
+                    lock (_microphoneLock)
+                    {
+                        ResetMicrophoneRenderCore();
+                        _microphoneStatusMessage = $"Android 麦克风写入端点不可用：{ex.Message}";
+                        message = _microphoneStatusMessage;
+                        return false;
+                    }
+                }
+            }
+
+            private MicrophoneQueueSnapshot EnqueueMicrophoneRenderPacket(byte[] buffer, int byteCount, long timestampMs)
+            {
+                var packetBuffer = ArrayPool<byte>.Shared.Rent(byteCount);
+                Buffer.BlockCopy(buffer, 0, packetBuffer, 0, byteCount);
+                var packet = new MicrophonePacket(
+                    packetBuffer,
+                    byteCount,
+                    timestampMs);
+                return _microphoneRenderQueue.Enqueue(packet);
+            }
+
+            private async Task PumpMicrophoneRenderQueueAsync(CancellationToken cancellationToken)
+            {
+                long packetsWritten = 0;
+                long bytesWritten = 0;
+                var lastStatsAt = DateTimeOffset.UtcNow;
+                double maxWriteMs = 0;
+                long slowWrites = 0;
+
+                try
+                {
+                    while (!cancellationToken.IsCancellationRequested)
+                    {
+                        var packet = await _microphoneRenderQueue.DequeueAsync(cancellationToken);
+                        if (packet is null)
+                        {
+                            return;
+                        }
+
+                        try
+                        {
+                            var writeStartedAt = Stopwatch.GetTimestamp();
+                            var endpointReady = AddMicrophoneSamplesToRenderBuffer(packet, out var endpointMessage);
+                            var writeMs = Stopwatch.GetElapsedTime(writeStartedAt).TotalMilliseconds;
+                            maxWriteMs = Math.Max(maxWriteMs, writeMs);
+                            if (writeMs > MicrophoneSlowWriteWarningMilliseconds)
+                            {
+                                slowWrites++;
+                            }
+
+                            if (endpointReady)
+                            {
+                                packetsWritten++;
+                                bytesWritten += packet.ByteCount;
+                            }
+
+                            var now = DateTimeOffset.UtcNow;
+                            if (packetsWritten == 1 || now - lastStatsAt >= TimeSpan.FromSeconds(1))
+                            {
+                                var queueSnapshot = _microphoneRenderQueue.Snapshot();
+                                MicrophoneRenderBufferSnapshot? renderSnapshot = null;
+                                lock (_microphoneLock)
+                                {
+                                    renderSnapshot = _microphoneRenderProvider?.Snapshot();
+                                }
+
+                                var sourceAgeMs = Math.Max(0, now.ToUnixTimeMilliseconds() - packet.TimestampMs);
+                                Log(
+                                    "AUDIO",
+                                    $"mic-render-pump endpointReady={endpointReady} packets={packetsWritten} bytes={bytesWritten} "
+                                    + $"sourceAgeMs={sourceAgeMs} queuePackets={queueSnapshot.QueuedPackets} queueBytes={queueSnapshot.QueuedBytes} "
+                                    + $"droppedPackets={queueSnapshot.DroppedPackets} droppedBytes={queueSnapshot.DroppedBytes} "
+                                    + (renderSnapshot.HasValue
+                                        ? $"renderBufferedMs={renderSnapshot.Value.BufferedMilliseconds:F2} renderDroppedBytes={renderSnapshot.Value.DroppedBytes} renderUnderflowFrames={renderSnapshot.Value.UnderflowFrames} "
+                                        : string.Empty)
+                                    + $"writeMs={writeMs:F2} maxWriteMs={maxWriteMs:F2} slowWrites={slowWrites}"
+                                    + (endpointReady ? string.Empty : $" message={LogValue(endpointMessage)}"));
+                                lastStatsAt = now;
+                                maxWriteMs = 0;
+                                slowWrites = 0;
+                            }
+                        }
+                        finally
+                        {
+                            packet.Dispose();
+                        }
+                    }
+                }
+                catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
+                {
+                }
+                catch (ObjectDisposedException) when (cancellationToken.IsCancellationRequested)
+                {
+                }
+                catch (Exception ex)
+                {
+                    Log("AUDIO", $"mic-render-pump-failed exception={ex.GetType().Name} message={LogValue(ex.Message)}");
+                }
+            }
+
+            private bool AddMicrophoneSamplesToRenderBuffer(MicrophonePacket packet, out string message)
+            {
+                RealtimeMicrophoneRenderProvider? renderProvider;
                 lock (_microphoneLock)
                 {
-                    if ((_microphoneRenderOutput is null || _microphoneSourceBuffer is null || _microphoneRenderFormat is null)
+                    if (_disposed)
+                    {
+                        message = _microphoneStatusMessage;
+                        return false;
+                    }
+
+                    if ((_microphoneRenderOutput is null || _microphoneRenderProvider is null || _microphoneRenderFormat is null)
                         && !EnsureMicrophoneReady(out message))
                     {
                         return false;
                     }
 
-                    if (_microphoneSourceBuffer is null || _microphoneRenderFormat is null)
+                    if (_microphoneRenderProvider is null)
                     {
                         message = _microphoneStatusMessage;
                         return false;
                     }
 
-                    try
+                    renderProvider = _microphoneRenderProvider;
+                }
+
+                try
+                {
+                    var bufferSnapshot = renderProvider.Write(packet.Buffer, 0, packet.ByteCount, packet.TimestampMs);
+                    if (bufferSnapshot.LastDroppedFrames > 0)
                     {
-                        var boundedByteCount = byteCount - (byteCount % AudioDefaults.MicFrameBytes);
-                        if (boundedByteCount <= 0)
+                        Log(
+                            "AUDIO",
+                            $"mic-render-buffer-drop events={bufferSnapshot.LastDroppedEvents} frames={bufferSnapshot.LastDroppedFrames} "
+                            + $"bytes={bufferSnapshot.LastDroppedBytes} totalEvents={bufferSnapshot.DroppedEvents} "
+                            + $"totalFrames={bufferSnapshot.DroppedFrames} totalBytes={bufferSnapshot.DroppedBytes} "
+                            + $"bufferedMs={bufferSnapshot.BufferedMilliseconds:F2} bufferedBytes={bufferSnapshot.BufferedBytes}"
+                            + (bufferSnapshot.LastDroppedSourceAgeMs.HasValue
+                                ? $" sourceAgeBeforeDrop={bufferSnapshot.LastDroppedSourceAgeMs.Value}"
+                                : string.Empty));
+                    }
+
+                    lock (_microphoneLock)
+                    {
+                        if (ReferenceEquals(_microphoneRenderProvider, renderProvider))
                         {
-                            message = _microphoneStatusMessage;
-                            return true;
+                            _microphoneStatusMessage = "Android 麦克风正在写入 Windows 虚拟线缆。";
                         }
 
-                        _microphoneSourceBuffer.AddSamples(buffer, 0, boundedByteCount);
-                        _microphoneStatusMessage = "Android 麦克风正在写入 Windows 虚拟线缆。";
                         message = _microphoneStatusMessage;
-                        return true;
                     }
-                    catch (Exception ex) when (ex is InvalidOperationException or COMException)
+
+                    return true;
+                }
+                catch (Exception ex) when (ex is InvalidOperationException or COMException)
+                {
+                    lock (_microphoneLock)
                     {
                         ResetMicrophoneRenderCore();
                         _microphoneStatusMessage = $"Android 麦克风写入端点不可用：{ex.Message}";
@@ -2431,6 +3144,8 @@ internal static partial class Program
                     }
 
                     _disposed = true;
+                    _microphoneRenderQueueCts.Cancel();
+                    _microphoneRenderQueue.Complete();
                     ResetMicrophoneRenderCore();
                     ResetSpeakerCaptureCore();
                     _speakerPacketAvailable.Set();
@@ -2488,7 +3203,7 @@ internal static partial class Program
                 }
 
                 throw new InvalidOperationException(
-                    $"Android 麦克风写入端点不支持 SideDock 可转换的共享模式格式；当前混音格式为 {FormatWaveFormat(device.AudioClient.MixFormat)}。请尝试在 Windows 声音设置里把虚拟线缆默认格式改为 48 kHz 或 44.1 kHz / 16-bit / stereo。");
+                    $"Android 麦克风写入端点不支持 SideDock 实时写入格式；当前混音格式为 {FormatWaveFormat(device.AudioClient.MixFormat)}。请尝试在 Windows 声音设置里把虚拟线缆默认格式改为 48 kHz / 16-bit / stereo。");
             }
 
             private static IEnumerable<WaveFormat> EnumerateMicrophoneRenderFormatCandidates(WaveFormat mixFormat)
@@ -2507,17 +3222,17 @@ internal static partial class Program
 
             private static IEnumerable<WaveFormat> EnumerateMicrophoneRenderFormatCandidatesCore(WaveFormat mixFormat)
             {
-                yield return new WaveFormat(AudioDefaults.SampleRate, AudioDefaults.BitsPerSample, AudioDefaults.MicChannels);
                 yield return new WaveFormat(AudioDefaults.SampleRate, AudioDefaults.BitsPerSample, AudioDefaults.SpeakerChannels);
+                yield return WaveFormat.CreateIeeeFloatWaveFormat(AudioDefaults.SampleRate, AudioDefaults.SpeakerChannels);
+                yield return new WaveFormat(AudioDefaults.SampleRate, AudioDefaults.BitsPerSample, AudioDefaults.MicChannels);
+                yield return WaveFormat.CreateIeeeFloatWaveFormat(AudioDefaults.SampleRate, AudioDefaults.MicChannels);
 
                 var mixChannels = NormalizeMicrophoneRenderChannels(mixFormat.Channels);
-                yield return new WaveFormat(mixFormat.SampleRate, AudioDefaults.BitsPerSample, mixChannels);
-                yield return new WaveFormat(mixFormat.SampleRate, AudioDefaults.BitsPerSample, AudioDefaults.SpeakerChannels);
-                yield return WaveFormat.CreateIeeeFloatWaveFormat(mixFormat.SampleRate, mixChannels);
-                yield return WaveFormat.CreateIeeeFloatWaveFormat(mixFormat.SampleRate, AudioDefaults.SpeakerChannels);
-
-                yield return new WaveFormat(44100, AudioDefaults.BitsPerSample, AudioDefaults.SpeakerChannels);
-                yield return WaveFormat.CreateIeeeFloatWaveFormat(44100, AudioDefaults.SpeakerChannels);
+                if (mixFormat.SampleRate == AudioDefaults.SampleRate)
+                {
+                    yield return new WaveFormat(mixFormat.SampleRate, AudioDefaults.BitsPerSample, mixChannels);
+                    yield return WaveFormat.CreateIeeeFloatWaveFormat(mixFormat.SampleRate, mixChannels);
+                }
             }
 
             private static int NormalizeMicrophoneRenderChannels(int channels)
@@ -2527,35 +3242,9 @@ internal static partial class Program
                     : AudioDefaults.SpeakerChannels;
             }
 
-            private static IWaveProvider CreateMicrophoneRenderProvider(BufferedWaveProvider sourceBuffer, WaveFormat renderFormat)
+            private static RealtimeMicrophoneRenderProvider CreateMicrophoneRenderProvider(WaveFormat renderFormat)
             {
-                ISampleProvider sampleProvider = new Pcm16BitToSampleProvider(sourceBuffer);
-
-                if (renderFormat.Channels == AudioDefaults.SpeakerChannels)
-                {
-                    sampleProvider = new MonoToStereoSampleProvider(sampleProvider);
-                }
-                else if (renderFormat.Channels != AudioDefaults.MicChannels)
-                {
-                    throw new InvalidOperationException($"不支持的 Android 麦克风写入声道数：{renderFormat.Channels}。");
-                }
-
-                if (renderFormat.SampleRate != AudioDefaults.SampleRate)
-                {
-                    sampleProvider = new WdlResamplingSampleProvider(sampleProvider, renderFormat.SampleRate);
-                }
-
-                if (IsPcm16WaveFormat(renderFormat))
-                {
-                    return new SampleToWaveProvider16(sampleProvider);
-                }
-
-                if (IsIeeeFloat32WaveFormat(renderFormat))
-                {
-                    return new SampleToWaveProvider(sampleProvider);
-                }
-
-                throw new InvalidOperationException($"不支持的 Android 麦克风写入格式：{FormatWaveFormat(renderFormat)}。");
+                return new RealtimeMicrophoneRenderProvider(renderFormat, MicrophoneRealtimeQueueMilliseconds);
             }
 
             private static bool IsPcm16WaveFormat(WaveFormat format)
@@ -2941,9 +3630,10 @@ internal static partial class Program
                 _microphoneRenderOutput?.Dispose();
                 _microphoneRenderDevice?.Dispose();
                 _microphoneRenderOutput = null;
-                _microphoneSourceBuffer = null;
+                _microphoneRenderProvider = null;
                 _microphoneRenderDevice = null;
                 _microphoneRenderFormat = null;
+                _microphoneRenderQueue.Clear();
             }
 
             private void LogMicrophoneOpenFailure(Exception ex)
