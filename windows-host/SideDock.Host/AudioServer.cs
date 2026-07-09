@@ -1,6 +1,7 @@
 using System.Buffers;
 using System.Buffers.Binary;
 using System.Collections.Concurrent;
+using System.Diagnostics;
 using System.IO.MemoryMappedFiles;
 using System.Net;
 using System.Net.Sockets;
@@ -32,7 +33,11 @@ internal static partial class Program
     {
         private const int HeaderSize = 36;
         private const int MaxMicPayloadBytes = AudioDefaults.SampleRate * AudioDefaults.MicFrameBytes;
-        private const int SpeakerChunkBytes = AudioDefaults.SampleRate / 50 * AudioDefaults.SpeakerFrameBytes;
+        private const int SpeakerChunkMilliseconds = 10;
+        private const int SpeakerChunkBytes = AudioDefaults.SampleRate * SpeakerChunkMilliseconds / 1000 * AudioDefaults.SpeakerFrameBytes;
+        private const int SpeakerBurstPacketLimit = 12;
+        private const int SpeakerBurstBufferBytes = (HeaderSize + SpeakerChunkBytes) * SpeakerBurstPacketLimit;
+        private static readonly bool EnableSpeakerSendSilenceFiller = false;
         private static readonly byte[] MicMagic = "SDAM"u8.ToArray();
         private static readonly byte[] SpeakerMagic = "SDAS"u8.ToArray();
 
@@ -518,16 +523,248 @@ internal static partial class Program
             }
         }
 
-        private async Task SendSpeakerAsync(
+        private Task SendSpeakerAsync(
+            int connectionId,
+            Stream stream,
+            SpeakerConnectionState speakerConnection,
+            CancellationToken cancellationToken)
+        {
+            return Task.Factory.StartNew(
+                () =>
+                {
+                    var previousPriority = Thread.CurrentThread.Priority;
+                    try
+                    {
+                        Thread.CurrentThread.Priority = ThreadPriority.Highest;
+                        SendSpeakerWorker(connectionId, stream, speakerConnection, cancellationToken);
+                    }
+                    finally
+                    {
+                        Thread.CurrentThread.Priority = previousPriority;
+                    }
+                },
+                cancellationToken,
+                TaskCreationOptions.LongRunning,
+                TaskScheduler.Default);
+        }
+
+        private void SendSpeakerWorker(
             int connectionId,
             Stream stream,
             SpeakerConnectionState speakerConnection,
             CancellationToken cancellationToken)
         {
             var header = ArrayPool<byte>.Shared.Rent(HeaderSize);
-            var payload = ArrayPool<byte>.Shared.Rent(SpeakerChunkBytes);
+            var sendBuffer = ArrayPool<byte>.Shared.Rent(SpeakerBurstBufferBytes);
+            var burstPayloads = new byte[SpeakerBurstPacketLimit][];
+            for (var index = 0; index < burstPayloads.Length; index++)
+            {
+                burstPayloads[index] = ArrayPool<byte>.Shared.Rent(SpeakerChunkBytes);
+            }
+
+            var payload = burstPayloads[0];
+            var burstByteCounts = new int[SpeakerBurstPacketLimit];
             var lastStatsAt = DateTimeOffset.MinValue;
             var lastUnavailableAt = DateTimeOffset.MinValue;
+            var lastSpeakerActivityAt = DateTimeOffset.MinValue;
+            var lastSlowSpeakerWriteLogAt = DateTimeOffset.MinValue;
+            var lastSendStatsTicks = Stopwatch.GetTimestamp();
+            long sendStatsPackets = 0;
+            long sendStatsBytes = 0;
+            long sendStatsReadCalls = 0;
+            long sendStatsBurstPackets = 0;
+            long sendStatsWriteCalls = 0;
+            long sendStatsEmptyReads = 0;
+            long sendStatsShortReads = 0;
+            double sendStatsReadMs = 0;
+            double sendStatsMaxReadMs = 0;
+            double sendStatsWriteMs = 0;
+            double sendStatsMaxWriteMs = 0;
+            double sendStatsWriteLockWaitMs = 0;
+            double sendStatsMaxWriteLockWaitMs = 0;
+
+            void LogSendStatsIfDue(DateTimeOffset now)
+            {
+                var elapsedSeconds = Stopwatch.GetElapsedTime(lastSendStatsTicks).TotalSeconds;
+                if (elapsedSeconds < 1)
+                {
+                    return;
+                }
+
+                Log(
+                    "AUDIO",
+                    $"speaker-send-stats packetsPerSecond={sendStatsPackets / elapsedSeconds:F1} bytesPerSecond={sendStatsBytes / elapsedSeconds:F0} readCalls={sendStatsReadCalls} burstPackets={sendStatsBurstPackets} burstPacketsPerRead={(sendStatsReadCalls <= 0 ? 0 : sendStatsBurstPackets / (double)sendStatsReadCalls):F1} writeCalls={sendStatsWriteCalls} packetsPerWrite={(sendStatsWriteCalls <= 0 ? 0 : sendStatsPackets / (double)sendStatsWriteCalls):F1} emptyReads={sendStatsEmptyReads} shortReads={sendStatsShortReads} avgReadMs={(sendStatsReadCalls <= 0 ? 0 : sendStatsReadMs / sendStatsReadCalls):F2} maxReadMs={sendStatsMaxReadMs:F2} avgWriteMs={(sendStatsWriteCalls <= 0 ? 0 : sendStatsWriteMs / sendStatsWriteCalls):F2} avgWritePerPacketMs={(sendStatsPackets <= 0 ? 0 : sendStatsWriteMs / sendStatsPackets):F2} maxWriteMs={sendStatsMaxWriteMs:F2} avgWriteLockWaitMs={(sendStatsWriteCalls <= 0 ? 0 : sendStatsWriteLockWaitMs / sendStatsWriteCalls):F2} maxWriteLockWaitMs={sendStatsMaxWriteLockWaitMs:F2} burstLimit={SpeakerBurstPacketLimit} targetPayloadBytes={SpeakerChunkBytes}");
+                lastSendStatsTicks = Stopwatch.GetTimestamp();
+                sendStatsPackets = 0;
+                sendStatsBytes = 0;
+                sendStatsReadCalls = 0;
+                sendStatsBurstPackets = 0;
+                sendStatsWriteCalls = 0;
+                sendStatsEmptyReads = 0;
+                sendStatsShortReads = 0;
+                sendStatsReadMs = 0;
+                sendStatsMaxReadMs = 0;
+                sendStatsWriteMs = 0;
+                sendStatsMaxWriteMs = 0;
+                sendStatsWriteLockWaitMs = 0;
+                sendStatsMaxWriteLockWaitMs = 0;
+            }
+
+#pragma warning disable CS8321
+            void SendCapturedSpeakerPacket(byte[] packetPayload, int bytesRead)
+            {
+                if (bytesRead < SpeakerChunkBytes)
+                {
+                    sendStatsShortReads++;
+                }
+
+                var nowMs = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds();
+                lastSpeakerActivityAt = DateTimeOffset.UtcNow;
+                var sent = WriteSpeakerPacket(
+                    stream,
+                    speakerConnection,
+                    header,
+                    packetPayload,
+                    bytesRead,
+                    nowMs,
+                    cancellationToken);
+
+                var now = DateTimeOffset.UtcNow;
+                sendStatsPackets++;
+                sendStatsBytes += bytesRead;
+                sendStatsWriteMs += sent.WriteElapsedMs;
+                sendStatsMaxWriteMs = Math.Max(sendStatsMaxWriteMs, sent.WriteElapsedMs);
+                sendStatsWriteLockWaitMs += sent.WriteLockWaitElapsedMs;
+                sendStatsMaxWriteLockWaitMs = Math.Max(sendStatsMaxWriteLockWaitMs, sent.WriteLockWaitElapsedMs);
+                LogSendStatsIfDue(now);
+
+                var totalWriteMs = sent.WriteLockWaitElapsedMs + sent.WriteElapsedMs;
+                if (totalWriteMs >= 50
+                    && now - lastSlowSpeakerWriteLogAt >= TimeSpan.FromSeconds(1))
+                {
+                    lastSlowSpeakerWriteLogAt = now;
+                    Log("AUDIO", $"speaker-send-write-slow backend={_audioBackend.Name} writeMs={sent.WriteElapsedMs:F1} writeLockWaitMs={sent.WriteLockWaitElapsedMs:F1} bytes={bytesRead} packets={sent.PacketCount} totalBytes={sent.ByteCount}");
+                }
+
+                if (sent.PacketCount != 1 && now - lastStatsAt < TimeSpan.FromSeconds(1))
+                {
+                    return;
+                }
+
+                UpdateDirectionTelemetry(
+                    AudioRuntimeDirection.Speaker,
+                    state: "playing",
+                    message: "ç”µè„‘è¾“å‡ºæ­£åœ¨å‘é€åˆ° Android æ’­æ”¾ã€‚",
+                    packets: sent.PacketCount,
+                    bytes: sent.ByteCount,
+                    levelPercent: CalculatePcm16LevelPercent(packetPayload, bytesRead),
+                    lastPacketUnixMs: now.ToUnixTimeMilliseconds(),
+                    sourceAgeMs: 0,
+                    approximateLatencyMs: 0,
+                    endpointReady: true);
+                if (sent.PacketCount == 1 || now - lastStatsAt >= TimeSpan.FromSeconds(1))
+                {
+                    Log("AUDIO", $"speaker-state=playing backend={_audioBackend.Name} packets={sent.PacketCount} bytes={sent.ByteCount} system-endpoint=ready writeMs={sent.WriteElapsedMs:F1} writeLockWaitMs={sent.WriteLockWaitElapsedMs:F1} payloadBytes={bytesRead}");
+                    PublishSpeakerStatusBestEffort(
+                        "playing",
+                        "ç”µè„‘è¾“å‡ºæ­£åœ¨å‘é€åˆ° Android æ’­æ”¾ã€‚",
+                        sent.PacketCount,
+                        sent.ByteCount);
+                    lastStatsAt = now;
+                }
+            }
+
+#pragma warning restore CS8321
+
+            void SendCapturedSpeakerBurst(int packetCount)
+            {
+                var limit = Math.Min(Math.Min(packetCount, burstPayloads.Length), burstByteCounts.Length);
+                var validPacketCount = 0;
+                var levelPercent = 0;
+                for (var index = 0; index < limit; index++)
+                {
+                    var bytesRead = burstByteCounts[index];
+                    if (bytesRead <= 0)
+                    {
+                        continue;
+                    }
+
+                    validPacketCount++;
+                    if (bytesRead < SpeakerChunkBytes)
+                    {
+                        sendStatsShortReads++;
+                    }
+
+                    levelPercent = Math.Max(levelPercent, CalculatePcm16LevelPercent(burstPayloads[index], bytesRead));
+                }
+
+                if (validPacketCount <= 0)
+                {
+                    return;
+                }
+
+                var nowMs = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds();
+                lastSpeakerActivityAt = DateTimeOffset.UtcNow;
+                var sent = WriteSpeakerBurst(
+                    stream,
+                    speakerConnection,
+                    sendBuffer,
+                    burstPayloads,
+                    burstByteCounts,
+                    limit,
+                    nowMs,
+                    cancellationToken);
+                if (sent.PacketsWritten <= 0)
+                {
+                    return;
+                }
+
+                var now = DateTimeOffset.UtcNow;
+                sendStatsPackets += sent.PacketsWritten;
+                sendStatsBytes += sent.BytesWritten;
+                sendStatsWriteCalls++;
+                sendStatsWriteMs += sent.WriteElapsedMs;
+                sendStatsMaxWriteMs = Math.Max(sendStatsMaxWriteMs, sent.WriteElapsedMs);
+                sendStatsWriteLockWaitMs += sent.WriteLockWaitElapsedMs;
+                sendStatsMaxWriteLockWaitMs = Math.Max(sendStatsMaxWriteLockWaitMs, sent.WriteLockWaitElapsedMs);
+                LogSendStatsIfDue(now);
+
+                var totalWriteMs = sent.WriteLockWaitElapsedMs + sent.WriteElapsedMs;
+                if (totalWriteMs >= 50
+                    && now - lastSlowSpeakerWriteLogAt >= TimeSpan.FromSeconds(1))
+                {
+                    lastSlowSpeakerWriteLogAt = now;
+                    Log("AUDIO", $"speaker-send-write-slow backend={_audioBackend.Name} writeMs={sent.WriteElapsedMs:F1} writeLockWaitMs={sent.WriteLockWaitElapsedMs:F1} payloadBytes={sent.BytesWritten} streamBytes={sent.StreamBytesWritten} burstPackets={sent.PacketsWritten} packets={sent.PacketCount} totalBytes={sent.ByteCount}");
+                }
+
+                if (sent.PacketCount != 1 && now - lastStatsAt < TimeSpan.FromSeconds(1))
+                {
+                    return;
+                }
+
+                var playingMessage = "电脑输出正在发送到 Android 播放。";
+                UpdateDirectionTelemetry(
+                    AudioRuntimeDirection.Speaker,
+                    state: "playing",
+                    message: playingMessage,
+                    packets: sent.PacketCount,
+                    bytes: sent.ByteCount,
+                    levelPercent: levelPercent,
+                    lastPacketUnixMs: now.ToUnixTimeMilliseconds(),
+                    sourceAgeMs: 0,
+                    approximateLatencyMs: 0,
+                    endpointReady: true);
+                if (sent.PacketCount == 1 || now - lastStatsAt >= TimeSpan.FromSeconds(1))
+                {
+                    Log("AUDIO", $"speaker-state=playing backend={_audioBackend.Name} packets={sent.PacketCount} bytes={sent.ByteCount} system-endpoint=ready writeMs={sent.WriteElapsedMs:F1} writeLockWaitMs={sent.WriteLockWaitElapsedMs:F1} payloadBytes={sent.BytesWritten} streamBytes={sent.StreamBytesWritten} burstPackets={sent.PacketsWritten}");
+                    PublishSpeakerStatusBestEffort(
+                        "playing",
+                        playingMessage,
+                        sent.PacketCount,
+                        sent.ByteCount);
+                    lastStatsAt = now;
+                }
+            }
 
             try
             {
@@ -536,7 +773,7 @@ internal static partial class Program
                     if (audioTestCoordinator.TryReadPlaybackTone(payload, SpeakerChunkBytes, out var testBytesRead))
                     {
                         var testNowMs = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds();
-                        var testSent = await WriteSpeakerPacketAsync(
+                        var testSent = WriteSpeakerPacket(
                             stream,
                             speakerConnection,
                             header,
@@ -556,17 +793,26 @@ internal static partial class Program
                             sourceAgeMs: 0,
                             approximateLatencyMs: 0,
                             endpointReady: true);
-                        await PublishSpeakerStatusAsync(
+                        PublishSpeakerStatusBestEffort(
                             "playing",
                             "正在发送播放测试音到 Android。",
-                            cancellationToken,
                             testSent.PacketCount,
                             testSent.ByteCount);
-                        await Task.Delay(20, cancellationToken);
+                        SleepWithCancellation(TimeSpan.FromMilliseconds(SpeakerChunkMilliseconds), cancellationToken);
                         continue;
                     }
 
-                    var readResult = _audioBackend.ReadSpeaker(payload, SpeakerChunkBytes);
+                    var readStartedAt = Stopwatch.GetTimestamp();
+                    var readResult = _audioBackend.ReadSpeakerBurst(
+                        burstPayloads,
+                        burstByteCounts,
+                        SpeakerChunkBytes,
+                        SpeakerBurstPacketLimit);
+                    var readElapsedMs = Stopwatch.GetElapsedTime(readStartedAt).TotalMilliseconds;
+                    sendStatsReadCalls++;
+                    sendStatsBurstPackets += readResult.PacketCount;
+                    sendStatsReadMs += readElapsedMs;
+                    sendStatsMaxReadMs = Math.Max(sendStatsMaxReadMs, readElapsedMs);
                     if (!readResult.EndpointReady)
                     {
                         var unavailableNow = DateTimeOffset.UtcNow;
@@ -581,22 +827,62 @@ internal static partial class Program
                                 endpointReady: false,
                                 lastError: readResult.Message);
                             var snapshot = speakerConnection.Snapshot();
-                            await PublishSpeakerStatusAsync(
+                            PublishSpeakerStatusBestEffort(
                                 "unavailable",
                                 readResult.Message,
-                                cancellationToken,
                                 snapshot.PacketCount,
                                 snapshot.ByteCount);
                         }
 
-                        await Task.Delay(250, cancellationToken);
+                        SleepWithCancellation(TimeSpan.FromMilliseconds(250), cancellationToken);
                         continue;
                     }
 
-                    var bytesRead = readResult.BytesRead;
-                    if (bytesRead <= 0)
+                    if (readResult.PacketCount <= 0)
                     {
+                        sendStatsEmptyReads++;
                         var waitingNow = DateTimeOffset.UtcNow;
+                        LogSendStatsIfDue(waitingNow);
+                        if (EnableSpeakerSendSilenceFiller
+                            && lastSpeakerActivityAt != DateTimeOffset.MinValue
+                            && waitingNow - lastSpeakerActivityAt <= TimeSpan.FromSeconds(2))
+                        {
+                            Array.Clear(payload, 0, SpeakerChunkBytes);
+                            var silenceSent = WriteSpeakerPacket(
+                                stream,
+                                speakerConnection,
+                                header,
+                                payload,
+                                SpeakerChunkBytes,
+                                waitingNow.ToUnixTimeMilliseconds(),
+                                cancellationToken);
+
+                            UpdateDirectionTelemetry(
+                                AudioRuntimeDirection.Speaker,
+                                state: "playing",
+                                message: "电脑输出正在发送到 Android 播放。",
+                                packets: silenceSent.PacketCount,
+                                bytes: silenceSent.ByteCount,
+                                levelPercent: 0,
+                                lastPacketUnixMs: waitingNow.ToUnixTimeMilliseconds(),
+                                sourceAgeMs: 0,
+                                approximateLatencyMs: 0,
+                                endpointReady: true);
+                            if (silenceSent.PacketCount == 1 || waitingNow - lastStatsAt >= TimeSpan.FromSeconds(1))
+                            {
+                                Log("AUDIO", $"speaker-state=playing backend={_audioBackend.Name} packets={silenceSent.PacketCount} bytes={silenceSent.ByteCount} system-endpoint=ready filler=silence writeMs={silenceSent.WriteElapsedMs:F1}");
+                                PublishSpeakerStatusBestEffort(
+                                    "playing",
+                                    "电脑输出正在发送到 Android 播放。",
+                                    silenceSent.PacketCount,
+                                    silenceSent.ByteCount);
+                                lastStatsAt = waitingNow;
+                            }
+
+                            SleepWithCancellation(TimeSpan.FromMilliseconds(SpeakerChunkMilliseconds), cancellationToken);
+                            continue;
+                        }
+
                         if (lastStatsAt == DateTimeOffset.MinValue || waitingNow - lastStatsAt >= TimeSpan.FromSeconds(1))
                         {
                             var snapshot = speakerConnection.Snapshot();
@@ -610,29 +896,20 @@ internal static partial class Program
                                 bytes: snapshot.ByteCount,
                                 levelPercent: 0,
                                 endpointReady: true);
-                            await PublishSpeakerStatusAsync(
+                            PublishSpeakerStatusBestEffort(
                                 "available",
                                 "等待所选 Windows 输出设备产生声音。",
-                                cancellationToken,
                                 snapshot.PacketCount,
                                 snapshot.ByteCount);
                         }
 
-                        await Task.Delay(10, cancellationToken);
+                        _audioBackend.WaitForSpeakerData(TimeSpan.FromMilliseconds(SpeakerChunkMilliseconds * 2), cancellationToken);
                         continue;
                     }
 
-                    var nowMs = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds();
-                    var sent = await WriteSpeakerPacketAsync(
-                        stream,
-                        speakerConnection,
-                        header,
-                        payload,
-                        bytesRead,
-                        nowMs,
-                        cancellationToken);
+                    SendCapturedSpeakerBurst(readResult.PacketCount);
 
-                    var now = DateTimeOffset.UtcNow;
+                    /*
                     UpdateDirectionTelemetry(
                         AudioRuntimeDirection.Speaker,
                         state: "playing",
@@ -646,15 +923,15 @@ internal static partial class Program
                         endpointReady: true);
                     if (sent.PacketCount == 1 || now - lastStatsAt >= TimeSpan.FromSeconds(1))
                     {
-                        Log("AUDIO", $"speaker-state=playing backend={_audioBackend.Name} packets={sent.PacketCount} bytes={sent.ByteCount} system-endpoint=ready");
-                        await PublishSpeakerStatusAsync(
+                        Log("AUDIO", $"speaker-state=playing backend={_audioBackend.Name} packets={sent.PacketCount} bytes={sent.ByteCount} system-endpoint=ready writeMs={sent.WriteElapsedMs:F1} payloadBytes={bytesRead}");
+                        PublishSpeakerStatusBestEffort(
                             "playing",
                             "电脑输出正在发送到 Android 播放。",
-                            cancellationToken,
                             sent.PacketCount,
                             sent.ByteCount);
                         lastStatsAt = now;
                     }
+                    */
                 }
             }
             catch (OperationCanceledException)
@@ -679,7 +956,11 @@ internal static partial class Program
             finally
             {
                 ArrayPool<byte>.Shared.Return(header);
-                ArrayPool<byte>.Shared.Return(payload);
+                ArrayPool<byte>.Shared.Return(sendBuffer);
+                foreach (var rentedPayload in burstPayloads)
+                {
+                    ArrayPool<byte>.Shared.Return(rentedPayload);
+                }
             }
         }
 
@@ -756,15 +1037,127 @@ internal static partial class Program
             long timestampMs,
             CancellationToken cancellationToken)
         {
+            var waitStartedAt = Stopwatch.GetTimestamp();
             await speakerConnection.WriteLock.WaitAsync(cancellationToken);
+            var waitElapsedMs = Stopwatch.GetElapsedTime(waitStartedAt).TotalMilliseconds;
             try
             {
+                var startedAt = Stopwatch.GetTimestamp();
                 var snapshot = speakerConnection.AddPacket(byteCount);
                 WriteHeader(header, SpeakerMagic, snapshot.PacketCount, timestampMs, AudioDefaults.SpeakerChannels, byteCount);
                 await stream.WriteAsync(header.AsMemory(0, HeaderSize), cancellationToken);
                 await stream.WriteAsync(payload.AsMemory(0, byteCount), cancellationToken);
                 await stream.FlushAsync(cancellationToken);
-                return snapshot;
+                return new SpeakerSendSnapshot(
+                    snapshot.PacketCount,
+                    snapshot.ByteCount,
+                    Stopwatch.GetElapsedTime(startedAt).TotalMilliseconds,
+                    waitElapsedMs);
+            }
+            finally
+            {
+                speakerConnection.WriteLock.Release();
+            }
+        }
+
+        private static SpeakerBurstSendSnapshot WriteSpeakerBurst(
+            Stream stream,
+            SpeakerConnectionState speakerConnection,
+            byte[] sendBuffer,
+            byte[][] payloads,
+            int[] byteCounts,
+            int packetCount,
+            long timestampMs,
+            CancellationToken cancellationToken)
+        {
+            var waitStartedAt = Stopwatch.GetTimestamp();
+            speakerConnection.WriteLock.Wait(cancellationToken);
+            var waitElapsedMs = Stopwatch.GetElapsedTime(waitStartedAt).TotalMilliseconds;
+            try
+            {
+                var startedAt = Stopwatch.GetTimestamp();
+                var limit = Math.Min(Math.Min(payloads.Length, byteCounts.Length), packetCount);
+                var offset = 0;
+                var packetsWritten = 0;
+                long bytesWritten = 0;
+                var snapshot = speakerConnection.Snapshot();
+                for (var index = 0; index < limit; index++)
+                {
+                    cancellationToken.ThrowIfCancellationRequested();
+                    var payload = payloads[index];
+                    var byteCount = Math.Min(byteCounts[index], payload.Length);
+                    byteCount -= byteCount % AudioDefaults.SpeakerFrameBytes;
+                    if (byteCount <= 0)
+                    {
+                        continue;
+                    }
+
+                    if (offset + HeaderSize + byteCount > sendBuffer.Length)
+                    {
+                        break;
+                    }
+
+                    snapshot = speakerConnection.AddPacket(byteCount);
+                    WriteHeader(
+                        sendBuffer.AsSpan(offset, HeaderSize),
+                        SpeakerMagic,
+                        snapshot.PacketCount,
+                        timestampMs,
+                        AudioDefaults.SpeakerChannels,
+                        byteCount);
+                    offset += HeaderSize;
+                    Buffer.BlockCopy(payload, 0, sendBuffer, offset, byteCount);
+                    offset += byteCount;
+                    packetsWritten++;
+                    bytesWritten += byteCount;
+                }
+
+                if (offset > 0)
+                {
+                    stream.Write(sendBuffer, 0, offset);
+                    stream.Flush();
+                }
+
+                return new SpeakerBurstSendSnapshot(
+                    snapshot.PacketCount,
+                    snapshot.ByteCount,
+                    packetsWritten,
+                    bytesWritten,
+                    offset,
+                    Stopwatch.GetElapsedTime(startedAt).TotalMilliseconds,
+                    waitElapsedMs);
+            }
+            finally
+            {
+                speakerConnection.WriteLock.Release();
+            }
+        }
+
+        private static SpeakerSendSnapshot WriteSpeakerPacket(
+            Stream stream,
+            SpeakerConnectionState speakerConnection,
+            byte[] header,
+            byte[] payload,
+            int byteCount,
+            long timestampMs,
+            CancellationToken cancellationToken)
+        {
+            var waitStartedAt = Stopwatch.GetTimestamp();
+            speakerConnection.WriteLock.Wait(cancellationToken);
+            var waitElapsedMs = Stopwatch.GetElapsedTime(waitStartedAt).TotalMilliseconds;
+            try
+            {
+                var startedAt = Stopwatch.GetTimestamp();
+                var snapshot = speakerConnection.AddPacket(byteCount);
+                WriteHeader(header, SpeakerMagic, snapshot.PacketCount, timestampMs, AudioDefaults.SpeakerChannels, byteCount);
+                stream.Write(header, 0, HeaderSize);
+                stream.Write(payload, 0, byteCount);
+                stream.Flush();
+                return new SpeakerSendSnapshot(
+                    snapshot.PacketCount,
+                    snapshot.ByteCount,
+                    Stopwatch.GetElapsedTime(startedAt).TotalMilliseconds,
+                    waitElapsedMs);
             }
             finally
             {
@@ -810,7 +1203,20 @@ internal static partial class Program
             }
         }
 
-        private sealed record SpeakerSendSnapshot(long PacketCount, long ByteCount);
+        private sealed record SpeakerSendSnapshot(
+            long PacketCount,
+            long ByteCount,
+            double WriteElapsedMs = 0,
+            double WriteLockWaitElapsedMs = 0);
+
+        private sealed record SpeakerBurstSendSnapshot(
+            long PacketCount,
+            long ByteCount,
+            int PacketsWritten,
+            long BytesWritten,
+            int StreamBytesWritten,
+            double WriteElapsedMs = 0,
+            double WriteLockWaitElapsedMs = 0);
 
         private static async Task<AudioDirectionCompletion> MonitorAudioDirectionAsync(
             string taskName,
@@ -1156,6 +1562,43 @@ internal static partial class Program
             }, cancellationToken);
         }
 
+        private void PublishSpeakerStatusBestEffort(
+            string state,
+            string message,
+            long packets = 0,
+            long bytes = 0)
+        {
+            if (!controlPublisher.HasActiveConnection)
+            {
+                return;
+            }
+
+            _ = Task.Run(async () =>
+            {
+                try
+                {
+                    await PublishSpeakerStatusAsync(state, message, CancellationToken.None, packets, bytes);
+                }
+                catch (Exception ex) when (ex is not OperationCanceledException)
+                {
+                    Log("AUDIO", $"speaker-status-publish-failed exception={ex.GetType().Name} message={LogValue(ex.Message)}");
+                }
+            });
+        }
+
+        private static void SleepWithCancellation(TimeSpan delay, CancellationToken cancellationToken)
+        {
+            if (delay <= TimeSpan.Zero)
+            {
+                return;
+            }
+
+            if (cancellationToken.WaitHandle.WaitOne(delay))
+            {
+                throw new OperationCanceledException(cancellationToken);
+            }
+        }
+
         private static void ValidateHeader(byte[] header, byte[] magic, string direction)
         {
             if (!header.AsSpan(0, 4).SequenceEqual(magic))
@@ -1172,14 +1615,19 @@ internal static partial class Program
 
         private static void WriteHeader(byte[] header, byte[] magic, long sequence, long timestampMs, int channels, int payloadLength)
         {
-            magic.CopyTo(header, 0);
-            BinaryPrimitives.WriteInt32LittleEndian(header.AsSpan(4, 4), 1);
-            BinaryPrimitives.WriteInt64LittleEndian(header.AsSpan(8, 8), sequence);
-            BinaryPrimitives.WriteInt64LittleEndian(header.AsSpan(16, 8), timestampMs);
-            BinaryPrimitives.WriteInt32LittleEndian(header.AsSpan(24, 4), AudioDefaults.SampleRate);
-            BinaryPrimitives.WriteInt16LittleEndian(header.AsSpan(28, 2), (short)channels);
-            BinaryPrimitives.WriteInt16LittleEndian(header.AsSpan(30, 2), AudioDefaults.BitsPerSample);
-            BinaryPrimitives.WriteInt32LittleEndian(header.AsSpan(32, 4), payloadLength);
+            WriteHeader(header.AsSpan(0, HeaderSize), magic, sequence, timestampMs, channels, payloadLength);
+        }
+
+        private static void WriteHeader(Span<byte> header, byte[] magic, long sequence, long timestampMs, int channels, int payloadLength)
+        {
+            magic.AsSpan().CopyTo(header);
+            BinaryPrimitives.WriteInt32LittleEndian(header.Slice(4, 4), 1);
+            BinaryPrimitives.WriteInt64LittleEndian(header.Slice(8, 8), sequence);
+            BinaryPrimitives.WriteInt64LittleEndian(header.Slice(16, 8), timestampMs);
+            BinaryPrimitives.WriteInt32LittleEndian(header.Slice(24, 4), AudioDefaults.SampleRate);
+            BinaryPrimitives.WriteInt16LittleEndian(header.Slice(28, 2), (short)channels);
+            BinaryPrimitives.WriteInt16LittleEndian(header.Slice(30, 2), AudioDefaults.BitsPerSample);
+            BinaryPrimitives.WriteInt32LittleEndian(header.Slice(32, 4), payloadLength);
         }
 
         private static IAudioBridgeBackend CreateAudioBackend(HostOptions hostOptions)
@@ -1220,9 +1668,15 @@ internal static partial class Program
             bool EnsureSpeakerReady(out string message);
 
             AudioReadResult ReadSpeaker(byte[] destination, int maxByteCount);
+
+            AudioBurstReadResult ReadSpeakerBurst(byte[][] destinations, int[] byteCounts, int maxByteCount, int maxPacketCount);
+
+            bool WaitForSpeakerData(TimeSpan timeout, CancellationToken cancellationToken);
         }
 
         private sealed record AudioReadResult(bool EndpointReady, int BytesRead, string Message);
+
+        private sealed record AudioBurstReadResult(bool EndpointReady, int PacketCount, int TotalBytes, string Message);
 
         private enum AudioRuntimeDirection
         {
@@ -1483,6 +1937,43 @@ internal static partial class Program
                 return new AudioReadResult(endpointReady, bytesRead, message);
             }
 
+            public AudioBurstReadResult ReadSpeakerBurst(byte[][] destinations, int[] byteCounts, int maxByteCount, int maxPacketCount)
+            {
+                var packetCount = 0;
+                var totalBytes = 0;
+                var message = SpeakerStatusMessage;
+                var limit = Math.Min(Math.Min(destinations.Length, byteCounts.Length), maxPacketCount);
+                for (var index = 0; index < limit; index++)
+                {
+                    var readResult = ReadSpeaker(destinations[index], maxByteCount);
+                    message = readResult.Message;
+                    if (!readResult.EndpointReady)
+                    {
+                        return new AudioBurstReadResult(false, packetCount, totalBytes, message);
+                    }
+
+                    if (readResult.BytesRead <= 0)
+                    {
+                        break;
+                    }
+
+                    byteCounts[index] = readResult.BytesRead;
+                    packetCount++;
+                    totalBytes += readResult.BytesRead;
+                    if (readResult.BytesRead < maxByteCount)
+                    {
+                        break;
+                    }
+                }
+
+                return new AudioBurstReadResult(true, packetCount, totalBytes, message);
+            }
+
+            public bool WaitForSpeakerData(TimeSpan timeout, CancellationToken cancellationToken)
+            {
+                return !cancellationToken.WaitHandle.WaitOne(timeout);
+            }
+
             public void Dispose()
             {
                 _micRing.Dispose();
@@ -1493,7 +1984,11 @@ internal static partial class Program
         private sealed class WasapiVirtualCableAudioBackend : IAudioBridgeBackend
         {
             private const int WasapiLatencyMilliseconds = 50;
-            private const int MaxSpeakerQueueBytes = AudioDefaults.SampleRate * AudioDefaults.SpeakerFrameBytes;
+            private const int MaxSpeakerQueueMilliseconds = 250;
+            private const int MaxSpeakerQueueBytes = AudioDefaults.SampleRate * AudioDefaults.SpeakerFrameBytes * MaxSpeakerQueueMilliseconds / 1000;
+            private const double SpeakerSilenceFillThresholdSeconds = 0.005;
+            private const double MaxSpeakerSilenceFillSeconds = 0.75;
+            private const int SpeakerCaptureBufferMilliseconds = 20;
 
             private readonly string? _speakerOutputLoopbackEndpointId;
             private readonly string? _microphoneRenderEndpointId;
@@ -1501,6 +1996,7 @@ internal static partial class Program
             private readonly object _speakerLock = new();
             private readonly ConcurrentQueue<byte[]> _speakerPackets = new();
             private readonly object _speakerPacketLock = new();
+            private readonly ManualResetEventSlim _speakerPacketAvailable = new(false);
 
             private MMDeviceEnumerator? _deviceEnumerator;
             private MMDevice? _microphoneRenderDevice;
@@ -1518,12 +2014,37 @@ internal static partial class Program
             private int _queuedSpeakerBytes;
             private byte[]? _speakerPendingPacket;
             private int _speakerPendingOffset;
+            private long _lastSpeakerCaptureTicks;
+            private double _lastSpeakerCaptureDurationSeconds;
+            private long _speakerCaptureEvents;
+            private long _speakerCaptureSourceBytes;
+            private long _speakerCaptureOutputBytes;
+            private long _speakerCaptureSilenceBytes;
+            private long _speakerCaptureDroppedPackets;
+            private long _speakerCaptureDroppedBytes;
+            private double _speakerCaptureMaxGapSeconds;
+            private long _lastSpeakerCaptureStatsTicks;
+            private long _lastSpeakerCaptureStatsEvents;
+            private long _lastSpeakerCaptureStatsSourceBytes;
+            private long _lastSpeakerCaptureStatsOutputBytes;
+            private long _lastSpeakerCaptureStatsSilenceBytes;
+            private long _lastSpeakerCaptureStatsDroppedPackets;
+            private long _lastSpeakerCaptureStatsDroppedBytes;
             private bool _disposed;
 
             public WasapiVirtualCableAudioBackend(string? speakerOutputLoopbackEndpointId, string? microphoneRenderEndpointId)
             {
                 _speakerOutputLoopbackEndpointId = NormalizeEndpointId(speakerOutputLoopbackEndpointId);
                 _microphoneRenderEndpointId = NormalizeEndpointId(microphoneRenderEndpointId);
+            }
+
+            private sealed class LowLatencyWasapiLoopbackCapture(MMDevice captureDevice, int bufferMilliseconds)
+                : WasapiCapture(captureDevice, true, bufferMilliseconds)
+            {
+                protected override AudioClientStreamFlags GetAudioClientStreamFlags()
+                {
+                    return AudioClientStreamFlags.Loopback;
+                }
             }
 
             public string Name => "wasapi-virtual-cable";
@@ -1751,23 +2272,22 @@ internal static partial class Program
 
                         var device = GetEndpoint(_speakerOutputLoopbackEndpointId, DataFlow.Render, "电脑声音 loopback 输出端点");
                         var mixFormat = device.AudioClient.MixFormat;
-                        var format = new WaveFormat(AudioDefaults.SampleRate, AudioDefaults.BitsPerSample, AudioDefaults.SpeakerChannels);
-                        EnsureFormatSupported(device, format, "电脑声音 loopback 输出端点");
-                        var capture = new WasapiLoopbackCapture(device)
+                        var capture = new LowLatencyWasapiLoopbackCapture(device, SpeakerCaptureBufferMilliseconds)
                         {
-                            WaveFormat = format
+                            WaveFormat = mixFormat
                         };
+                        var captureFormat = NormalizeSpeakerCaptureFormat(capture.WaveFormat);
                         capture.DataAvailable += OnSpeakerDataAvailable;
                         capture.RecordingStopped += OnSpeakerRecordingStopped;
                         capture.StartRecording();
 
                         _speakerCaptureDevice = device;
                         _speakerCapture = capture;
-                        _speakerCaptureFormat = format;
-                        _speakerStatusMessage = $"电脑声音 loopback 输出端点已就绪：{device.FriendlyName}；direction={device.DataFlow}；selectedFormat={FormatWaveFormat(format)}；mixFormat={FormatWaveFormat(mixFormat)}。";
+                        _speakerCaptureFormat = captureFormat;
+                        _speakerStatusMessage = $"电脑声音 loopback 输出端点已就绪：{device.FriendlyName}；direction={device.DataFlow}；captureFormat={FormatWaveFormat(captureFormat)}；outputFormat=pcm_s16le {AudioDefaults.SampleRate} Hz / {AudioDefaults.SpeakerChannels}ch；mixFormat={FormatWaveFormat(mixFormat)}。";
                         Log(
                             "AUDIO",
-                            $"wasapi-endpoint-opened role=speaker-loopback friendlyName={LogValue(device.FriendlyName)} direction={device.DataFlow} selectedFormat={LogValue(FormatWaveFormat(format))} mixFormat={LogValue(FormatWaveFormat(mixFormat))}");
+                            $"wasapi-endpoint-opened role=speaker-loopback friendlyName={LogValue(device.FriendlyName)} direction={device.DataFlow} captureFormat={LogValue(FormatWaveFormat(captureFormat))} outputFormat=pcm_s16le/{AudioDefaults.SampleRate}/stereo mixFormat={LogValue(FormatWaveFormat(mixFormat))} captureBufferMs={SpeakerCaptureBufferMilliseconds}");
                         message = _speakerStatusMessage;
                         return true;
                     }
@@ -1792,13 +2312,13 @@ internal static partial class Program
                     return new AudioReadResult(IsSpeakerReady, 0, message);
                 }
 
-                if (!EnsureSpeakerReady(out var readyMessage))
+                if (!EnsureSpeakerReadyForRead(out var readyMessage))
                 {
                     return new AudioReadResult(false, 0, readyMessage);
                 }
 
                 var bytesRead = DequeueSpeakerBytes(destination, maxByteCount);
-                if (bytesRead > 0)
+                if (bytesRead > 0 && _speakerCapture is null)
                 {
                     lock (_speakerLock)
                     {
@@ -1807,7 +2327,97 @@ internal static partial class Program
                     }
                 }
 
+                if (bytesRead > 0)
+                {
+                    readyMessage = SetSpeakerPlayingStatusMessage();
+                }
+
                 return new AudioReadResult(true, bytesRead, readyMessage);
+            }
+
+            public AudioBurstReadResult ReadSpeakerBurst(byte[][] destinations, int[] byteCounts, int maxByteCount, int maxPacketCount)
+            {
+                if (destinations.Length == 0 || byteCounts.Length == 0 || maxByteCount <= 0 || maxPacketCount <= 0)
+                {
+                    var message = SpeakerStatusMessage;
+                    return new AudioBurstReadResult(IsSpeakerReady, 0, 0, message);
+                }
+
+                if (!EnsureSpeakerReadyForRead(out var readyMessage))
+                {
+                    return new AudioBurstReadResult(false, 0, 0, readyMessage);
+                }
+
+                var packetCount = 0;
+                var totalBytes = 0;
+                var limit = Math.Min(Math.Min(destinations.Length, byteCounts.Length), maxPacketCount);
+                lock (_speakerPacketLock)
+                {
+                    for (var index = 0; index < limit; index++)
+                    {
+                        var bytesRead = DequeueSpeakerBytesLocked(destinations[index], maxByteCount);
+                        if (bytesRead <= 0)
+                        {
+                            break;
+                        }
+
+                        byteCounts[index] = bytesRead;
+                        packetCount++;
+                        totalBytes += bytesRead;
+                        if (bytesRead < maxByteCount)
+                        {
+                            break;
+                        }
+                    }
+
+                    if (_queuedSpeakerBytes <= 0 && _speakerPendingPacket is null)
+                    {
+                        _speakerPacketAvailable.Reset();
+                    }
+                    else
+                    {
+                        _speakerPacketAvailable.Set();
+                    }
+                }
+
+                if (packetCount > 0 && _speakerCapture is null)
+                {
+                    lock (_speakerLock)
+                    {
+                        _speakerStatusMessage = "æ­£åœ¨ loopback æ•èŽ·ç”µè„‘è¾“å‡ºå¹¶å‘é€åˆ° Androidã€‚";
+                        readyMessage = _speakerStatusMessage;
+                    }
+                }
+
+                if (packetCount > 0)
+                {
+                    readyMessage = SetSpeakerPlayingStatusMessage();
+                }
+
+                return new AudioBurstReadResult(true, packetCount, totalBytes, readyMessage);
+            }
+
+            private bool EnsureSpeakerReadyForRead(out string message)
+            {
+                if (Volatile.Read(ref _speakerCapture) is not null)
+                {
+                    message = Volatile.Read(ref _speakerStatusMessage);
+                    return true;
+                }
+
+                return EnsureSpeakerReady(out message);
+            }
+
+            private string SetSpeakerPlayingStatusMessage()
+            {
+                const string message = "正在 loopback 捕获电脑输出并发送到 Android。";
+                Volatile.Write(ref _speakerStatusMessage, message);
+                return message;
+            }
+
+            public bool WaitForSpeakerData(TimeSpan timeout, CancellationToken cancellationToken)
+            {
+                return _speakerPacketAvailable.Wait(timeout, cancellationToken);
             }
 
             public void Dispose()
@@ -1823,6 +2433,8 @@ internal static partial class Program
                     _disposed = true;
                     ResetMicrophoneRenderCore();
                     ResetSpeakerCaptureCore();
+                    _speakerPacketAvailable.Set();
+                    _speakerPacketAvailable.Dispose();
                     _deviceEnumerator?.Dispose();
                     _deviceEnumerator = null;
                 }
@@ -1981,25 +2593,270 @@ internal static partial class Program
 
             private void OnSpeakerDataAvailable(object? sender, WaveInEventArgs args)
             {
-                var byteCount = args.BytesRecorded - (args.BytesRecorded % AudioDefaults.SpeakerFrameBytes);
-                if (byteCount <= 0)
+                var capturedAtTicks = Stopwatch.GetTimestamp();
+                var captureFormat = _speakerCaptureFormat;
+                if (captureFormat is null)
                 {
                     return;
                 }
 
-                var copy = new byte[byteCount];
-                Buffer.BlockCopy(args.Buffer, 0, copy, 0, byteCount);
+                byte[] copy;
+                try
+                {
+                    copy = ConvertSpeakerCaptureToPcm16(args.Buffer, args.BytesRecorded, captureFormat);
+                }
+                catch (Exception ex) when (ex is InvalidOperationException or ArgumentException)
+                {
+                    lock (_speakerLock)
+                    {
+                        _speakerStatusMessage = $"电脑声音 loopback 格式转换失败：{ex.Message}";
+                    }
+                    Log(
+                        "AUDIO",
+                        $"speaker-state=unavailable backend=wasapi-virtual-cable reason=speaker-conversion-failed captureFormat={LogValue(FormatWaveFormat(captureFormat))} exception={ex.GetType().Name} message={LogValue(ex.Message)}");
+                    return;
+                }
 
+                if (copy.Length <= 0)
+                {
+                    return;
+                }
+
+                string? statsLogLine;
                 lock (_speakerPacketLock)
                 {
-                    while (_queuedSpeakerBytes + copy.Length > MaxSpeakerQueueBytes && _speakerPackets.TryDequeue(out var dropped))
+                    var silence = CreateSpeakerSilenceFillLocked(capturedAtTicks, copy.Length, out var gapSeconds);
+                    if (silence.Length > 0)
                     {
-                        _queuedSpeakerBytes -= dropped.Length;
+                        EnqueueSpeakerPacketLocked(silence);
                     }
 
-                    _speakerPackets.Enqueue(copy);
-                    _queuedSpeakerBytes += copy.Length;
+                    EnqueueSpeakerPacketLocked(copy);
+                    statsLogLine = RecordSpeakerCaptureStatsLocked(args.BytesRecorded, copy.Length, silence.Length, gapSeconds);
                 }
+
+                if (!string.IsNullOrWhiteSpace(statsLogLine))
+                {
+                    Log("AUDIO", statsLogLine);
+                }
+            }
+
+            private byte[] CreateSpeakerSilenceFillLocked(long capturedAtTicks, int nextPacketBytes, out double gapSeconds)
+            {
+                gapSeconds = 0;
+                var nextDurationSeconds = nextPacketBytes / (double)(AudioDefaults.SampleRate * AudioDefaults.SpeakerFrameBytes);
+                if (_lastSpeakerCaptureTicks == 0)
+                {
+                    _lastSpeakerCaptureTicks = capturedAtTicks;
+                    _lastSpeakerCaptureDurationSeconds = nextDurationSeconds;
+                    return Array.Empty<byte>();
+                }
+
+                var elapsedSeconds = (capturedAtTicks - _lastSpeakerCaptureTicks) / (double)Stopwatch.Frequency;
+                _lastSpeakerCaptureTicks = capturedAtTicks;
+                gapSeconds = elapsedSeconds - _lastSpeakerCaptureDurationSeconds;
+                _lastSpeakerCaptureDurationSeconds = nextDurationSeconds;
+                if (gapSeconds <= SpeakerSilenceFillThresholdSeconds || gapSeconds > MaxSpeakerSilenceFillSeconds)
+                {
+                    return Array.Empty<byte>();
+                }
+
+                var silenceFrames = (int)Math.Round(gapSeconds * AudioDefaults.SampleRate);
+                if (silenceFrames <= 0)
+                {
+                    return Array.Empty<byte>();
+                }
+
+                return new byte[silenceFrames * AudioDefaults.SpeakerFrameBytes];
+            }
+
+            private void EnqueueSpeakerPacketLocked(byte[] packet)
+            {
+                while (_queuedSpeakerBytes + packet.Length > MaxSpeakerQueueBytes && _speakerPackets.TryDequeue(out var dropped))
+                {
+                    _queuedSpeakerBytes -= dropped.Length;
+                    _speakerCaptureDroppedPackets++;
+                    _speakerCaptureDroppedBytes += dropped.Length;
+                }
+
+                _speakerPackets.Enqueue(packet);
+                _queuedSpeakerBytes += packet.Length;
+                _speakerPacketAvailable.Set();
+            }
+
+            private string? RecordSpeakerCaptureStatsLocked(int sourceBytes, int outputBytes, int silenceBytes, double gapSeconds)
+            {
+                _speakerCaptureEvents++;
+                _speakerCaptureSourceBytes += Math.Max(0, sourceBytes);
+                _speakerCaptureOutputBytes += Math.Max(0, outputBytes);
+                _speakerCaptureSilenceBytes += Math.Max(0, silenceBytes);
+                if (gapSeconds > _speakerCaptureMaxGapSeconds)
+                {
+                    _speakerCaptureMaxGapSeconds = gapSeconds;
+                }
+
+                var nowTicks = Stopwatch.GetTimestamp();
+                if (_lastSpeakerCaptureStatsTicks == 0)
+                {
+                    _lastSpeakerCaptureStatsTicks = nowTicks;
+                    _lastSpeakerCaptureStatsEvents = _speakerCaptureEvents;
+                    _lastSpeakerCaptureStatsSourceBytes = _speakerCaptureSourceBytes;
+                    _lastSpeakerCaptureStatsOutputBytes = _speakerCaptureOutputBytes;
+                    _lastSpeakerCaptureStatsSilenceBytes = _speakerCaptureSilenceBytes;
+                    _lastSpeakerCaptureStatsDroppedPackets = _speakerCaptureDroppedPackets;
+                    _lastSpeakerCaptureStatsDroppedBytes = _speakerCaptureDroppedBytes;
+                    _speakerCaptureMaxGapSeconds = 0;
+                    return null;
+                }
+
+                var elapsedSeconds = (nowTicks - _lastSpeakerCaptureStatsTicks) / (double)Stopwatch.Frequency;
+                if (elapsedSeconds < 1)
+                {
+                    return null;
+                }
+
+                var events = _speakerCaptureEvents - _lastSpeakerCaptureStatsEvents;
+                var sourceDelta = _speakerCaptureSourceBytes - _lastSpeakerCaptureStatsSourceBytes;
+                var outputDelta = _speakerCaptureOutputBytes - _lastSpeakerCaptureStatsOutputBytes;
+                var silenceDelta = _speakerCaptureSilenceBytes - _lastSpeakerCaptureStatsSilenceBytes;
+                var droppedPacketsDelta = _speakerCaptureDroppedPackets - _lastSpeakerCaptureStatsDroppedPackets;
+                var droppedBytesDelta = _speakerCaptureDroppedBytes - _lastSpeakerCaptureStatsDroppedBytes;
+                var pendingBytes = _speakerPendingPacket is null
+                    ? 0
+                    : Math.Max(0, _speakerPendingPacket.Length - _speakerPendingOffset);
+                var line =
+                    $"speaker-capture-stats eventsPerSecond={events / elapsedSeconds:F1} sourceBytesPerSecond={sourceDelta / elapsedSeconds:F0} outputBytesPerSecond={outputDelta / elapsedSeconds:F0} silenceBytesPerSecond={silenceDelta / elapsedSeconds:F0} droppedPacketsPerSecond={droppedPacketsDelta / elapsedSeconds:F1} droppedBytesPerSecond={droppedBytesDelta / elapsedSeconds:F0} totalEvents={_speakerCaptureEvents} totalOutputBytes={_speakerCaptureOutputBytes} totalSilenceBytes={_speakerCaptureSilenceBytes} totalDroppedPackets={_speakerCaptureDroppedPackets} totalDroppedBytes={_speakerCaptureDroppedBytes} lastSourceBytes={sourceBytes} lastOutputBytes={outputBytes} lastSilenceBytes={silenceBytes} maxGapMs={_speakerCaptureMaxGapSeconds * 1000:F1} queuedBytes={_queuedSpeakerBytes} queuedPackets={_speakerPackets.Count} maxQueueBytes={MaxSpeakerQueueBytes} pendingBytes={pendingBytes}";
+
+                _lastSpeakerCaptureStatsTicks = nowTicks;
+                _lastSpeakerCaptureStatsEvents = _speakerCaptureEvents;
+                _lastSpeakerCaptureStatsSourceBytes = _speakerCaptureSourceBytes;
+                _lastSpeakerCaptureStatsOutputBytes = _speakerCaptureOutputBytes;
+                _lastSpeakerCaptureStatsSilenceBytes = _speakerCaptureSilenceBytes;
+                _lastSpeakerCaptureStatsDroppedPackets = _speakerCaptureDroppedPackets;
+                _lastSpeakerCaptureStatsDroppedBytes = _speakerCaptureDroppedBytes;
+                _speakerCaptureMaxGapSeconds = 0;
+                return line;
+            }
+
+            private static WaveFormat NormalizeSpeakerCaptureFormat(WaveFormat format)
+            {
+                if (format is WaveFormatExtensible extensible)
+                {
+                    return extensible.ToStandardWaveFormat();
+                }
+
+                return format;
+            }
+
+            private static byte[] ConvertSpeakerCaptureToPcm16(byte[] buffer, int byteCount, WaveFormat captureFormat)
+            {
+                var format = NormalizeSpeakerCaptureFormat(captureFormat);
+                var bytesPerSample = format.BitsPerSample / 8;
+                var sourceFrameBytes = format.BlockAlign > 0
+                    ? format.BlockAlign
+                    : format.Channels * bytesPerSample;
+                if (format.SampleRate <= 0 || format.Channels <= 0 || bytesPerSample <= 0 || sourceFrameBytes <= 0)
+                {
+                    throw new InvalidOperationException($"Invalid speaker capture format: {FormatWaveFormat(format)}.");
+                }
+
+                var boundedByteCount = Math.Min(buffer.Length, byteCount);
+                boundedByteCount -= boundedByteCount % sourceFrameBytes;
+                if (boundedByteCount <= 0)
+                {
+                    return Array.Empty<byte>();
+                }
+
+                if (IsPcm16WaveFormat(format)
+                    && format.SampleRate == AudioDefaults.SampleRate
+                    && format.Channels == AudioDefaults.SpeakerChannels)
+                {
+                    var copy = new byte[boundedByteCount];
+                    Buffer.BlockCopy(buffer, 0, copy, 0, boundedByteCount);
+                    return copy;
+                }
+
+                var sourceFrameCount = boundedByteCount / sourceFrameBytes;
+                var outputFrameCount = format.SampleRate == AudioDefaults.SampleRate
+                    ? sourceFrameCount
+                    : Math.Max(1, (int)Math.Round(sourceFrameCount * AudioDefaults.SampleRate / (double)format.SampleRate));
+                var output = new byte[outputFrameCount * AudioDefaults.SpeakerFrameBytes];
+                for (var outputFrame = 0; outputFrame < outputFrameCount; outputFrame++)
+                {
+                    var sourcePosition = format.SampleRate == AudioDefaults.SampleRate
+                        ? outputFrame
+                        : outputFrame * format.SampleRate / (double)AudioDefaults.SampleRate;
+                    var sourceFrame = Math.Min(sourceFrameCount - 1, (int)sourcePosition);
+                    var nextFrame = Math.Min(sourceFrameCount - 1, sourceFrame + 1);
+                    var mix = sourcePosition - sourceFrame;
+                    var left = ReadSpeakerSampleAsFloat(buffer, sourceFrame, 0, format, sourceFrameBytes, bytesPerSample);
+                    var right = ReadSpeakerSampleAsFloat(buffer, sourceFrame, 1, format, sourceFrameBytes, bytesPerSample);
+                    if (nextFrame != sourceFrame && mix > 0)
+                    {
+                        left = Lerp(left, ReadSpeakerSampleAsFloat(buffer, nextFrame, 0, format, sourceFrameBytes, bytesPerSample), mix);
+                        right = Lerp(right, ReadSpeakerSampleAsFloat(buffer, nextFrame, 1, format, sourceFrameBytes, bytesPerSample), mix);
+                    }
+
+                    var outputOffset = outputFrame * AudioDefaults.SpeakerFrameBytes;
+                    BinaryPrimitives.WriteInt16LittleEndian(output.AsSpan(outputOffset, 2), FloatToPcm16(left));
+                    BinaryPrimitives.WriteInt16LittleEndian(output.AsSpan(outputOffset + 2, 2), FloatToPcm16(right));
+                }
+
+                return output;
+            }
+
+            private static float ReadSpeakerSampleAsFloat(
+                byte[] buffer,
+                int frameIndex,
+                int outputChannel,
+                WaveFormat format,
+                int sourceFrameBytes,
+                int bytesPerSample)
+            {
+                var sourceChannel = format.Channels == 1 ? 0 : Math.Min(outputChannel, format.Channels - 1);
+                var offset = frameIndex * sourceFrameBytes + sourceChannel * bytesPerSample;
+                return format.Encoding switch
+                {
+                    WaveFormatEncoding.Pcm when format.BitsPerSample == 16
+                        => BinaryPrimitives.ReadInt16LittleEndian(buffer.AsSpan(offset, 2)) / 32768f,
+                    WaveFormatEncoding.Pcm when format.BitsPerSample == 24
+                        => ReadPcm24LittleEndian(buffer, offset) / 8388608f,
+                    WaveFormatEncoding.Pcm when format.BitsPerSample == 32
+                        => BinaryPrimitives.ReadInt32LittleEndian(buffer.AsSpan(offset, 4)) / 2147483648f,
+                    WaveFormatEncoding.IeeeFloat when format.BitsPerSample == 32
+                        => BitConverter.Int32BitsToSingle(BinaryPrimitives.ReadInt32LittleEndian(buffer.AsSpan(offset, 4))),
+                    _ => throw new InvalidOperationException($"Unsupported speaker capture format: {FormatWaveFormat(format)}.")
+                };
+            }
+
+            private static int ReadPcm24LittleEndian(byte[] buffer, int offset)
+            {
+                var value = buffer[offset] | (buffer[offset + 1] << 8) | (buffer[offset + 2] << 16);
+                if ((value & 0x800000) != 0)
+                {
+                    value |= unchecked((int)0xFF000000);
+                }
+
+                return value;
+            }
+
+            private static float Lerp(float a, float b, double amount)
+            {
+                return (float)(a + ((b - a) * amount));
+            }
+
+            private static short FloatToPcm16(float sample)
+            {
+                if (float.IsNaN(sample) || float.IsInfinity(sample))
+                {
+                    return 0;
+                }
+
+                var clamped = Math.Clamp(sample, -1f, 1f);
+                var scaled = clamped < 0
+                    ? clamped * 32768f
+                    : clamped * short.MaxValue;
+                return (short)Math.Clamp((int)Math.Round(scaled), short.MinValue, short.MaxValue);
             }
 
             private void OnSpeakerRecordingStopped(object? sender, StoppedEventArgs args)
@@ -2020,36 +2877,54 @@ internal static partial class Program
             {
                 lock (_speakerPacketLock)
                 {
+                    return DequeueSpeakerBytesLocked(destination, maxByteCount);
+                }
+            }
+
+            private int DequeueSpeakerBytesLocked(byte[] destination, int maxByteCount)
+            {
+                var targetBytes = Math.Min(maxByteCount, destination.Length);
+                targetBytes -= targetBytes % AudioDefaults.SpeakerFrameBytes;
+                if (targetBytes <= 0)
+                {
+                    return 0;
+                }
+
+                var totalBytes = 0;
+                while (totalBytes < targetBytes)
+                {
                     if (_speakerPendingPacket is null || _speakerPendingOffset >= _speakerPendingPacket.Length)
                     {
                         if (!_speakerPackets.TryDequeue(out _speakerPendingPacket))
                         {
                             _speakerPendingOffset = 0;
-                            return 0;
+                            break;
                         }
 
                         _queuedSpeakerBytes -= _speakerPendingPacket.Length;
                         _speakerPendingOffset = 0;
                     }
 
-                    var available = Math.Min(maxByteCount, destination.Length);
-                    available = Math.Min(available, _speakerPendingPacket.Length - _speakerPendingOffset);
+                    var available = Math.Min(targetBytes - totalBytes, _speakerPendingPacket.Length - _speakerPendingOffset);
                     available -= available % AudioDefaults.SpeakerFrameBytes;
                     if (available <= 0)
                     {
-                        return 0;
+                        _speakerPendingPacket = null;
+                        _speakerPendingOffset = 0;
+                        continue;
                     }
 
-                    Buffer.BlockCopy(_speakerPendingPacket, _speakerPendingOffset, destination, 0, available);
+                    Buffer.BlockCopy(_speakerPendingPacket, _speakerPendingOffset, destination, totalBytes, available);
+                    totalBytes += available;
                     _speakerPendingOffset += available;
                     if (_speakerPendingOffset >= _speakerPendingPacket.Length)
                     {
                         _speakerPendingPacket = null;
                         _speakerPendingOffset = 0;
                     }
-
-                    return available;
                 }
+
+                return totalBytes;
             }
 
             private void ResetMicrophoneRenderCore()
@@ -2117,6 +2992,23 @@ internal static partial class Program
                     _queuedSpeakerBytes = 0;
                     _speakerPendingPacket = null;
                     _speakerPendingOffset = 0;
+                    _speakerPacketAvailable.Reset();
+                    _lastSpeakerCaptureTicks = 0;
+                    _lastSpeakerCaptureDurationSeconds = 0;
+                    _speakerCaptureEvents = 0;
+                    _speakerCaptureSourceBytes = 0;
+                    _speakerCaptureOutputBytes = 0;
+                    _speakerCaptureSilenceBytes = 0;
+                    _speakerCaptureDroppedPackets = 0;
+                    _speakerCaptureDroppedBytes = 0;
+                    _speakerCaptureMaxGapSeconds = 0;
+                    _lastSpeakerCaptureStatsTicks = 0;
+                    _lastSpeakerCaptureStatsEvents = 0;
+                    _lastSpeakerCaptureStatsSourceBytes = 0;
+                    _lastSpeakerCaptureStatsOutputBytes = 0;
+                    _lastSpeakerCaptureStatsSilenceBytes = 0;
+                    _lastSpeakerCaptureStatsDroppedPackets = 0;
+                    _lastSpeakerCaptureStatsDroppedBytes = 0;
                 }
             }
 
