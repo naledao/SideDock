@@ -5162,9 +5162,33 @@ public sealed partial class MainWindow : Window
         await InstallDriverAsync();
     }
 
+    private void OverviewVirtualDisplayCard_Tapped(object sender, TappedRoutedEventArgs e)
+    {
+        if (IsInteractiveVirtualDisplayCardElement(e.OriginalSource as DependencyObject, sender as DependencyObject))
+        {
+            return;
+        }
+
+        e.Handled = true;
+        OpenOverviewNavigationItem(OverviewNavigationItem.Display);
+    }
+
     private void OverviewDisplaySettingsButton_Click(object sender, RoutedEventArgs e)
     {
-        OpenWindowsDisplaySettings();
+        OpenOverviewNavigationItem(OverviewNavigationItem.Display);
+    }
+
+    private static bool IsInteractiveVirtualDisplayCardElement(DependencyObject? source, DependencyObject? card)
+    {
+        for (var current = source; current is not null && !ReferenceEquals(current, card); current = VisualTreeHelper.GetParent(current))
+        {
+            if (current is Button or ToggleSwitch or ComboBox)
+            {
+                return true;
+            }
+        }
+
+        return false;
     }
 
     private void OverviewPreviewFitButton_Click(object sender, RoutedEventArgs e)
@@ -5972,10 +5996,11 @@ public sealed partial class MainWindow : Window
         OverviewDisplayPage.ApplySettings(_appSettings);
         UpdateOverviewVideoLinkCard();
 
-        if (!_appSettings.StartVirtualDisplayWithHost)
+        var displayLayout = DisplayLayoutQuery.GetCurrent();
+        if (!IsVirtualDisplayToolRunning() || !displayLayout.HasSideDockVirtualDisplay)
         {
             OverviewDisplayPage.AddActivityLog(
-                "Virtual display mode selection saved. Auto manage is off, so Windows display topology was not changed.",
+                "显示模式已保存；虚拟显示器当前未运行，设置将在下次启动后应用。",
                 StaticDisplayActivityKind.Info);
             return;
         }

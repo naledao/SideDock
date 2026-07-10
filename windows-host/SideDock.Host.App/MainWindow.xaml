@@ -1179,7 +1179,16 @@
                                 <ColumnDefinition Width="1.2*" />
                             </Grid.ColumnDefinitions>
 
-                            <Border x:Name="OverviewVirtualDisplayCard" Height="200" Padding="12" CornerRadius="7" Background="#FFFFFF" BorderBrush="#D8DEE4" BorderThickness="1">
+                            <Border
+                                x:Name="OverviewVirtualDisplayCard"
+                                Height="200"
+                                Padding="12"
+                                CornerRadius="7"
+                                Background="#FFFFFF"
+                                BorderBrush="#D8DEE4"
+                                BorderThickness="1"
+                                Tapped="OverviewVirtualDisplayCard_Tapped"
+                                ToolTipService.ToolTip="打开虚拟显示器详情">
                                 <Grid>
                                     <Grid.RowDefinitions>
                                         <RowDefinition Height="Auto" />

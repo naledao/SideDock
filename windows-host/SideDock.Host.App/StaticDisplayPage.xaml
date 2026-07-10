@@ -687,7 +687,7 @@
                                                 </Grid.ColumnDefinitions>
                                                 <StackPanel Orientation="Horizontal" Spacing="10" VerticalAlignment="Center">
                                                     <FontIcon Glyph="&#xE713;" FontSize="19" Foreground="#30363D" />
-                                                    <TextBlock Text="自动管理" FontSize="14" FontWeight="SemiBold" Foreground="{StaticResource SideDockTextBrush}" />
+                                                    <TextBlock Text="随主机自动启动" FontSize="14" FontWeight="SemiBold" Foreground="{StaticResource SideDockTextBrush}" />
                                                 </StackPanel>
                                                 <ToggleSwitch
                                                     x:Name="AutoManageDisplaySwitch"
@@ -695,6 +695,7 @@
                                                     MinWidth="54"
                                                     OnContent=""
                                                     OffContent=""
+                                                    ToolTipService.ToolTip="控制启动主机时是否自动启动虚拟显示器；不影响手动修改显示参数"
                                                     Toggled="AutoManageDisplaySwitch_Toggled" />
                                             </Grid>
                                         </Grid>

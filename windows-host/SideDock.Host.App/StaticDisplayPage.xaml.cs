@@ -311,8 +311,8 @@ public sealed partial class StaticDisplayPage : UserControl
         NotifySettingsChanged(StaticDisplaySettingsChangeKind.AutoManage);
         AddActivityLog(
             _autoManageEnabled
-                ? "自动管理已开启，后续设置变更允许执行安全应用。"
-                : "自动管理已关闭，后续设置变更仅保存 UI 状态。",
+                ? "已开启随主机自动启动；手动选择显示参数仍会立即应用。"
+                : "已关闭随主机自动启动；手动选择显示参数仍会立即应用。",
             StaticDisplayActivityKind.Info);
     }
 
@@ -370,9 +370,9 @@ public sealed partial class StaticDisplayPage : UserControl
         SetSelectedResolution(normalized);
         NotifySettingsChanged(StaticDisplaySettingsChangeKind.Selection);
 
-        if (!_autoManageEnabled)
+        if (!CanApplyDisplaySettingsNow())
         {
-            AddActivityLog($"分辨率已保存为 {ResolutionLabel(normalized)}，自动管理关闭，未修改 Windows 显示拓扑。", StaticDisplayActivityKind.Info);
+            AddActivityLog($"分辨率已保存为 {ResolutionLabel(normalized)}；虚拟显示器当前未运行，将在下次启动后应用。", StaticDisplayActivityKind.Info);
             return;
         }
 
@@ -395,9 +395,9 @@ public sealed partial class StaticDisplayPage : UserControl
         SetSelectedRefreshRate(normalized);
         NotifySettingsChanged(StaticDisplaySettingsChangeKind.Selection);
 
-        if (!_autoManageEnabled)
+        if (!CanApplyDisplaySettingsNow())
         {
-            AddActivityLog($"刷新率已保存为 {normalized} Hz，自动管理关闭，未修改 Windows 显示拓扑。", StaticDisplayActivityKind.Info);
+            AddActivityLog($"刷新率已保存为 {normalized} Hz；虚拟显示器当前未运行，将在下次启动后应用。", StaticDisplayActivityKind.Info);
             return;
         }
 
@@ -413,11 +413,11 @@ public sealed partial class StaticDisplayPage : UserControl
             return;
         }
 
-        if (!_autoManageEnabled)
+        if (!CanApplyDisplaySettingsNow())
         {
             SetCurrentPresentationMode(mode);
             NotifySettingsChanged(StaticDisplaySettingsChangeKind.Selection);
-            AddActivityLog($"{PresentationModeLabel(mode)} saved. Auto manage is off, Windows display topology was not changed.", StaticDisplayActivityKind.Info);
+            AddActivityLog($"{PresentationModeLabel(mode)}已保存；虚拟显示器当前未运行，将在下次启动后应用。", StaticDisplayActivityKind.Info);
             return;
         }
 
@@ -429,6 +429,11 @@ public sealed partial class StaticDisplayPage : UserControl
         }
 
         await RequestPresentationModeApplyAsync(mode);
+    }
+
+    private bool CanApplyDisplaySettingsNow()
+    {
+        return _virtualDisplayRunning && _displayLayoutSnapshot.HasSideDockVirtualDisplay;
     }
 
     private async Task RequestDisplayModeApplyAsync(string resolution, string refreshRate)

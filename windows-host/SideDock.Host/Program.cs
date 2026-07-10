@@ -64,6 +64,11 @@ internal static partial class Program
             return 0;
         }
 
+        var mediaFoundationRuntime = OperatingSystem.IsWindows()
+            ? MediaFoundationRuntime.Start()
+            : null;
+        try
+        {
         using var appCts = new CancellationTokenSource();
         Console.CancelKeyPress += (_, eventArgs) =>
         {
@@ -124,14 +129,168 @@ internal static partial class Program
                 appCts.Token);
         }
 
-        await Task.WhenAll(
-            controlServer.RunAsync(appCts.Token),
-            cameraCommandServer.RunAsync(appCts.Token),
-            videoServer.RunAsync(appCts.Token),
-            audioServer.RunAsync(appCts.Token),
-            cameraServer.RunAsync(appCts.Token));
+        var serverTasks = new Dictionary<string, Task>(StringComparer.Ordinal)
+        {
+            ["control"] = controlServer.RunAsync(appCts.Token),
+            ["camera-command"] = cameraCommandServer.RunAsync(appCts.Token),
+            ["video"] = videoServer.RunAsync(appCts.Token),
+            ["audio"] = audioServer.RunAsync(appCts.Token),
+            ["camera"] = cameraServer.RunAsync(appCts.Token)
+        };
+        var firstCompletedServer = await Task.WhenAny(serverTasks.Values);
+        if (!appCts.IsCancellationRequested)
+        {
+            var stoppedServer = serverTasks.First(pair => ReferenceEquals(pair.Value, firstCompletedServer));
+            var failure = firstCompletedServer.Exception?.GetBaseException();
+            Log(
+                "HOST",
+                failure is null
+                    ? $"server stopped unexpectedly name={stoppedServer.Key} status={firstCompletedServer.Status}"
+                    : $"server failed name={stoppedServer.Key} error={failure.Message}");
+            appCts.Cancel();
+
+            try
+            {
+                await Task.WhenAll(serverTasks.Values);
+            }
+            catch (Exception ex) when (ex is OperationCanceledException || ReferenceEquals(ex, failure))
+            {
+                // Cancellation is expected while the remaining services shut down.
+            }
+
+            throw new InvalidOperationException(
+                $"SideDock server '{stoppedServer.Key}' stopped unexpectedly.",
+                failure);
+        }
+
+        await Task.WhenAll(serverTasks.Values);
 
         return 0;
+        }
+        finally
+        {
+            mediaFoundationRuntime?.Dispose();
+        }
+    }
+
+    private sealed class MediaFoundationRuntime : IDisposable
+    {
+        private const int S_OK = 0;
+        private const int S_FALSE = 1;
+        private const int COINIT_MULTITHREADED = 0;
+        private const int MF_VERSION = 0x00020070;
+        private const int MFSTARTUP_FULL = 0;
+        private static int _started;
+        private readonly ManualResetEventSlim _startupCompleted = new(false);
+        private readonly ManualResetEventSlim _shutdownRequested = new(false);
+        private readonly Thread _ownerThread;
+        private Exception? _startupError;
+        private int _disposed;
+
+        private MediaFoundationRuntime()
+        {
+            _ownerThread = new Thread(OwnerThreadMain)
+            {
+                IsBackground = true,
+                Name = "SideDock Media Foundation runtime"
+            };
+            _ownerThread.Start();
+        }
+
+        public static MediaFoundationRuntime Start()
+        {
+            var runtime = new MediaFoundationRuntime();
+            runtime._startupCompleted.Wait();
+            if (runtime._startupError is not null)
+            {
+                runtime.Dispose();
+                throw new InvalidOperationException("Unable to initialize the process Media Foundation runtime.", runtime._startupError);
+            }
+
+            return runtime;
+        }
+
+        public static void EnsureStarted()
+        {
+            if (Volatile.Read(ref _started) == 0)
+            {
+                throw new InvalidOperationException("The process Media Foundation runtime is not running.");
+            }
+        }
+
+        public void Dispose()
+        {
+            if (Interlocked.Exchange(ref _disposed, 1) != 0)
+            {
+                return;
+            }
+
+            _shutdownRequested.Set();
+            _ownerThread.Join();
+            _startupCompleted.Dispose();
+            _shutdownRequested.Dispose();
+        }
+
+        private void OwnerThreadMain()
+        {
+            var comInitialized = false;
+            var mfStarted = false;
+            try
+            {
+                var coHr = CoInitializeEx(IntPtr.Zero, COINIT_MULTITHREADED);
+                if (coHr is S_OK or S_FALSE)
+                {
+                    comInitialized = true;
+                }
+                else
+                {
+                    Marshal.ThrowExceptionForHR(coHr);
+                }
+
+                var mfHr = MFStartup(MF_VERSION, MFSTARTUP_FULL);
+                if (mfHr < 0)
+                {
+                    Marshal.ThrowExceptionForHR(mfHr);
+                }
+
+                mfStarted = true;
+                Volatile.Write(ref _started, 1);
+                Log("MEDIA FOUNDATION", $"process runtime started ownerThread={Environment.CurrentManagedThreadId}");
+                _startupCompleted.Set();
+                _shutdownRequested.Wait();
+            }
+            catch (Exception ex)
+            {
+                _startupError = ex;
+                _startupCompleted.Set();
+            }
+            finally
+            {
+                if (mfStarted)
+                {
+                    Volatile.Write(ref _started, 0);
+                    var shutdownHr = MFShutdown();
+                    Log("MEDIA FOUNDATION", $"process runtime MFShutdown HRESULT=0x{shutdownHr:X8} ownerThread={Environment.CurrentManagedThreadId}");
+                }
+
+                if (comInitialized)
+                {
+                    CoUninitialize();
+                }
+            }
+        }
+
+        [DllImport("ole32.dll", ExactSpelling = true)]
+        private static extern int CoInitializeEx(IntPtr reserved, int coInit);
+
+        [DllImport("ole32.dll", ExactSpelling = true)]
+        private static extern void CoUninitialize();
+
+        [DllImport("mfplat.dll", ExactSpelling = true)]
+        private static extern int MFStartup(int version, int flags);
+
+        [DllImport("mfplat.dll", ExactSpelling = true)]
+        private static extern int MFShutdown();
     }
 
     private static void PrintHeader(HostOptions options)
@@ -5331,9 +5490,10 @@ internal static partial class Program
         private readonly VideoModeState _videoModeState = videoModeState;
         private readonly ControlMessagePublisher _controlPublisher = controlPublisher;
         private readonly DisplayLayoutProvider _displayLayoutProvider = displayLayoutProvider;
+        private static readonly TimeSpan VideoTeardownTimeout = TimeSpan.FromSeconds(10);
+        private readonly SemaphoreSlim _sessionSupervisor = new(1, 1);
         private readonly object _connectionLock = new();
-        private CancellationTokenSource? _activeConnectionCts;
-        private Task? _activeConnectionTask;
+        private ActiveVideoConnection? _activeConnection;
         private int _connectionSerial;
 
         public async Task RunAsync(CancellationToken cancellationToken)
@@ -5347,47 +5507,182 @@ internal static partial class Program
                 {
                     var client = await _listener.AcceptTcpClientAsync(cancellationToken);
                     var connectionId = Interlocked.Increment(ref _connectionSerial);
-                    var connectionCts = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
-
-                    CancellationTokenSource? previousConnectionCts;
-                    Task? previousConnectionTask;
-                    lock (_connectionLock)
+                    try
                     {
-                        previousConnectionCts = _activeConnectionCts;
-                        previousConnectionTask = _activeConnectionTask;
-                        _activeConnectionCts = connectionCts;
-                        _activeConnectionTask = null;
+                        await StartConnectionAsync(connectionId, client, cancellationToken);
                     }
-
-                    if (previousConnectionCts is not null)
+                    catch (OperationCanceledException) when (!cancellationToken.IsCancellationRequested)
                     {
-                        Log("VIDEO", "检测到新的视频连接，关闭旧连接。");
-                        await previousConnectionCts.CancelAsync();
-                        await WaitForPreviousVideoConnectionAsync(previousConnectionTask, cancellationToken);
+                        Log($"VIDEO {connectionId}", "connection handoff was canceled; keeping the video listener active");
+                        AbortClient(client);
                     }
-
-                    var connectionTask = Task.Run(() => HandleClientAsync(connectionId, client, connectionCts, cancellationToken), cancellationToken);
-                    lock (_connectionLock)
+                    catch (Exception ex)
                     {
-                        if (ReferenceEquals(_activeConnectionCts, connectionCts))
+                        Log($"VIDEO {connectionId}", $"connection handoff failed: {ex.Message}; keeping the video listener active");
+                        AbortClient(client);
+                        await _controlPublisher.PublishAsync("encoder_error", new JsonObject
                         {
-                            _activeConnectionTask = connectionTask;
-                        }
+                            ["code"] = "VIDEO_CONNECTION_HANDOFF_FAILED",
+                            ["message"] = ex.Message,
+                            ["connectionId"] = connectionId
+                        }, CancellationToken.None);
                     }
                 }
             }
-            catch (OperationCanceledException)
+            catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
             {
                 Log("VIDEO", "正在关闭。");
             }
             catch (SocketException ex)
             {
                 Log("VIDEO", $"监听失败: {ex.Message}");
+                throw;
             }
             finally
             {
                 _listener.Stop();
+                await StopActiveConnectionAsync();
             }
+        }
+
+        private async Task StartConnectionAsync(int connectionId, TcpClient client, CancellationToken appToken)
+        {
+            var accepted = false;
+            await _sessionSupervisor.WaitAsync(appToken);
+            try
+            {
+                ActiveVideoConnection? previous;
+                lock (_connectionLock)
+                {
+                    previous = _activeConnection;
+                }
+
+                if (previous is not null)
+                {
+                    var teardown = Stopwatch.StartNew();
+                    Log($"VIDEO {connectionId}", $"previous connection cancellation begin generation={previous.ConnectionId}");
+                    previous.ConnectionCts.Cancel();
+                    AbortClient(previous.Client);
+                    try
+                    {
+                        await previous.ConnectionTask.WaitAsync(VideoTeardownTimeout, appToken);
+                    }
+                    catch (OperationCanceledException) when (!appToken.IsCancellationRequested)
+                    {
+                        Log($"VIDEO {connectionId}", $"previous connection completed as canceled generation={previous.ConnectionId}");
+                    }
+                    catch (TimeoutException)
+                    {
+                        teardown.Stop();
+                        var message = $"Previous video generation {previous.ConnectionId} did not finish teardown within {VideoTeardownTimeout.TotalSeconds:F0}s; rejecting generation {connectionId}.";
+                        Log($"VIDEO {connectionId}", $"VIDEO_TEARDOWN_TIMEOUT: {message} elapsed={teardown.Elapsed.TotalMilliseconds:F1}ms");
+                        await _controlPublisher.PublishAsync("encoder_error", new JsonObject
+                        {
+                            ["code"] = "VIDEO_TEARDOWN_TIMEOUT",
+                            ["message"] = message,
+                            ["previousConnectionId"] = previous.ConnectionId,
+                            ["rejectedConnectionId"] = connectionId,
+                            ["teardownMs"] = teardown.Elapsed.TotalMilliseconds
+                        }, CancellationToken.None);
+                        return;
+                    }
+
+                    teardown.Stop();
+                    Log($"VIDEO {connectionId}", $"previous connection cancellation complete generation={previous.ConnectionId} teardown={teardown.Elapsed.TotalMilliseconds:F1}ms");
+                }
+
+                var connectionCts = CancellationTokenSource.CreateLinkedTokenSource(appToken);
+                var startGate = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
+                ActiveVideoConnection? connection = null;
+                var connectionTask = Task.Run(async () =>
+                {
+                    await startGate.Task;
+                    await RunConnectionAsync(connection!, appToken);
+                });
+                connection = new ActiveVideoConnection(connectionId, client, connectionCts, connectionTask);
+                lock (_connectionLock)
+                {
+                    _activeConnection = connection;
+                }
+
+                accepted = true;
+                startGate.SetResult(true);
+                Log($"VIDEO {connectionId}", $"session generation accepted activeGeneration={connectionId}");
+            }
+            finally
+            {
+                _sessionSupervisor.Release();
+                if (!accepted)
+                {
+                    AbortClient(client);
+                }
+            }
+        }
+
+        private async Task RunConnectionAsync(ActiveVideoConnection connection, CancellationToken appToken)
+        {
+            try
+            {
+                await HandleClientAsync(connection.ConnectionId, connection.Client, connection.ConnectionCts, appToken);
+            }
+            finally
+            {
+                AbortClient(connection.Client);
+                connection.ConnectionCts.Dispose();
+                lock (_connectionLock)
+                {
+                    if (ReferenceEquals(_activeConnection, connection))
+                    {
+                        _activeConnection = null;
+                    }
+                }
+
+                Log($"VIDEO {connection.ConnectionId}", "视频通道已断开，session teardown complete");
+            }
+        }
+
+        private async Task StopActiveConnectionAsync()
+        {
+            await _sessionSupervisor.WaitAsync(CancellationToken.None);
+            try
+            {
+                ActiveVideoConnection? active;
+                lock (_connectionLock)
+                {
+                    active = _activeConnection;
+                }
+
+                if (active is null)
+                {
+                    return;
+                }
+
+                var teardown = Stopwatch.StartNew();
+                Log($"VIDEO {active.ConnectionId}", "host shutdown connection cancellation begin");
+                active.ConnectionCts.Cancel();
+                AbortClient(active.Client);
+                await active.ConnectionTask;
+                teardown.Stop();
+                Log($"VIDEO {active.ConnectionId}", $"host shutdown connection cancellation complete teardown={teardown.Elapsed.TotalMilliseconds:F1}ms");
+            }
+            finally
+            {
+                _sessionSupervisor.Release();
+            }
+        }
+
+        private static void AbortClient(TcpClient client)
+        {
+            try
+            {
+                client.Client.Shutdown(SocketShutdown.Both);
+            }
+            catch (Exception ex) when (ex is SocketException or ObjectDisposedException)
+            {
+                // The peer may already have closed the socket.
+            }
+
+            client.Dispose();
         }
 
         private async Task HandleClientAsync(
@@ -5396,75 +5691,43 @@ internal static partial class Program
             CancellationTokenSource connectionCts,
             CancellationToken appToken)
         {
-            using (client)
-            using (connectionCts)
-            {
-                var remote = client.Client.RemoteEndPoint?.ToString() ?? "unknown";
-                Log($"VIDEO {connectionId}", $"视频通道已连接: {remote}");
-
-                try
-                {
-                    var videoOptions = _videoModeState.CreateOptionsSnapshot();
-                    Log($"VIDEO {connectionId}", $"creating video source={FormatVideoSource(videoOptions.VideoSource)} {videoOptions.VideoWidth}x{videoOptions.VideoHeight}@{videoOptions.VideoFps}");
-                    await using var source = OperatingSystem.IsWindows()
-                        ? CreateVideoSource(connectionId, videoOptions)
-                        : CreateNonWindowsVideoSource(connectionId, videoOptions);
-                    var session = new VideoSession(connectionId, client, source, videoOptions, _videoModeState, _controlPublisher);
-                    await session.RunAsync(connectionCts.Token);
-                }
-                catch (FileNotFoundException)
-                {
-                    Log($"VIDEO {connectionId}", $"找不到测试视频文件: {_options.VideoFilePath}");
-                    Log("VIDEO", "可执行 tools/generate-test-video.ps1 生成 artifacts/test-videos/sidedock-720p30.h264。");
-                }
-                catch (InvalidDataException ex)
-                {
-                    Log($"VIDEO {connectionId}", $"测试视频格式无效: {ex.Message}");
-                }
-                catch (OperationCanceledException) when (appToken.IsCancellationRequested || connectionCts.IsCancellationRequested)
-                {
-                    // Application shutdown or superseded connection.
-                }
-                catch (Exception ex)
-                {
-                    Log($"VIDEO {connectionId}", $"视频通道异常: {ex.Message}");
-                }
-                finally
-                {
-                    lock (_connectionLock)
-                    {
-                        if (ReferenceEquals(_activeConnectionCts, connectionCts))
-                        {
-                            _activeConnectionCts = null;
-                            _activeConnectionTask = null;
-                        }
-                    }
-
-                    Log($"VIDEO {connectionId}", "视频通道已断开");
-                }
-            }
-        }
-
-        private static async Task WaitForPreviousVideoConnectionAsync(Task? previousConnectionTask, CancellationToken cancellationToken)
-        {
-            if (previousConnectionTask is null)
-            {
-                return;
-            }
+            var remote = client.Client.RemoteEndPoint?.ToString() ?? "unknown";
+            Log($"VIDEO {connectionId}", $"视频通道已连接: {remote} generation={connectionId}");
 
             try
             {
-                await previousConnectionTask.WaitAsync(TimeSpan.FromSeconds(2), cancellationToken);
+                var videoOptions = _videoModeState.CreateOptionsSnapshot();
+                Log($"VIDEO {connectionId}", $"creating video source={FormatVideoSource(videoOptions.VideoSource)} {videoOptions.VideoWidth}x{videoOptions.VideoHeight}@{videoOptions.VideoFps}");
+                await using var source = OperatingSystem.IsWindows()
+                    ? CreateVideoSource(connectionId, videoOptions)
+                    : CreateNonWindowsVideoSource(connectionId, videoOptions);
+                var session = new VideoSession(connectionId, client, source, videoOptions, _videoModeState, _controlPublisher);
+                await session.RunAsync(connectionCts.Token);
             }
-            catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
+            catch (FileNotFoundException)
             {
-                throw;
+                Log($"VIDEO {connectionId}", $"找不到测试视频文件: {_options.VideoFilePath}");
+                Log("VIDEO", "可执行 tools/generate-test-video.ps1 生成 artifacts/test-videos/sidedock-720p30.h264。");
             }
-            catch (Exception ex) when (ex is OperationCanceledException or TimeoutException)
+            catch (InvalidDataException ex)
             {
-                Log("VIDEO", "旧视频连接尚未完全退出，新连接继续接管。");
+                Log($"VIDEO {connectionId}", $"测试视频格式无效: {ex.Message}");
+            }
+            catch (OperationCanceledException) when (appToken.IsCancellationRequested || connectionCts.IsCancellationRequested)
+            {
+                // Application shutdown or superseded connection.
+            }
+            catch (Exception ex)
+            {
+                Log($"VIDEO {connectionId}", $"视频通道异常: {ex.Message}");
             }
         }
+
+        private sealed record ActiveVideoConnection(
+            int ConnectionId,
+            TcpClient Client,
+            CancellationTokenSource ConnectionCts,
+            Task ConnectionTask);
 
         [SupportedOSPlatform("windows")]
         private IEncodedVideoSource CreateVideoSource(int connectionId, HostOptions videoOptions)
@@ -7990,6 +8253,8 @@ internal static partial class Program
         private int _gpuFrameDumped;
         private readonly object _encoderLock = new();
         private int _encoderWatchdogStrikeCount;
+        private int _disposeState;
+        private readonly TaskCompletionSource<bool> _disposeCompletion = new(TaskCreationOptions.RunContinuationsAsynchronously);
         private const string DirectEncoderFallback = "none";
         private const string ReadbackEncoderFallback = "gpu-convert-nv12-readback";
         private const int EncoderWatchdogStrikeThreshold = 2;
@@ -8032,23 +8297,17 @@ internal static partial class Program
                 _encoderUsesD3DInput = probe.SupportsDirectInput;
                 _encoderFallbackReason = probe.FallbackReason;
                 _encoderMftName = probe.EncoderMftName;
+                _encoder = probe.Encoder;
                 _converter = new GpuBgraToNv12Converter(_frameSource.Device, _frameSource.Context, _options.VideoWidth, _options.VideoHeight, _options.VideoFps, _options.Nv12PoolSize);
                 if (_encoderUsesD3DInput)
                 {
-                    try
+                    if (_encoder is null)
                     {
-                        _encoder = CreateStartedEncoder(d3dInput: true);
-                        _encoderMftName = _encoder.SelectedMftName;
-                        Log($"ENCODER {_connectionId}", $"D3D11 input probe supported=true fallback=none mft={_encoderMftName}");
+                        throw new InvalidOperationException("D3D11 encoder probe did not return the validated encoder instance.");
                     }
-                    catch (Exception ex) when (IsD3D11EncoderInputFailure(ex))
-                    {
-                        _encoder?.Dispose();
-                        _encoder = null;
-                        _encoderUsesD3DInput = false;
-                        _encoderFallbackReason = FormatExceptionReason(ex);
-                        Log($"ENCODER {_connectionId}", $"D3D11 input probe passed but active encoder init failed; fallback={ReadbackEncoderFallback} reason={_encoderFallbackReason}");
-                    }
+
+                    _encoderMftName = _encoder.SelectedMftName;
+                    Log($"ENCODER {_connectionId}", $"D3D11 input probe supported=true reusedAsActive=true fallback=none mft={_encoderMftName}");
                 }
 
                 if (!_encoderUsesD3DInput)
@@ -8195,6 +8454,33 @@ internal static partial class Program
 
         public async ValueTask DisposeAsync()
         {
+            if (Interlocked.CompareExchange(ref _disposeState, 1, 0) != 0)
+            {
+                await _disposeCompletion.Task;
+                return;
+            }
+
+            try
+            {
+                await DisposeCoreAsync();
+            }
+            finally
+            {
+                Volatile.Write(ref _disposeState, 2);
+                _disposeCompletion.TrySetResult(true);
+            }
+        }
+
+        private async ValueTask DisposeCoreAsync()
+        {
+            var teardown = Stopwatch.StartNew();
+            Log($"ENCODER {_connectionId}", "teardown begin");
+            lock (_encoderLock)
+            {
+                _encoder?.StopInput("video source teardown");
+            }
+
+            Log($"ENCODER {_connectionId}", "encoder input stopped");
             if (_sourceCts is not null)
             {
                 await _sourceCts.CancelAsync();
@@ -8205,12 +8491,18 @@ internal static partial class Program
             if (OperatingSystem.IsWindows())
             {
                 _previewPublisher.Dispose();
-                _encoder?.Dispose();
+                MediaFoundationH264Encoder? encoder;
+                lock (_encoderLock)
+                {
+                    encoder = _encoder;
+                    _encoder = null;
+                }
+
+                encoder?.Dispose();
                 _converter?.Dispose();
                 _nv12Readback?.Dispose();
             }
 
-            _encoder = null;
             _converter = null;
             _nv12Readback = null;
             _frameSource.Dispose();
@@ -8241,6 +8533,8 @@ internal static partial class Program
             }
 
             _sourceCts?.Dispose();
+            teardown.Stop();
+            Log($"ENCODER {_connectionId}", $"teardown complete elapsed={teardown.Elapsed.TotalMilliseconds:F1}ms");
         }
 
         public void RecordSent(EncodedVideoPacket packet, double sendMs)
@@ -8263,8 +8557,16 @@ internal static partial class Program
             var encoder = d3dInput
                 ? new MediaFoundationH264Encoder(_options, _frameSource.Device)
                 : new MediaFoundationH264Encoder(_options);
-            encoder.Start();
-            return encoder;
+            try
+            {
+                encoder.Start();
+                return encoder;
+            }
+            catch
+            {
+                encoder.Dispose();
+                throw;
+            }
         }
 
         [SupportedOSPlatform("windows")]
@@ -8273,10 +8575,14 @@ internal static partial class Program
             lock (_encoderLock)
             {
                 var previous = _encoder;
+                _encoder = null;
+                previous?.StopInput("watchdog restart");
+                Log($"ENCODER {_connectionId}", $"watchdog old encoder shutdown begin reason={reason}");
+                previous?.Dispose();
+                Log($"ENCODER {_connectionId}", "watchdog old encoder shutdown complete; creating replacement");
                 var replacement = CreateStartedEncoder(_encoderUsesD3DInput);
                 _encoder = replacement;
                 _encoderMftName = replacement.SelectedMftName;
-                previous?.Dispose();
                 _encoderWatchdogStrikeCount = 0;
                 Log($"ENCODER {_connectionId}", $"watchdog restarted encoder reason={reason} mft={_encoderMftName}");
             }
@@ -8946,17 +9252,27 @@ internal static partial class Program
         [SupportedOSPlatform("windows")]
         private static D3D11EncoderInputProbeResult ProbeD3D11EncoderInput(HostOptions options, ID3D11Device device)
         {
+            MediaFoundationH264Encoder? encoder = null;
             try
             {
-                using var encoder = new MediaFoundationH264Encoder(options, device);
+                encoder = new MediaFoundationH264Encoder(options, device);
                 encoder.Start();
                 using var probeTexture = CreateD3D11EncoderProbeTexture(device, options.VideoWidth, options.VideoHeight);
                 encoder.EncodeFrame(probeTexture, 0);
-                return new D3D11EncoderInputProbeResult(true, null, encoder.SelectedMftName);
+                encoder.ResetAfterProbe();
+                return new D3D11EncoderInputProbeResult(true, null, encoder.SelectedMftName, encoder);
             }
             catch (Exception ex) when (IsD3D11EncoderInputFailure(ex))
             {
-                return new D3D11EncoderInputProbeResult(false, FormatExceptionReason(ex), null);
+                encoder?.StopInput("D3D11 probe fallback");
+                encoder?.Dispose();
+                return new D3D11EncoderInputProbeResult(false, FormatExceptionReason(ex), null, null);
+            }
+            catch
+            {
+                encoder?.StopInput("D3D11 probe failure");
+                encoder?.Dispose();
+                throw;
             }
         }
 
@@ -8980,7 +9296,7 @@ internal static partial class Program
 
         private static bool IsD3D11EncoderInputFailure(Exception ex)
         {
-            return ex is COMException or SharpGenException or InvalidOperationException or ArgumentException;
+            return ex is COMException or SharpGenException or InvalidOperationException or ArgumentException or TimeoutException;
         }
 
         private static string FormatExceptionReason(Exception ex)
@@ -9000,7 +9316,11 @@ internal static partial class Program
             return code is "IDD_GPU_FRAME_TIMEOUT" or "IDD_GPU_FRAME_STALE" or "IDD_GPU_SLOT_BUSY";
         }
 
-        private readonly record struct D3D11EncoderInputProbeResult(bool SupportsDirectInput, string? FallbackReason, string? EncoderMftName);
+        private readonly record struct D3D11EncoderInputProbeResult(
+            bool SupportsDirectInput,
+            string? FallbackReason,
+            string? EncoderMftName,
+            MediaFoundationH264Encoder? Encoder);
 
         private static bool IsTransientGpuPipelineFailure(SharpGenException ex)
         {
@@ -10565,11 +10885,25 @@ internal static partial class Program
         private int _outputBufferSize;
         private bool _outputProvidesSamples;
         private const int AsyncMftInputWaitMs = 1000;
+        private static readonly SemaphoreSlim HardwareEncoderGate = new(1, 1);
+        private static readonly ConcurrentBag<object> QuarantinedMftComObjects = new();
+        private static int _nextLifecycleId;
+        private static int _activeHardwareEncoderCount;
+        private readonly int _lifecycleId = Interlocked.Increment(ref _nextLifecycleId);
+        private readonly BlockingCollection<Action> _ownerQueue = new();
+        private readonly ManualResetEventSlim _ownerReady = new(false);
+        private readonly ManualResetEventSlim _disposeCompleted = new(false);
+        private readonly Thread _ownerThread;
+        private Exception? _ownerStartupError;
+        private int _ownerThreadId;
+        private int _disposeState;
+        private int _inputStopped;
+        private bool _hardwareEncoderGateHeld;
+        private bool _hardwareEncoderCounted;
+        private bool _shutdownQuarantined;
         private bool _asyncMft;
         private bool _asyncMftNeedsInput;
         private bool _started;
-        private bool _mfStarted;
-        private bool _comInitialized;
         private int _nalLengthSize = 4;
         private byte[]? _parameterSets;
 
@@ -10588,46 +10922,216 @@ internal static partial class Program
             {
                 throw new ArgumentException("Media Foundation NV12 input requires even video dimensions.", nameof(options));
             }
+
+            MediaFoundationRuntime.EnsureStarted();
+            _ownerThread = new Thread(OwnerThreadMain)
+            {
+                IsBackground = true,
+                Name = $"SideDock H264 MFT {_lifecycleId}"
+            };
+            _ownerThread.Start();
+            _ownerReady.Wait();
+            if (_ownerStartupError is not null)
+            {
+                _ownerThread.Join();
+                throw new InvalidOperationException("Unable to initialize the H.264 encoder MTA owner thread.", _ownerStartupError);
+            }
         }
 
         public void Start()
+        {
+            ExecuteOnOwnerThread(StartCore);
+        }
+
+        public void StopInput(string reason)
+        {
+            if (Interlocked.Exchange(ref _inputStopped, 1) == 0)
+            {
+                Log($"MFT {_lifecycleId}", $"encoder input stopped reason={reason}");
+            }
+        }
+
+        public void ResetAfterProbe()
+        {
+            ExecuteOnOwnerThread(ResetAfterProbeCore);
+        }
+
+        public IReadOnlyList<byte[]> EncodeFrame(byte[] nv12Frame, long frameId)
+        {
+            return ExecuteOnOwnerThread(() => EncodeFrameCore(nv12Frame, frameId));
+        }
+
+        public IReadOnlyList<byte[]> EncodeFrame(ID3D11Texture2D nv12Texture, long frameId)
+        {
+            return ExecuteOnOwnerThread(() => EncodeFrameCore(nv12Texture, frameId));
+        }
+
+        public void Dispose()
+        {
+            StopInput("encoder dispose");
+            if (Interlocked.CompareExchange(ref _disposeState, 1, 0) != 0)
+            {
+                if (Environment.CurrentManagedThreadId != Volatile.Read(ref _ownerThreadId))
+                {
+                    _disposeCompleted.Wait();
+                }
+
+                return;
+            }
+
+            try
+            {
+                ExecuteOnOwnerThread(ShutdownCore, allowDuringDispose: true);
+            }
+            finally
+            {
+                _ownerQueue.CompleteAdding();
+                if (Environment.CurrentManagedThreadId != Volatile.Read(ref _ownerThreadId))
+                {
+                    _ownerThread.Join();
+                }
+
+                Volatile.Write(ref _disposeState, 2);
+                _disposeCompleted.Set();
+            }
+        }
+
+        private void OwnerThreadMain()
+        {
+            var comInitialized = false;
+            try
+            {
+                var coHr = Native.CoInitializeEx(IntPtr.Zero, Native.COINIT_MULTITHREADED);
+                if (coHr is Native.S_OK or Native.S_FALSE)
+                {
+                    comInitialized = true;
+                }
+                else
+                {
+                    ThrowIfFailed(coHr, "CoInitializeEx failed for the encoder owner thread.");
+                }
+
+                Volatile.Write(ref _ownerThreadId, Environment.CurrentManagedThreadId);
+                Log($"MFT {_lifecycleId}", $"MTA owner thread started thread={Environment.CurrentManagedThreadId}");
+                _ownerReady.Set();
+                foreach (var action in _ownerQueue.GetConsumingEnumerable())
+                {
+                    action();
+                }
+            }
+            catch (Exception ex)
+            {
+                _ownerStartupError = ex;
+                _ownerReady.Set();
+            }
+            finally
+            {
+                if (comInitialized)
+                {
+                    Native.CoUninitialize();
+                }
+
+                Log($"MFT {_lifecycleId}", $"MTA owner thread stopped thread={Environment.CurrentManagedThreadId}");
+            }
+        }
+
+        private void ExecuteOnOwnerThread(Action action, bool allowDuringDispose = false)
+        {
+            ExecuteOnOwnerThread(() =>
+            {
+                action();
+                return true;
+            }, allowDuringDispose);
+        }
+
+        private T ExecuteOnOwnerThread<T>(Func<T> action, bool allowDuringDispose = false)
+        {
+            if (Environment.CurrentManagedThreadId == Volatile.Read(ref _ownerThreadId))
+            {
+                return action();
+            }
+
+            if (!allowDuringDispose && Volatile.Read(ref _disposeState) != 0)
+            {
+                throw new ObjectDisposedException(nameof(MediaFoundationH264Encoder));
+            }
+
+            var completion = new TaskCompletionSource<T>(TaskCreationOptions.RunContinuationsAsynchronously);
+            try
+            {
+                _ownerQueue.Add(() =>
+                {
+                    try
+                    {
+                        completion.SetResult(action());
+                    }
+                    catch (Exception ex)
+                    {
+                        completion.SetException(ex);
+                    }
+                });
+            }
+            catch (InvalidOperationException ex)
+            {
+                throw new ObjectDisposedException(nameof(MediaFoundationH264Encoder), ex);
+            }
+
+            return completion.Task.GetAwaiter().GetResult();
+        }
+
+        private void StartCore()
         {
             if (_started)
             {
                 return;
             }
 
-            var coHr = Native.CoInitializeEx(IntPtr.Zero, Native.COINIT_MULTITHREADED);
-            if (coHr == Native.S_OK || coHr == Native.S_FALSE)
+            MediaFoundationRuntime.EnsureStarted();
+            if (!HardwareEncoderGate.Wait(0))
             {
-                _comInitialized = true;
-            }
-            else if (coHr != Native.RPC_E_CHANGED_MODE)
-            {
-                ThrowIfFailed(coHr, "CoInitializeEx failed.");
+                throw new InvalidOperationException("The process Media Foundation encoder lifecycle gate is still held; refusing to create an overlapping encoder.");
             }
 
-            ThrowIfFailed(Native.MFStartup(Native.MF_VERSION, Native.MFSTARTUP_FULL), "MFStartup failed.");
-            _mfStarted = true;
+            _hardwareEncoderGateHeld = true;
+            Log($"MFT {_lifecycleId}", "process hardware encoder gate acquired");
 
-            CreateAndConfigureTransform();
+            try
+            {
+                CreateAndConfigureTransform();
 
-            var transform = GetTransform();
-            ThrowIfFailed(transform.ProcessMessage(Native.MFT_MESSAGE_NOTIFY_BEGIN_STREAMING, IntPtr.Zero), "Unable to begin Media Foundation streaming.");
-            ThrowIfFailed(transform.ProcessMessage(Native.MFT_MESSAGE_NOTIFY_START_OF_STREAM, IntPtr.Zero), "Unable to start Media Foundation stream.");
+                var transform = GetTransform();
+                ThrowIfFailed(transform.ProcessMessage(Native.MFT_MESSAGE_NOTIFY_BEGIN_STREAMING, IntPtr.Zero), "Unable to begin Media Foundation streaming.");
+                ThrowIfFailed(transform.ProcessMessage(Native.MFT_MESSAGE_NOTIFY_START_OF_STREAM, IntPtr.Zero), "Unable to start Media Foundation stream.");
 
-            RefreshOutputInfo();
-            RefreshParameterSets();
-            _started = true;
+                RefreshOutputInfo();
+                RefreshParameterSets();
+                _started = true;
+                if (SelectedMftName.Contains("NVIDIA", StringComparison.OrdinalIgnoreCase))
+                {
+                    var active = Interlocked.Increment(ref _activeHardwareEncoderCount);
+                    _hardwareEncoderCounted = true;
+                    Log($"MFT {_lifecycleId}", $"hardware encoder active mft={SelectedMftName} activeHardwareEncoders={active}");
+                    if (active > 1)
+                    {
+                        throw new InvalidOperationException($"More than one NVIDIA Media Foundation encoder is active (count={active}).");
+                    }
+                }
+                else
+                {
+                    Log($"MFT {_lifecycleId}", $"encoder active mft={SelectedMftName} activeHardwareEncoders={Volatile.Read(ref _activeHardwareEncoderCount)}");
+                }
+            }
+            catch
+            {
+                Volatile.Write(ref _inputStopped, 1);
+                ShutdownCore();
+                throw;
+            }
         }
 
-        public IReadOnlyList<byte[]> EncodeFrame(byte[] nv12Frame, long frameId)
+        private IReadOnlyList<byte[]> EncodeFrameCore(byte[] nv12Frame, long frameId)
         {
-            if (!_started)
-            {
-                throw new InvalidOperationException("Media Foundation encoder has not started.");
-            }
-
+            EnsureCanAcceptInput();
             var expectedLength = GetNv12FrameSize(_options.VideoWidth, _options.VideoHeight);
             if (nv12Frame.Length < expectedLength)
             {
@@ -10660,13 +11164,9 @@ internal static partial class Program
             return DrainOutput(transform);
         }
 
-        public IReadOnlyList<byte[]> EncodeFrame(ID3D11Texture2D nv12Texture, long frameId)
+        private IReadOnlyList<byte[]> EncodeFrameCore(ID3D11Texture2D nv12Texture, long frameId)
         {
-            if (!_started)
-            {
-                throw new InvalidOperationException("Media Foundation encoder has not started.");
-            }
-
+            EnsureCanAcceptInput();
             if (_d3dDevice is null)
             {
                 throw new InvalidOperationException("D3D11 surface encoding requires a D3D11 device.");
@@ -10704,42 +11204,194 @@ internal static partial class Program
             return DrainOutput(transform);
         }
 
-        public void Dispose()
+        private void EnsureCanAcceptInput()
         {
-            _eventGenerator = null;
+            if (!_started)
+            {
+                throw new InvalidOperationException("Media Foundation encoder has not started.");
+            }
 
+            if (Volatile.Read(ref _inputStopped) != 0)
+            {
+                throw new InvalidOperationException("Media Foundation encoder input has been stopped.");
+            }
+        }
+
+        private void ResetAfterProbeCore()
+        {
+            EnsureCanAcceptInput();
+            var reset = Stopwatch.StartNew();
+            Log($"MFT {_lifecycleId}", "probe flush begin");
+            var transform = GetTransform();
+            var flushHr = transform.ProcessMessage(Native.MFT_MESSAGE_COMMAND_FLUSH, IntPtr.Zero);
+            Log($"MFT {_lifecycleId}", $"probe flush result HRESULT=0x{flushHr:X8}");
+            ThrowIfFailed(flushHr, "Unable to flush the Media Foundation encoder after the D3D11 probe.");
+            DiscardPendingAsyncEvents("probe flush");
+            _asyncMftNeedsInput = false;
+            var startHr = transform.ProcessMessage(Native.MFT_MESSAGE_NOTIFY_START_OF_STREAM, IntPtr.Zero);
+            Log($"MFT {_lifecycleId}", $"probe stream restart result HRESULT=0x{startHr:X8}");
+            ThrowIfFailed(startHr, "Unable to restart the Media Foundation encoder after the D3D11 probe flush.");
+            reset.Stop();
+            Log($"MFT {_lifecycleId}", $"probe encoder reused reset complete elapsed={reset.Elapsed.TotalMilliseconds:F1}ms");
+        }
+
+        private void ShutdownCore()
+        {
+            var teardown = Stopwatch.StartNew();
+            Volatile.Write(ref _inputStopped, 1);
+            Log($"MFT {_lifecycleId}", $"shutdown begin started={_started} async={_asyncMft} mft={SelectedMftName}");
+
+            var eventQueueStopped = !_asyncMft;
+            try
+            {
+                var transform = _transform;
+                if (transform is not null)
+                {
+                    SendShutdownMessage(transform, Native.MFT_MESSAGE_NOTIFY_END_OF_STREAM, "end_of_stream");
+                    Log($"MFT {_lifecycleId}", "flush begin mode=discard");
+                    SendShutdownMessage(transform, Native.MFT_MESSAGE_COMMAND_FLUSH, "flush");
+                    DiscardPendingAsyncEvents("shutdown flush");
+                    SendShutdownMessage(transform, Native.MFT_MESSAGE_NOTIFY_END_STREAMING, "end_streaming");
+                    eventQueueStopped = TryShutdownMftEventQueue(transform, "encoder shutdown");
+                }
+            }
+            catch (Exception ex)
+            {
+                Log($"MFT {_lifecycleId}", $"shutdown sequence exception={FormatComFailure(ex)}");
+            }
+            finally
+            {
+                if (eventQueueStopped)
+                {
+                    ReleaseActiveTransform(shutdownEventQueue: false);
+                }
+                else
+                {
+                    QuarantineActiveTransform("IMFShutdown did not confirm a stopped async event queue");
+                }
+
+                _started = false;
+                if (!_shutdownQuarantined)
+                {
+                    ReleaseHardwareEncoderRegistration();
+                }
+
+                teardown.Stop();
+                var releaseStatus = _shutdownQuarantined ? "COM release skipped" : "COM objects release complete";
+                Log($"MFT {_lifecycleId}", $"{releaseStatus} teardown={teardown.Elapsed.TotalMilliseconds:F1}ms activeHardwareEncoders={Volatile.Read(ref _activeHardwareEncoderCount)}");
+            }
+        }
+
+        private void SendShutdownMessage(IMFTransform transform, int message, string stage)
+        {
+            var stageTimer = Stopwatch.StartNew();
+            try
+            {
+                var hr = transform.ProcessMessage(message, IntPtr.Zero);
+                stageTimer.Stop();
+                Log($"MFT {_lifecycleId}", $"shutdown stage={stage} HRESULT=0x{hr:X8} elapsed={stageTimer.Elapsed.TotalMilliseconds:F1}ms");
+            }
+            catch (Exception ex) when (ex is COMException or InvalidComObjectException)
+            {
+                stageTimer.Stop();
+                Log($"MFT {_lifecycleId}", $"shutdown stage={stage} exception={FormatComFailure(ex)} elapsed={stageTimer.Elapsed.TotalMilliseconds:F1}ms");
+            }
+        }
+
+        private void DiscardPendingAsyncEvents(string stage)
+        {
+            if (_eventGenerator is null)
+            {
+                return;
+            }
+
+            var discarded = 0;
+            while (discarded < 1024)
+            {
+                var hr = _eventGenerator.GetEvent(Native.MF_EVENT_FLAG_NO_WAIT, out var mediaEvent);
+                if (hr == Native.MF_E_NO_EVENTS_AVAILABLE)
+                {
+                    break;
+                }
+
+                if (hr < 0)
+                {
+                    Log($"MFT {_lifecycleId}", $"{stage} event discard stopped HRESULT=0x{hr:X8}");
+                    break;
+                }
+
+                ReleaseComObject(mediaEvent);
+                discarded++;
+            }
+
+            Log($"MFT {_lifecycleId}", $"{stage} async events discarded={discarded}");
+        }
+
+        private bool TryShutdownMftEventQueue(IMFTransform transform, string reason)
+        {
+            if (transform is not IMFShutdown shutdown)
+            {
+                Log($"MFT {_lifecycleId}", $"IMFShutdown unavailable async={_asyncMft} reason={reason}");
+                return !_asyncMft;
+            }
+
+            var shutdownTimer = Stopwatch.StartNew();
+            try
+            {
+                var shutdownHr = shutdown.Shutdown();
+                shutdownTimer.Stop();
+                Log($"MFT {_lifecycleId}", $"IMFShutdown result HRESULT=0x{shutdownHr:X8} elapsed={shutdownTimer.Elapsed.TotalMilliseconds:F1}ms reason={reason}");
+                if (shutdownHr >= 0)
+                {
+                    var statusHr = shutdown.GetShutdownStatus(out var status);
+                    var statusName = status == Native.MFSHUTDOWN_COMPLETED ? "completed" : status.ToString(CultureInfo.InvariantCulture);
+                    Log($"MFT {_lifecycleId}", $"IMFShutdown status HRESULT=0x{statusHr:X8} status={statusName}");
+                    return !_asyncMft || statusHr >= 0 && status == Native.MFSHUTDOWN_COMPLETED;
+                }
+
+                return !_asyncMft;
+            }
+            catch (Exception ex) when (ex is COMException or InvalidComObjectException)
+            {
+                shutdownTimer.Stop();
+                Log($"MFT {_lifecycleId}", $"IMFShutdown exception={FormatComFailure(ex)} elapsed={shutdownTimer.Elapsed.TotalMilliseconds:F1}ms reason={reason}");
+                return !_asyncMft;
+            }
+        }
+
+        private void QuarantineActiveTransform(string reason)
+        {
+            _shutdownQuarantined = true;
+            _eventGenerator = null;
             if (_transform is not null)
             {
-                try
-                {
-                    _transform.ProcessMessage(Native.MFT_MESSAGE_NOTIFY_END_OF_STREAM, IntPtr.Zero);
-                    _transform.ProcessMessage(Native.MFT_MESSAGE_NOTIFY_END_STREAMING, IntPtr.Zero);
-                }
-                catch (COMException)
-                {
-                    // Best-effort shutdown.
-                }
-
-                ReleaseComObject(_transform);
+                QuarantinedMftComObjects.Add(_transform);
                 _transform = null;
             }
 
             if (_dxgiDeviceManager is not null)
             {
-                ReleaseComObject(_dxgiDeviceManager);
+                QuarantinedMftComObjects.Add(_dxgiDeviceManager);
                 _dxgiDeviceManager = null;
             }
 
-            if (_mfStarted)
+            Log($"MFT {_lifecycleId}", $"COM release skipped and lifecycle gate retained reason={reason} quarantinedObjects={QuarantinedMftComObjects.Count}");
+        }
+
+        private void ReleaseHardwareEncoderRegistration()
+        {
+            if (_hardwareEncoderCounted)
             {
-                Native.MFShutdown();
-                _mfStarted = false;
+                _hardwareEncoderCounted = false;
+                var active = Interlocked.Decrement(ref _activeHardwareEncoderCount);
+                Log($"MFT {_lifecycleId}", $"hardware encoder inactive activeHardwareEncoders={active}");
             }
 
-            if (_comInitialized)
+            if (_hardwareEncoderGateHeld)
             {
-                Native.CoUninitialize();
-                _comInitialized = false;
+                _hardwareEncoderGateHeld = false;
+                HardwareEncoderGate.Release();
+                Log($"MFT {_lifecycleId}", "process hardware encoder gate released");
             }
         }
 
@@ -10869,6 +11521,11 @@ internal static partial class Program
                 _asyncMft = attributes.GetUINT32(ref asyncAttribute, out var asyncValue) >= 0 && asyncValue != 0;
                 if (_asyncMft)
                 {
+                    if (_transform is not IMFShutdown)
+                    {
+                        throw new InvalidOperationException("The asynchronous Media Foundation encoder does not implement IMFShutdown.");
+                    }
+
                     SetUInt32(attributes, Native.MF_TRANSFORM_ASYNC_UNLOCK, 1);
                 }
             }
@@ -10956,18 +11613,48 @@ internal static partial class Program
             return candidate.Clsid == Native.CLSID_CMSH264EncoderMFT ? 0 : 100;
         }
 
-        private void ReleaseActiveTransform()
+        private void ReleaseActiveTransform(bool shutdownEventQueue = true)
         {
-            if (_dxgiDeviceManager is not null)
+            if (_transform is not null && shutdownEventQueue)
             {
-                ReleaseComObject(_dxgiDeviceManager);
-                _dxgiDeviceManager = null;
+                if (!TryShutdownMftEventQueue(_transform, "candidate release"))
+                {
+                    QuarantineActiveTransform("candidate IMFShutdown did not complete");
+                    throw new InvalidOperationException("Unable to stop the asynchronous encoder candidate event queue safely.");
+                }
             }
 
+            _eventGenerator = null;
             if (_transform is not null)
             {
-                ReleaseComObject(_transform);
-                _transform = null;
+                try
+                {
+                    ReleaseComObject(_transform);
+                }
+                catch (Exception ex) when (ex is COMException or InvalidComObjectException)
+                {
+                    Log($"MFT {_lifecycleId}", $"IMFTransform release failed: {FormatComFailure(ex)}");
+                }
+                finally
+                {
+                    _transform = null;
+                }
+            }
+
+            if (_dxgiDeviceManager is not null)
+            {
+                try
+                {
+                    ReleaseComObject(_dxgiDeviceManager);
+                }
+                catch (Exception ex) when (ex is COMException or InvalidComObjectException)
+                {
+                    Log($"MFT {_lifecycleId}", $"DXGI device manager release failed: {FormatComFailure(ex)}");
+                }
+                finally
+                {
+                    _dxgiDeviceManager = null;
+                }
             }
 
             _dxgiResetToken = 0;
@@ -10975,7 +11662,6 @@ internal static partial class Program
             _outputProvidesSamples = false;
             _asyncMft = false;
             _asyncMftNeedsInput = false;
-            _eventGenerator = null;
             _nalLengthSize = 4;
             _parameterSets = null;
             SelectedMftName = string.Empty;
@@ -11997,6 +12683,18 @@ internal static partial class Program
         }
 
         [ComImport]
+        [Guid("97EC2EA4-0E42-4937-97AC-9D6D328824E1")]
+        [InterfaceType(ComInterfaceType.InterfaceIsIUnknown)]
+        private interface IMFShutdown
+        {
+            [PreserveSig]
+            int Shutdown();
+
+            [PreserveSig]
+            int GetShutdownStatus(out int status);
+        }
+
+        [ComImport]
         [Guid("2CD2D921-C447-44A7-A13C-4ADABFC247E3")]
         [InterfaceType(ComInterfaceType.InterfaceIsIUnknown)]
         private interface IMFAttributes
@@ -12477,17 +13175,16 @@ internal static partial class Program
         {
             public const int S_OK = 0;
             public const int S_FALSE = 1;
-            public const int MF_VERSION = 0x00020070;
-            public const int MFSTARTUP_FULL = 0;
             public const int COINIT_MULTITHREADED = 0;
             public const int CLSCTX_INPROC_SERVER = 1;
-            public const int RPC_E_CHANGED_MODE = unchecked((int)0x80010106);
             public const int VT_BOOL = 11;
             public const int VT_UI4 = 19;
             public const int MFVideoInterlace_Progressive = 2;
             public const int H264ProfileBaseline = 66;
             public const int eAVEncCommonRateControlMode_CBR = 0;
             public const int eAVEncH264PictureType_IDR = 0;
+            public const int MFT_MESSAGE_COMMAND_FLUSH = 0x00000000;
+            public const int MFT_MESSAGE_COMMAND_DRAIN = 0x00000001;
             public const int MFT_MESSAGE_SET_D3D_MANAGER = 0x00000002;
             public const int MFT_MESSAGE_NOTIFY_BEGIN_STREAMING = 0x10000000;
             public const int MFT_MESSAGE_NOTIFY_END_STREAMING = 0x10000001;
@@ -12502,8 +13199,10 @@ internal static partial class Program
             public const int MF_E_TRANSFORM_STREAM_CHANGE = unchecked((int)0xC00D6D61);
             public const int MF_E_TRANSFORM_NEED_MORE_INPUT = unchecked((int)0xC00D6D72);
             public const int MF_EVENT_FLAG_NO_WAIT = 0x00000001;
+            public const int MFSHUTDOWN_COMPLETED = 1;
             public const int METransformNeedInput = 601;
             public const int METransformHaveOutput = 602;
+            public const int METransformDrainComplete = 603;
             public const int MFT_ENUM_FLAG_SYNCMFT = 0x00000001;
             public const int MFT_ENUM_FLAG_ASYNCMFT = 0x00000002;
             public const int MFT_ENUM_FLAG_HARDWARE = 0x00000004;
@@ -12560,12 +13259,6 @@ internal static partial class Program
                 int context,
                 ref Guid iid,
                 [MarshalAs(UnmanagedType.Interface)] out IMFTransform instance);
-
-            [DllImport("mfplat.dll", ExactSpelling = true)]
-            public static extern int MFStartup(int version, int flags);
-
-            [DllImport("mfplat.dll", ExactSpelling = true)]
-            public static extern int MFShutdown();
 
             [DllImport("mfplat.dll", ExactSpelling = true)]
             public static extern int MFTEnumEx(
