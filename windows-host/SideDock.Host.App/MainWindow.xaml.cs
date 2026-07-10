@@ -6428,6 +6428,102 @@ public sealed partial class MainWindow : Window
         };
     }
 
+    private bool SynchronizeObservedVirtualDisplayMode(
+        VirtualDisplayMode? mode,
+        bool addActivityLog)
+    {
+        var resolution = NormalizeVirtualDisplayResolutionSelection(DisplayResolutionValueFromMode(mode));
+        var refreshRate = NormalizeVirtualDisplayRefreshRateSelection(DisplayRefreshRateValueFromMode(mode));
+        if (resolution is null || refreshRate is null)
+        {
+            return false;
+        }
+
+        var settingsChanged = !string.Equals(
+                _appSettings.VirtualDisplayResolution,
+                resolution,
+                StringComparison.OrdinalIgnoreCase)
+            || !string.Equals(
+                _appSettings.VirtualDisplayRefreshRate,
+                refreshRate,
+                StringComparison.OrdinalIgnoreCase);
+        var controlsChanged = !string.Equals(
+                Selected(OverviewVirtualDisplayResolutionCombo),
+                resolution,
+                StringComparison.OrdinalIgnoreCase)
+            || !string.Equals(
+                Selected(OverviewVirtualDisplayRefreshRateCombo),
+                refreshRate,
+                StringComparison.OrdinalIgnoreCase);
+        if (!settingsChanged && !controlsChanged)
+        {
+            return false;
+        }
+
+        _appSettings.VirtualDisplayResolution = resolution;
+        _appSettings.VirtualDisplayRefreshRate = refreshRate;
+        _appSettings.LastAppliedVirtualDisplayResolution = resolution;
+        _appSettings.LastAppliedVirtualDisplayRefreshRate = refreshRate;
+        _appSettings.Normalize();
+        if (settingsChanged)
+        {
+            TrySaveAppSettings("Runtime virtual display mode synchronized.", logSuccess: false);
+        }
+
+        OverviewDisplayPage.ApplySettings(_appSettings);
+        OverviewSettingsPage.ApplySettings(_appSettings);
+        SyncVirtualDisplayModeSelection(resolution, refreshRate);
+        if (addActivityLog)
+        {
+            OverviewDisplayPage.AddActivityLog(
+                $"已同步运行时显示模式：{FormatOverviewVirtualDisplayResolutionLabel(resolution)} @ {refreshRate} Hz。",
+                StaticDisplayActivityKind.Info);
+        }
+
+        return true;
+    }
+
+    private void HandleDisplayModeHostOutputLine(string line)
+    {
+        string modeValue;
+        if (line.Contains("display mode change ", StringComparison.OrdinalIgnoreCase))
+        {
+            if (!ExtractLogValue(line, "success=").Equals("true", StringComparison.OrdinalIgnoreCase))
+            {
+                return;
+            }
+
+            modeValue = ExtractLogValue(line, "result=");
+        }
+        else if (line.Contains("display layout mode sync ", StringComparison.OrdinalIgnoreCase))
+        {
+            modeValue = ExtractLogValue(line, "video=");
+        }
+        else
+        {
+            return;
+        }
+
+        var match = Regex.Match(
+            modeValue,
+            @"^(?<width>\d+)x(?<height>\d+)@(?<refresh>\d+)",
+            RegexOptions.CultureInvariant);
+        if (!match.Success
+            || !int.TryParse(match.Groups["width"].Value, NumberStyles.Integer, CultureInfo.InvariantCulture, out var width)
+            || !int.TryParse(match.Groups["height"].Value, NumberStyles.Integer, CultureInfo.InvariantCulture, out var height)
+            || !int.TryParse(match.Groups["refresh"].Value, NumberStyles.Integer, CultureInfo.InvariantCulture, out var refreshRate))
+        {
+            return;
+        }
+
+        if (SynchronizeObservedVirtualDisplayMode(
+                new VirtualDisplayMode(width, height, refreshRate),
+                addActivityLog: true))
+        {
+            RefreshVirtualDisplayState();
+        }
+    }
+
     private void InitializeOverviewCameraOptions()
     {
         RefreshOverviewCameraCapabilityOptions(CurrentCameraConfigSelection(_overviewCameraRequestedEnabled));
@@ -11208,6 +11304,16 @@ public sealed partial class MainWindow : Window
         var startupTaskState = RefreshStartupTaskState(logErrors: true);
         var running = IsVirtualDisplayToolRunning();
         var displayLayout = DisplayLayoutQuery.GetCurrent();
+        if (running
+            && displayLayout.HasSideDockVirtualDisplay
+            && !_virtualDisplayModeApplyInProgress
+            && !_virtualDisplayOperationInProgress)
+        {
+            SynchronizeObservedVirtualDisplayMode(
+                CurrentSideDockModeFromLayout(displayLayout),
+                addActivityLog: false);
+        }
+
         var state = DetermineVirtualDisplayOverviewState(running, out var driverInstalled, out var toolAvailable);
         var (statusText, subtext, statusBrush) = BuildVirtualDisplayStatusView(state, driverInstalled, toolAvailable);
         var displayOperationEnabled = !_virtualDisplayOperationInProgress
@@ -14261,6 +14367,12 @@ public sealed partial class MainWindow : Window
 
     private void HandleHostOutputLine(string line)
     {
+        if (line.Contains("display mode change ", StringComparison.OrdinalIgnoreCase)
+            || line.Contains("display layout mode sync ", StringComparison.OrdinalIgnoreCase))
+        {
+            HandleDisplayModeHostOutputLine(line);
+        }
+
         if (line.Contains("[CAMERA", StringComparison.OrdinalIgnoreCase))
         {
             HandleCameraHostOutputLine(line);

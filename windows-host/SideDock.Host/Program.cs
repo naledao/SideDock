@@ -5561,8 +5561,7 @@ internal static partial class Program
                 {
                     var teardown = Stopwatch.StartNew();
                     Log($"VIDEO {connectionId}", $"previous connection cancellation begin generation={previous.ConnectionId}");
-                    previous.ConnectionCts.Cancel();
-                    AbortClient(previous.Client);
+                    CancelConnection(previous);
                     try
                     {
                         await previous.ConnectionTask.WaitAsync(VideoTeardownTimeout, appToken);
@@ -5627,13 +5626,19 @@ internal static partial class Program
             }
             finally
             {
-                AbortClient(connection.Client);
-                connection.ConnectionCts.Dispose();
-                lock (_connectionLock)
+                try
                 {
-                    if (ReferenceEquals(_activeConnection, connection))
+                    AbortClient(connection.Client);
+                }
+                finally
+                {
+                    connection.ConnectionCts.Dispose();
+                    lock (_connectionLock)
                     {
-                        _activeConnection = null;
+                        if (ReferenceEquals(_activeConnection, connection))
+                        {
+                            _activeConnection = null;
+                        }
                     }
                 }
 
@@ -5659,8 +5664,7 @@ internal static partial class Program
 
                 var teardown = Stopwatch.StartNew();
                 Log($"VIDEO {active.ConnectionId}", "host shutdown connection cancellation begin");
-                active.ConnectionCts.Cancel();
-                AbortClient(active.Client);
+                CancelConnection(active);
                 await active.ConnectionTask;
                 teardown.Stop();
                 Log($"VIDEO {active.ConnectionId}", $"host shutdown connection cancellation complete teardown={teardown.Elapsed.TotalMilliseconds:F1}ms");
@@ -5671,18 +5675,40 @@ internal static partial class Program
             }
         }
 
-        private static void AbortClient(TcpClient client)
+        private static void CancelConnection(ActiveVideoConnection connection)
         {
             try
             {
-                client.Client.Shutdown(SocketShutdown.Both);
+                connection.ConnectionCts.Cancel();
+            }
+            catch (ObjectDisposedException)
+            {
+                // The connection may have completed between taking the active snapshot and cancellation.
+            }
+
+            AbortClient(connection.Client);
+        }
+
+        private static void AbortClient(TcpClient? client)
+        {
+            if (client is null)
+            {
+                return;
+            }
+
+            try
+            {
+                var socket = client.Client;
+                socket?.Shutdown(SocketShutdown.Both);
             }
             catch (Exception ex) when (ex is SocketException or ObjectDisposedException)
             {
-                // The peer may already have closed the socket.
+                // Another teardown path or the peer may already have closed the socket.
             }
-
-            client.Dispose();
+            finally
+            {
+                client.Dispose();
+            }
         }
 
         private async Task HandleClientAsync(
