@@ -377,6 +377,48 @@
                         </Border>
 
                         <Border Style="{StaticResource SettingsCardStyle}">
+                            <StackPanel Spacing="0">
+                                <TextBlock Text="存储空间" FontSize="16" FontWeight="SemiBold" Foreground="{StaticResource SettingsTextBrush}" Margin="0,0,0,14" />
+
+                                <Grid MinHeight="58" ColumnSpacing="14">
+                                    <Grid.ColumnDefinitions>
+                                        <ColumnDefinition Width="44" />
+                                        <ColumnDefinition Width="*" />
+                                    </Grid.ColumnDefinitions>
+                                    <Border Style="{StaticResource SettingsIconBoxStyle}">
+                                        <FontIcon Glyph="&#xE7F1;" FontSize="19" Foreground="#30363D" />
+                                    </Border>
+                                    <StackPanel Grid.Column="1" VerticalAlignment="Center" Spacing="4">
+                                        <TextBlock Text="旧版本运行文件" FontSize="14" Foreground="{StaticResource SettingsTextBrush}" />
+                                        <TextBlock Text="清理启动器、主机与驱动组件留下的旧构建；当前版本和本地配置会保留。" FontSize="12" Foreground="{StaticResource SettingsMutedBrush}" TextWrapping="Wrap" />
+                                    </StackPanel>
+                                </Grid>
+
+                                <Grid Margin="0,12,0,0" ColumnSpacing="12">
+                                    <Grid.ColumnDefinitions>
+                                        <ColumnDefinition Width="Auto" />
+                                        <ColumnDefinition Width="*" />
+                                        <ColumnDefinition Width="Auto" />
+                                    </Grid.ColumnDefinitions>
+                                    <Button
+                                        x:Name="CleanStorageButton"
+                                        Width="176"
+                                        Style="{StaticResource SettingsOutlineButtonStyle}"
+                                        Click="CleanStorageButton_Click">
+                                        <StackPanel Orientation="Horizontal" Spacing="10">
+                                            <FontIcon Glyph="&#xE74D;" FontSize="15" Foreground="#30363D" />
+                                            <TextBlock Text="清理旧版本文件..." VerticalAlignment="Center" FontSize="13" Foreground="#30363D" />
+                                        </StackPanel>
+                                    </Button>
+                                    <StackPanel Grid.Column="2" Orientation="Horizontal" Spacing="8" VerticalAlignment="Center">
+                                        <TextBlock x:Name="StorageSizeText" Text="程序文件占用：正在计算..." FontSize="12" Foreground="{StaticResource SettingsMutedBrush}" TextWrapping="Wrap" />
+                                        <FontIcon Glyph="&#xE946;" FontSize="14" Foreground="#30363D" />
+                                    </StackPanel>
+                                </Grid>
+                            </StackPanel>
+                        </Border>
+
+                        <Border Style="{StaticResource SettingsCardStyle}">
                             <Grid RowSpacing="12" ColumnSpacing="18">
                                 <Grid.RowDefinitions>
                                     <RowDefinition Height="Auto" />

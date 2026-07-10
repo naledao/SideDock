@@ -1012,6 +1012,7 @@ public sealed partial class MainWindow : Window
             OverviewNavigationDetailPanel.Visibility = Visibility.Collapsed;
             OverviewSettingsPage.ScrollToTop();
             _ = OverviewSettingsPage.RefreshLogSizeAsync();
+            _ = OverviewSettingsPage.RefreshStorageSizeAsync();
             return;
         }
 

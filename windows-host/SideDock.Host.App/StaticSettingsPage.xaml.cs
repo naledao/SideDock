@@ -151,9 +151,16 @@ public sealed partial class StaticSettingsPage : UserControl
         UpdateLogSizeText(result);
     }
 
+    internal async Task RefreshStorageSizeAsync()
+    {
+        StorageSizeText.Text = "程序文件占用：正在计算...";
+        var result = await Task.Run(SideDockStorageMaintenance.CalculateSize);
+        UpdateStorageSizeText(result);
+    }
+
     private async void StaticSettingsPage_Loaded(object sender, RoutedEventArgs e)
     {
-        await RefreshLogSizeAsync();
+        await Task.WhenAll(RefreshLogSizeAsync(), RefreshStorageSizeAsync());
     }
 
     private void RestorePortsButton_Click(object sender, RoutedEventArgs e)
@@ -187,6 +194,62 @@ public sealed partial class StaticSettingsPage : UserControl
             {
                 cleanupButton.IsEnabled = true;
             }
+        }
+    }
+
+    private async void CleanStorageButton_Click(object sender, RoutedEventArgs e)
+    {
+        CleanStorageButton.IsEnabled = false;
+
+        try
+        {
+            StorageSizeText.Text = "程序文件占用：正在扫描...";
+            var scan = await Task.Run(SideDockStorageMaintenance.CalculateSize);
+            UpdateStorageSizeText(scan);
+
+            if (scan.ReclaimableDirectoryCount == 0)
+            {
+                var warning = FormatWarningSummary(scan.Warnings);
+                ShowBanner(
+                    scan.HasWarnings ? "存储空间检查完成" : "没有可清理的旧版本",
+                    string.IsNullOrWhiteSpace(warning)
+                        ? "当前版本、最新构建和本地配置均已保留，没有发现可安全清理的旧版本文件。"
+                        : $"没有发现可安全清理的旧版本文件。{warning}");
+                return;
+            }
+
+            var dialog = new ContentDialog
+            {
+                XamlRoot = XamlRoot,
+                Title = "清理旧版本文件？",
+                Content = new TextBlock
+                {
+                    Text = $"将删除 {scan.ReclaimableDirectoryCount} 个旧构建目录，预计释放 {FormatFileSize(scan.ReclaimableBytes)}。\n\n当前运行版本、每类文件的最新构建、正在使用的文件以及 settings.json 等本地配置不会被删除。",
+                    TextWrapping = TextWrapping.Wrap
+                },
+                PrimaryButtonText = "开始清理",
+                CloseButtonText = "取消",
+                DefaultButton = ContentDialogButton.Close
+            };
+
+            if (await dialog.ShowAsync() != ContentDialogResult.Primary)
+            {
+                return;
+            }
+
+            StorageSizeText.Text = "程序文件占用：正在清理...";
+            var result = await Task.Run(SideDockStorageMaintenance.Clean);
+            UpdateStorageSizeText(result.After);
+            ShowStorageCleanupResult(result);
+        }
+        catch (Exception ex)
+        {
+            ShowBanner("清理旧版本失败", $"旧版本文件清理未完成：{ex.Message}");
+            await RefreshStorageSizeAsync();
+        }
+        finally
+        {
+            CleanStorageButton.IsEnabled = true;
         }
     }
 
@@ -587,6 +650,35 @@ public sealed partial class StaticSettingsPage : UserControl
         };
 
         LogSizeText.Text = $"当前日志大小：{FormatFileSize(result.TotalBytes)} {suffix}";
+    }
+
+    private void UpdateStorageSizeText(StorageScanResult result)
+    {
+        var reclaimable = result.ReclaimableDirectoryCount > 0
+            ? $"，可清理 {FormatFileSize(result.ReclaimableBytes)}（{result.ReclaimableDirectoryCount} 个旧版本）"
+            : "，没有可清理的旧版本";
+        var warning = result.HasWarnings ? "，部分目录不可访问" : string.Empty;
+        StorageSizeText.Text = $"程序文件占用：{FormatFileSize(result.TotalBytes)}{reclaimable}{warning}";
+    }
+
+    private void ShowStorageCleanupResult(StorageCleanupResult result)
+    {
+        var title = result.HasWarnings ? "旧版本已部分清理" : "旧版本已清理";
+        var detail = $"已删除 {result.DeletedDirectories} 个旧构建目录，释放 {FormatFileSize(result.ReleasedBytes)}；"
+            + $"当前程序文件占用 {FormatFileSize(result.After.TotalBytes)}。";
+
+        if (result.SkippedDirectories > 0)
+        {
+            detail += $"跳过 {result.SkippedDirectories} 个正在使用或不可访问的目录。";
+        }
+
+        var cleanupWarning = FormatWarningSummary(result.Warnings);
+        if (!string.IsNullOrWhiteSpace(cleanupWarning))
+        {
+            detail += cleanupWarning;
+        }
+
+        ShowBanner(title, detail);
     }
 
     private void ShowLogCleanupResult(LogCleanupResult result)
