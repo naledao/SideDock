@@ -53,6 +53,7 @@ public sealed partial class StaticSettingsPage : UserControl
         IncludePortInfoSwitch.IsOn = settings.IncludePortInfoInDiagnostics;
         Nv12ThreadsBox.Value = settings.Nv12PoolSize;
         EncoderQueueBox.Value = settings.EncodedPacketQueue;
+        AndroidCursorScaleBox.Value = settings.AndroidCursorScalePercent;
         SelectUpdateSourceKind(settings.UpdateSourceKind);
         UpdateGitHubRepositoryBox.Text = settings.UpdateGitHubRepository;
         UpdateManifestUrlBox.Text = settings.UpdateManifestUrl;
@@ -78,7 +79,8 @@ public sealed partial class StaticSettingsPage : UserControl
             || !TryReadInt(AudioPortBox, "音频端口", 1, 65535, out var audioPort, out error)
             || !TryReadInt(CameraPortBox, "摄像头端口", 1, 65535, out var cameraPort, out error)
             || !TryReadInt(Nv12ThreadsBox, "NV12 处理池", 1, 16, out var nv12PoolSize, out error)
-            || !TryReadInt(EncoderQueueBox, "编码包队列", 1, 8, out var encodedPacketQueue, out error))
+            || !TryReadInt(EncoderQueueBox, "编码包队列", 1, 8, out var encodedPacketQueue, out error)
+            || !TryReadInt(AndroidCursorScaleBox, "安卓端鼠标大小", 50, 200, out var androidCursorScalePercent, out error))
         {
             ShowBanner("设置未保存", error);
             return false;
@@ -107,6 +109,7 @@ public sealed partial class StaticSettingsPage : UserControl
             IncludePortInfoInDiagnostics = IncludePortInfoSwitch.IsOn,
             Nv12PoolSize = nv12PoolSize,
             EncodedPacketQueue = encodedPacketQueue,
+            AndroidCursorScalePercent = androidCursorScalePercent,
             ThemeMode = SelectedThemeMode(),
             InterfaceDensity = SelectedInterfaceDensity(),
             UpdateSourceKind = SelectedUpdateSourceKind(),

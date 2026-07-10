@@ -2956,6 +2956,7 @@ public final class MainActivity extends Activity implements ControlClient.Listen
             + " visible=" + (state != null && state.visible)
             + " display=" + (state == null ? "0x0" : state.displayWidth + "x" + state.displayHeight)
             + " pos=" + (state == null ? "0,0" : state.x + "," + state.y)
+            + " scale=" + (state == null ? "1.00" : String.format(Locale.ROOT, "%.2f", state.scale))
             + " contentRect=" + contentRectLeft + "," + contentRectTop + " "
             + contentRectWidth + "x" + contentRectHeight);
     }
@@ -3315,6 +3316,7 @@ public final class MainActivity extends Activity implements ControlClient.Listen
                 .append("  visible=").append(lastCursorState.visible)
                 .append("  pos=").append(lastCursorState.x).append(',').append(lastCursorState.y)
                 .append("  basis=").append(lastCursorState.displayWidth).append('x').append(lastCursorState.displayHeight)
+                .append("  scale=").append(String.format(Locale.ROOT, "%.2f", lastCursorState.scale))
                 .append("  n=").append(String.format(Locale.ROOT, "%.3f,%.3f", lastCursorState.nx, lastCursorState.ny));
             if (lastCursorState.desktopX != 0 || lastCursorState.desktopY != 0) {
                 builder.append("  desktop=").append(lastCursorState.desktopX).append(',').append(lastCursorState.desktopY);
@@ -3830,8 +3832,8 @@ public final class MainActivity extends Activity implements ControlClient.Listen
 
             arrowPath.moveTo(0f, 0f);
             arrowPath.lineTo(0f, 22f);
-            arrowPath.lineTo(6f, 16f);
-            arrowPath.lineTo(10f, 28f);
+            arrowPath.lineTo(6f, 15f);
+            arrowPath.lineTo(11f, 27f);
             arrowPath.lineTo(15f, 26f);
             arrowPath.lineTo(11f, 15f);
             arrowPath.lineTo(20f, 15f);
@@ -3868,11 +3870,20 @@ public final class MainActivity extends Activity implements ControlClient.Listen
 
             canvas.save();
             canvas.translate(x, y);
-            float cursorScale = density * CURSOR_OVERLAY_SCALE;
+            float scaleFactor = normalizedCursorScale(state.scale);
+            float cursorScale = density * CURSOR_OVERLAY_SCALE * scaleFactor;
             canvas.scale(cursorScale, cursorScale);
             canvas.drawPath(arrowPath, strokePaint);
             canvas.drawPath(arrowPath, fillPaint);
             canvas.restore();
+        }
+
+        private float normalizedCursorScale(double scale) {
+            if (Double.isNaN(scale) || Double.isInfinite(scale)) {
+                return 1f;
+            }
+
+            return Math.max(0.5f, Math.min(2f, (float) scale));
         }
 
         private float normalizedCursorCoordinate(double normalized, int value, int basis) {

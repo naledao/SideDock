@@ -935,7 +935,7 @@ public sealed partial class StaticDisplayPage : UserControl
         var textBrush = monitor.IsSideDockVirtualDisplay
             ? _sideDockBrush
             : monitor.IsPrimary ? _primaryBrush : _textBrush;
-        var compact = width < 170 || height < 105;
+        var compact = width < 170 || height < 150;
         var padding = compact ? 8 : 12;
         var maxTextWidth = Math.Max(24, width - padding * 2);
 

@@ -5838,6 +5838,7 @@ public sealed partial class MainWindow : Window
             "--camera-facing", Selected(CameraFacingCombo),
             "--nv12-pool-size", _appSettings.Nv12PoolSize.ToString(CultureInfo.InvariantCulture),
             "--encoded-packet-queue", _appSettings.EncodedPacketQueue.ToString(CultureInfo.InvariantCulture),
+            "--android-cursor-scale-percent", _appSettings.AndroidCursorScalePercent.ToString(CultureInfo.InvariantCulture),
             "--audio-backend", "wasapi-virtual-cable"
         };
 
@@ -8339,6 +8340,7 @@ public sealed partial class MainWindow : Window
         report.AppendLine($"分辨率/刷新率: {Selected(ResolutionCombo)} / {Selected(RefreshRateCombo)}fps");
         report.AppendLine($"配置分辨率/刷新率: {_appSettings.VirtualDisplayResolution} / {_appSettings.VirtualDisplayRefreshRate} Hz");
         report.AppendLine($"配置显示模式: {_appSettings.VirtualDisplayPresentationMode}");
+        report.AppendLine($"安卓端鼠标大小: {_appSettings.AndroidCursorScalePercent}%");
         report.AppendLine($"当前显示模式: {presentationState.Mode}");
         report.AppendLine($"显示模式详情: {presentationState.Summary}");
         report.AppendLine($"自动随 Host 管理: {_appSettings.StartVirtualDisplayWithHost}");

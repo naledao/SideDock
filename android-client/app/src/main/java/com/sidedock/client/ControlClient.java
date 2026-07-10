@@ -422,6 +422,7 @@ public final class ControlClient {
         public final double ny;
         public final int desktopX;
         public final int desktopY;
+        public final double scale;
         public final String source;
 
         public CursorState(
@@ -434,6 +435,7 @@ public final class ControlClient {
             double ny,
             int desktopX,
             int desktopY,
+            double scale,
             String source
         ) {
             this.visible = visible;
@@ -445,6 +447,7 @@ public final class ControlClient {
             this.ny = ny;
             this.desktopX = desktopX;
             this.desktopY = desktopY;
+            this.scale = scale;
             this.source = source;
         }
     }
@@ -1313,6 +1316,7 @@ public final class ControlClient {
                     message.payload.optDouble("ny", Double.NaN),
                     message.payload.optInt("desktopX", 0),
                     message.payload.optInt("desktopY", 0),
+                    message.payload.optDouble("scale", 1.0),
                     message.payload.optString("source", "")
                 ));
                 break;

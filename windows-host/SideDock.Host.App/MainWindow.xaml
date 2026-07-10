@@ -314,6 +314,20 @@
                         BorderBrush="#087C89"
                         Foreground="White"
                         Click="OverviewPrimaryActionButton_Click">
+                        <Button.Resources>
+                            <SolidColorBrush x:Key="ButtonBackground" Color="#087C89" />
+                            <SolidColorBrush x:Key="ButtonBackgroundPointerOver" Color="#096F7A" />
+                            <SolidColorBrush x:Key="ButtonBackgroundPressed" Color="#075E67" />
+                            <SolidColorBrush x:Key="ButtonBackgroundDisabled" Color="#AFC9CC" />
+                            <SolidColorBrush x:Key="ButtonForeground" Color="#FFFFFF" />
+                            <SolidColorBrush x:Key="ButtonForegroundPointerOver" Color="#FFFFFF" />
+                            <SolidColorBrush x:Key="ButtonForegroundPressed" Color="#FFFFFF" />
+                            <SolidColorBrush x:Key="ButtonForegroundDisabled" Color="#F3F8F9" />
+                            <SolidColorBrush x:Key="ButtonBorderBrush" Color="#087C89" />
+                            <SolidColorBrush x:Key="ButtonBorderBrushPointerOver" Color="#096F7A" />
+                            <SolidColorBrush x:Key="ButtonBorderBrushPressed" Color="#075E67" />
+                            <SolidColorBrush x:Key="ButtonBorderBrushDisabled" Color="#AFC9CC" />
+                        </Button.Resources>
                         <StackPanel Orientation="Horizontal" Spacing="10">
                             <FontIcon x:Name="OverviewPrimaryActionIcon" Glyph="&#xE768;" FontSize="16" Foreground="White" />
                             <TextBlock

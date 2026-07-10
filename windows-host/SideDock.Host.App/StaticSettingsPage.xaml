@@ -425,6 +425,7 @@
                                     <RowDefinition Height="Auto" />
                                     <RowDefinition Height="Auto" />
                                     <RowDefinition Height="Auto" />
+                                    <RowDefinition Height="Auto" />
                                 </Grid.RowDefinitions>
                                 <Grid.ColumnDefinitions>
                                     <ColumnDefinition Width="*" />
@@ -433,18 +434,33 @@
                                 <TextBlock Grid.ColumnSpan="2" Text="高级" FontSize="16" FontWeight="SemiBold" Foreground="{StaticResource SettingsTextBrush}" />
 
                                 <StackPanel Grid.Row="1" VerticalAlignment="Center" Spacing="4">
+                                    <TextBlock Text="安卓端鼠标大小（%）" FontSize="14" Foreground="#30363D" />
+                                    <TextBlock Text="调整安卓画面中合成鼠标的大小；保存后在下次启动主机时生效。" FontSize="12" Foreground="{StaticResource SettingsMutedBrush}" TextWrapping="Wrap" />
+                                </StackPanel>
+                                <NumberBox
+                                    x:Name="AndroidCursorScaleBox"
+                                    Grid.Row="1"
+                                    Grid.Column="1"
+                                    Value="100"
+                                    Minimum="50"
+                                    Maximum="200"
+                                    SmallChange="10"
+                                    LargeChange="25"
+                                    SpinButtonPlacementMode="Compact" />
+
+                                <StackPanel Grid.Row="2" VerticalAlignment="Center" Spacing="4">
                                     <TextBlock Text="NV12 处理池（帧）" FontSize="14" Foreground="#30363D" />
                                     <TextBlock Text="增加可减少掉帧，但会占用更多显存。" FontSize="12" Foreground="{StaticResource SettingsMutedBrush}" TextWrapping="Wrap" />
                                 </StackPanel>
-                                <NumberBox x:Name="Nv12ThreadsBox" Grid.Row="1" Grid.Column="1" Value="4" Minimum="1" Maximum="16" SpinButtonPlacementMode="Compact" />
+                                <NumberBox x:Name="Nv12ThreadsBox" Grid.Row="2" Grid.Column="1" Value="4" Minimum="1" Maximum="16" SpinButtonPlacementMode="Compact" />
 
-                                <StackPanel Grid.Row="2" VerticalAlignment="Center" Spacing="4">
+                                <StackPanel Grid.Row="3" VerticalAlignment="Center" Spacing="4">
                                     <TextBlock Text="编码包队列（帧）" FontSize="14" Foreground="#30363D" />
                                     <TextBlock Text="增加可提升吞吐量，但会增加延迟。" FontSize="12" Foreground="{StaticResource SettingsMutedBrush}" TextWrapping="Wrap" />
                                 </StackPanel>
-                                <NumberBox x:Name="EncoderQueueBox" Grid.Row="2" Grid.Column="1" Value="2" Minimum="1" Maximum="8" SpinButtonPlacementMode="Compact" />
+                                <NumberBox x:Name="EncoderQueueBox" Grid.Row="3" Grid.Column="1" Value="2" Minimum="1" Maximum="8" SpinButtonPlacementMode="Compact" />
 
-                                <Border Grid.Row="3" Grid.ColumnSpan="2" Padding="14,10" CornerRadius="5" Background="#FFF8EA" BorderBrush="#E9A23B" BorderThickness="1">
+                                <Border Grid.Row="4" Grid.ColumnSpan="2" Padding="14,10" CornerRadius="5" Background="#FFF8EA" BorderBrush="#E9A23B" BorderThickness="1">
                                     <StackPanel Orientation="Horizontal" Spacing="10">
                                         <FontIcon Glyph="&#xE7BA;" FontSize="18" Foreground="#D97706" />
                                         <TextBlock Text="高级设置可能影响稳定性或延迟，除非必要请保留默认值。" VerticalAlignment="Center" FontSize="12" Foreground="{StaticResource SettingsMutedBrush}" TextWrapping="Wrap" />

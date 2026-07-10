@@ -38,6 +38,7 @@ internal sealed class AppSettings
     public const int DefaultCameraPort = 27186;
     public const int DefaultNv12PoolSize = 4;
     public const int DefaultEncodedPacketQueue = 2;
+    public const int DefaultAndroidCursorScalePercent = 100;
     public const string DefaultAdbSerialValue = "HA1K3AX0";
     public const string DefaultUpdateGitHubRepository = "naledao/SideDock";
 
@@ -62,6 +63,7 @@ internal sealed class AppSettings
     public bool IncludePortInfoInDiagnostics { get; set; } = true;
     public int Nv12PoolSize { get; set; } = DefaultNv12PoolSize;
     public int EncodedPacketQueue { get; set; } = DefaultEncodedPacketQueue;
+    public int AndroidCursorScalePercent { get; set; } = DefaultAndroidCursorScalePercent;
     public AppThemeMode ThemeMode { get; set; } = AppThemeMode.System;
     public AppInterfaceDensity InterfaceDensity { get; set; } = AppInterfaceDensity.Standard;
     public AppUpdateSourceKind UpdateSourceKind { get; set; } = AppUpdateSourceKind.GitHubReleases;
@@ -95,6 +97,11 @@ internal sealed class AppSettings
             allowUnknown: true);
         Nv12PoolSize = Clamp(Nv12PoolSize, 1, 16, DefaultNv12PoolSize);
         EncodedPacketQueue = Clamp(EncodedPacketQueue, 1, 8, DefaultEncodedPacketQueue);
+        AndroidCursorScalePercent = Clamp(
+            AndroidCursorScalePercent,
+            50,
+            200,
+            DefaultAndroidCursorScalePercent);
         ThemeMode = NormalizeThemeMode(ThemeMode);
         InterfaceDensity = NormalizeInterfaceDensity(InterfaceDensity);
         UpdateSourceKind = NormalizeUpdateSourceKind(UpdateSourceKind);

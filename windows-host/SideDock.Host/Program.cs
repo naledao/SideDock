@@ -40,6 +40,7 @@ internal static partial class Program
     private const int DefaultVideoGop = 30;
     private const int DefaultMaxVideoQueue = 2;
     private const int DefaultNv12PoolSize = 4;
+    private const int DefaultAndroidCursorScalePercent = 100;
     private static readonly TimeSpan AdbCommandTimeout = TimeSpan.FromSeconds(6);
     private const VideoSourceKind DefaultVideoSource = VideoSourceKind.IddGpu;
     private const string DefaultVideoFile = "artifacts/test-videos/sidedock-720p30.h264";
@@ -159,6 +160,7 @@ internal static partial class Program
         Console.WriteLine($"编码规格: {options.VideoWidth}x{options.VideoHeight} bitrate={options.VideoBitrate} ({(options.AutoVideoBitrate ? "auto" : "manual")})");
         Console.WriteLine($"编码调优: {FormatEncoderTuningForLog(options)}");
         Console.WriteLine($"链路容量: nv12Pool={options.Nv12PoolSize} encodedPacketQueue={options.EncodedPacketQueue}");
+        Console.WriteLine($"Android 合成鼠标大小: {options.AndroidCursorScalePercent}%");
         Console.WriteLine($"音频能力: microphone={(options.AudioDeviceEnabled && options.MicrophoneEnabled ? "enabled" : "disabled")} speaker={(options.AudioDeviceEnabled && options.SpeakerEnabled ? "enabled" : "disabled")}");
         Console.WriteLine($"摄像头能力: {(options.CameraEnabled ? "enabled" : "disabled")} {options.CameraWidth}x{options.CameraHeight}@{options.CameraFps} {options.CameraCodec} facing={options.CameraFacing}");
         if (!string.IsNullOrWhiteSpace(options.CameraReplayFilePath))
@@ -3265,6 +3267,8 @@ internal static partial class Program
                 ["ny"] = state.Ny,
                 ["desktopX"] = state.DesktopX,
                 ["desktopY"] = state.DesktopY,
+                ["scale"] = _options.AndroidCursorScalePercent / 100.0,
+                ["scalePercent"] = _options.AndroidCursorScalePercent,
                 ["source"] = "host-cursor"
             }, cancellationToken);
         }
@@ -15398,6 +15402,7 @@ internal static partial class Program
         int MaxVideoQueue,
         int Nv12PoolSize,
         int EncodedPacketQueue,
+        int AndroidCursorScalePercent,
         bool EnableInputInjection,
         InputTargetKind InputTarget,
         bool ListWindows,
@@ -15460,6 +15465,7 @@ internal static partial class Program
             var maxVideoQueue = DefaultMaxVideoQueue;
             var nv12PoolSize = DefaultNv12PoolSize;
             var encodedPacketQueue = DefaultMaxVideoQueue;
+            var androidCursorScalePercent = DefaultAndroidCursorScalePercent;
             var enableInputInjection = false;
             InputTargetKind? inputTarget = null;
             var listWindows = false;
@@ -15712,6 +15718,15 @@ internal static partial class Program
 
                         break;
 
+                    case "--android-cursor-scale-percent":
+                    case "--cursor-scale-percent":
+                        if (int.TryParse(args[index + 1], out var parsedAndroidCursorScalePercent))
+                        {
+                            androidCursorScalePercent = Math.Clamp(parsedAndroidCursorScalePercent, 50, 200);
+                        }
+
+                        break;
+
                     case "--input-target":
                         inputTarget = ParseInputTarget(args[index + 1]);
                         break;
@@ -15788,6 +15803,7 @@ internal static partial class Program
                 maxVideoQueue,
                 nv12PoolSize,
                 encodedPacketQueue,
+                androidCursorScalePercent,
                 enableInputInjection,
                 inputTarget.Value,
                 listWindows,
