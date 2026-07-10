@@ -890,6 +890,17 @@ public sealed partial class MainWindow : Window
                 ? compact ? new Thickness(8, 0, 8, 0) : new Thickness(10, 0, 10, 0)
                 : compact ? new Thickness(12, 0, 12, 0) : new Thickness(14, 0, 14, 0);
             text.Visibility = textVisibility;
+
+            if (container.Child is Grid navigationGrid && navigationGrid.ColumnDefinitions.Count >= 3)
+            {
+                navigationGrid.ColumnSpacing = _overviewSidebarCollapsed ? 0 : 10;
+                navigationGrid.ColumnDefinitions[1].Width = _overviewSidebarCollapsed
+                    ? new GridLength(1, GridUnitType.Star)
+                    : GridLength.Auto;
+                navigationGrid.ColumnDefinitions[2].Width = _overviewSidebarCollapsed
+                    ? new GridLength(0)
+                    : new GridLength(1, GridUnitType.Star);
+            }
         }
     }
 
@@ -962,6 +973,7 @@ public sealed partial class MainWindow : Window
         OverviewPrimaryActionIcon.Glyph = showCameraPage ? "\uE722" : "\uE768";
         OverviewStartHostButton.Visibility = showAudioPage || showDiagnosticsPage || showSettingsPage ? Visibility.Collapsed : Visibility.Visible;
         OverviewDefaultHeaderActions.Visibility = showAudioPage || showDiagnosticsPage || showSettingsPage ? Visibility.Collapsed : Visibility.Visible;
+        OverviewDisplayHeaderCopyLogButton.Visibility = showDisplayPage ? Visibility.Visible : Visibility.Collapsed;
         OverviewCameraHeaderCopyLogButton.Visibility = showCameraPage ? Visibility.Visible : Visibility.Collapsed;
         OverviewCameraHeaderCopyAndroidLogButton.Visibility = showCameraPage ? Visibility.Visible : Visibility.Collapsed;
         OverviewAudioHeaderActions.Visibility = showAudioPage ? Visibility.Visible : Visibility.Collapsed;
@@ -3750,6 +3762,25 @@ public sealed partial class MainWindow : Window
     private void OverviewAudioHeaderCopyLogButton_Click(object sender, RoutedEventArgs e)
     {
         CopyAudioDiagnosticsToClipboard();
+    }
+
+    private void OverviewDisplayHeaderCopyLogButton_Click(object sender, RoutedEventArgs e)
+    {
+        try
+        {
+            var package = new DataPackage { RequestedOperation = DataPackageOperation.Copy };
+            package.SetText(BuildVirtualDisplayLogReport());
+            Clipboard.SetContent(package);
+            Clipboard.Flush();
+            OverviewDisplayHeaderCopyLogButtonText.Text = "已复制";
+            OverviewDisplayPage.AddActivityLog("虚拟显示器调试日志已复制。", StaticDisplayActivityKind.Success);
+        }
+        catch (Exception ex)
+        {
+            OverviewDisplayHeaderCopyLogButtonText.Text = "复制失败";
+            OverviewDisplayPage.AddActivityLog($"复制虚拟显示器调试日志失败：{ex.Message}", StaticDisplayActivityKind.Failure);
+            ShowError("无法复制虚拟显示器日志", ex.Message);
+        }
     }
 
     private void OverviewCameraHeaderCopyLogButton_Click(object sender, RoutedEventArgs e)
@@ -8293,6 +8324,8 @@ public sealed partial class MainWindow : Window
         var running = IsVirtualDisplayToolRunning();
         var state = DetermineVirtualDisplayOverviewState(running, out var driverInstalled, out var toolAvailable);
         var (statusText, subtext, _) = BuildVirtualDisplayStatusView(state, driverInstalled, toolAvailable);
+        var displayLayout = DisplayLayoutQuery.GetCurrent();
+        var presentationState = VirtualDisplayModeService.GetPresentationState();
 
         report.AppendLine("---- 虚拟显示器诊断 ----");
         report.AppendLine($"状态: {statusText}");
@@ -8304,7 +8337,46 @@ public sealed partial class MainWindow : Window
         report.AppendLine($"进程名: {DeviceToolProcessName}");
         report.AppendLine($"视频源: {Selected(VideoSourceCombo)}");
         report.AppendLine($"分辨率/刷新率: {Selected(ResolutionCombo)} / {Selected(RefreshRateCombo)}fps");
+        report.AppendLine($"配置分辨率/刷新率: {_appSettings.VirtualDisplayResolution} / {_appSettings.VirtualDisplayRefreshRate} Hz");
+        report.AppendLine($"配置显示模式: {_appSettings.VirtualDisplayPresentationMode}");
+        report.AppendLine($"当前显示模式: {presentationState.Mode}");
+        report.AppendLine($"显示模式详情: {presentationState.Summary}");
+        report.AppendLine($"自动随 Host 管理: {_appSettings.StartVirtualDisplayWithHost}");
+        report.AppendLine($"Host 持有虚拟显示器: {_hostOwnsVirtualDisplay}");
+        report.AppendLine($"显示器查询错误: {FormatOptional(displayLayout.QueryError)}");
+        report.AppendLine($"活动显示器数量: {displayLayout.Monitors.Count}");
         report.AppendLine($"最后错误: {FormatOptional(_virtualDisplayLastError)}");
+
+        foreach (var monitor in displayLayout.Monitors)
+        {
+            report.AppendLine();
+            report.AppendLine($"显示器: {monitor.DisplayName}");
+            report.AppendLine($"  DeviceName: {FormatOptional(monitor.DeviceName)}");
+            report.AppendLine($"  DeviceString: {FormatOptional(monitor.DeviceString)}");
+            report.AppendLine($"  DeviceID: {FormatOptional(monitor.DeviceId)}");
+            report.AppendLine($"  坐标/尺寸: ({monitor.X}, {monitor.Y}) / {monitor.Width} x {monitor.Height}");
+            report.AppendLine($"  刷新率: {monitor.RefreshRate} Hz");
+            report.AppendLine($"  主显示器: {monitor.IsPrimary}");
+            report.AppendLine($"  SideDock 虚拟显示器: {monitor.IsSideDockVirtualDisplay}");
+        }
+    }
+
+    private string BuildVirtualDisplayLogReport()
+    {
+        var report = new StringBuilder();
+        report.AppendLine("SideDock 虚拟显示器调试日志");
+        report.AppendLine($"时间: {DateTimeOffset.Now:yyyy-MM-dd HH:mm:ss.fff zzz}");
+        report.AppendLine();
+        AppendVersionAndSystemInfo(report);
+        report.AppendLine();
+        AppendVirtualDisplayDiagnostics(report);
+        report.AppendLine();
+        report.AppendLine("---- 虚拟显示器页面活动日志 ----");
+        report.AppendLine(OverviewDisplayPage.BuildActivityLogReport());
+        report.AppendLine();
+        report.AppendLine("---- Host 运行日志 ----");
+        report.Append(BuildHostLogReport());
+        return report.ToString();
     }
 
     private string BuildHostLogReport()
@@ -9992,6 +10064,30 @@ public sealed partial class MainWindow : Window
             "SideDock.Host",
             "bin",
             "Debug",
+            "net8.0-windows10.0.19041.0",
+            HostExe));
+        yield return Path.GetFullPath(Path.Combine(
+            baseDirectory,
+            "..",
+            "..",
+            "..",
+            "..",
+            "..",
+            "SideDock.Host",
+            "bin",
+            "Release",
+            "net8.0-windows10.0.19041.0",
+            HostExe));
+        yield return Path.GetFullPath(Path.Combine(
+            baseDirectory,
+            "..",
+            "..",
+            "..",
+            "..",
+            "..",
+            "SideDock.Host",
+            "bin",
+            "Debug",
             "net8.0",
             HostExe));
         yield return Path.GetFullPath(Path.Combine(
@@ -10015,6 +10111,32 @@ public sealed partial class MainWindow : Window
             yield return Path.Combine(_payloadRoot, "SideDock.Host", "x64", "Debug", HostExe);
         }
 
+        yield return Path.GetFullPath(Path.Combine(
+            baseDirectory,
+            "..",
+            "..",
+            "..",
+            "..",
+            "..",
+            "windows-host",
+            "SideDock.Host",
+            "bin",
+            "Debug",
+            "net8.0-windows10.0.19041.0",
+            HostExe));
+        yield return Path.GetFullPath(Path.Combine(
+            baseDirectory,
+            "..",
+            "..",
+            "..",
+            "..",
+            "..",
+            "windows-host",
+            "SideDock.Host",
+            "bin",
+            "Release",
+            "net8.0-windows10.0.19041.0",
+            HostExe));
         yield return Path.GetFullPath(Path.Combine(
             baseDirectory,
             "..",

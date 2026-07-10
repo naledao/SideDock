@@ -5482,30 +5482,21 @@ internal static partial class Program
 
             if (videoOptions.VideoSource == VideoSourceKind.IddGpu)
             {
-                Log($"VIDEO {connectionId}", "active video-source=idd-gpu direct-input-probe=startup source-fallback=idd-on-gpu-init-failure");
-                return new FallbackEncodedVideoSource(
-                    new MediaFoundationGpuVideoSource(
-                        connectionId,
+                if (!OperatingSystem.IsWindowsVersionAtLeast(10, 0, 19041))
+                {
+                    throw new PlatformNotSupportedException("Cursor-free idd-gpu capture requires Windows 10 version 2004 or later.");
+                }
+
+                Log($"VIDEO {connectionId}", "active video-source=idd-gpu capture=wgc-monitor cursorCapture=false frameRepair=off fallback=disabled");
+                return new MediaFoundationGpuVideoSource(
+                    connectionId,
+                    videoOptions,
+                    _controlPublisher,
+                    _displayLayoutProvider,
+                    new WindowsGraphicsCaptureFrameSource(
                         videoOptions,
-                        _controlPublisher,
                         _displayLayoutProvider,
-                        new IddGpuFrameSource(videoOptions, message => Log($"CAPTURE {connectionId}", message))),
-                    () => new MediaFoundationBgraVideoSource(
-                        connectionId,
-                        videoOptions with { VideoSource = VideoSourceKind.Idd },
-                        _controlPublisher,
-                        new IddBgraFrameSource(videoOptions with { VideoSource = VideoSourceKind.Idd }, message => Log($"CAPTURE {connectionId}", message))),
-                    async (ex, cancellationToken) =>
-                    {
-                        Log($"VIDEO {connectionId}", $"active video-source=idd fallback-from=idd-gpu reason={ex.Message}");
-                        await _controlPublisher.PublishAsync("encoder_error", new JsonObject
-                        {
-                            ["code"] = "GPU_CAPTURE_INIT_FAILED",
-                            ["message"] = ex.Message,
-                            ["fallback"] = "idd",
-                            ["gpuPath"] = true
-                        }, cancellationToken);
-                    });
+                        message => Log($"CAPTURE {connectionId}", message)));
             }
 
             return new MediaFoundationBgraVideoSource(
@@ -9052,260 +9043,6 @@ internal static partial class Program
     }
 
     [SupportedOSPlatform("windows")]
-    private sealed class GpuCursorFrameScrubber : IDisposable
-    {
-        private const int MaxCursorSamples = 20;
-        private const double MaxSampleAgeSeconds = 0.35;
-        private const int ScrubLeft = 96;
-        private const int ScrubTop = 64;
-        private const int ScrubRight = 128;
-        private const int ScrubBottom = 160;
-
-        private readonly ID3D11Device _device;
-        private readonly ID3D11DeviceContext _context;
-        private readonly DisplayLayoutProvider _displayLayoutProvider;
-        private readonly Action<string> _log;
-        private readonly object _sampleLock = new();
-        private readonly CursorSample[] _samples = new CursorSample[MaxCursorSamples];
-        private int _sampleCount;
-        private int _nextSampleIndex;
-        private ID3D11Texture2D? _scratchTexture;
-        private ID3D11Texture2D? _previousTexture;
-        private int _textureWidth;
-        private int _textureHeight;
-        private Format _textureFormat;
-        private bool _previousReady;
-        private long _scrubbedFrames;
-        private long _patchesCopied;
-        private long _lastLogTicks;
-
-        public GpuCursorFrameScrubber(
-            ID3D11Device device,
-            ID3D11DeviceContext context,
-            DisplayLayoutProvider displayLayoutProvider,
-            Action<string> log)
-        {
-            _device = device;
-            _context = context;
-            _displayLayoutProvider = displayLayoutProvider;
-            _log = log;
-        }
-
-        public void RecordCursorSample()
-        {
-            DpiAwareness.TryEnableCurrentThreadPerMonitorV2();
-            var layout = _displayLayoutProvider.GetLayout(force: false);
-            if (layout is null || !DisplayNative.GetCursorPos(out var point))
-            {
-                return;
-            }
-
-            if (point.X < layout.X
-                || point.X >= layout.X + layout.Width
-                || point.Y < layout.Y
-                || point.Y >= layout.Y + layout.Height)
-            {
-                return;
-            }
-
-            var sample = new CursorSample(
-                Math.Clamp(point.X - layout.X, 0, Math.Max(0, layout.Width - 1)),
-                Math.Clamp(point.Y - layout.Y, 0, Math.Max(0, layout.Height - 1)),
-                layout.Width,
-                layout.Height,
-                Stopwatch.GetTimestamp());
-
-            lock (_sampleLock)
-            {
-                if (_sampleCount > 0)
-                {
-                    var previousIndex = (_nextSampleIndex - 1 + MaxCursorSamples) % MaxCursorSamples;
-                    var previous = _samples[previousIndex];
-                    if (previous.IsValid
-                        && Math.Abs(previous.X - sample.X) <= 1
-                        && Math.Abs(previous.Y - sample.Y) <= 1
-                        && previous.DisplayWidth == sample.DisplayWidth
-                        && previous.DisplayHeight == sample.DisplayHeight)
-                    {
-                        _samples[previousIndex] = sample;
-                        return;
-                    }
-                }
-
-                _samples[_nextSampleIndex] = sample;
-                _nextSampleIndex = (_nextSampleIndex + 1) % MaxCursorSamples;
-                _sampleCount = Math.Min(MaxCursorSamples, _sampleCount + 1);
-            }
-        }
-
-        public ID3D11Texture2D Scrub(ID3D11Texture2D sourceTexture)
-        {
-            var description = sourceTexture.Description;
-            if (description.Format != Format.B8G8R8A8_UNorm)
-            {
-                return sourceTexture;
-            }
-
-            EnsureTextures(description);
-            var previousTexture = _previousTexture ?? throw new InvalidOperationException("Previous cursor scrub texture is not initialized.");
-            var scratchTexture = _scratchTexture ?? throw new InvalidOperationException("Scratch cursor scrub texture is not initialized.");
-            var samples = SnapshotRecentSamples(Stopwatch.GetTimestamp());
-            if (!_previousReady || samples.Length == 0)
-            {
-                _context.CopyResource(previousTexture, sourceTexture);
-                _context.Flush();
-                _previousReady = true;
-                return sourceTexture;
-            }
-
-            _context.CopyResource(scratchTexture, sourceTexture);
-            var patches = 0;
-            foreach (var sample in samples)
-            {
-                if (!TryBuildPatchBox(sample, checked((int)description.Width), checked((int)description.Height), out var box))
-                {
-                    continue;
-                }
-
-                _context.CopySubresourceRegion(
-                    scratchTexture,
-                    0,
-                    checked((uint)box.Left),
-                    checked((uint)box.Top),
-                    0,
-                    previousTexture,
-                    0,
-                    box);
-                patches += 1;
-            }
-
-            if (patches == 0)
-            {
-                _context.CopyResource(previousTexture, sourceTexture);
-                _context.Flush();
-                return sourceTexture;
-            }
-
-            _context.CopyResource(previousTexture, scratchTexture);
-            _context.Flush();
-            Interlocked.Increment(ref _scrubbedFrames);
-            Interlocked.Add(ref _patchesCopied, patches);
-            LogIfNeeded(samples.Length, patches);
-            return scratchTexture;
-        }
-
-        private void EnsureTextures(Texture2DDescription sourceDescription)
-        {
-            var width = checked((int)sourceDescription.Width);
-            var height = checked((int)sourceDescription.Height);
-            if (_scratchTexture is not null
-                && _previousTexture is not null
-                && _textureWidth == width
-                && _textureHeight == height
-                && _textureFormat == sourceDescription.Format)
-            {
-                return;
-            }
-
-            _scratchTexture?.Dispose();
-            _previousTexture?.Dispose();
-            var textureDescription = sourceDescription;
-            textureDescription.Usage = ResourceUsage.Default;
-            textureDescription.CPUAccessFlags = CpuAccessFlags.None;
-            textureDescription.MiscFlags = ResourceOptionFlags.None;
-            if ((textureDescription.BindFlags & BindFlags.ShaderResource) == 0)
-            {
-                textureDescription.BindFlags |= BindFlags.ShaderResource;
-            }
-
-            _scratchTexture = _device.CreateTexture2D(in textureDescription);
-            _previousTexture = _device.CreateTexture2D(in textureDescription);
-            _textureWidth = width;
-            _textureHeight = height;
-            _textureFormat = sourceDescription.Format;
-            _previousReady = false;
-            _log($"cursor scrub initialized texture={width}x{height} format={sourceDescription.Format} history={MaxCursorSamples} patch={ScrubLeft + ScrubRight}x{ScrubTop + ScrubBottom}");
-        }
-
-        private CursorSample[] SnapshotRecentSamples(long nowTicks)
-        {
-            var cutoffTicks = nowTicks - (long)(Stopwatch.Frequency * MaxSampleAgeSeconds);
-            lock (_sampleLock)
-            {
-                if (_sampleCount == 0)
-                {
-                    return [];
-                }
-
-                var output = new List<CursorSample>(_sampleCount);
-                for (var i = 0; i < _sampleCount; i++)
-                {
-                    var sample = _samples[i];
-                    if (sample.IsValid && sample.Ticks >= cutoffTicks)
-                    {
-                        output.Add(sample);
-                    }
-                }
-
-                return output.ToArray();
-            }
-        }
-
-        private static bool TryBuildPatchBox(CursorSample sample, int textureWidth, int textureHeight, out Box box)
-        {
-            box = default;
-            if (!sample.IsValid || textureWidth <= 0 || textureHeight <= 0)
-            {
-                return false;
-            }
-
-            var x = sample.DisplayWidth <= 1
-                ? 0
-                : (int)Math.Round(sample.X * (textureWidth - 1) / (double)(sample.DisplayWidth - 1));
-            var y = sample.DisplayHeight <= 1
-                ? 0
-                : (int)Math.Round(sample.Y * (textureHeight - 1) / (double)(sample.DisplayHeight - 1));
-            var left = Math.Clamp(x - ScrubLeft, 0, textureWidth);
-            var top = Math.Clamp(y - ScrubTop, 0, textureHeight);
-            var right = Math.Clamp(x + ScrubRight, 0, textureWidth);
-            var bottom = Math.Clamp(y + ScrubBottom, 0, textureHeight);
-            if (right <= left || bottom <= top)
-            {
-                return false;
-            }
-
-            box = new Box(left, top, 0, right, bottom, 1);
-            return true;
-        }
-
-        private void LogIfNeeded(int samples, int patches)
-        {
-            var nowTicks = Stopwatch.GetTimestamp();
-            var previousTicks = Interlocked.Read(ref _lastLogTicks);
-            if (previousTicks != 0 && (nowTicks - previousTicks) / (double)Stopwatch.Frequency < 1.0)
-            {
-                return;
-            }
-
-            Interlocked.Exchange(ref _lastLogTicks, nowTicks);
-            _log($"cursor scrub frames={Interlocked.Read(ref _scrubbedFrames)} patches={Interlocked.Read(ref _patchesCopied)} recentSamples={samples} framePatches={patches}");
-        }
-
-        public void Dispose()
-        {
-            _scratchTexture?.Dispose();
-            _previousTexture?.Dispose();
-            _scratchTexture = null;
-            _previousTexture = null;
-        }
-
-        private readonly record struct CursorSample(int X, int Y, int DisplayWidth, int DisplayHeight, long Ticks)
-        {
-            public bool IsValid => DisplayWidth > 0 && DisplayHeight > 0;
-        }
-    }
-
-    [SupportedOSPlatform("windows")]
     private sealed class GpuBgraToNv12Converter : IDisposable
     {
         private readonly ID3D11Device _device;
@@ -10170,6 +9907,7 @@ internal static partial class Program
         private const uint FrameMagic = 0x474B4453; // SDKG
         private const int FrameVersion = 1;
         private const int FrameFormatBgra = 1;
+        private const int FrameFlagSystemCursorExcluded = 0x00000001;
         private const int SlotCountMax = 12;
         private const int MetadataHeaderSize = 72;
         private const int SlotHeaderSize = 32;
@@ -10288,7 +10026,8 @@ internal static partial class Program
 
             var metadata = WaitForReadyMetadata(waitStartedAt, cancellationToken);
             _lastFrameStopwatchTicks = Stopwatch.GetTimestamp();
-            _log($"connected GPU texture ring width={metadata.Width} height={metadata.Height} slots={metadata.SlotCount} generation={metadata.Generation} adapterLuid=0x{metadata.AdapterLuidHigh:X8}{metadata.AdapterLuidLow:X8}");
+            var systemCursorExcluded = (metadata.Flags & FrameFlagSystemCursorExcluded) != 0;
+            _log($"connected GPU texture ring width={metadata.Width} height={metadata.Height} slots={metadata.SlotCount} generation={metadata.Generation} adapterLuid=0x{metadata.AdapterLuidHigh:X8}{metadata.AdapterLuidLow:X8} cursorPlane={(systemCursorExcluded ? "hardware-separated" : "legacy-software-or-unknown")} frameRepair=off flags=0x{metadata.Flags:X8}");
         }
 
         public GpuFrameLease AcquireLatestFrame(CancellationToken cancellationToken)

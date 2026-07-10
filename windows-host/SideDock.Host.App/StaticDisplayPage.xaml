@@ -946,7 +946,7 @@
                         <Grid Grid.Column="1" RowSpacing="14">
                             <Grid.RowDefinitions>
                                 <RowDefinition Height="252" />
-                                <RowDefinition Height="214" />
+                                <RowDefinition Height="Auto" />
                                 <RowDefinition Height="*" />
                             </Grid.RowDefinitions>
 

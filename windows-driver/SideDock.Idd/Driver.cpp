@@ -701,7 +701,12 @@ bool SharedGpuFrameRing::IsConsumerAlive() const
     return WaitForSingleObject(m_consumerAliveEvent, 0) == WAIT_OBJECT_0;
 }
 
-bool SharedGpuFrameRing::WriteFrame(Direct3DDevice& device, ID3D11Texture2D* sourceTexture, UINT64 timestampQpc, UINT slotCount)
+bool SharedGpuFrameRing::WriteFrame(
+    Direct3DDevice& device,
+    ID3D11Texture2D* sourceTexture,
+    UINT64 timestampQpc,
+    UINT slotCount,
+    UINT flags)
 {
     if (!EnsureInitialized(device, sourceTexture, slotCount))
     {
@@ -764,6 +769,16 @@ bool SharedGpuFrameRing::WriteFrame(Direct3DDevice& device, ID3D11Texture2D* sou
     m_metadata->SlotCount = m_slotCount;
     m_metadata->LatestSlot = slotIndex;
     m_metadata->TimestampQpc = timestampQpc;
+    if (m_metadata->Flags != flags)
+    {
+        TraceEvents(
+            TRACE_LEVEL_INFORMATION,
+            TRACE_SWAPCHAIN,
+            "%!FUNC! GPU frame contract flags=0x%08x systemCursorExcluded=%u",
+            flags,
+            (flags & SharedGpuFrameFlagSystemCursorExcluded) != 0 ? 1 : 0);
+    }
+    m_metadata->Flags = flags;
     MemoryBarrier();
     m_metadata->WriteSeq = seq;
     m_writeSeq = seq;
@@ -1199,7 +1214,15 @@ bool SwapChainProcessor::ExportTextureWithCursor(ID3D11Texture2D* cleanTexture, 
     if (m_sharedGpuFrameRing.EnsureInitialized(*m_device, exportTexture, m_monitorContext->GpuRingSlotCount()) &&
         m_sharedGpuFrameRing.IsConsumerAlive())
     {
-        if (m_sharedGpuFrameRing.WriteFrame(*m_device, exportTexture, timestampQpc, m_monitorContext->GpuRingSlotCount()))
+        const UINT frameFlags = m_monitorContext->IsHardwareCursorEnabled()
+            ? SharedGpuFrameFlagSystemCursorExcluded
+            : 0;
+        if (m_sharedGpuFrameRing.WriteFrame(
+                *m_device,
+                exportTexture,
+                timestampQpc,
+                m_monitorContext->GpuRingSlotCount(),
+                frameFlags))
         {
             ++m_gpuFramesExported;
             if ((m_gpuFramesExported % 300) == 0)
@@ -1932,6 +1955,11 @@ bool MonitorContext::GetHardwareCursorSnapshot(HardwareCursorSnapshot& snapshot)
     return true;
 }
 
+bool MonitorContext::IsHardwareCursorEnabled() const
+{
+    return m_hardwareCursorEnabled;
+}
+
 UINT MonitorContext::GpuRingSlotCount() const
 {
     return m_gpuRingSlotCount;
@@ -1966,6 +1994,22 @@ bool MonitorContext::HandleHardwareCursorUpdate()
         m_lastCursorShapeId = result.CursorShapeInfo.ShapeId;
     }
 
+    ++m_hardwareCursorQueries;
+    if (m_hardwareCursorQueries == 1 || result.IsCursorShapeUpdated)
+    {
+        TraceEvents(
+            TRACE_LEVEL_INFORMATION,
+            TRACE_MONITOR,
+            "%!FUNC! out-of-band cursor query=%llu visible=%u updated=%u shape=%u type=%u size=%ux%u",
+            m_hardwareCursorQueries,
+            m_lastCursorVisible,
+            result.IsCursorShapeUpdated,
+            m_lastCursorShapeId,
+            static_cast<UINT>(m_lastCursorShapeInfo.CursorType),
+            m_lastCursorShapeInfo.Width,
+            m_lastCursorShapeInfo.Height);
+    }
+
     TraceEvents(
         TRACE_LEVEL_VERBOSE,
         TRACE_MONITOR,
@@ -1992,7 +2036,6 @@ void MonitorContext::AssignSwapChain(IDDCX_SWAPCHAIN swapChain, LUID renderAdapt
         return;
     }
 
-    EnableHardwareCursor();
     m_processor = std::make_unique<SwapChainProcessor>(swapChain, device, newFrameEvent, this);
 }
 

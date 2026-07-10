@@ -192,6 +192,20 @@ public sealed partial class StaticDisplayPage : UserControl
         AddActivityLog(message, brush, glyph, kind);
     }
 
+    internal string BuildActivityLogReport()
+    {
+        if (_activityLogEntries.Count == 0)
+        {
+            return "(暂无虚拟显示器页面活动日志)";
+        }
+
+        return string.Join(
+            Environment.NewLine,
+            _activityLogEntries
+                .OrderBy(entry => entry.Timestamp)
+                .Select(entry => $"{entry.Timestamp:yyyy-MM-dd HH:mm:ss.fff zzz} [{ActivityKindLabel(entry.Kind)}] {entry.Message}"));
+    }
+
     private void AddActivityLog(string message, Brush brush, string glyph, StaticDisplayActivityKind kind)
     {
         if (string.IsNullOrWhiteSpace(message))

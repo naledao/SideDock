@@ -63,6 +63,7 @@ namespace SideDock::Idd
     inline constexpr UINT SharedFrameVersion = 1;
     inline constexpr UINT SharedGpuFrameMagic = 0x474B4453; // SDKG
     inline constexpr UINT SharedGpuFrameVersion = 1;
+    inline constexpr UINT SharedGpuFrameFlagSystemCursorExcluded = 0x00000001;
 
     struct Direct3DDevice
     {
@@ -175,7 +176,12 @@ namespace SideDock::Idd
 
         bool EnsureInitialized(Direct3DDevice& device, ID3D11Texture2D* sourceTexture, UINT slotCount);
         bool IsConsumerAlive() const;
-        bool WriteFrame(Direct3DDevice& device, ID3D11Texture2D* sourceTexture, UINT64 timestampQpc, UINT slotCount);
+        bool WriteFrame(
+            Direct3DDevice& device,
+            ID3D11Texture2D* sourceTexture,
+            UINT64 timestampQpc,
+            UINT slotCount,
+            UINT flags);
 
     private:
         void Close();
@@ -291,6 +297,7 @@ namespace SideDock::Idd
         HANDLE GetHardwareCursorEvent() const;
         bool HandleHardwareCursorUpdate();
         bool GetHardwareCursorSnapshot(HardwareCursorSnapshot& snapshot) const;
+        bool IsHardwareCursorEnabled() const;
         UINT GpuRingSlotCount() const;
 
         void AssignSwapChain(IDDCX_SWAPCHAIN swapChain, LUID renderAdapter, HANDLE newFrameEvent);
@@ -306,6 +313,7 @@ namespace SideDock::Idd
         INT m_lastCursorY = 0;
         IDDCX_CURSOR_SHAPE_INFO m_lastCursorShapeInfo = {};
         std::array<BYTE, MaxHardwareCursorShapeBytes> m_cursorShapeBuffer = {};
+        UINT64 m_hardwareCursorQueries = 0;
         std::unique_ptr<SwapChainProcessor> m_processor;
         UINT m_gpuRingSlotCount = DefaultSharedGpuFrameSlotCount;
     };
