@@ -345,6 +345,21 @@
                             </StackPanel>
                         </Button>
                         <Button
+                            x:Name="OverviewCameraHeaderCopyLogButton"
+                            MinWidth="104"
+                            Height="34"
+                            Padding="8,0"
+                            CornerRadius="5"
+                            Background="Transparent"
+                            BorderThickness="0"
+                            Visibility="Collapsed"
+                            Click="OverviewCameraHeaderCopyLogButton_Click">
+                            <StackPanel Orientation="Horizontal" Spacing="8">
+                                <FontIcon Glyph="&#xE8C8;" FontSize="16" Foreground="#111827" />
+                                <TextBlock x:Name="OverviewCameraHeaderCopyLogButtonText" Text="复制日志" VerticalAlignment="Center" FontSize="13" Foreground="#111827" />
+                            </StackPanel>
+                        </Button>
+                        <Button
                             x:Name="OverviewActionsButton"
                             Height="34"
                             Padding="8,0"
@@ -2967,7 +2982,7 @@
                                             <TextBlock x:Name="OverviewCameraEncodingFpsText" Grid.Row="2" Grid.Column="1" Text="-- fps" FontSize="13" Foreground="#111827" HorizontalAlignment="Right" />
                                             <TextBlock Grid.Row="3" Text="码率" FontSize="12" Foreground="#5B6570" />
                                             <TextBlock x:Name="OverviewCameraEncodingBitrateText" Grid.Row="3" Grid.Column="1" Text="--" FontSize="13" Foreground="#111827" HorizontalAlignment="Right" />
-                                            <TextBlock Grid.Row="4" Text="解码延迟" FontSize="12" Foreground="#5B6570" />
+                                            <TextBlock Grid.Row="4" Text="解码缓存" FontSize="12" Foreground="#5B6570" />
                                             <TextBlock x:Name="OverviewCameraEncodingDecodeLagText" Grid.Row="4" Grid.Column="1" Text="--" FontSize="13" Foreground="#111827" HorizontalAlignment="Right" />
                                         </Grid>
                                     </StackPanel>

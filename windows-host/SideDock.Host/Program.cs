@@ -2655,6 +2655,12 @@ internal static partial class Program
                 + $" actualKbps={ReadDouble(payload, "actualKbps"):F0}"
                 + $" fpsJitter={ReadDouble(payload, "fpsJitter"):F1}"
                 + $" bitrateJitter={ReadDouble(payload, "bitrateJitter"):F1}"
+                + $" androidFrameTsUs={ReadLong(payload, "lastPresentationTimeUs")}"
+                + $" androidPacketSentUnixMs={ReadLong(payload, "lastPacketSentAtUnixMs")}"
+                + $" encoderOutputAgeMs={ReadDouble(payload, "encoderOutputAgeMs"):F1}"
+                + $" packetWriteMs={ReadDouble(payload, "packetWriteMs"):F2}"
+                + $" packetWriteAvgMs={ReadDouble(payload, "averagePacketWriteMs"):F2}"
+                + $" packetWriteMaxMs={ReadDouble(payload, "maxPacketWriteMs"):F2}"
                 + (string.IsNullOrWhiteSpace(message) ? string.Empty : $" message={message}"));
         }
 
