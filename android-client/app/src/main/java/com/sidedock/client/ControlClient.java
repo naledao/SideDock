@@ -881,7 +881,13 @@ public final class ControlClient {
         double actualFps,
         double actualKbps,
         double fpsJitter,
-        double bitrateJitter
+        double bitrateJitter,
+        long lastPresentationTimeUs,
+        long lastPacketSentAtUnixMs,
+        double encoderOutputAgeMs,
+        double packetWriteMs,
+        double averagePacketWriteMs,
+        double maxPacketWriteMs
     ) {
         sendFromAnyThread("camera_status", payload(
             "state", state == null ? "" : state,
@@ -905,7 +911,13 @@ public final class ControlClient {
             "actualFps", actualFps,
             "actualKbps", actualKbps,
             "fpsJitter", fpsJitter,
-            "bitrateJitter", bitrateJitter
+            "bitrateJitter", bitrateJitter,
+            "lastPresentationTimeUs", lastPresentationTimeUs,
+            "lastPacketSentAtUnixMs", lastPacketSentAtUnixMs,
+            "encoderOutputAgeMs", encoderOutputAgeMs,
+            "packetWriteMs", packetWriteMs,
+            "averagePacketWriteMs", averagePacketWriteMs,
+            "maxPacketWriteMs", maxPacketWriteMs
         ));
     }
 

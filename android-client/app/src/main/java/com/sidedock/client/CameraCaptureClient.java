@@ -9,7 +9,10 @@ import android.hardware.camera2.CameraCaptureSession;
 import android.hardware.camera2.CameraCharacteristics;
 import android.hardware.camera2.CameraDevice;
 import android.hardware.camera2.CameraManager;
+import android.hardware.camera2.CaptureFailure;
 import android.hardware.camera2.CaptureRequest;
+import android.hardware.camera2.CaptureResult;
+import android.hardware.camera2.TotalCaptureResult;
 import android.hardware.camera2.params.StreamConfigurationMap;
 import android.media.MediaCodec;
 import android.media.MediaCodecInfo;
@@ -20,7 +23,9 @@ import android.os.Build;
 import android.os.Bundle;
 import android.os.Handler;
 import android.os.HandlerThread;
+import android.os.SystemClock;
 import android.provider.Settings;
+import android.util.Log;
 import android.util.Range;
 import android.util.Size;
 import android.view.Surface;
@@ -31,13 +36,17 @@ import java.net.InetSocketAddress;
 import java.net.Socket;
 import java.nio.ByteBuffer;
 import java.nio.ByteOrder;
+import java.util.ArrayDeque;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Collections;
 import java.util.Comparator;
 import java.util.HashSet;
+import java.util.Iterator;
+import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Locale;
+import java.util.Map;
 import java.util.Set;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.ExecutorService;
@@ -47,6 +56,8 @@ import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicReference;
 
 public final class CameraCaptureClient {
+    private static final String TAG = "SideDockCamera";
+
     public interface Listener {
         void onCameraCaptureState(
             String state,
@@ -71,7 +82,13 @@ public final class CameraCaptureClient {
             double actualFps,
             double actualKbps,
             double fpsJitter,
-            double bitrateJitter
+            double bitrateJitter,
+            long lastPresentationTimeUs,
+            long lastPacketSentAtUnixMs,
+            double encoderOutputAgeMs,
+            double packetWriteMs,
+            double averagePacketWriteMs,
+            double maxPacketWriteMs
         );
     }
 
@@ -90,6 +107,10 @@ public final class CameraCaptureClient {
     private static final long INITIAL_RECOVERY_DELAY_MS = 300L;
     private static final long MAX_RECOVERY_DELAY_MS = 15000L;
     private static final long STABLE_CAPTURE_RESET_MS = 10000L;
+    private static final int MAX_CAPTURE_TIMINGS = 360;
+    private static final int MAX_LATENCY_SAMPLES = 4096;
+    private static final long CAPTURE_TIMING_RETENTION_NS = TimeUnit.SECONDS.toNanos(10L);
+    private static final long PTS_MATCH_TOLERANCE_US = 2_000L;
 
     private final Context context;
     private final Listener listener;
@@ -330,9 +351,16 @@ public final class CameraCaptureClient {
                     Range<Integer> fpsRange = chooseFpsRange(characteristics, effectiveFps);
                     String effectiveFacing = cameraFacingName(characteristics, facing);
 
-                    encoder = createEncoder(effectiveCodec, captureSize.getWidth(), captureSize.getHeight(), effectiveFps);
+                    ConfiguredEncoder configuredEncoder = createEncoder(
+                        effectiveCodec,
+                        captureSize.getWidth(),
+                        captureSize.getHeight(),
+                        effectiveFps);
+                    encoder = configuredEncoder.encoder;
                     encoderSurface = encoder.createInputSurface();
                     encoder.start();
+
+                    FrameLatencyTracker latencyTracker = new FrameLatencyTracker(characteristics);
 
                     cameraThread = new HandlerThread("SideDock-Camera2");
                     cameraThread.start();
@@ -340,7 +368,14 @@ public final class CameraCaptureClient {
 
                     cameraDevice = openCamera(cameraManager, cameraId, cameraHandler, cameraRuntimeError);
                     captureSession = createCaptureSession(cameraDevice, encoderSurface, cameraHandler);
-                    startRepeatingCapture(cameraDevice, captureSession, encoderSurface, characteristics, fpsRange);
+                    startRepeatingCapture(
+                        cameraDevice,
+                        captureSession,
+                        encoderSurface,
+                        characteristics,
+                        fpsRange,
+                        cameraHandler,
+                        latencyTracker);
 
                     emitConfigApplied(port, captureSize.getWidth(), captureSize.getHeight(), effectiveFps, effectiveCodec, effectiveFacing);
                     long nowMs = System.currentTimeMillis();
@@ -353,7 +388,12 @@ public final class CameraCaptureClient {
                     recoveryStartedAtMs = 0L;
                     captureStartedAtMs = nowMs;
                     consecutiveFailureCount = 0L;
-                    drainEncoder(encoder, nextSocket.getOutputStream(), runGeneration, cameraRuntimeError);
+                    drainEncoder(
+                        configuredEncoder,
+                        nextSocket.getOutputStream(),
+                        runGeneration,
+                        cameraRuntimeError,
+                        latencyTracker);
                 } catch (Exception ex) {
                     if (running && isCurrentGeneration(runGeneration)) {
                         long nowMs = System.currentTimeMillis();
@@ -404,11 +444,13 @@ public final class CameraCaptureClient {
     }
 
     private void drainEncoder(
-        MediaCodec encoder,
+        ConfiguredEncoder configuredEncoder,
         OutputStream output,
         long runGeneration,
-        AtomicReference<Exception> cameraRuntimeError
+        AtomicReference<Exception> cameraRuntimeError,
+        FrameLatencyTracker latencyTracker
     ) throws Exception {
+        MediaCodec encoder = configuredEncoder.encoder;
         MediaCodec.BufferInfo bufferInfo = new MediaCodec.BufferInfo();
         byte[] header = new byte[HEADER_SIZE];
         byte[] payload = new byte[0];
@@ -422,6 +464,13 @@ public final class CameraCaptureClient {
         long lastStatsFrames = 0L;
         long lastStatsBytes = 0L;
         long lastSyncFrameRequestMs = 0L;
+        long intervalPacketWriteSamples = 0L;
+        double intervalPacketWriteMs = 0.0d;
+        double intervalMaxPacketWriteMs = 0.0d;
+        long lastPresentationTimeUs = 0L;
+        long lastPacketSentAtUnixMs = 0L;
+        double lastEncoderOutputAgeMs = -1.0d;
+        double lastPacketWriteMs = 0.0d;
         double previousActualFps = 0.0d;
         double previousActualKbps = 0.0d;
         byte[] codecConfig = new byte[0];
@@ -444,7 +493,9 @@ public final class CameraCaptureClient {
             }
 
             if (outputIndex == MediaCodec.INFO_OUTPUT_FORMAT_CHANGED) {
-                byte[] config = codecConfigFromFormat(encoder.getOutputFormat());
+                MediaFormat outputFormat = encoder.getOutputFormat();
+                logEncoderOutputFormat(configuredEncoder, outputFormat);
+                byte[] config = codecConfigFromFormat(outputFormat);
                 if (config.length > 0) {
                     codecConfig = config;
                     sequence += 1L;
@@ -460,6 +511,7 @@ public final class CameraCaptureClient {
                 continue;
             }
 
+            long encoderOutputArrivalNs = SystemClock.elapsedRealtimeNanos();
             ByteBuffer outputBuffer = encoder.getOutputBuffer(outputIndex);
             try {
                 if (outputBuffer != null && bufferInfo.size > 0) {
@@ -471,6 +523,12 @@ public final class CameraCaptureClient {
                     outputBuffer.get(payload, 0, bufferInfo.size);
 
                     int flags = packetFlags(bufferInfo.flags);
+                    FrameLatencySample frameLatency = (flags & FLAG_CODEC_CONFIG) != 0
+                        ? FrameLatencySample.UNAVAILABLE
+                        : latencyTracker.onEncoderOutput(
+                            bufferInfo.presentationTimeUs,
+                            encoderOutputArrivalNs,
+                            (flags & FLAG_KEY_FRAME) != 0);
                     byte[] packetPayload = normalizeH264AccessUnit(payload, bufferInfo.size);
                     if ((flags & FLAG_CODEC_CONFIG) != 0) {
                         codecConfig = packetPayload;
@@ -479,7 +537,16 @@ public final class CameraCaptureClient {
                     }
 
                     sequence += 1L;
+                    long writeStartedNs = System.nanoTime();
                     writePacket(output, header, packetPayload, packetPayload.length, sequence, bufferInfo.presentationTimeUs, flags, runGeneration);
+                    long writeFinishedNs = System.nanoTime();
+                    lastPacketWriteMs = Math.max(0.0d, (writeFinishedNs - writeStartedNs) / 1_000_000.0d);
+                    intervalPacketWriteSamples += 1L;
+                    intervalPacketWriteMs += lastPacketWriteMs;
+                    intervalMaxPacketWriteMs = Math.max(intervalMaxPacketWriteMs, lastPacketWriteMs);
+                    lastPresentationTimeUs = bufferInfo.presentationTimeUs;
+                    lastPacketSentAtUnixMs = System.currentTimeMillis();
+                    lastEncoderOutputAgeMs = frameLatency.encoderOutputAgeMs;
                     packetsSent += 1L;
                     bytesSent += packetPayload.length;
                     if ((flags & FLAG_KEY_FRAME) != 0) {
@@ -500,10 +567,17 @@ public final class CameraCaptureClient {
                         double actualKbps = Math.max(0.0d, ((bytesSent - lastStatsBytes) * 8.0d) / 1000.0d / elapsedSeconds);
                         double fpsJitter = jitterPercent(previousActualFps, actualFps);
                         double bitrateJitter = jitterPercent(previousActualKbps, actualKbps);
+                        double averagePacketWriteMs = intervalPacketWriteSamples <= 0L
+                            ? 0.0d
+                            : intervalPacketWriteMs / intervalPacketWriteSamples;
+                        double maxPacketWriteMs = intervalMaxPacketWriteMs;
 
                         lastStatsAtMs = now;
                         lastStatsFrames = videoFramesSent;
                         lastStatsBytes = bytesSent;
+                        intervalPacketWriteSamples = 0L;
+                        intervalPacketWriteMs = 0.0d;
+                        intervalMaxPacketWriteMs = 0.0d;
                         previousActualFps = actualFps;
                         previousActualKbps = actualKbps;
                         emitStats(
@@ -514,7 +588,22 @@ public final class CameraCaptureClient {
                             actualFps,
                             actualKbps,
                             fpsJitter,
-                            bitrateJitter);
+                            bitrateJitter,
+                            lastPresentationTimeUs,
+                            lastPacketSentAtUnixMs,
+                            lastEncoderOutputAgeMs,
+                            lastPacketWriteMs,
+                            averagePacketWriteMs,
+                            maxPacketWriteMs);
+                        Log.i(
+                            TAG,
+                            latencyTracker.snapshot().toLogString(
+                                configuredEncoder.tier.label,
+                                actualFps,
+                                actualKbps,
+                                lastPacketWriteMs,
+                                averagePacketWriteMs,
+                                maxPacketWriteMs));
                     }
                 }
             } finally {
@@ -540,23 +629,57 @@ public final class CameraCaptureClient {
         }
     }
 
-    private MediaCodec createEncoder(String mime, int encodeWidth, int encodeHeight, int encodeFps) throws Exception {
+    private ConfiguredEncoder createEncoder(String mime, int encodeWidth, int encodeHeight, int encodeFps) throws Exception {
         if (!DEFAULT_CODEC.equals(mime)) {
             throw new IllegalArgumentException("Unsupported camera codec: " + mime);
         }
 
-        MediaCodec encoder = MediaCodec.createEncoderByType(mime);
-        MediaFormat format = createEncoderFormat(mime, encodeWidth, encodeHeight, encodeFps, encoder.getCodecInfo(), true);
-        try {
-            encoder.configure(format, null, null, MediaCodec.CONFIGURE_FLAG_ENCODE);
-            return encoder;
-        } catch (Exception ex) {
-            releaseEncoder(encoder);
-            encoder = MediaCodec.createEncoderByType(mime);
-            format = createEncoderFormat(mime, encodeWidth, encodeHeight, encodeFps, encoder.getCodecInfo(), false);
-            encoder.configure(format, null, null, MediaCodec.CONFIGURE_FLAG_ENCODE);
-            return encoder;
+        Exception lastFailure = null;
+        EncoderConfigTier[] tiers = new EncoderConfigTier[] {
+            EncoderConfigTier.ZERO_LATENCY,
+            EncoderConfigTier.REALTIME,
+            EncoderConfigTier.BASE
+        };
+        for (EncoderConfigTier tier : tiers) {
+            MediaCodec encoder = null;
+            try {
+                encoder = MediaCodec.createEncoderByType(mime);
+                MediaCodecInfo codecInfo = encoder.getCodecInfo();
+                MediaFormat format = createEncoderFormat(
+                    mime,
+                    encodeWidth,
+                    encodeHeight,
+                    encodeFps,
+                    codecInfo,
+                    tier);
+                String codecDetails = codecDetails(encoder, codecInfo);
+                Log.i(
+                    TAG,
+                    "encoder_config_attempt tier=" + tier.label
+                        + " " + codecDetails
+                        + " requestedFormat=" + format);
+                encoder.configure(format, null, null, MediaCodec.CONFIGURE_FLAG_ENCODE);
+                Log.i(TAG, "encoder_config_success tier=" + tier.label + " " + codecDetails);
+                Log.i(TAG, "encoder_config_selected tier=" + tier.label + " " + codecDetails);
+                return new ConfiguredEncoder(encoder, tier, format, codecDetails);
+            } catch (Exception ex) {
+                lastFailure = ex;
+                String details = encoder == null
+                    ? "encoderName=unavailable canonicalName=unavailable hardwareAccelerated=unknown vendor=unknown softwareOnly=unknown"
+                    : codecDetails(encoder, codecInfoQuietly(encoder));
+                Log.e(
+                    TAG,
+                    "encoder_config_failure tier=" + tier.label
+                        + " " + details
+                        + " error=" + exceptionSummaryWithCauses(ex),
+                    ex);
+                releaseEncoder(encoder);
+            }
         }
+
+        throw new IllegalStateException(
+            "All encoder configuration tiers failed; last error=" + exceptionSummaryWithCauses(lastFailure),
+            lastFailure);
     }
 
     private MediaFormat createEncoderFormat(
@@ -565,14 +688,14 @@ public final class CameraCaptureClient {
         int encodeHeight,
         int encodeFps,
         MediaCodecInfo codecInfo,
-        boolean lowLatency
+        EncoderConfigTier tier
     ) {
         MediaFormat format = MediaFormat.createVideoFormat(mime, encodeWidth, encodeHeight);
         format.setInteger(MediaFormat.KEY_COLOR_FORMAT, MediaCodecInfo.CodecCapabilities.COLOR_FormatSurface);
         format.setInteger(MediaFormat.KEY_BIT_RATE, recommendedBitrate(encodeWidth, encodeHeight, encodeFps));
         format.setInteger(MediaFormat.KEY_FRAME_RATE, encodeFps);
         format.setInteger(MediaFormat.KEY_I_FRAME_INTERVAL, 1);
-        configureAvcEncoderFormat(format, codecInfo, mime, encodeFps, lowLatency);
+        configureAvcEncoderFormat(format, codecInfo, mime, encodeFps, tier);
         return format;
     }
 
@@ -581,7 +704,7 @@ public final class CameraCaptureClient {
         MediaCodecInfo codecInfo,
         String mime,
         int encodeFps,
-        boolean lowLatency
+        EncoderConfigTier tier
     ) {
         if (!DEFAULT_CODEC.equals(mime) || codecInfo == null) {
             return;
@@ -602,8 +725,8 @@ public final class CameraCaptureClient {
         } catch (Exception ignored) {
         }
 
-        if (lowLatency) {
-            configureAvcLowLatencyEncoderFormat(format, encodeFps);
+        if (tier != EncoderConfigTier.BASE) {
+            configureAvcRealtimeEncoderFormat(format, encodeFps, tier == EncoderConfigTier.ZERO_LATENCY);
         }
 
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.N) {
@@ -616,18 +739,11 @@ public final class CameraCaptureClient {
         }
     }
 
-    private static void configureAvcLowLatencyEncoderFormat(MediaFormat format, int encodeFps) {
+    private static void configureAvcRealtimeEncoderFormat(MediaFormat format, int encodeFps, boolean zeroLatency) {
         trySetInteger(format, MediaFormat.KEY_PRIORITY, 0);
-        trySetFloat(format, MediaFormat.KEY_OPERATING_RATE, (float) Math.max(1, encodeFps));
-        trySetInteger(format, MediaFormat.KEY_LATENCY, 0);
-        trySetInteger(format, MediaFormat.KEY_PREPEND_HEADER_TO_SYNC_FRAMES, 1);
-
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
-            trySetInteger(format, MediaFormat.KEY_MAX_B_FRAMES, 0);
-        }
-
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
-            trySetInteger(format, MediaFormat.KEY_LOW_LATENCY, 1);
+        trySetInteger(format, MediaFormat.KEY_OPERATING_RATE, Math.max(1, encodeFps));
+        if (zeroLatency) {
+            trySetInteger(format, MediaFormat.KEY_LATENCY, 0);
         }
     }
 
@@ -638,10 +754,78 @@ public final class CameraCaptureClient {
         }
     }
 
-    private static void trySetFloat(MediaFormat format, String key, float value) {
+    private static String codecDetails(MediaCodec encoder, MediaCodecInfo codecInfo) {
+        String encoderName = "unavailable";
+        String canonicalName = "unavailable";
+        String hardwareAccelerated = "unknown";
+        String vendor = "unknown";
+        String softwareOnly = "unknown";
         try {
-            format.setFloat(key, value);
+            encoderName = encoder == null ? "unavailable" : encoder.getName();
         } catch (Exception ignored) {
+        }
+
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+            try {
+                canonicalName = encoder == null ? "unavailable" : encoder.getCanonicalName();
+            } catch (Exception ignored) {
+            }
+
+            if (codecInfo != null) {
+                try {
+                    hardwareAccelerated = Boolean.toString(codecInfo.isHardwareAccelerated());
+                    vendor = Boolean.toString(codecInfo.isVendor());
+                    softwareOnly = Boolean.toString(codecInfo.isSoftwareOnly());
+                } catch (Exception ignored) {
+                }
+            }
+        }
+
+        if ("unavailable".equals(canonicalName)) {
+            canonicalName = encoderName;
+        }
+
+        return "encoderName=" + encoderName
+            + " canonicalName=" + canonicalName
+            + " hardwareAccelerated=" + hardwareAccelerated
+            + " vendor=" + vendor
+            + " softwareOnly=" + softwareOnly;
+    }
+
+    private static MediaCodecInfo codecInfoQuietly(MediaCodec encoder) {
+        if (encoder == null) {
+            return null;
+        }
+        try {
+            return encoder.getCodecInfo();
+        } catch (Exception ignored) {
+            return null;
+        }
+    }
+
+    private static void logEncoderOutputFormat(ConfiguredEncoder configuredEncoder, MediaFormat outputFormat) {
+        Log.i(
+            TAG,
+            "encoder_output_format tier=" + configuredEncoder.tier.label
+                + " " + configuredEncoder.codecDetails
+                + " requestedLatency=" + mediaFormatInteger(configuredEncoder.requestedFormat, MediaFormat.KEY_LATENCY)
+                + " actualLatency=" + mediaFormatInteger(outputFormat, MediaFormat.KEY_LATENCY)
+                + " profile=" + mediaFormatInteger(outputFormat, MediaFormat.KEY_PROFILE)
+                + " level=" + mediaFormatInteger(outputFormat, MediaFormat.KEY_LEVEL)
+                + " bitrateMode=" + mediaFormatInteger(outputFormat, MediaFormat.KEY_BITRATE_MODE)
+                + " maxBFrames=" + mediaFormatInteger(outputFormat, MediaFormat.KEY_MAX_B_FRAMES)
+                + " outputFormat=" + outputFormat);
+    }
+
+    private static String mediaFormatInteger(MediaFormat format, String key) {
+        if (format == null || !format.containsKey(key)) {
+            return "absent";
+        }
+
+        try {
+            return Integer.toString(format.getInteger(key));
+        } catch (Exception ex) {
+            return "unreadable(" + ex.getClass().getSimpleName() + ")";
         }
     }
 
@@ -799,7 +983,9 @@ public final class CameraCaptureClient {
         CameraCaptureSession session,
         Surface encoderSurface,
         CameraCharacteristics characteristics,
-        Range<Integer> fpsRange
+        Range<Integer> fpsRange,
+        Handler cameraHandler,
+        FrameLatencyTracker latencyTracker
     ) throws CameraAccessException {
         CaptureRequest.Builder builder = cameraDevice.createCaptureRequest(CameraDevice.TEMPLATE_RECORD);
         builder.addTarget(encoderSurface);
@@ -808,7 +994,46 @@ public final class CameraCaptureClient {
         if (fpsRange != null) {
             builder.set(CaptureRequest.CONTROL_AE_TARGET_FPS_RANGE, fpsRange);
         }
-        session.setRepeatingRequest(builder.build(), null, null);
+        session.setRepeatingRequest(builder.build(), new CameraCaptureSession.CaptureCallback() {
+            @Override
+            public void onCaptureStarted(
+                CameraCaptureSession captureSession,
+                CaptureRequest request,
+                long timestamp,
+                long frameNumber
+            ) {
+                latencyTracker.onCaptureStarted(
+                    timestamp,
+                    frameNumber,
+                    SystemClock.elapsedRealtimeNanos());
+            }
+
+            @Override
+            public void onCaptureCompleted(
+                CameraCaptureSession captureSession,
+                CaptureRequest request,
+                TotalCaptureResult result
+            ) {
+                latencyTracker.onCaptureCompleted(
+                    result.get(CaptureResult.SENSOR_TIMESTAMP),
+                    result.getFrameNumber(),
+                    SystemClock.elapsedRealtimeNanos());
+            }
+
+            @Override
+            public void onCaptureFailed(
+                CameraCaptureSession captureSession,
+                CaptureRequest request,
+                CaptureFailure failure
+            ) {
+                latencyTracker.onCaptureFailed(failure.getFrameNumber());
+            }
+
+            @Override
+            public void onCaptureSequenceAborted(CameraCaptureSession captureSession, int sequenceId) {
+                latencyTracker.onCaptureSequenceAborted();
+            }
+        }, cameraHandler);
     }
 
     private static void configureLowLatencyCaptureRequest(
@@ -2219,6 +2444,28 @@ public final class CameraCaptureClient {
             : type + ": " + message;
     }
 
+    private static String exceptionSummaryWithCauses(Throwable throwable) {
+        if (throwable == null) {
+            return "none";
+        }
+
+        StringBuilder summary = new StringBuilder();
+        Throwable current = throwable;
+        Set<Throwable> visited = Collections.newSetFromMap(new java.util.IdentityHashMap<Throwable, Boolean>());
+        while (current != null && visited.add(current)) {
+            if (summary.length() > 0) {
+                summary.append(" <- ");
+            }
+            summary.append(current.getClass().getName());
+            String message = current.getMessage();
+            if (message != null && !message.trim().isEmpty()) {
+                summary.append(": ").append(message.trim());
+            }
+            current = current.getCause();
+        }
+        return summary.toString();
+    }
+
     private static void sleepQuietly(long delayMs) {
         try {
             Thread.sleep(delayMs);
@@ -2250,7 +2497,13 @@ public final class CameraCaptureClient {
         double actualFps,
         double actualKbps,
         double fpsJitter,
-        double bitrateJitter
+        double bitrateJitter,
+        long lastPresentationTimeUs,
+        long lastPacketSentAtUnixMs,
+        double encoderOutputAgeMs,
+        double packetWriteMs,
+        double averagePacketWriteMs,
+        double maxPacketWriteMs
     ) {
         listener.onCameraCaptureStats(
             packetsSent,
@@ -2265,7 +2518,463 @@ public final class CameraCaptureClient {
             actualFps,
             actualKbps,
             fpsJitter,
-            bitrateJitter);
+            bitrateJitter,
+            lastPresentationTimeUs,
+            lastPacketSentAtUnixMs,
+            encoderOutputAgeMs,
+            packetWriteMs,
+            averagePacketWriteMs,
+            maxPacketWriteMs);
+    }
+
+    private enum EncoderConfigTier {
+        ZERO_LATENCY("zero-latency"),
+        REALTIME("realtime"),
+        BASE("base");
+
+        final String label;
+
+        EncoderConfigTier(String label) {
+            this.label = label;
+        }
+    }
+
+    private static final class ConfiguredEncoder {
+        final MediaCodec encoder;
+        final EncoderConfigTier tier;
+        final MediaFormat requestedFormat;
+        final String codecDetails;
+
+        ConfiguredEncoder(
+            MediaCodec encoder,
+            EncoderConfigTier tier,
+            MediaFormat requestedFormat,
+            String codecDetails
+        ) {
+            this.encoder = encoder;
+            this.tier = tier;
+            this.requestedFormat = requestedFormat;
+            this.codecDetails = codecDetails;
+        }
+    }
+
+    private static final class FrameLatencyTracker {
+        private final boolean realtimeTimestampSource;
+        private final String timestampSourceName;
+        private final LinkedHashMap<Long, FrameTiming> pendingTimings = new LinkedHashMap<>();
+        private final RollingLatencySamples encoderOutputAgeMs = new RollingLatencySamples();
+        private final RollingLatencySamples sensorToCaptureStartedMs = new RollingLatencySamples();
+        private final RollingLatencySamples sensorToCaptureCompleteMs = new RollingLatencySamples();
+        private final RollingLatencySamples captureCompleteToEncoderOutputMs = new RollingLatencySamples();
+        private final RollingLatencySamples sensorToEncoderOutputMs = new RollingLatencySamples();
+        private final RollingLatencySamples keyFrameEncoderOutputAgeMs = new RollingLatencySamples();
+        private final RollingLatencySamples deltaFrameEncoderOutputAgeMs = new RollingLatencySamples();
+        private long captureStartedCallbacks;
+        private long captureCompletedCallbacks;
+        private long encoderOutputFrames;
+        private long matchedEncoderFrames;
+        private long unmatchedEncoderFrames;
+        private long duplicateCaptureTimings;
+        private long missingSensorTimestamps;
+        private long failedCaptures;
+        private long abortedCaptureSequences;
+        private long evictedCaptureTimings;
+        private long lastCameraFrameNumber = -1L;
+
+        FrameLatencyTracker(CameraCharacteristics characteristics) {
+            Integer timestampSource = characteristics == null
+                ? null
+                : characteristics.get(CameraCharacteristics.SENSOR_INFO_TIMESTAMP_SOURCE);
+            realtimeTimestampSource = timestampSource != null
+                && timestampSource == CameraCharacteristics.SENSOR_INFO_TIMESTAMP_SOURCE_REALTIME;
+            timestampSourceName = cameraTimestampSourceName(timestampSource);
+            Log.i(
+                TAG,
+                "camera_timestamp_source source=" + timestampSourceName
+                    + " realtimeComparable=" + realtimeTimestampSource
+                    + " pendingCapacity=" + MAX_CAPTURE_TIMINGS
+                    + " sampleCapacity=" + MAX_LATENCY_SAMPLES);
+        }
+
+        synchronized void onCaptureStarted(long sensorTimestampNs, long frameNumber, long callbackArrivalNs) {
+            captureStartedCallbacks += 1L;
+            lastCameraFrameNumber = frameNumber;
+            cleanPending(callbackArrivalNs);
+            long presentationTimeUs = sensorTimestampNs / 1000L;
+            FrameTiming timing = pendingTimings.get(presentationTimeUs);
+            if (timing == null) {
+                timing = new FrameTiming();
+                pendingTimings.put(presentationTimeUs, timing);
+            } else {
+                duplicateCaptureTimings += 1L;
+            }
+            timing.sensorTimestampNs = sensorTimestampNs;
+            timing.frameNumber = frameNumber;
+            timing.captureStartedArrivalNs = callbackArrivalNs;
+            timing.lastUpdatedNs = callbackArrivalNs;
+            if (realtimeTimestampSource) {
+                sensorToCaptureStartedMs.add(elapsedMs(callbackArrivalNs, sensorTimestampNs));
+            }
+            trimPendingToCapacity();
+        }
+
+        synchronized void onCaptureCompleted(
+            Long sensorTimestampNs,
+            long frameNumber,
+            long callbackArrivalNs
+        ) {
+            captureCompletedCallbacks += 1L;
+            lastCameraFrameNumber = frameNumber;
+            cleanPending(callbackArrivalNs);
+            if (sensorTimestampNs == null || sensorTimestampNs <= 0L) {
+                missingSensorTimestamps += 1L;
+                return;
+            }
+
+            long presentationTimeUs = sensorTimestampNs / 1000L;
+            FrameTiming timing = pendingTimings.get(presentationTimeUs);
+            if (timing == null) {
+                timing = new FrameTiming();
+                timing.sensorTimestampNs = sensorTimestampNs;
+                timing.frameNumber = frameNumber;
+                pendingTimings.put(presentationTimeUs, timing);
+            }
+            timing.captureCompletedArrivalNs = callbackArrivalNs;
+            timing.lastUpdatedNs = callbackArrivalNs;
+            if (realtimeTimestampSource) {
+                sensorToCaptureCompleteMs.add(elapsedMs(callbackArrivalNs, sensorTimestampNs));
+            }
+            trimPendingToCapacity();
+        }
+
+        synchronized void onCaptureFailed(long frameNumber) {
+            failedCaptures += 1L;
+            Iterator<Map.Entry<Long, FrameTiming>> iterator = pendingTimings.entrySet().iterator();
+            while (iterator.hasNext()) {
+                if (iterator.next().getValue().frameNumber == frameNumber) {
+                    iterator.remove();
+                    return;
+                }
+            }
+        }
+
+        synchronized void onCaptureSequenceAborted() {
+            abortedCaptureSequences += 1L;
+            pendingTimings.clear();
+        }
+
+        synchronized FrameLatencySample onEncoderOutput(
+            long presentationTimeUs,
+            long outputArrivalNs,
+            boolean keyFrame
+        ) {
+            encoderOutputFrames += 1L;
+            cleanPending(outputArrivalNs);
+            double outputAgeMs = realtimeTimestampSource
+                ? elapsedMs(outputArrivalNs, presentationTimeUs * 1000L)
+                : -1.0d;
+            encoderOutputAgeMs.add(outputAgeMs);
+            if (keyFrame) {
+                keyFrameEncoderOutputAgeMs.add(outputAgeMs);
+            } else {
+                deltaFrameEncoderOutputAgeMs.add(outputAgeMs);
+            }
+
+            FrameTiming timing = removeMatchingTiming(presentationTimeUs);
+            if (timing == null) {
+                unmatchedEncoderFrames += 1L;
+            } else {
+                matchedEncoderFrames += 1L;
+                if (timing.captureCompletedArrivalNs > 0L) {
+                    captureCompleteToEncoderOutputMs.add(
+                        elapsedMs(outputArrivalNs, timing.captureCompletedArrivalNs));
+                }
+                if (realtimeTimestampSource && timing.sensorTimestampNs > 0L) {
+                    sensorToEncoderOutputMs.add(elapsedMs(outputArrivalNs, timing.sensorTimestampNs));
+                }
+            }
+            return new FrameLatencySample(outputAgeMs);
+        }
+
+        synchronized LatencySnapshot snapshot() {
+            return new LatencySnapshot(
+                timestampSourceName,
+                captureStartedCallbacks,
+                captureCompletedCallbacks,
+                encoderOutputFrames,
+                matchedEncoderFrames,
+                unmatchedEncoderFrames,
+                pendingTimings.size(),
+                duplicateCaptureTimings,
+                missingSensorTimestamps,
+                failedCaptures,
+                abortedCaptureSequences,
+                evictedCaptureTimings,
+                lastCameraFrameNumber,
+                encoderOutputAgeMs.snapshot(),
+                sensorToCaptureStartedMs.snapshot(),
+                sensorToCaptureCompleteMs.snapshot(),
+                captureCompleteToEncoderOutputMs.snapshot(),
+                sensorToEncoderOutputMs.snapshot(),
+                keyFrameEncoderOutputAgeMs.snapshot(),
+                deltaFrameEncoderOutputAgeMs.snapshot());
+        }
+
+        private FrameTiming removeMatchingTiming(long presentationTimeUs) {
+            FrameTiming exact = pendingTimings.remove(presentationTimeUs);
+            if (exact != null) {
+                return exact;
+            }
+
+            Long nearestKey = null;
+            long nearestDistanceUs = Long.MAX_VALUE;
+            for (Long candidateKey : pendingTimings.keySet()) {
+                long distanceUs = Math.abs(candidateKey - presentationTimeUs);
+                if (distanceUs <= PTS_MATCH_TOLERANCE_US && distanceUs < nearestDistanceUs) {
+                    nearestKey = candidateKey;
+                    nearestDistanceUs = distanceUs;
+                }
+            }
+            return nearestKey == null ? null : pendingTimings.remove(nearestKey);
+        }
+
+        private void cleanPending(long nowNs) {
+            Iterator<Map.Entry<Long, FrameTiming>> iterator = pendingTimings.entrySet().iterator();
+            while (iterator.hasNext()) {
+                FrameTiming timing = iterator.next().getValue();
+                if (timing.lastUpdatedNs > 0L
+                    && nowNs >= timing.lastUpdatedNs
+                    && nowNs - timing.lastUpdatedNs > CAPTURE_TIMING_RETENTION_NS) {
+                    iterator.remove();
+                    evictedCaptureTimings += 1L;
+                }
+            }
+            trimPendingToCapacity();
+        }
+
+        private void trimPendingToCapacity() {
+            while (pendingTimings.size() > MAX_CAPTURE_TIMINGS) {
+                Iterator<Long> iterator = pendingTimings.keySet().iterator();
+                if (!iterator.hasNext()) {
+                    return;
+                }
+                iterator.next();
+                iterator.remove();
+                evictedCaptureTimings += 1L;
+            }
+        }
+    }
+
+    private static String cameraTimestampSourceName(Integer timestampSource) {
+        if (timestampSource == null) {
+            return "UNAVAILABLE";
+        }
+        if (timestampSource == CameraCharacteristics.SENSOR_INFO_TIMESTAMP_SOURCE_REALTIME) {
+            return "REALTIME";
+        }
+        if (timestampSource == CameraCharacteristics.SENSOR_INFO_TIMESTAMP_SOURCE_UNKNOWN) {
+            return "UNKNOWN";
+        }
+        return "VALUE_" + timestampSource;
+    }
+
+    private static double elapsedMs(long laterNs, long earlierNs) {
+        if (laterNs <= 0L || earlierNs <= 0L) {
+            return -1.0d;
+        }
+        double elapsed = (laterNs - earlierNs) / 1_000_000.0d;
+        if (elapsed < -0.1d || elapsed > 600_000.0d) {
+            return -1.0d;
+        }
+        return Math.max(0.0d, elapsed);
+    }
+
+    private static final class FrameTiming {
+        long sensorTimestampNs;
+        long frameNumber = -1L;
+        long captureStartedArrivalNs;
+        long captureCompletedArrivalNs;
+        long lastUpdatedNs;
+    }
+
+    private static final class FrameLatencySample {
+        static final FrameLatencySample UNAVAILABLE = new FrameLatencySample(-1.0d);
+        final double encoderOutputAgeMs;
+
+        FrameLatencySample(double encoderOutputAgeMs) {
+            this.encoderOutputAgeMs = encoderOutputAgeMs;
+        }
+    }
+
+    private static final class RollingLatencySamples {
+        private final ArrayDeque<Double> values = new ArrayDeque<>();
+
+        void add(double value) {
+            if (value < 0.0d || Double.isNaN(value) || Double.isInfinite(value)) {
+                return;
+            }
+            if (values.size() >= MAX_LATENCY_SAMPLES) {
+                values.removeFirst();
+            }
+            values.addLast(value);
+        }
+
+        LatencyPercentiles snapshot() {
+            if (values.isEmpty()) {
+                return new LatencyPercentiles(0, -1.0d, -1.0d, -1.0d);
+            }
+            List<Double> sorted = new ArrayList<>(values);
+            Collections.sort(sorted);
+            return new LatencyPercentiles(
+                sorted.size(),
+                percentile(sorted, 0.50d),
+                percentile(sorted, 0.95d),
+                percentile(sorted, 0.99d));
+        }
+
+        private static double percentile(List<Double> sorted, double percentile) {
+            if (sorted.size() == 1) {
+                return sorted.get(0);
+            }
+            double index = percentile * (sorted.size() - 1);
+            int lower = (int) Math.floor(index);
+            int upper = (int) Math.ceil(index);
+            if (lower == upper) {
+                return sorted.get(lower);
+            }
+            double weight = index - lower;
+            return sorted.get(lower) * (1.0d - weight) + sorted.get(upper) * weight;
+        }
+    }
+
+    private static final class LatencyPercentiles {
+        final int count;
+        final double p50;
+        final double p95;
+        final double p99;
+
+        LatencyPercentiles(int count, double p50, double p95, double p99) {
+            this.count = count;
+            this.p50 = p50;
+            this.p95 = p95;
+            this.p99 = p99;
+        }
+
+        String toLogString() {
+            return String.format(
+                Locale.US,
+                "n=%d p50=%.2f p95=%.2f p99=%.2f",
+                count,
+                p50,
+                p95,
+                p99);
+        }
+    }
+
+    private static final class LatencySnapshot {
+        final String timestampSource;
+        final long captureStartedCallbacks;
+        final long captureCompletedCallbacks;
+        final long encoderOutputFrames;
+        final long matchedEncoderFrames;
+        final long unmatchedEncoderFrames;
+        final int pendingTimings;
+        final long duplicateCaptureTimings;
+        final long missingSensorTimestamps;
+        final long failedCaptures;
+        final long abortedCaptureSequences;
+        final long evictedCaptureTimings;
+        final long lastCameraFrameNumber;
+        final LatencyPercentiles encoderOutputAgeMs;
+        final LatencyPercentiles sensorToCaptureStartedMs;
+        final LatencyPercentiles sensorToCaptureCompleteMs;
+        final LatencyPercentiles captureCompleteToEncoderOutputMs;
+        final LatencyPercentiles sensorToEncoderOutputMs;
+        final LatencyPercentiles keyFrameEncoderOutputAgeMs;
+        final LatencyPercentiles deltaFrameEncoderOutputAgeMs;
+
+        LatencySnapshot(
+            String timestampSource,
+            long captureStartedCallbacks,
+            long captureCompletedCallbacks,
+            long encoderOutputFrames,
+            long matchedEncoderFrames,
+            long unmatchedEncoderFrames,
+            int pendingTimings,
+            long duplicateCaptureTimings,
+            long missingSensorTimestamps,
+            long failedCaptures,
+            long abortedCaptureSequences,
+            long evictedCaptureTimings,
+            long lastCameraFrameNumber,
+            LatencyPercentiles encoderOutputAgeMs,
+            LatencyPercentiles sensorToCaptureStartedMs,
+            LatencyPercentiles sensorToCaptureCompleteMs,
+            LatencyPercentiles captureCompleteToEncoderOutputMs,
+            LatencyPercentiles sensorToEncoderOutputMs,
+            LatencyPercentiles keyFrameEncoderOutputAgeMs,
+            LatencyPercentiles deltaFrameEncoderOutputAgeMs
+        ) {
+            this.timestampSource = timestampSource;
+            this.captureStartedCallbacks = captureStartedCallbacks;
+            this.captureCompletedCallbacks = captureCompletedCallbacks;
+            this.encoderOutputFrames = encoderOutputFrames;
+            this.matchedEncoderFrames = matchedEncoderFrames;
+            this.unmatchedEncoderFrames = unmatchedEncoderFrames;
+            this.pendingTimings = pendingTimings;
+            this.duplicateCaptureTimings = duplicateCaptureTimings;
+            this.missingSensorTimestamps = missingSensorTimestamps;
+            this.failedCaptures = failedCaptures;
+            this.abortedCaptureSequences = abortedCaptureSequences;
+            this.evictedCaptureTimings = evictedCaptureTimings;
+            this.lastCameraFrameNumber = lastCameraFrameNumber;
+            this.encoderOutputAgeMs = encoderOutputAgeMs;
+            this.sensorToCaptureStartedMs = sensorToCaptureStartedMs;
+            this.sensorToCaptureCompleteMs = sensorToCaptureCompleteMs;
+            this.captureCompleteToEncoderOutputMs = captureCompleteToEncoderOutputMs;
+            this.sensorToEncoderOutputMs = sensorToEncoderOutputMs;
+            this.keyFrameEncoderOutputAgeMs = keyFrameEncoderOutputAgeMs;
+            this.deltaFrameEncoderOutputAgeMs = deltaFrameEncoderOutputAgeMs;
+        }
+
+        String toLogString(
+            String tier,
+            double actualFps,
+            double actualKbps,
+            double packetWriteMs,
+            double averagePacketWriteMs,
+            double maxPacketWriteMs
+        ) {
+            return String.format(
+                Locale.US,
+                "latency_stats tier=%s actualFps=%.2f actualKbps=%.2f packetWriteMs=%.3f averagePacketWriteMs=%.3f maxPacketWriteMs=%.3f",
+                tier,
+                actualFps,
+                actualKbps,
+                packetWriteMs,
+                averagePacketWriteMs,
+                maxPacketWriteMs)
+                + " timestampSource=" + timestampSource
+                + " frames(started=" + captureStartedCallbacks
+                + " completed=" + captureCompletedCallbacks
+                + " output=" + encoderOutputFrames
+                + " matched=" + matchedEncoderFrames
+                + " unmatched=" + unmatchedEncoderFrames
+                + " pending=" + pendingTimings
+                + " duplicate=" + duplicateCaptureTimings
+                + " missingTimestamp=" + missingSensorTimestamps
+                + " failed=" + failedCaptures
+                + " aborted=" + abortedCaptureSequences
+                + " evicted=" + evictedCaptureTimings
+                + " lastFrame=" + lastCameraFrameNumber + ")"
+                + " encoderOutputAgeMs{" + encoderOutputAgeMs.toLogString() + "}"
+                + " sensorToCaptureStartedMs{" + sensorToCaptureStartedMs.toLogString() + "}"
+                + " sensorToCaptureCompleteMs{" + sensorToCaptureCompleteMs.toLogString() + "}"
+                + " captureCompleteToEncoderOutputMs{" + captureCompleteToEncoderOutputMs.toLogString() + "}"
+                + " sensorToEncoderOutputMs{" + sensorToEncoderOutputMs.toLogString() + "}"
+                + " keyFrameEncoderOutputAgeMs{" + keyFrameEncoderOutputAgeMs.toLogString() + "}"
+                + " deltaFrameEncoderOutputAgeMs{" + deltaFrameEncoderOutputAgeMs.toLogString() + "}";
+        }
     }
 
     private static final class StopToken {

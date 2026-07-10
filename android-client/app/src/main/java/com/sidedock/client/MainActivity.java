@@ -287,6 +287,12 @@ public final class MainActivity extends Activity implements ControlClient.Listen
     private double cameraActualKbps;
     private double cameraFpsJitter;
     private double cameraBitrateJitter;
+    private long cameraLastPresentationTimeUs;
+    private long cameraLastPacketSentAtUnixMs;
+    private double cameraEncoderOutputAgeMs = -1.0d;
+    private double cameraPacketWriteMs;
+    private double cameraAveragePacketWriteMs;
+    private double cameraMaxPacketWriteMs;
     private ControlClient.CameraConfig pendingCameraConfig;
 
     @Override
@@ -582,6 +588,12 @@ public final class MainActivity extends Activity implements ControlClient.Listen
         cameraBytesSent = 0L;
         cameraKeyFramesSent = 0L;
         cameraCodecConfigPacketsSent = 0L;
+        cameraLastPresentationTimeUs = 0L;
+        cameraLastPacketSentAtUnixMs = 0L;
+        cameraEncoderOutputAgeMs = -1.0d;
+        cameraPacketWriteMs = 0.0d;
+        cameraAveragePacketWriteMs = 0.0d;
+        cameraMaxPacketWriteMs = 0.0d;
         lastCameraHint = hostCameraEnabled
             ? "Camera uplink configured; restarting capture."
             : "Host camera uplink is disabled.";
@@ -778,7 +790,13 @@ public final class MainActivity extends Activity implements ControlClient.Listen
         double actualFps,
         double actualKbps,
         double fpsJitter,
-        double bitrateJitter
+        double bitrateJitter,
+        long lastPresentationTimeUs,
+        long lastPacketSentAtUnixMs,
+        double encoderOutputAgeMs,
+        double packetWriteMs,
+        double averagePacketWriteMs,
+        double maxPacketWriteMs
     ) {
         mainHandler.post(new Runnable() {
             @Override
@@ -796,6 +814,12 @@ public final class MainActivity extends Activity implements ControlClient.Listen
                 cameraActualKbps = actualKbps;
                 cameraFpsJitter = fpsJitter;
                 cameraBitrateJitter = bitrateJitter;
+                cameraLastPresentationTimeUs = lastPresentationTimeUs;
+                cameraLastPacketSentAtUnixMs = lastPacketSentAtUnixMs;
+                cameraEncoderOutputAgeMs = encoderOutputAgeMs;
+                cameraPacketWriteMs = packetWriteMs;
+                cameraAveragePacketWriteMs = averagePacketWriteMs;
+                cameraMaxPacketWriteMs = maxPacketWriteMs;
                 publishCameraStatus("capturing", "Camera capture is running.");
                 updateOverlay();
             }
@@ -2293,7 +2317,13 @@ public final class MainActivity extends Activity implements ControlClient.Listen
             cameraActualFps,
             cameraActualKbps,
             cameraFpsJitter,
-            cameraBitrateJitter
+            cameraBitrateJitter,
+            cameraLastPresentationTimeUs,
+            cameraLastPacketSentAtUnixMs,
+            cameraEncoderOutputAgeMs,
+            cameraPacketWriteMs,
+            cameraAveragePacketWriteMs,
+            cameraMaxPacketWriteMs
         );
     }
 
