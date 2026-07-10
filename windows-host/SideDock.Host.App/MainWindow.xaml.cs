@@ -963,6 +963,7 @@ public sealed partial class MainWindow : Window
         OverviewStartHostButton.Visibility = showAudioPage || showDiagnosticsPage || showSettingsPage ? Visibility.Collapsed : Visibility.Visible;
         OverviewDefaultHeaderActions.Visibility = showAudioPage || showDiagnosticsPage || showSettingsPage ? Visibility.Collapsed : Visibility.Visible;
         OverviewCameraHeaderCopyLogButton.Visibility = showCameraPage ? Visibility.Visible : Visibility.Collapsed;
+        OverviewCameraHeaderCopyAndroidLogButton.Visibility = showCameraPage ? Visibility.Visible : Visibility.Collapsed;
         OverviewAudioHeaderActions.Visibility = showAudioPage ? Visibility.Visible : Visibility.Collapsed;
         OverviewSettingsHeaderActions.Visibility = showSettingsPage ? Visibility.Visible : Visibility.Collapsed;
 
@@ -3763,6 +3764,34 @@ public sealed partial class MainWindow : Window
         }
     }
 
+    private async void OverviewCameraHeaderCopyAndroidLogButton_Click(object sender, RoutedEventArgs e)
+    {
+        OverviewCameraHeaderCopyAndroidLogButton.IsEnabled = false;
+        OverviewCameraHeaderCopyAndroidLogButtonText.Text = "复制中...";
+        try
+        {
+            var result = await TryCopyAndroidCameraLogToClipboardAsync();
+            if (result.Success)
+            {
+                OverviewCameraHeaderCopyAndroidLogButtonText.Text = "已复制";
+            }
+            else
+            {
+                OverviewCameraHeaderCopyAndroidLogButtonText.Text = "复制失败";
+                ShowError("无法复制安卓摄像头日志", result.ErrorMessage);
+            }
+        }
+        catch (Exception ex)
+        {
+            OverviewCameraHeaderCopyAndroidLogButtonText.Text = "复制失败";
+            ShowError("无法复制安卓摄像头日志", ex.Message);
+        }
+        finally
+        {
+            OverviewCameraHeaderCopyAndroidLogButton.IsEnabled = true;
+        }
+    }
+
     private void OverviewActionsMenuFlyout_Opening(object sender, object e)
     {
         UpdateOverviewActionButtons();
@@ -4838,6 +4867,71 @@ public sealed partial class MainWindow : Window
         {
             errorMessage = ex.Message;
             return false;
+        }
+    }
+
+    private async Task<(bool Success, string ErrorMessage)> TryCopyAndroidCameraLogToClipboardAsync()
+    {
+        var serial = SelectedOrKnownDefaultAdbSerial();
+        if (string.IsNullOrWhiteSpace(serial))
+        {
+            return (false, "未选择 Android 设备，请先在连接页刷新并选择设备。");
+        }
+
+        var selectedDevice = _lastAdbDeviceRows.FirstOrDefault(row =>
+            row.Serial.Equals(serial, StringComparison.OrdinalIgnoreCase));
+        if (selectedDevice is not null
+            && !selectedDevice.State.Equals("device", StringComparison.OrdinalIgnoreCase))
+        {
+            return (false, $"Android 设备 {serial} 当前状态为 {selectedDevice.State}，无法读取 Logcat。");
+        }
+
+        var adbPath = ResolveAdbPath(AdbPathBox.Text.Trim());
+        var arguments = $"-s {QuoteArgument(serial)} logcat -d -v threadtime SideDockCamera:I *:S";
+        var result = await RunAdbAsync(adbPath, arguments, TimeSpan.FromSeconds(12));
+        if (result.TimedOut)
+        {
+            return (false, $"读取 Android 摄像头 Logcat 超时：{serial}");
+        }
+
+        if (result.ExitCode != 0)
+        {
+            var details = string.IsNullOrWhiteSpace(result.Stderr) ? result.Stdout : result.Stderr;
+            return (
+                false,
+                $"读取 Android 摄像头 Logcat 失败（退出码 {result.ExitCode}）："
+                    + (string.IsNullOrWhiteSpace(details) ? "ADB 未返回错误详情。" : details));
+        }
+
+        try
+        {
+            var report = new StringBuilder();
+            report.AppendLine("SideDock Android 摄像头 Logcat");
+            report.AppendLine($"时间: {DateTimeOffset.Now:yyyy-MM-dd HH:mm:ss zzz}");
+            report.AppendLine($"ADB 路径: {adbPath}");
+            report.AppendLine($"ADB 设备: {serial}");
+            report.AppendLine($"命令: adb {arguments}");
+            report.AppendLine();
+            report.AppendLine("---- SideDockCamera Logcat ----");
+            report.AppendLine(string.IsNullOrWhiteSpace(result.Stdout)
+                ? "(当前 Logcat buffer 中没有 SideDockCamera 日志)"
+                : result.Stdout);
+            if (!string.IsNullOrWhiteSpace(result.Stderr))
+            {
+                report.AppendLine();
+                report.AppendLine("---- ADB stderr ----");
+                report.AppendLine(result.Stderr);
+            }
+
+            var package = new DataPackage { RequestedOperation = DataPackageOperation.Copy };
+            package.SetText(report.ToString());
+            Clipboard.SetContent(package);
+            Clipboard.Flush();
+            return (true, string.Empty);
+        }
+        catch (Exception ex)
+        {
+            return (false, ex.Message);
         }
     }
 
@@ -13984,6 +14078,11 @@ public sealed partial class MainWindow : Window
         if (OverviewCameraHeaderCopyLogButtonText is not null)
         {
             OverviewCameraHeaderCopyLogButtonText.Text = "复制日志";
+        }
+
+        if (OverviewCameraHeaderCopyAndroidLogButtonText is not null)
+        {
+            OverviewCameraHeaderCopyAndroidLogButtonText.Text = "复制安卓日志";
         }
 
         UpdateCameraStatusView();

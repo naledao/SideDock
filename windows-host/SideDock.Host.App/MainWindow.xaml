@@ -360,6 +360,21 @@
                             </StackPanel>
                         </Button>
                         <Button
+                            x:Name="OverviewCameraHeaderCopyAndroidLogButton"
+                            MinWidth="120"
+                            Height="34"
+                            Padding="8,0"
+                            CornerRadius="5"
+                            Background="Transparent"
+                            BorderThickness="0"
+                            Visibility="Collapsed"
+                            Click="OverviewCameraHeaderCopyAndroidLogButton_Click">
+                            <StackPanel Orientation="Horizontal" Spacing="8">
+                                <FontIcon Glyph="&#xE896;" FontSize="16" Foreground="#111827" />
+                                <TextBlock x:Name="OverviewCameraHeaderCopyAndroidLogButtonText" Text="复制安卓日志" VerticalAlignment="Center" FontSize="13" Foreground="#111827" />
+                            </StackPanel>
+                        </Button>
+                        <Button
                             x:Name="OverviewActionsButton"
                             Height="34"
                             Padding="8,0"
