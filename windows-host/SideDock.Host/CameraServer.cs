@@ -202,7 +202,7 @@ internal static partial class Program
         private async Task ReceivePacketsAsync(int connectionId, NetworkStream stream, CancellationToken cancellationToken)
         {
             var header = ArrayPool<byte>.Shared.Rent(HeaderSize);
-            var stats = new CameraReceiveStats();
+            var stats = new CameraReceiveStats(cameraRuntimeState.Current.Fps);
             var lastLogAt = DateTimeOffset.UtcNow;
             long lastLogPackets = 0;
             long lastLogFrames = 0;
@@ -281,7 +281,11 @@ internal static partial class Program
                             + $"lastSeq={packet.Sequence} flags={FormatFlags(packet.Flags)} payload={packet.PayloadLength} "
                             + $"keyFrames={stats.KeyFrameCount} codecConfigPackets={stats.CodecConfigPacketCount} "
                             + $"decodedFrames={stats.DecodedFrameCount} decodeErrors={stats.DecodeErrorCount} "
-                            + $"previewSeq={_latestFrameCache.PublishedFrameSequence} decodeLagMs={stats.LastDecodeLagMs:F1} "
+                            + $"latestInputTimestampUs={stats.LatestInputTimestampUs} latestInputSequence={stats.LatestInputSequence} "
+                            + $"sourceDeltaUs={stats.LastSourceTimestampDeltaUs} decodedSourceTimestampUs={stats.DecodedSourceTimestampUs} "
+                            + $"decodedSourceSequence={stats.DecodedSourceSequence} decodeBufferedUs={stats.DecodeBufferedUs} "
+                            + $"decodeBufferedFrames={stats.DecodeBufferedFrames:F1} hostDecodeProcessingMs={stats.LastHostDecodeProcessingMs:F1} "
+                            + $"unmatchedDecodedTimestampCount={stats.UnmatchedDecodedTimestampCount} previewSeq={_latestFrameCache.PublishedFrameSequence} "
                             + $"lastFrameAt={FormatTimestamp(stats.LastFrameAt)} lastDecodedFrameAt={FormatTimestamp(stats.LastDecodedFrameAt)}"
                             + (string.IsNullOrWhiteSpace(stats.LastDecodeError) ? string.Empty : $" lastError={stats.LastDecodeError}"));
                         await PublishServerStatusAsync(
@@ -431,16 +435,16 @@ internal static partial class Program
             {
                 if (!isCodecConfig && needsKeyFrame && codecConfig is not null && codecConfig.Length > 0)
                 {
-                    foreach (var configFrame in decoder.Decode(codecConfig, packet.TimestampUs))
+                    foreach (var configFrame in decoder.Decode(codecConfig, packet.TimestampUs, packet.Sequence))
                     {
-                        PublishDecodedFrame(stats, configFrame, packet.TimestampUs);
+                        PublishDecodedFrame(stats, configFrame);
                     }
                 }
 
                 var payload = payloadBuffer.AsSpan(0, payloadLength);
-                foreach (var frame in decoder.Decode(payload, packet.TimestampUs))
+                foreach (var frame in decoder.Decode(payload, packet.TimestampUs, packet.Sequence))
                 {
-                    PublishDecodedFrame(stats, frame, packet.TimestampUs);
+                    PublishDecodedFrame(stats, frame);
                 }
 
                 return isCodecConfig;
@@ -453,10 +457,16 @@ internal static partial class Program
             }
         }
 
-        private void PublishDecodedFrame(CameraReceiveStats stats, CameraDecodedFrame frame, long sourceTimestampUs)
+        private void PublishDecodedFrame(CameraReceiveStats stats, CameraDecodedFrame frame)
         {
-            _latestFrameCache.Write(frame.Bgra, frame.Width, frame.Height, frame.Stride, sourceTimestampUs);
-            stats.RecordDecodedFrame();
+            _latestFrameCache.Write(
+                frame.Bgra,
+                frame.Width,
+                frame.Height,
+                frame.Stride,
+                frame.DecodedSourceTimestampUs,
+                frame.DecodedSourceSequence);
+            stats.RecordDecodedFrame(frame);
         }
 
         private static string FormatFlags(int flags)
@@ -702,6 +712,14 @@ internal static partial class Program
                 ["codecConfigPackets"] = stats?.CodecConfigPacketCount ?? 0,
                 ["decodedFrames"] = stats?.DecodedFrameCount ?? 0,
                 ["decodeErrors"] = stats?.DecodeErrorCount ?? 0,
+                ["latestInputTimestampUs"] = stats?.LatestInputTimestampUs ?? -1,
+                ["latestInputSequence"] = stats?.LatestInputSequence ?? -1,
+                ["decodedSourceTimestampUs"] = stats?.DecodedSourceTimestampUs ?? -1,
+                ["decodedSourceSequence"] = stats?.DecodedSourceSequence ?? -1,
+                ["decodeBufferedUs"] = stats?.DecodeBufferedUs ?? -1,
+                ["decodeBufferedFrames"] = stats?.DecodeBufferedFrames ?? -1.0,
+                ["hostDecodeProcessingMs"] = stats?.LastHostDecodeProcessingMs ?? -1.0,
+                ["unmatchedDecodedTimestampCount"] = stats?.UnmatchedDecodedTimestampCount ?? 0,
                 ["approxFps"] = approxFps,
                 ["approxKbps"] = approxKbps,
                 ["fpsJitter"] = fpsJitter,
@@ -711,7 +729,6 @@ internal static partial class Program
                 ["consecutiveFailureCount"] = stability.ConsecutiveFailureCount,
                 ["lastRecoveryDurationMs"] = stability.LastRecoveryDurationMs,
                 ["lastDisconnectReason"] = stability.LastDisconnectReason,
-                ["decodeLagMs"] = stats?.LastDecodeLagMs ?? 0.0,
                 ["lastFrameAt"] = FormatTimestamp(stats?.LastFrameAt),
                 ["lastDecodedFrameAt"] = FormatTimestamp(stats?.LastDecodedFrameAt),
                 ["lastError"] = stats?.LastDecodeError ?? "",
@@ -892,6 +909,17 @@ internal static partial class Program
 
         private sealed class CameraReceiveStats
         {
+            private const long MaxComparableBufferedDurationUs = 10_000_000;
+            private readonly double _configuredFrameIntervalUs;
+            private double _estimatedFrameIntervalUs;
+            private bool _hasLatestInputTimestamp;
+
+            public CameraReceiveStats(int configuredFps)
+            {
+                _configuredFrameIntervalUs = 1_000_000.0 / Math.Max(1, configuredFps);
+                _estimatedFrameIntervalUs = _configuredFrameIntervalUs;
+            }
+
             public long PacketCount { get; private set; }
 
             public long FrameCount { get; private set; }
@@ -910,7 +938,23 @@ internal static partial class Program
 
             public DateTimeOffset LastDecodedFrameAt { get; private set; }
 
-            public double LastDecodeLagMs { get; private set; }
+            public double LastHostDecodeProcessingMs { get; private set; } = -1.0;
+
+            public long LatestInputTimestampUs { get; private set; } = -1;
+
+            public long LatestInputSequence { get; private set; } = -1;
+
+            public long LastSourceTimestampDeltaUs { get; private set; }
+
+            public long DecodedSourceTimestampUs { get; private set; } = -1;
+
+            public long DecodedSourceSequence { get; private set; } = -1;
+
+            public long DecodeBufferedUs { get; private set; } = -1;
+
+            public double DecodeBufferedFrames { get; private set; } = -1.0;
+
+            public long UnmatchedDecodedTimestampCount { get; private set; }
 
             public string LastDecodeError { get; private set; } = string.Empty;
 
@@ -927,6 +971,27 @@ internal static partial class Program
                 {
                     FrameCount += 1;
                     LastFrameAt = DateTimeOffset.UtcNow;
+                    if (packet.TimestampUs >= 0)
+                    {
+                        if (_hasLatestInputTimestamp)
+                        {
+                            var deltaUs = packet.TimestampUs - LatestInputTimestampUs;
+                            LastSourceTimestampDeltaUs = deltaUs;
+                            if (deltaUs > 0 && deltaUs <= 1_000_000)
+                            {
+                                _estimatedFrameIntervalUs = (_estimatedFrameIntervalUs * 0.875) + (deltaUs * 0.125);
+                            }
+                            else if (deltaUs < 0 || deltaUs > MaxComparableBufferedDurationUs)
+                            {
+                                _estimatedFrameIntervalUs = _configuredFrameIntervalUs;
+                            }
+                        }
+
+                        LatestInputTimestampUs = packet.TimestampUs;
+                        _hasLatestInputTimestamp = true;
+                    }
+
+                    LatestInputSequence = packet.Sequence;
                 }
 
                 if ((packet.Flags & FlagKeyFrame) != 0)
@@ -935,15 +1000,35 @@ internal static partial class Program
                 }
             }
 
-            public void RecordDecodedFrame()
+            public void RecordDecodedFrame(CameraDecodedFrame frame)
             {
                 DecodedFrameCount += 1;
-                var now = DateTimeOffset.UtcNow;
-                LastDecodedFrameAt = now;
-                if (LastFrameAt != default)
+                LastDecodedFrameAt = DateTimeOffset.UtcNow;
+                DecodedSourceTimestampUs = frame.DecodedSourceTimestampUs;
+                DecodedSourceSequence = frame.DecodedSourceSequence;
+                LastHostDecodeProcessingMs = frame.HostDecodeProcessingMs;
+                if (!frame.SourceTimestampMatched)
                 {
-                    LastDecodeLagMs = Math.Max(0.0, (now - LastFrameAt).TotalMilliseconds);
+                    UnmatchedDecodedTimestampCount += 1;
                 }
+
+                if (!_hasLatestInputTimestamp || frame.DecodedSourceTimestampUs < 0)
+                {
+                    DecodeBufferedUs = -1;
+                    DecodeBufferedFrames = -1.0;
+                    return;
+                }
+
+                var bufferedUs = LatestInputTimestampUs - frame.DecodedSourceTimestampUs;
+                if (bufferedUs < 0 || bufferedUs > MaxComparableBufferedDurationUs)
+                {
+                    DecodeBufferedUs = -1;
+                    DecodeBufferedFrames = -1.0;
+                    return;
+                }
+
+                DecodeBufferedUs = bufferedUs;
+                DecodeBufferedFrames = bufferedUs / Math.Max(1.0, _estimatedFrameIntervalUs);
             }
 
             public void RecordDecodeError(string message)
@@ -1011,7 +1096,7 @@ internal static partial class Program
 
         public long PublishedFrameSequence => Interlocked.Read(ref _frameSequence);
 
-        public void Write(byte[] bgra, int width, int height, int stride, long sourceTimestampUs)
+        public void Write(byte[] bgra, int width, int height, int stride, long sourceTimestampUs, long sourceSequence)
         {
             if (width <= 0 || height <= 0 || stride < width * 4)
             {
@@ -1030,12 +1115,12 @@ internal static partial class Program
                 var busySequence = checked(nextSequence * 2 - 1);
                 var readySequence = checked(nextSequence * 2);
 
-                WriteToView(_view, bgra, width, height, stride, frameBytes, sourceTimestampUs, busySequence, readySequence);
+                WriteToView(_view, bgra, width, height, stride, frameBytes, sourceTimestampUs, sourceSequence, busySequence, readySequence);
                 if (_globalViewPointer != IntPtr.Zero)
                 {
                     try
                     {
-                        WriteToNativeView(_globalViewPointer, bgra, width, height, stride, frameBytes, sourceTimestampUs, busySequence, readySequence);
+                        WriteToNativeView(_globalViewPointer, bgra, width, height, stride, frameBytes, sourceTimestampUs, sourceSequence, busySequence, readySequence);
                     }
                     catch (Exception ex) when (ex is ExternalException or AccessViolationException)
                     {
@@ -1167,6 +1252,7 @@ internal static partial class Program
             int stride,
             int frameBytes,
             long sourceTimestampUs,
+            long sourceSequence,
             long busySequence,
             long readySequence)
         {
@@ -1182,7 +1268,7 @@ internal static partial class Program
             view.Write(28, frameBytes);
             view.Write(40, sourceTimestampUs);
             view.Write(48, DateTimeOffset.UtcNow.ToUnixTimeMilliseconds());
-            view.Write(56, 0L);
+            view.Write(56, sourceSequence);
             view.Write(32, readySequence);
         }
 
@@ -1225,6 +1311,7 @@ internal static partial class Program
             int stride,
             int frameBytes,
             long sourceTimestampUs,
+            long sourceSequence,
             long busySequence,
             long readySequence)
         {
@@ -1240,7 +1327,7 @@ internal static partial class Program
             WriteNativeInt32(view, 28, frameBytes);
             WriteNativeInt64(view, 40, sourceTimestampUs);
             WriteNativeInt64(view, 48, DateTimeOffset.UtcNow.ToUnixTimeMilliseconds());
-            WriteNativeInt64(view, 56, 0L);
+            WriteNativeInt64(view, 56, sourceSequence);
             WriteNativeInt64(view, 32, readySequence);
         }
 
@@ -1425,7 +1512,15 @@ internal static partial class Program
         }
     }
 
-    private sealed record CameraDecodedFrame(byte[] Bgra, int Width, int Height, int Stride);
+    private sealed record CameraDecodedFrame(
+        byte[] Bgra,
+        int Width,
+        int Height,
+        int Stride,
+        long DecodedSourceTimestampUs,
+        long DecodedSourceSequence,
+        double HostDecodeProcessingMs,
+        bool SourceTimestampMatched);
 
     private sealed class CameraH264Decoder : IDisposable
     {
@@ -1449,10 +1544,10 @@ internal static partial class Program
             _decoder.Start();
         }
 
-        public IReadOnlyList<CameraDecodedFrame> Decode(ReadOnlySpan<byte> payload, long timestampUs)
+        public IReadOnlyList<CameraDecodedFrame> Decode(ReadOnlySpan<byte> payload, long timestampUs, long sequence)
         {
             var decoder = _decoder ?? throw new InvalidOperationException("Camera decoder is not started.");
-            return decoder.Decode(payload, timestampUs);
+            return decoder.Decode(payload, timestampUs, sequence);
         }
 
         public void Reset()
@@ -1472,9 +1567,12 @@ internal static partial class Program
         {
             private const int OutputFormatNv12 = 0;
             private const int OutputFormatRgb32 = 1;
+            private const int MaxInputTimestampMappings = 256;
             private readonly int _width;
             private readonly int _height;
             private readonly int _fps;
+            private readonly Queue<InputTimestampMapping> _inputMappingsInOrder = new();
+            private readonly Dictionary<long, Queue<InputTimestampMapping>> _inputMappingsByTimestamp = new();
             private IMFTransform? _transform;
             private int _outputBufferSize;
             private bool _outputProvidesSamples;
@@ -1519,7 +1617,7 @@ internal static partial class Program
                 _started = true;
             }
 
-            public IReadOnlyList<CameraDecodedFrame> Decode(ReadOnlySpan<byte> payload, long timestampUs)
+            public IReadOnlyList<CameraDecodedFrame> Decode(ReadOnlySpan<byte> payload, long timestampUs, long sequence)
             {
                 if (!_started)
                 {
@@ -1532,6 +1630,7 @@ internal static partial class Program
                 }
 
                 var transform = GetTransform();
+                RegisterInputTimestamp(timestampUs, sequence);
                 using var inputSample = CreateInputSample(payload, timestampUs);
                 var hr = transform.ProcessInput(0, inputSample.Sample, 0);
                 if (hr == Native.MF_E_NOTACCEPTING)
@@ -1569,6 +1668,8 @@ internal static partial class Program
                     _transform = null;
                 }
 
+                ClearInputTimestampMappings();
+
                 if (_mfStarted)
                 {
                     Native.MFShutdown();
@@ -1590,6 +1691,7 @@ internal static partial class Program
                     try
                     {
                         CreateTransform(candidate);
+                        ConfigureLowLatencyMode(candidate);
                         ConfigureMediaTypes();
                         SelectedMftName = candidate.Name;
                         return;
@@ -1611,6 +1713,54 @@ internal static partial class Program
                 ThrowIfFailed(
                     Native.CoCreateInstance(ref clsid, IntPtr.Zero, Native.CLSCTX_INPROC_SERVER, ref iid, out _transform),
                     $"Unable to create H.264 Media Foundation decoder MFT '{candidate.Name}'.");
+            }
+
+            private void ConfigureLowLatencyMode(H264DecoderMftCandidate candidate)
+            {
+                IMFAttributes? attributes = null;
+                try
+                {
+                    var hr = GetTransform().GetAttributes(out attributes);
+                    if (IsUnsupportedLowLatencyResult(hr))
+                    {
+                        Log(
+                            "CAMERA",
+                            $"camera-decoder-low-latency=unsupported decoder={candidate.Name} stage=get-attributes hresult=0x{hr:X8}");
+                        return;
+                    }
+
+                    ThrowIfFailed(hr, $"Unable to read H.264 decoder attributes for '{candidate.Name}'.");
+                    if (attributes is null)
+                    {
+                        throw new InvalidOperationException($"H.264 decoder '{candidate.Name}' returned no attribute store.");
+                    }
+
+                    var attribute = Native.MF_LOW_LATENCY;
+                    hr = attributes.SetUINT32(ref attribute, 1);
+                    if (IsUnsupportedLowLatencyResult(hr))
+                    {
+                        Log(
+                            "CAMERA",
+                            $"camera-decoder-low-latency=unsupported decoder={candidate.Name} stage=set-attribute hresult=0x{hr:X8}");
+                        return;
+                    }
+
+                    ThrowIfFailed(hr, $"Unable to enable low-latency mode on H.264 decoder '{candidate.Name}'.");
+                    Log(
+                        "CAMERA",
+                        $"camera-decoder-low-latency=enabled decoder={candidate.Name} attribute=MF_LOW_LATENCY value=1");
+                }
+                finally
+                {
+                    ReleaseComObject(attributes);
+                }
+            }
+
+            private static bool IsUnsupportedLowLatencyResult(int hr)
+            {
+                return hr == Native.E_NOTIMPL
+                    || hr == Native.E_NOINTERFACE
+                    || hr == Native.MF_E_ATTRIBUTENOTFOUND;
             }
 
             private IReadOnlyList<H264DecoderMftCandidate> EnumerateH264DecoderCandidates()
@@ -1777,6 +1927,103 @@ internal static partial class Program
                 return new InputSampleHandle(sample, buffer);
             }
 
+            private void RegisterInputTimestamp(long timestampUs, long sequence)
+            {
+                if (timestampUs < 0)
+                {
+                    return;
+                }
+
+                var mapping = new InputTimestampMapping(timestampUs, sequence, Stopwatch.GetTimestamp());
+                _inputMappingsInOrder.Enqueue(mapping);
+                if (!_inputMappingsByTimestamp.TryGetValue(timestampUs, out var timestampMappings))
+                {
+                    timestampMappings = new Queue<InputTimestampMapping>();
+                    _inputMappingsByTimestamp.Add(timestampUs, timestampMappings);
+                }
+
+                timestampMappings.Enqueue(mapping);
+                TrimInputTimestampMappings();
+            }
+
+            private bool TryTakeInputTimestampMapping(long timestampUs, out InputTimestampMapping? mapping)
+            {
+                mapping = null;
+                if (!_inputMappingsByTimestamp.TryGetValue(timestampUs, out var timestampMappings))
+                {
+                    return false;
+                }
+
+                while (timestampMappings.Count > 0)
+                {
+                    var candidate = timestampMappings.Dequeue();
+                    if (candidate.Consumed)
+                    {
+                        continue;
+                    }
+
+                    candidate.Consumed = true;
+                    mapping = candidate;
+                    break;
+                }
+
+                if (timestampMappings.Count == 0)
+                {
+                    _inputMappingsByTimestamp.Remove(timestampUs);
+                }
+
+                PruneConsumedInputMappings();
+                return mapping is not null;
+            }
+
+            private void TrimInputTimestampMappings()
+            {
+                PruneConsumedInputMappings();
+                while (_inputMappingsInOrder.Count > MaxInputTimestampMappings)
+                {
+                    var evicted = _inputMappingsInOrder.Dequeue();
+                    if (evicted.Consumed)
+                    {
+                        continue;
+                    }
+
+                    evicted.Consumed = true;
+                    PruneTimestampBucket(evicted.TimestampUs);
+                }
+            }
+
+            private void PruneConsumedInputMappings()
+            {
+                while (_inputMappingsInOrder.TryPeek(out var mapping) && mapping.Consumed)
+                {
+                    _inputMappingsInOrder.Dequeue();
+                }
+            }
+
+            private void PruneTimestampBucket(long timestampUs)
+            {
+                if (!_inputMappingsByTimestamp.TryGetValue(timestampUs, out var timestampMappings))
+                {
+                    return;
+                }
+
+                while (timestampMappings.TryPeek(out var mapping) && mapping.Consumed)
+                {
+                    timestampMappings.Dequeue();
+                }
+
+                if (timestampMappings.Count == 0)
+                {
+                    _inputMappingsByTimestamp.Remove(timestampUs);
+                }
+            }
+
+            private void ClearInputTimestampMappings()
+            {
+                _inputMappingsInOrder.Clear();
+                _inputMappingsByTimestamp.Clear();
+            }
+
             private List<CameraDecodedFrame> DrainOutput(IMFTransform transform)
             {
                 var frames = new List<CameraDecodedFrame>();
@@ -1831,8 +2078,29 @@ internal static partial class Program
                         {
                             if (sample is not null)
                             {
+                                var timestampHr = sample.GetSampleTime(out var sampleTime100Ns);
+                                if (timestampHr < 0 && timestampHr != Native.MF_E_NO_SAMPLE_TIMESTAMP)
+                                {
+                                    ThrowIfFailed(timestampHr, "Unable to read Media Foundation camera output sample time.");
+                                }
+
+                                var decodedSourceTimestampUs = timestampHr >= 0 && sampleTime100Ns >= 0
+                                    ? sampleTime100Ns / 10
+                                    : -1;
+                                InputTimestampMapping? inputMapping = null;
+                                var sourceTimestampMatched = decodedSourceTimestampUs >= 0
+                                    && TryTakeInputTimestampMapping(decodedSourceTimestampUs, out inputMapping);
+                                var decodedSourceSequence = sourceTimestampMatched ? inputMapping!.Sequence : -1;
+                                var hostDecodeProcessingMs = sourceTimestampMatched
+                                    ? Math.Max(0.0, Stopwatch.GetElapsedTime(inputMapping!.AcceptedAtTimestamp).TotalMilliseconds)
+                                    : -1.0;
                                 var bytes = ReadSampleBytes(sample);
-                                var frame = ConvertOutputToBgra(bytes);
+                                var frame = ConvertOutputToBgra(
+                                    bytes,
+                                    decodedSourceTimestampUs,
+                                    decodedSourceSequence,
+                                    hostDecodeProcessingMs,
+                                    sourceTimestampMatched);
                                 if (frame is not null)
                                 {
                                     frames.Add(frame);
@@ -1897,7 +2165,12 @@ internal static partial class Program
                     : Math.Max(64 * 1024, _width * _height * 4);
             }
 
-            private CameraDecodedFrame? ConvertOutputToBgra(byte[] output)
+            private CameraDecodedFrame? ConvertOutputToBgra(
+                byte[] output,
+                long decodedSourceTimestampUs,
+                long decodedSourceSequence,
+                double hostDecodeProcessingMs,
+                bool sourceTimestampMatched)
             {
                 if (_outputFormat == OutputFormatRgb32)
                 {
@@ -1910,7 +2183,15 @@ internal static partial class Program
                     var bgra = new byte[frameBytes];
                     Buffer.BlockCopy(output, 0, bgra, 0, frameBytes);
                     EnsureAlpha(bgra);
-                    return new CameraDecodedFrame(bgra, _width, _height, _width * 4);
+                    return new CameraDecodedFrame(
+                        bgra,
+                        _width,
+                        _height,
+                        _width * 4,
+                        decodedSourceTimestampUs,
+                        decodedSourceSequence,
+                        hostDecodeProcessingMs,
+                        sourceTimestampMatched);
                 }
 
                 var nv12Bytes = checked(_width * _height * 3 / 2);
@@ -1921,7 +2202,15 @@ internal static partial class Program
 
                 var converted = new byte[checked(_width * _height * 4)];
                 ConvertNv12ToBgra(output, converted, _width, _height);
-                return new CameraDecodedFrame(converted, _width, _height, _width * 4);
+                return new CameraDecodedFrame(
+                    converted,
+                    _width,
+                    _height,
+                    _width * 4,
+                    decodedSourceTimestampUs,
+                    decodedSourceSequence,
+                    hostDecodeProcessingMs,
+                    sourceTimestampMatched);
             }
 
             private static void ConvertNv12ToBgra(byte[] nv12, byte[] bgra, int width, int height)
@@ -1966,11 +2255,17 @@ internal static partial class Program
                 _outputProvidesSamples = false;
                 _outputFormat = OutputFormatNv12;
                 SelectedMftName = string.Empty;
+                ClearInputTimestampMappings();
             }
 
             private IMFTransform GetTransform()
             {
                 return _transform ?? throw new InvalidOperationException("Media Foundation camera decoder is not initialized.");
+            }
+
+            private sealed record InputTimestampMapping(long TimestampUs, long Sequence, long AcceptedAtTimestamp)
+            {
+                public bool Consumed { get; set; }
             }
         }
 
@@ -2535,6 +2830,8 @@ internal static partial class Program
             public const int COINIT_MULTITHREADED = 0;
             public const int CLSCTX_INPROC_SERVER = 1;
             public const int RPC_E_CHANGED_MODE = unchecked((int)0x80010106);
+            public const int E_NOTIMPL = unchecked((int)0x80004001);
+            public const int E_NOINTERFACE = unchecked((int)0x80004002);
             public const int MFVideoInterlace_Progressive = 2;
             public const int MFT_MESSAGE_NOTIFY_BEGIN_STREAMING = 0x10000000;
             public const int MFT_MESSAGE_NOTIFY_END_STREAMING = 0x10000001;
@@ -2543,6 +2840,8 @@ internal static partial class Program
             public const int MFT_OUTPUT_DATA_BUFFER_FORMAT_CHANGE = 0x00000100;
             public const int MFT_OUTPUT_STREAM_PROVIDES_SAMPLES = 0x00000100;
             public const int MF_E_NOTACCEPTING = unchecked((int)0xC00D36B5);
+            public const int MF_E_NO_SAMPLE_TIMESTAMP = unchecked((int)0xC00D36C8);
+            public const int MF_E_ATTRIBUTENOTFOUND = unchecked((int)0xC00D36E6);
             public const int MF_E_TRANSFORM_STREAM_CHANGE = unchecked((int)0xC00D6D61);
             public const int MF_E_TRANSFORM_NEED_MORE_INPUT = unchecked((int)0xC00D6D72);
             public const int MFT_ENUM_FLAG_SYNCMFT = 0x00000001;
@@ -2559,6 +2858,7 @@ internal static partial class Program
             public static readonly Guid MFVideoFormat_H264 = new("34363248-0000-0010-8000-00AA00389B71");
             public static readonly Guid MFVideoFormat_NV12 = new("3231564E-0000-0010-8000-00AA00389B71");
             public static readonly Guid MFVideoFormat_RGB32 = new("00000016-0000-0010-8000-00AA00389B71");
+            public static Guid MF_LOW_LATENCY = new("9C27891A-ED7A-40E1-88E8-B22727A024EE");
             public static Guid MF_MT_MAJOR_TYPE = new("48EBA18E-F8C9-4687-BF11-0A74C9F96A8F");
             public static Guid MF_MT_SUBTYPE = new("F7E34C9A-42E8-4714-B74B-CB29D72C35E5");
             public static Guid MF_MT_ALL_SAMPLES_INDEPENDENT = new("C9173739-5E56-461C-B713-46FB995CB95F");

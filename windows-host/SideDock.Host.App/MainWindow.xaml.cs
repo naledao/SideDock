@@ -251,6 +251,13 @@ public sealed partial class MainWindow : Window
     private WriteableBitmap? _cameraPreviewBitmap;
     private long _lastCameraPreviewSequence;
     private DateTimeOffset? _lastCameraPreviewAt;
+    private DateTimeOffset? _lastCameraPreviewReadAt;
+    private DateTimeOffset? _lastCameraPreviewLatencyLogAt;
+    private long _lastCameraPreviewSourceSequence;
+    private long _lastCameraPreviewSourceTimestampUs;
+    private double _lastCameraPreviewFrameAgeMs;
+    private double _lastCameraPreviewCopyMs;
+    private int _lastCameraPreviewFrameBytes;
     private OverviewPreviewFrameReader? _overviewPreviewReader;
     private EventWaitHandle? _overviewPreviewConsumerAlive;
     private bool? _overviewPreviewConsumerAliveState;
@@ -955,6 +962,8 @@ public sealed partial class MainWindow : Window
         OverviewPrimaryActionIcon.Glyph = showCameraPage ? "\uE722" : "\uE768";
         OverviewStartHostButton.Visibility = showAudioPage || showDiagnosticsPage || showSettingsPage ? Visibility.Collapsed : Visibility.Visible;
         OverviewDefaultHeaderActions.Visibility = showAudioPage || showDiagnosticsPage || showSettingsPage ? Visibility.Collapsed : Visibility.Visible;
+        OverviewCameraHeaderCopyLogButton.Visibility = showCameraPage ? Visibility.Visible : Visibility.Collapsed;
+        OverviewCameraHeaderCopyAndroidLogButton.Visibility = showCameraPage ? Visibility.Visible : Visibility.Collapsed;
         OverviewAudioHeaderActions.Visibility = showAudioPage ? Visibility.Visible : Visibility.Collapsed;
         OverviewSettingsHeaderActions.Visibility = showSettingsPage ? Visibility.Visible : Visibility.Collapsed;
 
@@ -1670,9 +1679,9 @@ public sealed partial class MainWindow : Window
             return true;
         }
 
-        if (IsCameraReceiving(_cameraDiagnostics) && _cameraDiagnostics.DecodeLagMs > 0)
+        if (IsCameraReceiving(_cameraDiagnostics) && _cameraDiagnostics.DecodeBufferedMs >= 0)
         {
-            latencyMs = _cameraDiagnostics.DecodeLagMs;
+            latencyMs = _cameraDiagnostics.DecodeBufferedMs;
             return true;
         }
 
@@ -3742,6 +3751,47 @@ public sealed partial class MainWindow : Window
         CopyAudioDiagnosticsToClipboard();
     }
 
+    private void OverviewCameraHeaderCopyLogButton_Click(object sender, RoutedEventArgs e)
+    {
+        if (TryCopyCameraDiagnosticsToClipboard(out var errorMessage))
+        {
+            OverviewCameraHeaderCopyLogButtonText.Text = "已复制";
+        }
+        else
+        {
+            OverviewCameraHeaderCopyLogButtonText.Text = "复制失败";
+            ShowError("无法复制摄像头日志", errorMessage);
+        }
+    }
+
+    private async void OverviewCameraHeaderCopyAndroidLogButton_Click(object sender, RoutedEventArgs e)
+    {
+        OverviewCameraHeaderCopyAndroidLogButton.IsEnabled = false;
+        OverviewCameraHeaderCopyAndroidLogButtonText.Text = "复制中...";
+        try
+        {
+            var result = await TryCopyAndroidCameraLogToClipboardAsync();
+            if (result.Success)
+            {
+                OverviewCameraHeaderCopyAndroidLogButtonText.Text = "已复制";
+            }
+            else
+            {
+                OverviewCameraHeaderCopyAndroidLogButtonText.Text = "复制失败";
+                ShowError("无法复制安卓摄像头日志", result.ErrorMessage);
+            }
+        }
+        catch (Exception ex)
+        {
+            OverviewCameraHeaderCopyAndroidLogButtonText.Text = "复制失败";
+            ShowError("无法复制安卓摄像头日志", ex.Message);
+        }
+        finally
+        {
+            OverviewCameraHeaderCopyAndroidLogButton.IsEnabled = true;
+        }
+    }
+
     private void OverviewActionsMenuFlyout_Opening(object sender, object e)
     {
         UpdateOverviewActionButtons();
@@ -4792,23 +4842,96 @@ public sealed partial class MainWindow : Window
 
     private void CopyCameraDiagnosticsButton_Click(object sender, RoutedEventArgs e)
     {
-        if (StaticOverviewUi)
+        if (TryCopyCameraDiagnosticsToClipboard(out _))
         {
-            return;
+            CopyCameraDiagnosticsButtonText.Text = "已复制";
+        }
+        else
+        {
+            CopyCameraDiagnosticsButtonText.Text = "复制失败";
+        }
+    }
+
+    private bool TryCopyCameraDiagnosticsToClipboard(out string errorMessage)
+    {
+        try
+        {
+            var package = new DataPackage { RequestedOperation = DataPackageOperation.Copy };
+            package.SetText(BuildCameraDiagnosticsReport());
+            Clipboard.SetContent(package);
+            Clipboard.Flush();
+            errorMessage = string.Empty;
+            return true;
+        }
+        catch (Exception ex)
+        {
+            errorMessage = ex.Message;
+            return false;
+        }
+    }
+
+    private async Task<(bool Success, string ErrorMessage)> TryCopyAndroidCameraLogToClipboardAsync()
+    {
+        var serial = SelectedOrKnownDefaultAdbSerial();
+        if (string.IsNullOrWhiteSpace(serial))
+        {
+            return (false, "未选择 Android 设备，请先在连接页刷新并选择设备。");
+        }
+
+        var selectedDevice = _lastAdbDeviceRows.FirstOrDefault(row =>
+            row.Serial.Equals(serial, StringComparison.OrdinalIgnoreCase));
+        if (selectedDevice is not null
+            && !selectedDevice.State.Equals("device", StringComparison.OrdinalIgnoreCase))
+        {
+            return (false, $"Android 设备 {serial} 当前状态为 {selectedDevice.State}，无法读取 Logcat。");
+        }
+
+        var adbPath = ResolveAdbPath(AdbPathBox.Text.Trim());
+        var arguments = $"-s {QuoteArgument(serial)} logcat -d -v threadtime SideDockCamera:I *:S";
+        var result = await RunAdbAsync(adbPath, arguments, TimeSpan.FromSeconds(12));
+        if (result.TimedOut)
+        {
+            return (false, $"读取 Android 摄像头 Logcat 超时：{serial}");
+        }
+
+        if (result.ExitCode != 0)
+        {
+            var details = string.IsNullOrWhiteSpace(result.Stderr) ? result.Stdout : result.Stderr;
+            return (
+                false,
+                $"读取 Android 摄像头 Logcat 失败（退出码 {result.ExitCode}）："
+                    + (string.IsNullOrWhiteSpace(details) ? "ADB 未返回错误详情。" : details));
         }
 
         try
         {
-            var details = BuildCameraDiagnosticsReport();
+            var report = new StringBuilder();
+            report.AppendLine("SideDock Android 摄像头 Logcat");
+            report.AppendLine($"时间: {DateTimeOffset.Now:yyyy-MM-dd HH:mm:ss zzz}");
+            report.AppendLine($"ADB 路径: {adbPath}");
+            report.AppendLine($"ADB 设备: {serial}");
+            report.AppendLine($"命令: adb {arguments}");
+            report.AppendLine();
+            report.AppendLine("---- SideDockCamera Logcat ----");
+            report.AppendLine(string.IsNullOrWhiteSpace(result.Stdout)
+                ? "(当前 Logcat buffer 中没有 SideDockCamera 日志)"
+                : result.Stdout);
+            if (!string.IsNullOrWhiteSpace(result.Stderr))
+            {
+                report.AppendLine();
+                report.AppendLine("---- ADB stderr ----");
+                report.AppendLine(result.Stderr);
+            }
+
             var package = new DataPackage { RequestedOperation = DataPackageOperation.Copy };
-            package.SetText(details);
+            package.SetText(report.ToString());
             Clipboard.SetContent(package);
             Clipboard.Flush();
-            CopyCameraDiagnosticsButtonText.Text = "已复制";
+            return (true, string.Empty);
         }
-        catch
+        catch (Exception ex)
         {
-            CopyCameraDiagnosticsButtonText.Text = "复制失败";
+            return (false, ex.Message);
         }
     }
 
@@ -7573,11 +7696,11 @@ public sealed partial class MainWindow : Window
             return;
         }
 
-        if (IsCameraReceiving(_cameraDiagnostics) && _cameraDiagnostics.DecodeLagMs > 0)
+        if (IsCameraReceiving(_cameraDiagnostics) && _cameraDiagnostics.DecodeBufferedMs >= 0)
         {
-            _lastOverviewLatencyText = $"{_cameraDiagnostics.DecodeLagMs:F0} ms";
-            _lastOverviewLatencyDetailText = "摄像头解码滞后";
-            SetOverviewLatencyView(_cameraDiagnostics.DecodeLagMs, _lastOverviewLatencyDetailText);
+            _lastOverviewLatencyText = $"{_cameraDiagnostics.DecodeBufferedMs:F0} ms";
+            _lastOverviewLatencyDetailText = $"摄像头解码缓存 {_cameraDiagnostics.DecodeBufferedFrames:F1} 帧";
+            SetOverviewLatencyView(_cameraDiagnostics.DecodeBufferedMs, _lastOverviewLatencyDetailText);
             return;
         }
 
@@ -10913,6 +11036,18 @@ public sealed partial class MainWindow : Window
         return string.IsNullOrWhiteSpace(value) ? "(空)" : value;
     }
 
+    private static string FormatOptionalMilliseconds(double value)
+    {
+        return value < 0 ? "(unavailable)" : $"{value:F1} ms";
+    }
+
+    private static string FormatOptionalUnixMilliseconds(long value)
+    {
+        return value <= 0
+            ? "(unavailable)"
+            : DateTimeOffset.FromUnixTimeMilliseconds(value).ToLocalTime().ToString("yyyy-MM-dd HH:mm:ss.fff zzz", CultureInfo.InvariantCulture);
+    }
+
     private static string FormatNumberBox(NumberBox numberBox)
     {
         return double.IsNaN(numberBox.Value) ? "(无效)" : ((int)numberBox.Value).ToString();
@@ -11765,6 +11900,11 @@ public sealed partial class MainWindow : Window
                 return;
             }
 
+            var readAt = DateTimeOffset.UtcNow;
+            var frameAgeMs = frame.WrittenAtUnixMs > 0
+                ? Math.Max(0.0, readAt.ToUnixTimeMilliseconds() - frame.WrittenAtUnixMs)
+                : -1.0;
+
             if (_cameraPreviewBitmap is null
                 || _cameraPreviewBitmap.PixelWidth != frame.Width
                 || _cameraPreviewBitmap.PixelHeight != frame.Height)
@@ -11773,6 +11913,7 @@ public sealed partial class MainWindow : Window
                 SetCameraPreviewImageSource(_cameraPreviewBitmap);
             }
 
+            var copyStarted = Stopwatch.GetTimestamp();
             using (var stream = _cameraPreviewBitmap.PixelBuffer.AsStream())
             {
                 stream.Seek(0, SeekOrigin.Begin);
@@ -11780,9 +11921,21 @@ public sealed partial class MainWindow : Window
             }
 
             _cameraPreviewBitmap.Invalidate();
+            var copyMs = (Stopwatch.GetTimestamp() - copyStarted) * 1000.0 / Stopwatch.Frequency;
             _lastCameraPreviewSequence = frame.Sequence;
             _lastCameraPreviewAt = DateTimeOffset.FromUnixTimeMilliseconds(frame.WrittenAtUnixMs);
+            _lastCameraPreviewReadAt = readAt;
+            _lastCameraPreviewSourceSequence = frame.SourceSequence;
+            _lastCameraPreviewSourceTimestampUs = frame.SourceTimestampUs;
+            _lastCameraPreviewFrameAgeMs = frameAgeMs;
+            _lastCameraPreviewCopyMs = Math.Max(0.0, copyMs);
+            _lastCameraPreviewFrameBytes = frame.Bgra.Length;
             _cameraDiagnostics.PreviewFrameSequence = Math.Max(_cameraDiagnostics.PreviewFrameSequence, frame.Sequence);
+            _cameraDiagnostics.PreviewSourceSequence = frame.SourceSequence;
+            _cameraDiagnostics.PreviewSourceTimestampUs = frame.SourceTimestampUs;
+            _cameraDiagnostics.PreviewFrameAgeMs = frameAgeMs;
+            _cameraDiagnostics.PreviewCopyMs = _lastCameraPreviewCopyMs;
+            LogCameraPreviewLatency(frame, frameAgeMs, _lastCameraPreviewCopyMs);
             SetCameraPreviewPlaceholder("", visible: false);
             UpdateCameraStatusView();
         }
@@ -11811,6 +11964,22 @@ public sealed partial class MainWindow : Window
         }
 
         UpdateCameraStatusView();
+    }
+
+    private void LogCameraPreviewLatency(CameraPreviewFrame frame, double frameAgeMs, double copyMs)
+    {
+        var now = DateTimeOffset.Now;
+        if (_lastCameraPreviewLatencyLogAt is not null
+            && now - _lastCameraPreviewLatencyLogAt.Value < TimeSpan.FromSeconds(1))
+        {
+            return;
+        }
+
+        _lastCameraPreviewLatencyLogAt = now;
+        AppendRecentCameraLogLine(
+            $"camera-preview-ui sequence={frame.Sequence} sourceSeq={frame.SourceSequence} "
+            + $"sourceTsUs={frame.SourceTimestampUs} cacheAgeMs={frameAgeMs:F1} copyMs={copyMs:F2} "
+            + $"bytes={frame.Bgra.Length} size={frame.Width}x{frame.Height}");
     }
 
     private void SetCameraPreviewEnabled(bool enabled)
@@ -11863,9 +12032,15 @@ public sealed partial class MainWindow : Window
 
     private string FormatCameraPreviewState()
     {
-        return _cameraPreviewEnabled
-            ? FormatCameraAge(_lastCameraPreviewAt?.ToString("O") ?? string.Empty)
-            : "已关闭";
+        if (!_cameraPreviewEnabled)
+        {
+            return "已关闭";
+        }
+
+        var age = FormatCameraAge(_lastCameraPreviewAt?.ToString("O") ?? string.Empty);
+        return _lastCameraPreviewFrameAgeMs > 0
+            ? $"{age} · cache {_lastCameraPreviewFrameAgeMs:F0}ms"
+            : age;
     }
 
     private void SetCameraPreviewImageSource(ImageSource? source)
@@ -11904,7 +12079,8 @@ public sealed partial class MainWindow : Window
         CameraConfigText.Text = $"port {camera.Port} · {camera.Width}x{camera.Height}@{camera.Fps} · {camera.Codec} · {camera.Facing} · {FormatCameraConfigSourceLabel(_cameraConfigSource)}";
         CameraMetricsText.Text =
             $"{camera.ApproxFps:F1} fps · {camera.ApproxKbps:F0} kbps · packets {camera.Packets} · frames {camera.Frames} · decoded {camera.DecodedFrames} · "
-            + $"decode {camera.DecodeLagMs:F0}ms · preview {FormatCameraPreviewState()} · last {FormatCameraAge(camera.LastFrameAt)}";
+            + $"decode buffer {FormatOptionalMilliseconds(camera.DecodeBufferedMs)} / {camera.DecodeBufferedFrames:F1} frames · "
+            + $"host processing {FormatOptionalMilliseconds(camera.HostDecodeProcessingMs)} · preview {FormatCameraPreviewState()} · last {FormatCameraAge(camera.LastFrameAt)}";
         var errorText = string.IsNullOrWhiteSpace(camera.LastError) ? "无" : camera.LastError;
         CameraMetricsText.Text +=
             $" · jitter {camera.FpsJitter:F0}%/{camera.BitrateJitter:F0}%"
@@ -12117,8 +12293,8 @@ public sealed partial class MainWindow : Window
             : OverviewCameraEncodingFpsText.Text;
         var displayKbps = camera.ActualKbps > 0 ? camera.ActualKbps : camera.ApproxKbps;
         OverviewCameraEncodingBitrateText.Text = $"{FormatCameraBitrate(displayKbps)} · jitter {camera.BitrateJitter:F0}%";
-        OverviewCameraEncodingDecodeLagText.Text = camera.DecodeLagMs > 0
-            ? $"{camera.DecodeLagMs:F0} ms"
+        OverviewCameraEncodingDecodeLagText.Text = camera.DecodeBufferedUs >= 0
+            ? $"{camera.DecodeBufferedFrames:F1} 帧 · {camera.DecodeBufferedMs:F0} ms"
             : "--";
     }
 
@@ -13734,13 +13910,29 @@ public sealed partial class MainWindow : Window
         report.AppendLine($"码率 kbps: {camera.ApproxKbps:F0}");
         report.AppendLine($"Android 实际 fps/kbps: {camera.ActualFps:F1}/{camera.ActualKbps:F0}");
         report.AppendLine($"fps/bitrate 波动: {camera.FpsJitter:F1}%/{camera.BitrateJitter:F1}%");
+        report.AppendLine("---- 摄像头预览延迟分段 ----");
+        report.AppendLine($"Android 最近帧时间戳(us): {camera.ClientLastPresentationTimeUs}");
+        report.AppendLine($"Android 最近发包时间: {FormatOptionalUnixMilliseconds(camera.ClientLastPacketSentAtUnixMs)}");
+        report.AppendLine($"Android 编码器输出帧年龄: {FormatOptionalMilliseconds(camera.ClientEncoderOutputAgeMs)}");
+        report.AppendLine($"Android socket 写入耗时: last {FormatOptionalMilliseconds(camera.ClientPacketWriteMs)} / avg {FormatOptionalMilliseconds(camera.ClientAveragePacketWriteMs)} / max {FormatOptionalMilliseconds(camera.ClientMaxPacketWriteMs)}");
+        report.AppendLine($"Host 最新输入源时间戳/序号: {camera.LatestInputTimestampUs}/{camera.LatestInputSequence}");
+        report.AppendLine($"Host 源帧间隔(us): {camera.SourceTimestampDeltaUs}");
+        report.AppendLine($"解码输出源时间戳/序号: {camera.DecodedSourceTimestampUs}/{camera.DecodedSourceSequence}");
+        report.AppendLine($"MFT 解码缓存: {camera.DecodeBufferedUs} us / {FormatOptionalMilliseconds(camera.DecodeBufferedMs)} / {camera.DecodeBufferedFrames:F1} frames");
+        report.AppendLine($"Host 输入到解码输出处理耗时: {FormatOptionalMilliseconds(camera.HostDecodeProcessingMs)}");
+        report.AppendLine($"无法匹配的解码输出时间戳数: {camera.UnmatchedDecodedTimestampCount}");
+        report.AppendLine($"WinUI 预览共享缓存年龄: {FormatOptionalMilliseconds(camera.PreviewFrameAgeMs)}");
+        report.AppendLine($"WinUI 预览像素拷贝耗时: {FormatOptionalMilliseconds(camera.PreviewCopyMs)}");
+        report.AppendLine($"WinUI 最近读取时间: {FormatOptional(_lastCameraPreviewReadAt?.ToString("O"))}");
+        report.AppendLine($"WinUI 预览源序号/源时间戳: {_lastCameraPreviewSourceSequence}/{_lastCameraPreviewSourceTimestampUs}");
+        report.AppendLine($"WinUI 预览帧字节数: {_lastCameraPreviewFrameBytes}");
         report.AppendLine($"camera reconnect count: {camera.ReconnectCount}");
         report.AppendLine($"recovery attempt count: {camera.RecoveryAttemptCount}");
         report.AppendLine($"consecutive failure count: {camera.ConsecutiveFailureCount}");
         report.AppendLine($"last recovery duration: {camera.LastRecoveryDurationMs} ms");
         report.AppendLine($"last disconnect reason: {FormatOptional(camera.LastDisconnectReason)}");
         report.AppendLine($"解码帧/错误: {camera.DecodedFrames}/{camera.DecodeErrors}");
-        report.AppendLine($"最近解码滞后: {camera.DecodeLagMs:F1} ms");
+        report.AppendLine($"最近解码缓存: {FormatOptionalMilliseconds(camera.DecodeBufferedMs)} ({camera.DecodeBufferedFrames:F1} frames)");
         report.AppendLine($"Windows 预览: {(_cameraPreviewEnabled ? "启用" : "关闭")}");
         report.AppendLine($"共享预览帧序号: {_lastCameraPreviewSequence}");
         report.AppendLine($"共享预览最近时间: {FormatOptional(_lastCameraPreviewAt?.ToString("O"))}");
@@ -13849,6 +14041,15 @@ public sealed partial class MainWindow : Window
         _lastCameraStatusLine = null;
         _lastCameraErrorLine = null;
         _lastCameraErrorMessage = null;
+        _lastCameraPreviewSequence = 0;
+        _lastCameraPreviewAt = null;
+        _lastCameraPreviewReadAt = null;
+        _lastCameraPreviewLatencyLogAt = null;
+        _lastCameraPreviewSourceSequence = 0;
+        _lastCameraPreviewSourceTimestampUs = 0;
+        _lastCameraPreviewFrameAgeMs = 0;
+        _lastCameraPreviewCopyMs = 0;
+        _lastCameraPreviewFrameBytes = 0;
         _cameraCapabilities = null;
         _cameraCapabilityHint = "Waiting for Android camera capabilities; showing default camera options.";
         _lastVideoStatsLine = null;
@@ -13872,6 +14073,16 @@ public sealed partial class MainWindow : Window
         if (CopyCameraDiagnosticsButtonText is not null)
         {
             CopyCameraDiagnosticsButtonText.Text = "复制诊断";
+        }
+
+        if (OverviewCameraHeaderCopyLogButtonText is not null)
+        {
+            OverviewCameraHeaderCopyLogButtonText.Text = "复制日志";
+        }
+
+        if (OverviewCameraHeaderCopyAndroidLogButtonText is not null)
+        {
+            OverviewCameraHeaderCopyAndroidLogButtonText.Text = "复制安卓日志";
         }
 
         UpdateCameraStatusView();
@@ -14538,6 +14749,12 @@ public sealed partial class MainWindow : Window
             _cameraDiagnostics.ClientBytes = ExtractLogLong(line, "bytes=", _cameraDiagnostics.ClientBytes);
             _cameraDiagnostics.ClientKeyFrames = ExtractLogLong(line, "keyFrames=", _cameraDiagnostics.ClientKeyFrames);
             _cameraDiagnostics.ClientCodecConfigPackets = ExtractLogLong(line, "codecConfigPackets=", _cameraDiagnostics.ClientCodecConfigPackets);
+            _cameraDiagnostics.ClientLastPresentationTimeUs = ExtractLogLong(line, "androidFrameTsUs=", _cameraDiagnostics.ClientLastPresentationTimeUs);
+            _cameraDiagnostics.ClientLastPacketSentAtUnixMs = ExtractLogLong(line, "androidPacketSentUnixMs=", _cameraDiagnostics.ClientLastPacketSentAtUnixMs);
+            _cameraDiagnostics.ClientEncoderOutputAgeMs = ExtractLogDouble(line, "encoderOutputAgeMs=", _cameraDiagnostics.ClientEncoderOutputAgeMs);
+            _cameraDiagnostics.ClientPacketWriteMs = ExtractLogDouble(line, "packetWriteMs=", _cameraDiagnostics.ClientPacketWriteMs);
+            _cameraDiagnostics.ClientAveragePacketWriteMs = ExtractLogDouble(line, "packetWriteAvgMs=", _cameraDiagnostics.ClientAveragePacketWriteMs);
+            _cameraDiagnostics.ClientMaxPacketWriteMs = ExtractLogDouble(line, "packetWriteMaxMs=", _cameraDiagnostics.ClientMaxPacketWriteMs);
         }
         else
         {
@@ -14554,7 +14771,21 @@ public sealed partial class MainWindow : Window
             _cameraDiagnostics.DecodedFrames = ExtractLogLong(line, "decodedFrames=", _cameraDiagnostics.DecodedFrames);
             _cameraDiagnostics.DecodeErrors = ExtractLogLong(line, "decodeErrors=", _cameraDiagnostics.DecodeErrors);
             _cameraDiagnostics.PreviewFrameSequence = ExtractLogLong(line, "previewSeq=", _cameraDiagnostics.PreviewFrameSequence);
-            _cameraDiagnostics.DecodeLagMs = ExtractLogDouble(line, "decodeLagMs=", _cameraDiagnostics.DecodeLagMs);
+            _cameraDiagnostics.HostDecodeProcessingMs = ExtractLogDouble(
+                line,
+                "hostDecodeProcessingMs=",
+                ExtractLogDouble(line, "decodeLagMs=", _cameraDiagnostics.HostDecodeProcessingMs));
+            _cameraDiagnostics.LatestInputTimestampUs = ExtractLogLong(line, "latestInputTimestampUs=", _cameraDiagnostics.LatestInputTimestampUs);
+            _cameraDiagnostics.LatestInputSequence = ExtractLogLong(line, "latestInputSequence=", _cameraDiagnostics.LatestInputSequence);
+            _cameraDiagnostics.SourceTimestampDeltaUs = ExtractLogLong(line, "sourceDeltaUs=", _cameraDiagnostics.SourceTimestampDeltaUs);
+            _cameraDiagnostics.DecodedSourceTimestampUs = ExtractLogLong(line, "decodedSourceTimestampUs=", _cameraDiagnostics.DecodedSourceTimestampUs);
+            _cameraDiagnostics.DecodedSourceSequence = ExtractLogLong(line, "decodedSourceSequence=", _cameraDiagnostics.DecodedSourceSequence);
+            _cameraDiagnostics.DecodeBufferedUs = ExtractLogLong(line, "decodeBufferedUs=", _cameraDiagnostics.DecodeBufferedUs);
+            _cameraDiagnostics.DecodeBufferedFrames = ExtractLogDouble(line, "decodeBufferedFrames=", _cameraDiagnostics.DecodeBufferedFrames);
+            _cameraDiagnostics.UnmatchedDecodedTimestampCount = ExtractLogLong(
+                line,
+                "unmatchedDecodedTimestampCount=",
+                _cameraDiagnostics.UnmatchedDecodedTimestampCount);
             _cameraDiagnostics.ApproxFps = ExtractLogDouble(line, "approxFps=", _cameraDiagnostics.ApproxFps);
             _cameraDiagnostics.ApproxKbps = ExtractLogDouble(line, "approxKbps=", _cameraDiagnostics.ApproxKbps);
             _cameraDiagnostics.LastFrameAt = NonEmpty(ExtractLogValue(line, "lastFrameAt="), _cameraDiagnostics.LastFrameAt);
@@ -17135,7 +17366,33 @@ public sealed partial class MainWindow : Window
 
         public long PreviewFrameSequence { get; set; }
 
-        public double DecodeLagMs { get; set; }
+        public long PreviewSourceSequence { get; set; }
+
+        public long PreviewSourceTimestampUs { get; set; }
+
+        public double PreviewFrameAgeMs { get; set; }
+
+        public double PreviewCopyMs { get; set; }
+
+        public double HostDecodeProcessingMs { get; set; } = -1.0;
+
+        public long LatestInputTimestampUs { get; set; } = -1;
+
+        public long LatestInputSequence { get; set; } = -1;
+
+        public long SourceTimestampDeltaUs { get; set; }
+
+        public long DecodedSourceTimestampUs { get; set; } = -1;
+
+        public long DecodedSourceSequence { get; set; } = -1;
+
+        public long DecodeBufferedUs { get; set; } = -1;
+
+        public double DecodeBufferedFrames { get; set; } = -1.0;
+
+        public long UnmatchedDecodedTimestampCount { get; set; }
+
+        public double DecodeBufferedMs => DecodeBufferedUs < 0 ? -1.0 : DecodeBufferedUs / 1000.0;
 
         public double ApproxFps { get; set; }
 
@@ -17173,6 +17430,18 @@ public sealed partial class MainWindow : Window
 
         public long ClientCodecConfigPackets { get; set; }
 
+        public long ClientLastPresentationTimeUs { get; set; }
+
+        public long ClientLastPacketSentAtUnixMs { get; set; }
+
+        public double ClientEncoderOutputAgeMs { get; set; } = -1.0;
+
+        public double ClientPacketWriteMs { get; set; }
+
+        public double ClientAveragePacketWriteMs { get; set; }
+
+        public double ClientMaxPacketWriteMs { get; set; }
+
         public string PermissionText => string.IsNullOrWhiteSpace(PermissionGranted) ? "unknown" : PermissionGranted;
 
         public void Reset()
@@ -17194,7 +17463,19 @@ public sealed partial class MainWindow : Window
             DecodedFrames = 0;
             DecodeErrors = 0;
             PreviewFrameSequence = 0;
-            DecodeLagMs = 0;
+            PreviewSourceSequence = 0;
+            PreviewSourceTimestampUs = 0;
+            PreviewFrameAgeMs = 0;
+            PreviewCopyMs = 0;
+            HostDecodeProcessingMs = -1.0;
+            LatestInputTimestampUs = -1;
+            LatestInputSequence = -1;
+            SourceTimestampDeltaUs = 0;
+            DecodedSourceTimestampUs = -1;
+            DecodedSourceSequence = -1;
+            DecodeBufferedUs = -1;
+            DecodeBufferedFrames = -1.0;
+            UnmatchedDecodedTimestampCount = 0;
             ApproxFps = 0;
             ApproxKbps = 0;
             FpsJitter = 0;
@@ -17213,6 +17494,12 @@ public sealed partial class MainWindow : Window
             ClientBytes = 0;
             ClientKeyFrames = 0;
             ClientCodecConfigPackets = 0;
+            ClientLastPresentationTimeUs = 0;
+            ClientLastPacketSentAtUnixMs = 0;
+            ClientEncoderOutputAgeMs = -1.0;
+            ClientPacketWriteMs = 0;
+            ClientAveragePacketWriteMs = 0;
+            ClientMaxPacketWriteMs = 0;
         }
     }
 
@@ -17591,7 +17878,9 @@ public sealed partial class MainWindow : Window
             var stride = _view.ReadInt32(20);
             var format = _view.ReadInt32(24);
             var frameBytes = _view.ReadInt32(28);
+            var sourceTimestampUs = _view.ReadInt64(40);
             var writtenAtUnixMs = _view.ReadInt64(48);
+            var sourceSequence = _view.ReadInt64(56);
             if (magic != Magic
                 || version != Version
                 || headerSize != HeaderSize
@@ -17618,7 +17907,7 @@ public sealed partial class MainWindow : Window
             var bgra = stride == width * 4
                 ? raw
                 : CompactRows(raw, width, height, stride);
-            return new CameraPreviewFrame(frameSequence, width, height, writtenAtUnixMs, bgra);
+            return new CameraPreviewFrame(frameSequence, width, height, sourceTimestampUs, sourceSequence, writtenAtUnixMs, bgra);
         }
 
         public void Dispose()
@@ -17640,7 +17929,7 @@ public sealed partial class MainWindow : Window
         }
     }
 
-    private sealed record CameraPreviewFrame(long Sequence, int Width, int Height, long WrittenAtUnixMs, byte[] Bgra);
+    private sealed record CameraPreviewFrame(long Sequence, int Width, int Height, long SourceTimestampUs, long SourceSequence, long WrittenAtUnixMs, byte[] Bgra);
 
     private sealed record AudioRuntimeConfigurationSnapshot(
         bool AudioDeviceEnabled,
