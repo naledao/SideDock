@@ -106,6 +106,7 @@ public sealed partial class MainWindow : Window
     private static readonly string[] HostSupportedCameraCodecs = { "video/avc" };
     private static readonly TimeSpan OverviewPreviewStaleAfter = TimeSpan.FromMilliseconds(1500);
     private static readonly TimeSpan VirtualDisplayStatusCacheDuration = TimeSpan.FromSeconds(30);
+    private static readonly TimeSpan PrimaryNetworkInterfaceCacheDuration = TimeSpan.FromSeconds(30);
     private static readonly string DeviceToolProcessName = Path.GetFileNameWithoutExtension(DeviceToolExe);
     private static readonly UIntPtr WindowSubclassId = new(1);
     private static readonly bool StaticOverviewUi = true;
@@ -210,6 +211,9 @@ public sealed partial class MainWindow : Window
     private DateTimeOffset? _lastNetworkSampleAt;
     private double? _lastNetworkSendBps;
     private double? _lastNetworkReceiveBps;
+    private NetworkInterface? _primaryNetworkInterface;
+    private DateTimeOffset? _lastPrimaryNetworkInterfaceScanAt;
+    private bool _primaryNetworkInterfaceScanInProgress;
     private string _lastOverviewCpuText = "未运行";
     private string _lastOverviewMemoryText = "未运行";
     private string _lastOverviewNetworkText = "暂无数据";
@@ -2663,12 +2667,12 @@ public sealed partial class MainWindow : Window
             _successBrush);
     }
 
-    private static IPAddress? TryGetPrimaryNetworkAddress(out string interfaceName)
+    private IPAddress? TryGetPrimaryNetworkAddress(out string interfaceName)
     {
         interfaceName = string.Empty;
         try
         {
-            var networkInterface = FindPrimaryNetworkInterface();
+            var networkInterface = _primaryNetworkInterface;
             if (networkInterface is null)
             {
                 return null;
@@ -7671,6 +7675,7 @@ public sealed partial class MainWindow : Window
 
     private void UpdateOverviewNetworkDiagnostics()
     {
+        QueuePrimaryNetworkInterfaceRefreshIfNeeded();
         var sample = TryReadPrimaryNetworkDiagnostics();
         if (sample is null || sample.LinkSpeedBps <= 0)
         {
@@ -7699,11 +7704,54 @@ public sealed partial class MainWindow : Window
         UpdateOverviewFooterMachineInfo();
     }
 
+    private void QueuePrimaryNetworkInterfaceRefreshIfNeeded()
+    {
+        if (_primaryNetworkInterfaceScanInProgress)
+        {
+            return;
+        }
+
+        var now = DateTimeOffset.UtcNow;
+        if (_lastPrimaryNetworkInterfaceScanAt is { } lastScanAt
+            && now - lastScanAt < PrimaryNetworkInterfaceCacheDuration)
+        {
+            return;
+        }
+
+        _ = RefreshPrimaryNetworkInterfaceAsync();
+    }
+
+    private async Task RefreshPrimaryNetworkInterfaceAsync()
+    {
+        if (_primaryNetworkInterfaceScanInProgress)
+        {
+            return;
+        }
+
+        _primaryNetworkInterfaceScanInProgress = true;
+        try
+        {
+            _primaryNetworkInterface = await Task.Run(FindPrimaryNetworkInterface);
+            _lastPrimaryNetworkInterfaceScanAt = DateTimeOffset.UtcNow;
+        }
+        catch
+        {
+            _primaryNetworkInterface = null;
+            _lastPrimaryNetworkInterfaceScanAt = DateTimeOffset.UtcNow;
+        }
+        finally
+        {
+            _primaryNetworkInterfaceScanInProgress = false;
+        }
+
+        UpdateOverviewNetworkDiagnostics();
+    }
+
     private NetworkDiagnosticsSample? TryReadPrimaryNetworkDiagnostics()
     {
         try
         {
-            var networkInterface = FindPrimaryNetworkInterface();
+            var networkInterface = _primaryNetworkInterface;
             if (networkInterface is null)
             {
                 return null;
@@ -7742,6 +7790,8 @@ public sealed partial class MainWindow : Window
         }
         catch
         {
+            _primaryNetworkInterface = null;
+            _lastPrimaryNetworkInterfaceScanAt = null;
             return null;
         }
     }
@@ -14908,7 +14958,9 @@ public sealed partial class MainWindow : Window
             _videoDiagnostics.DroppedFrames = droppedFrames;
         }
 
-        UpdateOverviewRuntimeDiagnostics();
+        // Runtime cards are refreshed by _runtimeDiagnosticsTimer. Keeping this handler
+        // parse-only prevents 500 ms Android stats from repeatedly enumerating network
+        // interfaces and rebuilding the diagnostics UI on the window thread.
     }
 
     private void HandleEncoderStatsHostOutputLine(string line)
@@ -14934,7 +14986,7 @@ public sealed partial class MainWindow : Window
             _videoDiagnostics.OutputKbps = outputKbps;
         }
 
-        UpdateOverviewRuntimeDiagnostics();
+        // The periodic runtime diagnostics timer coalesces encoder and client stats.
     }
 
     private void HandleCameraHostOutputLine(string line)
