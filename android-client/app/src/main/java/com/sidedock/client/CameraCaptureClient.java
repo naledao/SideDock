@@ -2561,6 +2561,7 @@ public final class CameraCaptureClient {
     private static final class FrameLatencyTracker {
         private final boolean realtimeTimestampSource;
         private final String timestampSourceName;
+        private final long monotonicToRealtimeOffsetUs;
         private final LinkedHashMap<Long, FrameTiming> pendingTimings = new LinkedHashMap<>();
         private final RollingLatencySamples encoderOutputAgeMs = new RollingLatencySamples();
         private final RollingLatencySamples sensorToCaptureStartedMs = new RollingLatencySamples();
@@ -2579,6 +2580,8 @@ public final class CameraCaptureClient {
         private long failedCaptures;
         private long abortedCaptureSequences;
         private long evictedCaptureTimings;
+        private long rawTimestampMatches;
+        private long adjustedTimestampMatches;
         private long lastCameraFrameNumber = -1L;
 
         FrameLatencyTracker(CameraCharacteristics characteristics) {
@@ -2588,10 +2591,12 @@ public final class CameraCaptureClient {
             realtimeTimestampSource = timestampSource != null
                 && timestampSource == CameraCharacteristics.SENSOR_INFO_TIMESTAMP_SOURCE_REALTIME;
             timestampSourceName = cameraTimestampSourceName(timestampSource);
+            monotonicToRealtimeOffsetUs = sampleMonotonicToRealtimeOffsetUs();
             Log.i(
                 TAG,
                 "camera_timestamp_source source=" + timestampSourceName
                     + " realtimeComparable=" + realtimeTimestampSource
+                    + " monotonicToRealtimeOffsetUs=" + monotonicToRealtimeOffsetUs
                     + " pendingCapacity=" + MAX_CAPTURE_TIMINGS
                     + " sampleCapacity=" + MAX_LATENCY_SAMPLES);
         }
@@ -2670,8 +2675,9 @@ public final class CameraCaptureClient {
         ) {
             encoderOutputFrames += 1L;
             cleanPending(outputArrivalNs);
-            double outputAgeMs = realtimeTimestampSource
-                ? elapsedMs(outputArrivalNs, presentationTimeUs * 1000L)
+            FrameTiming timing = removeMatchingTiming(presentationTimeUs);
+            double outputAgeMs = realtimeTimestampSource && timing != null
+                ? elapsedMs(outputArrivalNs, timing.sensorTimestampNs)
                 : -1.0d;
             encoderOutputAgeMs.add(outputAgeMs);
             if (keyFrame) {
@@ -2680,7 +2686,6 @@ public final class CameraCaptureClient {
                 deltaFrameEncoderOutputAgeMs.add(outputAgeMs);
             }
 
-            FrameTiming timing = removeMatchingTiming(presentationTimeUs);
             if (timing == null) {
                 unmatchedEncoderFrames += 1L;
             } else {
@@ -2710,6 +2715,9 @@ public final class CameraCaptureClient {
                 failedCaptures,
                 abortedCaptureSequences,
                 evictedCaptureTimings,
+                monotonicToRealtimeOffsetUs,
+                rawTimestampMatches,
+                adjustedTimestampMatches,
                 lastCameraFrameNumber,
                 encoderOutputAgeMs.snapshot(),
                 sensorToCaptureStartedMs.snapshot(),
@@ -2721,6 +2729,25 @@ public final class CameraCaptureClient {
         }
 
         private FrameTiming removeMatchingTiming(long presentationTimeUs) {
+            FrameTiming rawMatch = removeTimingNear(presentationTimeUs);
+            if (rawMatch != null) {
+                rawTimestampMatches += 1L;
+                return rawMatch;
+            }
+
+            if (!realtimeTimestampSource) {
+                return null;
+            }
+
+            long adjustedPresentationTimeUs = presentationTimeUs + monotonicToRealtimeOffsetUs;
+            FrameTiming adjustedMatch = removeTimingNear(adjustedPresentationTimeUs);
+            if (adjustedMatch != null) {
+                adjustedTimestampMatches += 1L;
+            }
+            return adjustedMatch;
+        }
+
+        private FrameTiming removeTimingNear(long presentationTimeUs) {
             FrameTiming exact = pendingTimings.remove(presentationTimeUs);
             if (exact != null) {
                 return exact;
@@ -2776,6 +2803,15 @@ public final class CameraCaptureClient {
             return "UNKNOWN";
         }
         return "VALUE_" + timestampSource;
+    }
+
+    private static long sampleMonotonicToRealtimeOffsetUs() {
+        long monotonicBeforeNs = System.nanoTime();
+        long realtimeNs = SystemClock.elapsedRealtimeNanos();
+        long monotonicAfterNs = System.nanoTime();
+        long monotonicMidpointNs = monotonicBeforeNs
+            + ((monotonicAfterNs - monotonicBeforeNs) / 2L);
+        return (realtimeNs - monotonicMidpointNs) / 1000L;
     }
 
     private static double elapsedMs(long laterNs, long earlierNs) {
@@ -2884,6 +2920,9 @@ public final class CameraCaptureClient {
         final long failedCaptures;
         final long abortedCaptureSequences;
         final long evictedCaptureTimings;
+        final long monotonicToRealtimeOffsetUs;
+        final long rawTimestampMatches;
+        final long adjustedTimestampMatches;
         final long lastCameraFrameNumber;
         final LatencyPercentiles encoderOutputAgeMs;
         final LatencyPercentiles sensorToCaptureStartedMs;
@@ -2906,6 +2945,9 @@ public final class CameraCaptureClient {
             long failedCaptures,
             long abortedCaptureSequences,
             long evictedCaptureTimings,
+            long monotonicToRealtimeOffsetUs,
+            long rawTimestampMatches,
+            long adjustedTimestampMatches,
             long lastCameraFrameNumber,
             LatencyPercentiles encoderOutputAgeMs,
             LatencyPercentiles sensorToCaptureStartedMs,
@@ -2927,6 +2969,9 @@ public final class CameraCaptureClient {
             this.failedCaptures = failedCaptures;
             this.abortedCaptureSequences = abortedCaptureSequences;
             this.evictedCaptureTimings = evictedCaptureTimings;
+            this.monotonicToRealtimeOffsetUs = monotonicToRealtimeOffsetUs;
+            this.rawTimestampMatches = rawTimestampMatches;
+            this.adjustedTimestampMatches = adjustedTimestampMatches;
             this.lastCameraFrameNumber = lastCameraFrameNumber;
             this.encoderOutputAgeMs = encoderOutputAgeMs;
             this.sensorToCaptureStartedMs = sensorToCaptureStartedMs;
@@ -2967,6 +3012,9 @@ public final class CameraCaptureClient {
                 + " aborted=" + abortedCaptureSequences
                 + " evicted=" + evictedCaptureTimings
                 + " lastFrame=" + lastCameraFrameNumber + ")"
+                + " ptsClock(monotonicToRealtimeOffsetUs=" + monotonicToRealtimeOffsetUs
+                + " rawMatches=" + rawTimestampMatches
+                + " adjustedMatches=" + adjustedTimestampMatches + ")"
                 + " encoderOutputAgeMs{" + encoderOutputAgeMs.toLogString() + "}"
                 + " sensorToCaptureStartedMs{" + sensorToCaptureStartedMs.toLogString() + "}"
                 + " sensorToCaptureCompleteMs{" + sensorToCaptureCompleteMs.toLogString() + "}"
