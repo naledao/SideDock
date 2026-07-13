@@ -17960,6 +17960,7 @@ public sealed partial class MainWindow : Window
 
         private readonly MemoryMappedFile _mapping;
         private readonly MemoryMappedViewAccessor _view;
+        private byte[] _frameBuffer = Array.Empty<byte>();
 
         private OverviewPreviewFrameReader(MemoryMappedFile mapping, MemoryMappedViewAccessor view)
         {
@@ -18018,8 +18019,14 @@ public sealed partial class MainWindow : Window
                 throw new InvalidDataException("预览帧缓存格式不匹配。");
             }
 
-            var raw = new byte[frameBytes];
-            _view.ReadArray(HeaderSize, raw, 0, raw.Length);
+            var rowBytes = checked(width * 4);
+            var compactFrameBytes = checked(rowBytes * height);
+            if (_frameBuffer.Length != compactFrameBytes)
+            {
+                _frameBuffer = new byte[compactFrameBytes];
+            }
+
+            ReadFrameRows(_view, _frameBuffer, width, height, stride);
 
             var sequenceAfter = _view.ReadInt64(32);
             if (sequenceAfter != sequenceBefore || (sequenceAfter & 1) != 0)
@@ -18027,10 +18034,7 @@ public sealed partial class MainWindow : Window
                 return null;
             }
 
-            var bgra = stride == width * 4
-                ? raw
-                : CompactRows(raw, width, height, stride);
-            return new OverviewPreviewFrame(frameSequence, width, height, writtenAtUnixMs, bgra);
+            return new OverviewPreviewFrame(frameSequence, width, height, writtenAtUnixMs, _frameBuffer);
         }
 
         public void Dispose()
@@ -18039,16 +18043,24 @@ public sealed partial class MainWindow : Window
             _mapping.Dispose();
         }
 
-        private static byte[] CompactRows(byte[] raw, int width, int height, int stride)
+        private static void ReadFrameRows(
+            MemoryMappedViewAccessor view,
+            byte[] destination,
+            int width,
+            int height,
+            int stride)
         {
             var rowBytes = width * 4;
-            var compact = new byte[rowBytes * height];
-            for (var y = 0; y < height; y++)
+            if (stride == rowBytes)
             {
-                Buffer.BlockCopy(raw, y * stride, compact, y * rowBytes, rowBytes);
+                view.ReadArray(HeaderSize, destination, 0, destination.Length);
+                return;
             }
 
-            return compact;
+            for (var y = 0; y < height; y++)
+            {
+                view.ReadArray(HeaderSize + (long)y * stride, destination, y * rowBytes, rowBytes);
+            }
         }
     }
 
@@ -18065,6 +18077,7 @@ public sealed partial class MainWindow : Window
 
         private readonly MemoryMappedFile _mapping;
         private readonly MemoryMappedViewAccessor _view;
+        private byte[] _frameBuffer = Array.Empty<byte>();
 
         private CameraPreviewFrameReader(MemoryMappedFile mapping, MemoryMappedViewAccessor view)
         {
@@ -18125,8 +18138,14 @@ public sealed partial class MainWindow : Window
                 return null;
             }
 
-            var raw = new byte[frameBytes];
-            _view.ReadArray(HeaderSize, raw, 0, raw.Length);
+            var rowBytes = checked(width * 4);
+            var compactFrameBytes = checked(rowBytes * height);
+            if (_frameBuffer.Length != compactFrameBytes)
+            {
+                _frameBuffer = new byte[compactFrameBytes];
+            }
+
+            ReadFrameRows(_view, _frameBuffer, width, height, stride);
 
             var sequenceAfter = _view.ReadInt64(32);
             if (sequenceAfter != sequenceBefore || (sequenceAfter & 1) != 0)
@@ -18134,10 +18153,7 @@ public sealed partial class MainWindow : Window
                 return null;
             }
 
-            var bgra = stride == width * 4
-                ? raw
-                : CompactRows(raw, width, height, stride);
-            return new CameraPreviewFrame(frameSequence, width, height, sourceTimestampUs, sourceSequence, writtenAtUnixMs, bgra);
+            return new CameraPreviewFrame(frameSequence, width, height, sourceTimestampUs, sourceSequence, writtenAtUnixMs, _frameBuffer);
         }
 
         public void Dispose()
@@ -18146,16 +18162,24 @@ public sealed partial class MainWindow : Window
             _mapping.Dispose();
         }
 
-        private static byte[] CompactRows(byte[] raw, int width, int height, int stride)
+        private static void ReadFrameRows(
+            MemoryMappedViewAccessor view,
+            byte[] destination,
+            int width,
+            int height,
+            int stride)
         {
             var rowBytes = width * 4;
-            var compact = new byte[rowBytes * height];
-            for (var y = 0; y < height; y++)
+            if (stride == rowBytes)
             {
-                Buffer.BlockCopy(raw, y * stride, compact, y * rowBytes, rowBytes);
+                view.ReadArray(HeaderSize, destination, 0, destination.Length);
+                return;
             }
 
-            return compact;
+            for (var y = 0; y < height; y++)
+            {
+                view.ReadArray(HeaderSize + (long)y * stride, destination, y * rowBytes, rowBytes);
+            }
         }
     }
 
