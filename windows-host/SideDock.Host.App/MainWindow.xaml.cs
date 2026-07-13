@@ -8,6 +8,7 @@ using System.Net.Sockets;
 using System.Reflection;
 using System.Runtime.InteropServices;
 using System.Runtime.InteropServices.WindowsRuntime;
+using System.Security.Cryptography;
 using System.Text;
 using System.Text.Json;
 using System.Text.RegularExpressions;
@@ -13445,6 +13446,14 @@ public sealed partial class MainWindow : Window
     {
         try
         {
+            using var userRoot = RegistryKey.OpenBaseKey(RegistryHive.CurrentUser, RegistryView.Registry64);
+            using var userKey = userRoot.OpenSubKey($@"Software\Classes\CLSID\{VirtualCameraMediaSourceClsid}\InProcServer32");
+            if (!string.IsNullOrWhiteSpace(userKey?.GetValue(null) as string))
+            {
+                return false;
+            }
+
+            var expectedMachineDllPath = GetMachineVirtualCameraMediaSourcePath(expectedDllPath);
             using var root = RegistryKey.OpenBaseKey(RegistryHive.LocalMachine, RegistryView.Registry64);
             using var key = root.OpenSubKey($@"Software\Classes\CLSID\{VirtualCameraMediaSourceClsid}\InProcServer32");
             var registeredPath = key?.GetValue(null) as string;
@@ -13452,13 +13461,24 @@ public sealed partial class MainWindow : Window
                 && File.Exists(registeredPath)
                 && string.Equals(
                     Path.GetFullPath(registeredPath),
-                    Path.GetFullPath(expectedDllPath),
+                    expectedMachineDllPath,
                     StringComparison.OrdinalIgnoreCase);
         }
         catch
         {
             return false;
         }
+    }
+
+    private static string GetMachineVirtualCameraMediaSourcePath(string sourceDllPath)
+    {
+        using var stream = File.OpenRead(sourceDllPath);
+        var fingerprint = Convert.ToHexString(SHA256.HashData(stream))[..16].ToLowerInvariant();
+        return Path.Combine(
+            Environment.GetFolderPath(Environment.SpecialFolder.CommonApplicationData),
+            "SideDock",
+            "VirtualCamera",
+            $"SideDock.VirtualCamera.MediaSource.{fingerprint}.dll");
     }
 
     private async Task<VirtualCameraToolResult> RunVirtualCameraToolAsync(string command, string scope)

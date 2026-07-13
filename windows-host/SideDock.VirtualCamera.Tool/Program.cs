@@ -1,4 +1,5 @@
 using System.Runtime.InteropServices;
+using System.Security.Cryptography;
 using System.Text;
 using System.Text.Json;
 using Microsoft.Win32;
@@ -12,6 +13,7 @@ internal static class Program
     private const string CameraName = "SideDock Camera";
     private const string MediaSourceFriendlyName = "SideDock Camera Media Source";
     private const string MediaSourceClsid = "{951EE24C-E200-4E62-8035-F76214F695D2}";
+    private const string MediaSourceDllName = "SideDock.VirtualCamera.MediaSource.dll";
     private const string InProcServer32SubKey = $@"Software\Classes\CLSID\{MediaSourceClsid}\InProcServer32";
     private const int MfVersion = 0x00020070;
     private static readonly JsonSerializerOptions JsonOptions = new(JsonSerializerDefaults.Web) { WriteIndented = true };
@@ -84,13 +86,7 @@ Defaults: --scope user, --lifetime system, --access currentUser.
 
     private static int Install(CommandOptions options)
     {
-        var dllPath = ResolveMediaSourceDllPath(options);
-        if (!File.Exists(dllPath))
-        {
-            throw new FileNotFoundException("Media source DLL was not found.", dllPath);
-        }
-
-        InstallComRegistration(options.Scope, dllPath);
+        var dllPath = InstallRegistration(options);
         Console.WriteLine(JsonSerializer.Serialize(new
         {
             ok = true,
@@ -104,7 +100,8 @@ Defaults: --scope user, --lifetime system, --access currentUser.
 
     private static async Task<int> EnsureStartAsync(CommandOptions options)
     {
-        if (!GetRegistration(options.Scope).Registered)
+        var registration = GetRegistration(options.Scope);
+        if (options.Scope.Equals("machine", StringComparison.OrdinalIgnoreCase))
         {
             var dllPath = ResolveMediaSourceDllPath(options);
             if (!File.Exists(dllPath))
@@ -112,7 +109,18 @@ Defaults: --scope user, --lifetime system, --access currentUser.
                 throw new FileNotFoundException("Media source DLL was not found.", dllPath);
             }
 
-            InstallComRegistration(options.Scope, dllPath);
+            var expectedPath = GetMachineMediaSourcePath(dllPath);
+            var userRegistration = GetRegistration("user");
+            if (!registration.Registered
+                || !string.Equals(registration.DllPath, expectedPath, StringComparison.OrdinalIgnoreCase)
+                || userRegistration.Registered)
+            {
+                InstallRegistration(options);
+            }
+        }
+        else if (!registration.Registered)
+        {
+            InstallRegistration(options);
         }
 
         return await StartAsync(options);
@@ -298,6 +306,54 @@ Defaults: --scope user, --lifetime system, --access currentUser.
         inprocKey.SetValue("ThreadingModel", "Both", RegistryValueKind.String);
     }
 
+    private static string InstallRegistration(CommandOptions options)
+    {
+        var sourceDllPath = ResolveMediaSourceDllPath(options);
+        if (!File.Exists(sourceDllPath))
+        {
+            throw new FileNotFoundException("Media source DLL was not found.", sourceDllPath);
+        }
+
+        var registrationDllPath = options.Scope.Equals("machine", StringComparison.OrdinalIgnoreCase)
+            ? StageMachineMediaSource(sourceDllPath)
+            : sourceDllPath;
+        InstallComRegistration(options.Scope, registrationDllPath);
+
+        // HKCU takes precedence over HKLM when COM resolves HKCR. Remove an old
+        // per-user SideDock registration so it cannot redirect Frame Server back
+        // to a launcher/AppData path that LocalService cannot access.
+        if (options.Scope.Equals("machine", StringComparison.OrdinalIgnoreCase))
+        {
+            RemoveComRegistration("user");
+        }
+
+        return registrationDllPath;
+    }
+
+    private static string StageMachineMediaSource(string sourceDllPath)
+    {
+        var targetPath = GetMachineMediaSourcePath(sourceDllPath);
+        Directory.CreateDirectory(Path.GetDirectoryName(targetPath)
+            ?? throw new InvalidOperationException("Machine media source directory is unavailable."));
+        if (!File.Exists(targetPath))
+        {
+            File.Copy(sourceDllPath, targetPath, overwrite: false);
+        }
+
+        return targetPath;
+    }
+
+    private static string GetMachineMediaSourcePath(string sourceDllPath)
+    {
+        using var stream = File.OpenRead(sourceDllPath);
+        var fingerprint = Convert.ToHexString(SHA256.HashData(stream))[..16].ToLowerInvariant();
+        return Path.Combine(
+            Environment.GetFolderPath(Environment.SpecialFolder.CommonApplicationData),
+            "SideDock",
+            "VirtualCamera",
+            $"SideDock.VirtualCamera.MediaSource.{fingerprint}.dll");
+    }
+
     private static void RemoveComRegistration(string scope)
     {
         var hive = ScopeHive(scope);
@@ -321,7 +377,7 @@ Defaults: --scope user, --lifetime system, --access currentUser.
 
         var candidates = new List<string>
         {
-            Path.Combine(AppContext.BaseDirectory, "SideDock.VirtualCamera.MediaSource.dll")
+            Path.Combine(AppContext.BaseDirectory, MediaSourceDllName)
         };
 
         var current = new DirectoryInfo(AppContext.BaseDirectory);
@@ -333,13 +389,13 @@ Defaults: --scope user, --lifetime system, --access currentUser.
                 "SideDock.VirtualCamera.MediaSource",
                 "x64",
                 "Debug",
-                "SideDock.VirtualCamera.MediaSource.dll"));
+                MediaSourceDllName));
             candidates.Add(Path.Combine(
                 current.FullName,
                 "SideDock.VirtualCamera.MediaSource",
                 "x64",
                 "Debug",
-                "SideDock.VirtualCamera.MediaSource.dll"));
+                MediaSourceDllName));
             current = current.Parent;
         }
 
