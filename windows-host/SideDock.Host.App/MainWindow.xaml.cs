@@ -300,9 +300,6 @@ public sealed partial class MainWindow : Window
     private int _pendingCameraRuntimeConfigSerial;
     private string _cameraRuntimeApplyMessage = "";
     private DateTimeOffset? _cameraRuntimeApplyCompletedAt;
-    private bool _virtualCameraAutoRecoveryInProgress;
-    private int _virtualCameraAutoRecoveryFailures;
-    private DateTimeOffset? _lastVirtualCameraAutoRecoveryAt;
     private bool _virtualAudioCableInstallInProgress;
     private VirtualDisplayOverviewState? _virtualDisplayTransientState;
     private string? _virtualDisplayLastError;
@@ -1968,7 +1965,7 @@ public sealed partial class MainWindow : Window
             return new DiagnosticsHealthCheckState
             {
                 Status = DiagnosticsStatusKind.Normal,
-                Detail = $"已注册并运行，设备数 {_virtualCameraDiagnostics.DeviceCount}，供帧 {FormatVirtualCameraServedAt(_virtualCameraDiagnostics.LastServedAt)}"
+                Detail = $"已注册并运行，设备数 {_virtualCameraDiagnostics.DeviceCount}，{FormatVirtualCameraServingSummary(_virtualCameraDiagnostics)}"
             };
         }
 
@@ -12351,7 +12348,7 @@ public sealed partial class MainWindow : Window
         var virtualCamera = _virtualCameraDiagnostics;
         VirtualCameraStatusText.Text =
             $"注册: {virtualCamera.RegistrationText} · 运行: {virtualCamera.RunningText} · "
-            + $"供帧: {FormatVirtualCameraServedAt(virtualCamera.LastServedAt)} · 源帧 {virtualCamera.SourceFrameSequence}";
+            + $"最近供帧: {FormatVirtualCameraServedAt(virtualCamera.LastServedAt)} · 源帧 {virtualCamera.SourceFrameSequence}";
         if (!string.IsNullOrWhiteSpace(virtualCamera.LastError) && string.IsNullOrWhiteSpace(camera.LastError))
         {
             CameraErrorText.Text = virtualCamera.LastError;
@@ -12404,7 +12401,7 @@ public sealed partial class MainWindow : Window
         else if (IsCameraReceiving(camera) && virtualCamera.Running)
         {
             title = "摄像头链路正常";
-            detail = $"视频流正在接收，虚拟相机{virtualCamera.RunningText}，供帧 {FormatVirtualCameraServedAt(virtualCamera.LastServedAt)}。";
+            detail = $"视频流正在接收，虚拟相机{virtualCamera.RunningText}，{FormatVirtualCameraServingSummary(virtualCamera)}。";
             glyph = "\uE73E";
             foreground = _successBrush;
             background = _overviewReadyBackgroundBrush;
@@ -12623,8 +12620,8 @@ public sealed partial class MainWindow : Window
         }
         else if (virtualCamera.Running)
         {
-            OverviewVirtualCameraServingText.Text = $"等待供帧 · {FormatVirtualCameraServedAt(virtualCamera.LastServedAt)}";
-            OverviewVirtualCameraServingText.Foreground = _warningBrush;
+            OverviewVirtualCameraServingText.Text = FormatVirtualCameraServingSummary(virtualCamera);
+            OverviewVirtualCameraServingText.Foreground = _secondaryBrush;
         }
         else
         {
@@ -12642,6 +12639,19 @@ public sealed partial class MainWindow : Window
 
         var age = DateTimeOffset.UtcNow - virtualCamera.LastServedAt.Value.ToUniversalTime();
         return virtualCamera.Running && age.TotalSeconds <= 5;
+    }
+
+    private static string FormatVirtualCameraServingSummary(VirtualCameraDiagnosticsState virtualCamera)
+    {
+        if (IsVirtualCameraServing(virtualCamera))
+        {
+            return $"正在供帧，源帧 {virtualCamera.SourceFrameSequence}";
+        }
+
+        var lastServed = FormatVirtualCameraServedAt(virtualCamera.LastServedAt);
+        return lastServed == "--"
+            ? "已就绪，等待应用使用"
+            : $"已就绪，等待应用使用；最近供帧 {lastServed}";
     }
 
     private void UpdateOverviewCameraRecentEvents()
@@ -13548,69 +13558,7 @@ public sealed partial class MainWindow : Window
     {
         TryApplyVirtualCameraServedStatusFile();
         TryApplyVirtualCameraToolStatusFile();
-        if (IsVirtualCameraServing(_virtualCameraDiagnostics))
-        {
-            _virtualCameraAutoRecoveryFailures = 0;
-        }
-
-        MaybeRecoverVirtualCameraServing();
         UpdateCameraStatusView();
-    }
-
-    private void MaybeRecoverVirtualCameraServing()
-    {
-        if (_virtualCameraAutoRecoveryInProgress
-            || !_overviewCameraRequestedEnabled
-            || _hostProcess is not { HasExited: false }
-            || !IsCameraReceiving(_cameraDiagnostics)
-            || !_virtualCameraDiagnostics.Running
-            || IsVirtualCameraServing(_virtualCameraDiagnostics)
-            || _virtualCameraAutoRecoveryFailures >= 3)
-        {
-            return;
-        }
-
-        if (_lastVirtualCameraAutoRecoveryAt is not null
-            && DateTimeOffset.Now - _lastVirtualCameraAutoRecoveryAt.Value < TimeSpan.FromSeconds(30))
-        {
-            return;
-        }
-
-        _ = RecoverVirtualCameraServingAsync();
-    }
-
-    private async Task RecoverVirtualCameraServingAsync()
-    {
-        _virtualCameraAutoRecoveryInProgress = true;
-        _lastVirtualCameraAutoRecoveryAt = DateTimeOffset.Now;
-        _virtualCameraDiagnostics.LastToolState = "auto-recover-serving";
-        AppendRecentCameraLogLine("camera-recovery-event=virtual_camera_recovery_start reason=serving_stalled");
-        UpdateCameraStatusView();
-
-        try
-        {
-            await RunVirtualCameraCommandAsync("ensure-start");
-            RefreshVirtualCameraStatusFromFiles();
-            if (IsVirtualCameraServing(_virtualCameraDiagnostics))
-            {
-                _virtualCameraAutoRecoveryFailures = 0;
-                AppendRecentCameraLogLine("camera-recovery-event=virtual_camera_recovery_success");
-            }
-            else
-            {
-                _virtualCameraAutoRecoveryFailures++;
-                if (_virtualCameraAutoRecoveryFailures >= 3)
-                {
-                    _virtualCameraDiagnostics.LastError = "Virtual camera serving stalled; automatic recovery failed 3 times. Use restart or check the virtual camera driver.";
-                }
-                AppendRecentCameraLogLine($"camera-recovery-event=virtual_camera_recovery_failed failures={_virtualCameraAutoRecoveryFailures}");
-            }
-        }
-        finally
-        {
-            _virtualCameraAutoRecoveryInProgress = false;
-            UpdateCameraStatusView();
-        }
     }
 
     private void TryApplyVirtualCameraServedStatusFile()
