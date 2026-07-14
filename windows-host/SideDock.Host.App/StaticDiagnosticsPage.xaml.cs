@@ -62,6 +62,8 @@ public sealed partial class StaticDiagnosticsPage : UserControl
     private DiagnosticsTrendRange _selectedTrendRange = DiagnosticsTrendRange.OneMinute;
     private DiagnosticsOperationKind? _busyOperation;
     private bool _isHostRunning;
+    private bool _logRowsDirty;
+    private bool _performanceTrendDirty;
 
     public StaticDiagnosticsPage()
     {
@@ -145,6 +147,7 @@ public sealed partial class StaticDiagnosticsPage : UserControl
         _portStates = state.Ports.Count > 0 ? state.Ports : DiagnosticsPortState.DefaultPorts;
         RenderPortSummaryRows();
         UpdateLogEmptyState();
+        RefreshDeferredVisualsIfVisible();
     }
 
     public void AppendLog(
@@ -183,10 +186,18 @@ public sealed partial class StaticDiagnosticsPage : UserControl
         {
             var removed = _logEntries[0];
             _logEntries.RemoveAt(0);
-            if (MatchesSelectedLogSource(removed) && DiagnosticsLogPanel.Children.Count > 0)
+            if (Visibility == Visibility.Visible
+                && MatchesSelectedLogSource(removed)
+                && DiagnosticsLogPanel.Children.Count > 0)
             {
                 DiagnosticsLogPanel.Children.RemoveAt(0);
             }
+        }
+
+        if (Visibility != Visibility.Visible)
+        {
+            _logRowsDirty = true;
+            return;
         }
 
         if (MatchesSelectedLogSource(entry))
@@ -214,20 +225,25 @@ public sealed partial class StaticDiagnosticsPage : UserControl
                 _performanceSamples.Clear();
             }
 
-            RenderPerformanceTrend();
-            UpdateLogEmptyState();
+            RequestPerformanceTrendRender();
             return;
         }
 
         _performanceSamples.Add(sample);
         var cutoff = sample.Timestamp - MaxPerformanceTrendRange;
         _performanceSamples.RemoveAll(existing => existing.Timestamp < cutoff);
-        RenderPerformanceTrend();
-        UpdateLogEmptyState();
+        RequestPerformanceTrendRender();
     }
 
     private void RenderLogRows()
     {
+        if (Visibility != Visibility.Visible)
+        {
+            _logRowsDirty = true;
+            return;
+        }
+
+        _logRowsDirty = false;
         DiagnosticsLogPanel.Children.Clear();
         foreach (var entry in _logEntries.Where(MatchesSelectedLogSource))
         {
@@ -499,6 +515,13 @@ public sealed partial class StaticDiagnosticsPage : UserControl
 
     private void RenderPerformanceTrend()
     {
+        if (Visibility != Visibility.Visible)
+        {
+            _performanceTrendDirty = true;
+            return;
+        }
+
+        _performanceTrendDirty = false;
         UpdateTrendRangeButtons();
         DiagnosticsTrendCanvas.Children.Clear();
 
@@ -559,6 +582,36 @@ public sealed partial class StaticDiagnosticsPage : UserControl
         DrawNetworkBars(visibleSamples, start, now, width, height, networkScaleMbps);
         DrawTrendLine(visibleSamples, start, now, width, height, sample => sample.MemoryBytes, memoryScaleBytes, _memoryTrendBrush);
         DrawTrendLine(visibleSamples, start, now, width, height, sample => sample.CpuPercent, 100, _cpuTrendBrush);
+    }
+
+    private void RequestPerformanceTrendRender()
+    {
+        if (Visibility == Visibility.Visible)
+        {
+            RenderPerformanceTrend();
+            UpdateLogEmptyState();
+            return;
+        }
+
+        _performanceTrendDirty = true;
+    }
+
+    private void RefreshDeferredVisualsIfVisible()
+    {
+        if (Visibility != Visibility.Visible)
+        {
+            return;
+        }
+
+        if (_logRowsDirty)
+        {
+            RenderLogRows();
+        }
+
+        if (_performanceTrendDirty)
+        {
+            RenderPerformanceTrend();
+        }
     }
 
     private void DrawTrendGrid(double width, double height)

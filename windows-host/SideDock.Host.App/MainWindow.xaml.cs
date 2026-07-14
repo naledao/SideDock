@@ -103,6 +103,7 @@ public sealed partial class MainWindow : Window
     private const int HostPortReleaseWaitMs = 2500;
     private const string AudioPreferencesFileName = "audio-preferences.json";
     private static readonly TimeSpan AudioTelemetryStaleAfter = TimeSpan.FromSeconds(5);
+    private static readonly TimeSpan CameraPreviewStatusRefreshInterval = TimeSpan.FromSeconds(1);
     private static readonly string[] HostSupportedCameraCodecs = { "video/avc" };
     private static readonly TimeSpan OverviewPreviewStaleAfter = TimeSpan.FromMilliseconds(1500);
     private static readonly TimeSpan VirtualDisplayStatusCacheDuration = TimeSpan.FromSeconds(30);
@@ -236,6 +237,8 @@ public sealed partial class MainWindow : Window
     private string _lastAdbReverseDetail = "启动主机时自动配置 ADB reverse。";
     private bool _restartingForCameraFacing;
     private bool _cameraPreviewEnabled = true;
+    private bool _previewTimersReady;
+    private bool _windowHiddenToTray;
     private bool _loadingAudioEndpointChoices;
     private string? _boundMicrophoneRenderEndpointId;
     private string? _boundMicrophoneRenderEndpointName;
@@ -258,6 +261,7 @@ public sealed partial class MainWindow : Window
     private DateTimeOffset? _lastCameraPreviewAt;
     private DateTimeOffset? _lastCameraPreviewReadAt;
     private DateTimeOffset? _lastCameraPreviewLatencyLogAt;
+    private DateTimeOffset? _lastCameraPreviewStatusRefreshAt;
     private long _lastCameraPreviewSourceSequence;
     private long _lastCameraPreviewSourceTimestampUs;
     private double _lastCameraPreviewFrameAgeMs;
@@ -270,6 +274,9 @@ public sealed partial class MainWindow : Window
     private long _lastOverviewPreviewSequence;
     private DateTimeOffset? _lastOverviewPreviewAt;
     private OverviewPreviewState _overviewPreviewState = OverviewPreviewState.HostNotStarted;
+    private string? _overviewPreviewStateDetail;
+    private bool _overviewPreviewStateHasImage;
+    private bool _overviewPreviewStateInitialized;
     private bool _overviewPreviewEnabled = true;
     private bool _overviewPreviewFillMode;
     private bool _overviewPreviewOverlayVisible = true;
@@ -481,24 +488,13 @@ public sealed partial class MainWindow : Window
 
         _cameraPreviewTimer.Interval = TimeSpan.FromMilliseconds(CameraPreviewIntervalMs);
         _cameraPreviewTimer.Tick += (_, _) => UpdateCameraPreview();
-        if (!StaticOverviewUi)
-        {
-            _cameraPreviewTimer.Start();
-        }
 
         UpdateCameraPreviewToggleView();
 
         _overviewPreviewTimer.Interval = TimeSpan.FromMilliseconds(OverviewPreviewIntervalMs);
         _overviewPreviewTimer.Tick += (_, _) => UpdateOverviewPreview();
-        if (StaticOverviewUi && _overviewPreviewEnabled)
-        {
-            SetOverviewPreviewConsumerAlive(true);
-            _overviewPreviewTimer.Start();
-        }
-        else
-        {
-            SetOverviewPreviewConsumerAlive(false);
-        }
+        _previewTimersReady = true;
+        UpdatePreviewTimerActivity(refreshActivePreviews: true);
 
         UpdateOverviewPreviewChrome();
         SetOverviewPreviewState(_overviewPreviewEnabled
@@ -939,6 +935,7 @@ public sealed partial class MainWindow : Window
         }
 
         UpdateOverviewPageChrome(item);
+        UpdatePreviewTimerActivity(refreshActivePreviews: true);
     }
 
     private void UpdateOverviewPageChrome(OverviewNavigationItem item)
@@ -987,13 +984,50 @@ public sealed partial class MainWindow : Window
 
         if (showCameraPage)
         {
-            if (_cameraPreviewEnabled)
+            UpdateCameraStatusView();
+        }
+    }
+
+    private void UpdatePreviewTimerActivity(bool refreshActivePreviews = false)
+    {
+        if (!_previewTimersReady)
+        {
+            return;
+        }
+
+        var overviewPreviewActive = StaticOverviewUi
+            && !_windowHiddenToTray
+            && _overviewNavigationItem == OverviewNavigationItem.Overview
+            && _overviewPreviewEnabled;
+        if (overviewPreviewActive)
+        {
+            SetOverviewPreviewConsumerAlive(true);
+            _overviewPreviewTimer.Start();
+            if (refreshActivePreviews)
             {
-                _cameraPreviewTimer.Start();
+                UpdateOverviewPreview();
+            }
+        }
+        else
+        {
+            _overviewPreviewTimer.Stop();
+            SetOverviewPreviewConsumerAlive(false);
+        }
+
+        var cameraPreviewActive = _cameraPreviewEnabled
+            && !_windowHiddenToTray
+            && (!StaticOverviewUi || _overviewNavigationItem == OverviewNavigationItem.Camera);
+        if (cameraPreviewActive)
+        {
+            _cameraPreviewTimer.Start();
+            if (refreshActivePreviews)
+            {
                 UpdateCameraPreview();
             }
-
-            UpdateCameraStatusView();
+        }
+        else
+        {
+            _cameraPreviewTimer.Stop();
         }
     }
 
@@ -3478,6 +3512,8 @@ public sealed partial class MainWindow : Window
 
     private void HideToTray()
     {
+        _windowHiddenToTray = true;
+        UpdatePreviewTimerActivity();
         ShowWindow(_windowHandle, SwHide);
     }
 
@@ -3485,6 +3521,8 @@ public sealed partial class MainWindow : Window
     {
         DispatcherQueue.TryEnqueue(() =>
         {
+            _windowHiddenToTray = false;
+            UpdatePreviewTimerActivity(refreshActivePreviews: true);
             ShowWindow(_windowHandle, SwShow);
             ShowWindow(_windowHandle, SwRestore);
             Activate();
@@ -3992,11 +4030,26 @@ public sealed partial class MainWindow : Window
             return;
         }
 
+        if (stream.Equals("stdout", StringComparison.OrdinalIgnoreCase)
+            && IsHighFrequencyHostTelemetryLine(line))
+        {
+            return;
+        }
+
         var source = ClassifyHostOutputLogSource(line);
         var severity = stream.Equals("stderr", StringComparison.OrdinalIgnoreCase)
             ? DiagnosticsLogSeverity.Error
             : InferDiagnosticsLogSeverity(line);
         AppendStaticDiagnosticsLog(source, $"{stream}: {line}", severity, isHostPipe: true);
+    }
+
+    private static bool IsHighFrequencyHostTelemetryLine(string line)
+    {
+        return line.Contains("audio_runtime_telemetry", StringComparison.OrdinalIgnoreCase)
+            || line.Contains("video stats", StringComparison.OrdinalIgnoreCase)
+            || line.Contains("android input stats 1s", StringComparison.OrdinalIgnoreCase)
+            || (line.Contains("[ENCODER", StringComparison.OrdinalIgnoreCase)
+                && line.Contains(" stats ", StringComparison.OrdinalIgnoreCase));
     }
 
     private void AppendAdbCommandDiagnosticsLog(string arguments, AdbCommandResult result)
@@ -11988,13 +12041,11 @@ public sealed partial class MainWindow : Window
         {
             if (enabled)
             {
-                SetOverviewPreviewConsumerAlive(true);
-                _overviewPreviewTimer.Start();
-                UpdateOverviewPreview();
+                UpdatePreviewTimerActivity(refreshActivePreviews: true);
             }
             else
             {
-                SetOverviewPreviewConsumerAlive(false);
+                UpdatePreviewTimerActivity();
                 ResetOverviewPreview(clearImage: true);
                 SetOverviewPreviewState(OverviewPreviewState.Disabled);
             }
@@ -12006,17 +12057,14 @@ public sealed partial class MainWindow : Window
         _overviewPreviewEnabled = enabled;
         if (enabled)
         {
-            SetOverviewPreviewConsumerAlive(true);
             SetOverviewPreviewState(IsHostRunningForPreview()
                 ? OverviewPreviewState.WaitingSource
                 : OverviewPreviewState.HostNotStarted);
-            _overviewPreviewTimer.Start();
-            UpdateOverviewPreview();
+            UpdatePreviewTimerActivity(refreshActivePreviews: true);
         }
         else
         {
-            _overviewPreviewTimer.Stop();
-            SetOverviewPreviewConsumerAlive(false);
+            UpdatePreviewTimerActivity();
             ResetOverviewPreview(clearImage: true);
             SetOverviewPreviewState(OverviewPreviewState.Disabled);
         }
@@ -12088,7 +12136,19 @@ public sealed partial class MainWindow : Window
 
     private void SetOverviewPreviewState(OverviewPreviewState state, string? detail = null)
     {
+        var hasImage = OverviewPreviewImage?.Source is not null;
+        if (_overviewPreviewStateInitialized
+            && _overviewPreviewState == state
+            && string.Equals(_overviewPreviewStateDetail, detail, StringComparison.Ordinal)
+            && _overviewPreviewStateHasImage == hasImage)
+        {
+            return;
+        }
+
         _overviewPreviewState = state;
+        _overviewPreviewStateDetail = detail;
+        _overviewPreviewStateHasImage = hasImage;
+        _overviewPreviewStateInitialized = true;
         if (OverviewPreviewStatusText is null)
         {
             return;
@@ -12116,7 +12176,6 @@ public sealed partial class MainWindow : Window
             _ => _overviewPreviewNeutralBadgeBrush
         };
 
-        var hasImage = OverviewPreviewImage?.Source is not null;
         var showEmpty = state is OverviewPreviewState.Disabled or OverviewPreviewState.HostNotStarted or OverviewPreviewState.WaitingSource or OverviewPreviewState.Unavailable or OverviewPreviewState.Error
             || !hasImage;
         OverviewPreviewEmptyState.Visibility = showEmpty ? Visibility.Visible : Visibility.Collapsed;
@@ -12194,6 +12253,7 @@ public sealed partial class MainWindow : Window
             if (_cameraPreviewReader is null)
             {
                 SetCameraPreviewPlaceholder("等待摄像头解码帧", visible: true);
+                RefreshCameraPreviewStatusIfNeeded();
                 return;
             }
 
@@ -12241,7 +12301,7 @@ public sealed partial class MainWindow : Window
             _cameraDiagnostics.PreviewCopyMs = _lastCameraPreviewCopyMs;
             LogCameraPreviewLatency(frame, frameAgeMs, _lastCameraPreviewCopyMs);
             SetCameraPreviewPlaceholder("", visible: false);
-            UpdateCameraStatusView();
+            RefreshCameraPreviewStatusIfNeeded();
         }
         catch (FileNotFoundException)
         {
@@ -12255,7 +12315,7 @@ public sealed partial class MainWindow : Window
             _cameraPreviewReader = null;
             _cameraDiagnostics.LastError = ex.Message;
             SetCameraPreviewPlaceholder("预览缓存暂不可读", visible: true);
-            UpdateCameraStatusView();
+            RefreshCameraPreviewStatusIfNeeded(force: true);
         }
     }
 
@@ -12264,9 +12324,24 @@ public sealed partial class MainWindow : Window
         if (_lastCameraPreviewAt is null)
         {
             SetCameraPreviewPlaceholder("等待摄像头解码帧", CameraPreviewImage.Source is null);
+            RefreshCameraPreviewStatusIfNeeded();
             return;
         }
 
+        RefreshCameraPreviewStatusIfNeeded();
+    }
+
+    private void RefreshCameraPreviewStatusIfNeeded(bool force = false)
+    {
+        var now = DateTimeOffset.UtcNow;
+        if (!force
+            && _lastCameraPreviewStatusRefreshAt is not null
+            && now - _lastCameraPreviewStatusRefreshAt.Value < CameraPreviewStatusRefreshInterval)
+        {
+            return;
+        }
+
+        _lastCameraPreviewStatusRefreshAt = now;
         UpdateCameraStatusView();
     }
 
@@ -12292,9 +12367,8 @@ public sealed partial class MainWindow : Window
         {
             if (enabled)
             {
-                _cameraPreviewTimer.Start();
                 SetCameraPreviewPlaceholder("等待摄像头解码帧", CameraPreviewImage.Source is null);
-                UpdateCameraPreview();
+                UpdatePreviewTimerActivity(refreshActivePreviews: true);
             }
 
             UpdateCameraPreviewToggleView();
@@ -12306,12 +12380,11 @@ public sealed partial class MainWindow : Window
         if (enabled)
         {
             SetCameraPreviewPlaceholder("等待摄像头解码帧", CameraPreviewImage.Source is null);
-            _cameraPreviewTimer.Start();
-            UpdateCameraPreview();
+            UpdatePreviewTimerActivity(refreshActivePreviews: true);
         }
         else
         {
-            _cameraPreviewTimer.Stop();
+            UpdatePreviewTimerActivity();
             _cameraPreviewReader?.Dispose();
             _cameraPreviewReader = null;
             _cameraPreviewBitmap = null;
@@ -14319,6 +14392,7 @@ public sealed partial class MainWindow : Window
         _lastCameraPreviewAt = null;
         _lastCameraPreviewReadAt = null;
         _lastCameraPreviewLatencyLogAt = null;
+        _lastCameraPreviewStatusRefreshAt = null;
         _lastCameraPreviewSourceSequence = 0;
         _lastCameraPreviewSourceTimestampUs = 0;
         _lastCameraPreviewFrameAgeMs = 0;
@@ -14687,8 +14761,12 @@ public sealed partial class MainWindow : Window
     {
         var now = DateTimeOffset.Now;
         var hasTelemetry = HasAudioRuntimeTelemetry();
+        var previousMicrophoneStatus = _microphoneRuntimeStatus;
+        var previousSpeakerStatus = _speakerRuntimeStatus;
         RefreshAudioRuntimeTelemetryStatusCore(now);
-        if (hasTelemetry)
+        if (hasTelemetry
+            && (previousMicrophoneStatus != _microphoneRuntimeStatus
+                || previousSpeakerStatus != _speakerRuntimeStatus))
         {
             UpdateAudioState(BuildAudioRuntimeTelemetryHint());
         }

@@ -56,8 +56,12 @@ internal static partial class Program
         public async Task RunAsync(CancellationToken cancellationToken)
         {
             InitializeTelemetryState();
+            var publishPeriodicTelemetry = options.AudioDeviceEnabled
+                && (options.MicrophoneEnabled || options.SpeakerEnabled);
             using var telemetryCts = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
-            var telemetryTask = Task.Run(() => PublishTelemetryLoopAsync(telemetryCts.Token), CancellationToken.None);
+            var telemetryTask = publishPeriodicTelemetry
+                ? Task.Run(() => PublishTelemetryLoopAsync(telemetryCts.Token), CancellationToken.None)
+                : null;
 
             try
             {
@@ -172,8 +176,12 @@ internal static partial class Program
             }
             finally
             {
-                await telemetryCts.CancelAsync();
-                await WaitForTelemetryLoopAsync(telemetryTask);
+                if (telemetryTask is not null)
+                {
+                    await telemetryCts.CancelAsync();
+                    await WaitForTelemetryLoopAsync(telemetryTask);
+                }
+
                 _listener.Stop();
                 _audioBackend.Dispose();
             }

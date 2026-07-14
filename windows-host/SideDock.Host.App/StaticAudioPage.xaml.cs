@@ -21,6 +21,16 @@ public sealed partial class StaticAudioPage : UserControl
     private bool _syncingState;
     private bool _statusBannerDismissed;
     private AudioRecoveryAction _primaryRecoveryAction = AudioRecoveryAction.NoAction;
+    private StaticAudioPageState? _lastState;
+    private object? _speakerItemsSource;
+    private object? _speakerSelectedItem;
+    private object? _microphoneItemsSource;
+    private object? _microphoneSelectedItem;
+    private string _speakerEndpointStatus = string.Empty;
+    private Brush? _speakerEndpointStatusBrush;
+    private string _microphoneEndpointStatus = string.Empty;
+    private Brush? _microphoneEndpointStatusBrush;
+    private string[]? _visibleLogLines;
 
     public StaticAudioPage()
     {
@@ -73,6 +83,12 @@ public sealed partial class StaticAudioPage : UserControl
 
     internal void UpdateState(StaticAudioPageState state)
     {
+        if (state == _lastState)
+        {
+            return;
+        }
+
+        _lastState = state;
         if (state.BannerSeverity is StaticAudioBannerSeverity.Warning or StaticAudioBannerSeverity.Error)
         {
             _statusBannerDismissed = false;
@@ -189,6 +205,27 @@ public sealed partial class StaticAudioPage : UserControl
         string microphoneStatus,
         Brush microphoneStatusBrush)
     {
+        if (ReferenceEquals(_speakerItemsSource, speakerItemsSource)
+            && ReferenceEquals(_speakerSelectedItem, speakerSelectedItem)
+            && ReferenceEquals(_microphoneItemsSource, microphoneItemsSource)
+            && ReferenceEquals(_microphoneSelectedItem, microphoneSelectedItem)
+            && string.Equals(_speakerEndpointStatus, speakerStatus, StringComparison.Ordinal)
+            && ReferenceEquals(_speakerEndpointStatusBrush, speakerStatusBrush)
+            && string.Equals(_microphoneEndpointStatus, microphoneStatus, StringComparison.Ordinal)
+            && ReferenceEquals(_microphoneEndpointStatusBrush, microphoneStatusBrush))
+        {
+            return;
+        }
+
+        _speakerItemsSource = speakerItemsSource;
+        _speakerSelectedItem = speakerSelectedItem;
+        _microphoneItemsSource = microphoneItemsSource;
+        _microphoneSelectedItem = microphoneSelectedItem;
+        _speakerEndpointStatus = speakerStatus;
+        _speakerEndpointStatusBrush = speakerStatusBrush;
+        _microphoneEndpointStatus = microphoneStatus;
+        _microphoneEndpointStatusBrush = microphoneStatusBrush;
+
         _syncingState = true;
         try
         {
@@ -210,13 +247,20 @@ public sealed partial class StaticAudioPage : UserControl
 
     internal void UpdateRecentLogs(IReadOnlyList<string> logLines)
     {
-        RecentAudioLogStackPanel.Children.Clear();
-
         var visibleLines = logLines
             .Where(line => !string.IsNullOrWhiteSpace(line))
             .Reverse()
             .Take(VisibleLogEntries)
             .ToArray();
+        if (_visibleLogLines is not null
+            && _visibleLogLines.SequenceEqual(visibleLines, StringComparer.Ordinal))
+        {
+            return;
+        }
+
+        _visibleLogLines = visibleLines;
+        RecentAudioLogStackPanel.Children.Clear();
+
         if (visibleLines.Length == 0)
         {
             RecentAudioLogStackPanel.Children.Add(new TextBlock
@@ -506,7 +550,7 @@ public sealed class StaticAudioSwitchChangedEventArgs : EventArgs
     public bool MicrophoneEnabled { get; }
 }
 
-internal sealed class StaticAudioPageState
+internal sealed record StaticAudioPageState
 {
     public bool ShowBanner { get; init; } = true;
 
