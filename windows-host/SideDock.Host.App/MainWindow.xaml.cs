@@ -11,6 +11,7 @@ using System.Runtime.InteropServices.WindowsRuntime;
 using System.Security.Cryptography;
 using System.Text;
 using System.Text.Json;
+using System.Text.Json.Nodes;
 using System.Text.RegularExpressions;
 using Microsoft.UI;
 using Microsoft.UI.Text;
@@ -606,6 +607,9 @@ public sealed partial class MainWindow : Window
 
             if (StaticOverviewUi)
             {
+                SelectComboBoxValue(
+                    OverviewConnectionModeCombo,
+                    _appSettings.ConnectionMode == AppConnectionMode.Lan ? "局域网" : "USB");
                 OverviewControlPortBox.Value = _appSettings.ControlPort;
                 OverviewVideoPortBox.Value = _appSettings.VideoPort;
                 OverviewAudioPortBox.Value = _appSettings.AudioPort;
@@ -1129,6 +1133,9 @@ public sealed partial class MainWindow : Window
         _syncingOverviewConnectionControls = true;
         try
         {
+            SelectComboBoxValue(
+                OverviewConnectionModeCombo,
+                _appSettings.ConnectionMode == AppConnectionMode.Lan ? "局域网" : "USB");
             OverviewControlPortBox.Value = double.IsNaN(ControlPortBox.Value) ? _appSettings.ControlPort : ControlPortBox.Value;
             OverviewVideoPortBox.Value = double.IsNaN(VideoPortBox.Value) ? _appSettings.VideoPort : VideoPortBox.Value;
             OverviewAudioPortBox.Value = _appSettings.AudioPort;
@@ -1193,12 +1200,15 @@ public sealed partial class MainWindow : Window
 
         OverviewConnectionStartHostButton.IsEnabled = CanStartOverviewHost() && !busy;
         OverviewConnectionMoreActionsButton.IsEnabled = true;
-        OverviewConnectionAdbDeviceCombo.IsEnabled = canEditStartupSettings && !_adbRefreshInProgress;
-        OverviewConnectionDeviceListView.IsEnabled = canEditStartupSettings && !_adbRefreshInProgress;
+        var lanMode = IsLanConnectionMode();
+        OverviewConnectionModeCombo.IsEnabled = canEditStartupSettings;
+        OverviewLanDetailsPanel.Visibility = lanMode ? Visibility.Visible : Visibility.Collapsed;
+        OverviewConnectionAdbDeviceCombo.IsEnabled = !lanMode && canEditStartupSettings && !_adbRefreshInProgress;
+        OverviewConnectionDeviceListView.IsEnabled = !lanMode && canEditStartupSettings && !_adbRefreshInProgress;
         OverviewRestoreDefaultPortsButton.IsEnabled = canEditStartupSettings;
         OverviewAdvancedConnectionOptionsButton.IsEnabled = true;
-        OverviewAdbPathBox.IsEnabled = canEditStartupSettings;
-        OverviewAdbPathBrowseButton.IsEnabled = canEditStartupSettings;
+        OverviewAdbPathBox.IsEnabled = !lanMode && canEditStartupSettings;
+        OverviewAdbPathBrowseButton.IsEnabled = !lanMode && canEditStartupSettings;
         OverviewControlPortBox.IsEnabled = canEditStartupSettings;
         OverviewVideoPortBox.IsEnabled = canEditStartupSettings;
         OverviewAudioPortBox.IsEnabled = canEditStartupSettings;
@@ -1377,6 +1387,11 @@ public sealed partial class MainWindow : Window
 
     private (OverviewStepState State, string Detail) BuildOverviewConnectionUsbStep()
     {
+        if (IsLanConnectionMode())
+        {
+            return (OverviewStepState.Complete, "已选择局域网直连，不需要 USB 调试");
+        }
+
         if (_adbRefreshInProgress)
         {
             return (OverviewStepState.Active, "正在刷新 ADB 设备列表");
@@ -1411,6 +1426,18 @@ public sealed partial class MainWindow : Window
 
     private (OverviewStepState State, string Detail) BuildOverviewConnectionAuthStep()
     {
+        if (IsLanConnectionMode())
+        {
+            if (_audioAndroidControlConnected)
+            {
+                return (OverviewStepState.Complete, "Android 已通过加密控制会话认证");
+            }
+
+            return _overviewHostServiceState == OverviewHostServiceState.Running
+                ? (OverviewStepState.Active, "等待 Android 输入配对码并建立 TLS 会话")
+                : (OverviewStepState.Waiting, "启动主机后生成配对码");
+        }
+
         var selectedRow = SelectedAdbDeviceRow();
         if (selectedRow is not null)
         {
@@ -1458,6 +1485,11 @@ public sealed partial class MainWindow : Window
 
     private (OverviewStepState State, string Detail) BuildOverviewConnectionReverseStep(OverviewStepState authState)
     {
+        if (IsLanConnectionMode())
+        {
+            return (OverviewStepState.Complete, "局域网模式使用 TLS 与会话令牌，不使用 ADB reverse");
+        }
+
         if (_overviewHostServiceState == OverviewHostServiceState.Starting)
         {
             return (OverviewStepState.Active, _lastAdbStatusText);
@@ -1501,6 +1533,7 @@ public sealed partial class MainWindow : Window
             OverviewHostServiceState.Starting => (OverviewStepState.Active, "正在启动会话"),
             OverviewHostServiceState.Error => (OverviewStepState.Error, _overviewHostDetailText),
             _ when portState == OverviewStepState.Error => (OverviewStepState.Error, "请修正端口配置后再启动"),
+            _ when IsLanConnectionMode() && portState != OverviewStepState.Error => (OverviewStepState.Complete, "可以启动局域网会话"),
             _ when authState == OverviewStepState.Complete => (OverviewStepState.Complete, "可以启动会话"),
             _ when authState == OverviewStepState.Warning => (OverviewStepState.Warning, "请先处理设备选择或授权"),
             _ => (OverviewStepState.Waiting, "等待设备和端口检查")
@@ -5303,6 +5336,206 @@ public sealed partial class MainWindow : Window
         SyncAdbDeviceSelectionFrom(OverviewConnectionAdbDeviceCombo);
     }
 
+    private void OverviewConnectionModeCombo_SelectionChanged(object sender, SelectionChangedEventArgs e)
+    {
+        if (_syncingOverviewConnectionControls || !_uiReady)
+        {
+            return;
+        }
+
+        _appSettings.ConnectionMode = Selected(OverviewConnectionModeCombo).Equals(
+            "局域网",
+            StringComparison.OrdinalIgnoreCase)
+            ? AppConnectionMode.Lan
+            : AppConnectionMode.Usb;
+        _lastAdbReverseConfigured = null;
+        _lastAdbReverseDetail = _appSettings.ConnectionMode == AppConnectionMode.Lan
+            ? "局域网模式不使用 ADB reverse。"
+            : "等待启动时配置 ADB reverse。";
+        if (_appSettings.ConnectionMode == AppConnectionMode.Lan)
+        {
+            OverviewLanAddressText.Text = "启动主机后显示";
+            OverviewLanPairingCodeText.Text = "------";
+            OverviewLanPairingUriText.Text = "启动主机后生成 sidedock:// 配对链接";
+        }
+
+        AppSettingsStore.Save(_appSettings);
+        UpdateOverviewConnectionPage();
+    }
+
+    private void OverviewCopyLanPairingLinkButton_Click(object sender, RoutedEventArgs e)
+    {
+        var value = OverviewLanPairingUriText.Text?.Trim() ?? string.Empty;
+        if (!value.StartsWith("sidedock://", StringComparison.OrdinalIgnoreCase))
+        {
+            OverviewLanFirewallStatusText.Text = "请先启动局域网主机以生成配对链接";
+            return;
+        }
+
+        var package = new DataPackage { RequestedOperation = DataPackageOperation.Copy };
+        package.SetText(value);
+        Clipboard.SetContent(package);
+        Clipboard.Flush();
+        OverviewLanFirewallStatusText.Text = "配对链接已复制，可生成二维码或发送到 Android";
+    }
+
+    private async void OverviewManageLanPairingsButton_Click(object sender, RoutedEventArgs e)
+    {
+        try
+        {
+            if (_hostProcess is not { HasExited: false } || !IsLanConnectionMode())
+            {
+                await ShowLanPairingMessageAsync("管理已配对设备", "请先以局域网模式启动主机。");
+                return;
+            }
+
+            var devices = await LoadLanPairedDevicesAsync();
+            if (devices.Count == 0)
+            {
+                await ShowLanPairingMessageAsync("已配对设备", "当前没有已配对的 Android 设备。");
+                return;
+            }
+
+            var selector = new ComboBox
+            {
+                HorizontalAlignment = HorizontalAlignment.Stretch,
+                ItemsSource = devices,
+                DisplayMemberPath = nameof(LanPairedDeviceChoice.DisplayName),
+                SelectedIndex = 0
+            };
+            var content = new StackPanel { Spacing = 10 };
+            content.Children.Add(new TextBlock
+            {
+                Text = "选择需要解除授权的设备。解除后，该设备必须重新输入配对码。",
+                TextWrapping = TextWrapping.Wrap
+            });
+            content.Children.Add(selector);
+            var dialog = new ContentDialog
+            {
+                XamlRoot = RootShell.XamlRoot,
+                Title = "管理已配对设备",
+                Content = content,
+                PrimaryButtonText = "解除配对",
+                CloseButtonText = "取消",
+                DefaultButton = ContentDialogButton.Close
+            };
+            if (await dialog.ShowAsync() != ContentDialogResult.Primary
+                || selector.SelectedItem is not LanPairedDeviceChoice selected)
+            {
+                return;
+            }
+
+            var removed = await RemoveLanPairedDeviceAsync(selected.DeviceId);
+            OverviewLanFirewallStatusText.Text = removed
+                ? $"已解除 {selected.DeviceName} 的配对"
+                : "解除配对失败，请查看诊断日志";
+            if (!removed)
+            {
+                await ShowLanPairingMessageAsync("解除配对失败", "主机未找到该设备，或本地管理命令执行失败。");
+            }
+        }
+        catch (Exception ex)
+        {
+            await ShowLanPairingMessageAsync("管理配对失败", ex.Message);
+        }
+    }
+
+    private async Task<IReadOnlyList<LanPairedDeviceChoice>> LoadLanPairedDevicesAsync()
+    {
+        using var document = await SendLanPairingCommandAsync("lan_pairings_list", deviceId: null);
+        var root = document.RootElement;
+        if (!root.TryGetProperty("ok", out var ok) || !ok.GetBoolean())
+        {
+            return Array.Empty<LanPairedDeviceChoice>();
+        }
+
+        var devices = new List<LanPairedDeviceChoice>();
+        if (!root.TryGetProperty("devices", out var items) || items.ValueKind != JsonValueKind.Array)
+        {
+            return devices;
+        }
+
+        foreach (var item in items.EnumerateArray())
+        {
+            var deviceId = item.TryGetProperty("deviceId", out var id) ? id.GetString() ?? string.Empty : string.Empty;
+            var deviceName = item.TryGetProperty("deviceName", out var name) ? name.GetString() ?? "Android device" : "Android device";
+            var lastConnectedAt = item.TryGetProperty("lastConnectedAtUnixMs", out var last) && last.TryGetInt64(out var unixMs)
+                ? DateTimeOffset.FromUnixTimeMilliseconds(unixMs).ToLocalTime().ToString("g", CultureInfo.CurrentCulture)
+                : "从未连接";
+            if (!string.IsNullOrWhiteSpace(deviceId))
+            {
+                devices.Add(new LanPairedDeviceChoice(deviceId, deviceName, lastConnectedAt));
+            }
+        }
+
+        return devices;
+    }
+
+    private async Task<bool> RemoveLanPairedDeviceAsync(string deviceId)
+    {
+        using var document = await SendLanPairingCommandAsync("lan_pairing_remove", deviceId);
+        return document.RootElement.TryGetProperty("ok", out var ok) && ok.GetBoolean();
+    }
+
+    private static async Task<JsonDocument> SendLanPairingCommandAsync(string type, string? deviceId)
+    {
+        using var client = new TcpClient();
+        await client.ConnectAsync(IPAddress.Loopback, DefaultCameraCommandPort).WaitAsync(TimeSpan.FromSeconds(3));
+        await using var stream = client.GetStream();
+        using var writer = new StreamWriter(stream, new UTF8Encoding(false), bufferSize: 4096, leaveOpen: true)
+        {
+            AutoFlush = true,
+            NewLine = "\n"
+        };
+        using var reader = new StreamReader(stream, Encoding.UTF8, false, bufferSize: 4096, leaveOpen: true);
+        var payload = new JsonObject();
+        if (!string.IsNullOrWhiteSpace(deviceId))
+        {
+            payload["deviceId"] = deviceId;
+        }
+
+        var request = JsonSerializer.Serialize(new
+        {
+            v = 1,
+            type,
+            seq = 1,
+            ts = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds(),
+            payload
+        });
+        await writer.WriteLineAsync(request);
+        var response = await reader.ReadLineAsync().WaitAsync(TimeSpan.FromSeconds(3));
+        if (string.IsNullOrWhiteSpace(response))
+        {
+            throw new IOException("本地主机管理端口没有返回响应。");
+        }
+
+        return JsonDocument.Parse(response);
+    }
+
+    private async Task ShowLanPairingMessageAsync(string title, string message)
+    {
+        var dialog = new ContentDialog
+        {
+            XamlRoot = RootShell.XamlRoot,
+            Title = title,
+            Content = new TextBlock { Text = message, TextWrapping = TextWrapping.Wrap },
+            CloseButtonText = "关闭"
+        };
+        await dialog.ShowAsync();
+    }
+
+    private sealed record LanPairedDeviceChoice(string DeviceId, string DeviceName, string LastConnectedAt)
+    {
+        public string DisplayName => $"{DeviceName} · 最近连接 {LastConnectedAt}";
+    }
+
+    private bool IsLanConnectionMode()
+    {
+        return StaticOverviewUi && OverviewConnectionModeCombo is not null
+            ? Selected(OverviewConnectionModeCombo).Equals("局域网", StringComparison.OrdinalIgnoreCase)
+            : _appSettings.ConnectionMode == AppConnectionMode.Lan;
+    }
+
     private void OverviewConnectionDeviceListView_SelectionChanged(object sender, SelectionChangedEventArgs e)
     {
         if (_syncingAdbDeviceSelection
@@ -5726,10 +5959,15 @@ public sealed partial class MainWindow : Window
             CameraFacingCombo.IsEnabled = false;
             OverallStatusText.Text = "启动中";
             OverallStatusText.Foreground = _secondaryBrush;
-            var configureAdbReverse = _appSettings.ConfigureAdbReverseOnHostStart;
+            var lanMode = IsLanConnectionMode();
+            _appSettings.ConnectionMode = lanMode ? AppConnectionMode.Lan : AppConnectionMode.Usb;
+            AppSettingsStore.Save(_appSettings);
+            var configureAdbReverse = !lanMode && _appSettings.ConfigureAdbReverseOnHostStart;
             var adbStartupStatus = configureAdbReverse
                 ? "正在检查 ADB reverse..."
-                : "ADB reverse 自动配置已关闭。";
+                : lanMode
+                    ? "局域网模式不使用 ADB reverse。"
+                    : "ADB reverse 自动配置已关闭。";
             SetAdbStatus(adbStartupStatus, _secondaryBrush);
             SetOverviewHostState(OverviewHostServiceState.Starting, adbStartupStatus);
             UpdateOverviewConnectionPage();
@@ -5753,14 +5991,14 @@ public sealed partial class MainWindow : Window
                 return;
             }
 
-            adbPath = ResolveAdbPath(AdbPathBox.Text.Trim());
+            adbPath = lanMode ? null : ResolveAdbPath(AdbPathBox.Text.Trim());
             if (configureAdbReverse)
             {
                 var explicitAdbSerial = SelectedAdbSerial();
                 await RefreshAdbDevicesAsync(showErrors: false, resolvedAdbPath: adbPath);
                 var selectedAdbSerial = explicitAdbSerial ?? SelectedAdbSerial();
                 var reversePorts = GetConfiguredReversePorts();
-                var adbPreflight = await ConfigureAdbReverseBeforeHostStartAsync(adbPath, reversePorts, selectedAdbSerial);
+                var adbPreflight = await ConfigureAdbReverseBeforeHostStartAsync(adbPath!, reversePorts, selectedAdbSerial);
                 if (!adbPreflight.Success)
                 {
                     _lastAdbReverseConfigured = false;
@@ -5787,11 +6025,14 @@ public sealed partial class MainWindow : Window
             }
             else
             {
-                adbSerial = SelectedOrKnownDefaultAdbSerial();
+                adbSerial = lanMode ? null : SelectedOrKnownDefaultAdbSerial();
                 _lastAdbReverseConfigured = false;
                 _lastAdbReverseSerial = adbSerial;
-                _lastAdbReverseDetail = "ADB reverse 自动配置已关闭。";
-                _lastDiagnosticsAdbSnapshot = DiagnosticsAdbReverseSnapshot.NotChecked("ADB reverse 自动配置已关闭，尚未检查映射。");
+                _lastAdbReverseDetail = lanMode
+                    ? "局域网模式不使用 ADB reverse。"
+                    : "ADB reverse 自动配置已关闭。";
+                _lastDiagnosticsAdbSnapshot = DiagnosticsAdbReverseSnapshot.NotChecked(
+                    lanMode ? "局域网模式不使用 ADB reverse。" : "ADB reverse 自动配置已关闭，尚未检查映射。");
                 SetAdbStatus(_lastAdbReverseDetail, _secondaryBrush);
                 UpdateOverviewConnectionPage();
             }
@@ -5903,6 +6144,7 @@ public sealed partial class MainWindow : Window
         var cameraFps = SelectedOverviewCameraFps();
         var args = new List<string>
         {
+            "--connection-mode", IsLanConnectionMode() ? "lan" : "usb",
             "--video-source", Selected(VideoSourceCombo),
             "--resolution", Selected(ResolutionCombo),
             "--refresh-rate", Selected(RefreshRateCombo),
@@ -14459,6 +14701,29 @@ public sealed partial class MainWindow : Window
 
     private void HandleHostOutputLine(string line)
     {
+        if (line.Contains("[LAN READY]", StringComparison.OrdinalIgnoreCase))
+        {
+            HandleLanReadyHostOutputLine(line);
+        }
+        else if (line.Contains("[LAN AUTH] authenticated", StringComparison.OrdinalIgnoreCase))
+        {
+            var deviceName = ExtractLogValue(line, "deviceName=");
+            OverviewLanFirewallStatusText.Text = string.IsNullOrWhiteSpace(deviceName)
+                ? "Android 已通过 TLS 配对认证"
+                : $"已连接设备：{deviceName}";
+            UpdateOverviewConnectionPage();
+        }
+        else if (line.Contains("[LAN FIREWALL]", StringComparison.OrdinalIgnoreCase))
+        {
+            var status = ExtractLogValue(line, "status=");
+            OverviewLanFirewallStatusText.Text = status switch
+            {
+                "ready" => "Windows 防火墙专用网络规则已就绪",
+                "requires_elevation" => "防火墙规则需要管理员权限；如连接失败，请以管理员身份启动一次",
+                _ => "Windows 防火墙规则检查失败，请查看诊断日志"
+            };
+        }
+
         if (line.Contains("display mode change ", StringComparison.OrdinalIgnoreCase)
             || line.Contains("display layout mode sync ", StringComparison.OrdinalIgnoreCase))
         {
@@ -14473,6 +14738,12 @@ public sealed partial class MainWindow : Window
         if (line.Contains("video stats", StringComparison.OrdinalIgnoreCase))
         {
             HandleVideoStatsHostOutputLine(line);
+            if (IsLanConnectionMode())
+            {
+                var latency = ExtractLogValue(line, "e2e=");
+                var reconnects = ExtractLogValue(line, "reconnects=");
+                OverviewLanQualityText.Text = $"连接质量：延迟 {NonEmpty(latency, "--")} · 重连 {NonEmpty(reconnects, "0")}";
+            }
         }
 
         if (line.Contains("audio_runtime_telemetry", StringComparison.OrdinalIgnoreCase)
@@ -14571,6 +14842,36 @@ public sealed partial class MainWindow : Window
             ? AudioUnavailableHint(direction, errorMessage)
             : AudioStateHint(direction, nextStatus.Value);
         UpdateAudioState(hint);
+    }
+
+    private void HandleLanReadyHostOutputLine(string line)
+    {
+        var addresses = ExtractLogValue(line, "addresses=");
+        var address = addresses
+            .Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries)
+            .FirstOrDefault() ?? string.Empty;
+        var controlPort = ExtractLogValue(line, "controlPort=");
+        var pairingCode = ExtractLogValue(line, "pairingCode=");
+        var fingerprint = ExtractLogValue(line, "fingerprint=");
+
+        OverviewLanAddressText.Text = string.IsNullOrWhiteSpace(address)
+            ? $"未检测到可用 IPv4 地址 · 端口 {controlPort}"
+            : $"{addresses} · 控制端口 {controlPort}";
+        OverviewLanPairingCodeText.Text = string.IsNullOrWhiteSpace(pairingCode) ? "------" : pairingCode;
+        if (!string.IsNullOrWhiteSpace(address)
+            && !string.IsNullOrWhiteSpace(controlPort)
+            && !string.IsNullOrWhiteSpace(pairingCode)
+            && !string.IsNullOrWhiteSpace(fingerprint))
+        {
+            OverviewLanPairingUriText.Text = "sidedock://pair?host="
+                + System.Uri.EscapeDataString(address)
+                + "&port=" + System.Uri.EscapeDataString(controlPort)
+                + "&code=" + System.Uri.EscapeDataString(pairingCode)
+                + "&fingerprint=" + System.Uri.EscapeDataString(fingerprint);
+        }
+
+        OverviewLanFirewallStatusText.Text = "TLS 监听已启动，正在等待 Android 配对";
+        UpdateOverviewConnectionPage();
     }
 
     private bool TryHandleAudioRuntimeTelemetryLine(string line)

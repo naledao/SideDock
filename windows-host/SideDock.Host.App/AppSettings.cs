@@ -11,6 +11,12 @@ internal enum AppThemeMode
     Dark
 }
 
+internal enum AppConnectionMode
+{
+    Usb,
+    Lan
+}
+
 internal enum AppInterfaceDensity
 {
     Standard,
@@ -46,6 +52,7 @@ internal sealed class AppSettings
     public bool MinimizeToTrayOnClose { get; set; } = true;
     public bool StartVirtualDisplayWithHost { get; set; } = true;
     public bool ConfigureAdbReverseOnHostStart { get; set; } = true;
+    public AppConnectionMode ConnectionMode { get; set; } = AppConnectionMode.Usb;
     public string VirtualDisplayResolution { get; set; } = "1080p";
     public string VirtualDisplayRefreshRate { get; set; } = "120";
     public VirtualDisplayPresentationMode VirtualDisplayPresentationMode { get; set; } = global::SideDock.Host.App.VirtualDisplayPresentationMode.Extend;
@@ -79,6 +86,9 @@ internal sealed class AppSettings
     public AppSettings Normalize()
     {
         AdbPath = (AdbPath ?? string.Empty).Trim();
+        ConnectionMode = ConnectionMode is AppConnectionMode.Usb or AppConnectionMode.Lan
+            ? ConnectionMode
+            : AppConnectionMode.Usb;
         DefaultAdbSerial = NormalizeOptional(DefaultAdbSerial);
         ControlPort = NormalizePort(ControlPort, DefaultControlPort);
         VideoPort = NormalizePort(VideoPort, DefaultVideoPort);

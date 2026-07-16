@@ -1809,6 +1809,65 @@
                                 </Grid>
                             </Border>
 
+                            <Border
+                                Padding="18,14"
+                                CornerRadius="7"
+                                Background="#FFFFFF"
+                                BorderBrush="#D8DEE4"
+                                BorderThickness="1">
+                                <Grid ColumnSpacing="18">
+                                    <Grid.ColumnDefinitions>
+                                        <ColumnDefinition Width="220" />
+                                        <ColumnDefinition Width="*" />
+                                    </Grid.ColumnDefinitions>
+                                    <StackPanel Spacing="7">
+                                        <TextBlock Text="连接模式" FontSize="14" FontWeight="SemiBold" Foreground="#111827" />
+                                        <ComboBox
+                                            x:Name="OverviewConnectionModeCombo"
+                                            HorizontalAlignment="Stretch"
+                                            SelectionChanged="OverviewConnectionModeCombo_SelectionChanged">
+                                            <ComboBoxItem Content="USB" />
+                                            <ComboBoxItem Content="局域网" />
+                                        </ComboBox>
+                                        <TextBlock Text="USB 保留 ADB reverse；局域网使用 TLS 加密直连。" FontSize="12" TextWrapping="Wrap" Foreground="#5B6570" />
+                                    </StackPanel>
+                                    <Grid x:Name="OverviewLanDetailsPanel" Grid.Column="1" ColumnSpacing="18" Visibility="Collapsed">
+                                        <Grid.ColumnDefinitions>
+                                            <ColumnDefinition Width="1.2*" />
+                                            <ColumnDefinition Width="0.8*" />
+                                            <ColumnDefinition Width="1.4*" />
+                                        </Grid.ColumnDefinitions>
+                                        <StackPanel Spacing="5">
+                                            <TextBlock Text="局域网地址" FontSize="12" Foreground="#5B6570" />
+                                            <TextBlock x:Name="OverviewLanAddressText" Text="启动主机后显示" FontSize="14" FontWeight="SemiBold" Foreground="#111827" TextWrapping="Wrap" />
+                                            <TextBlock x:Name="OverviewLanFirewallStatusText" Text="防火墙状态将在启动时检查" FontSize="12" Foreground="#5B6570" />
+                                            <TextBlock x:Name="OverviewLanQualityText" Text="连接质量：等待设备" FontSize="12" Foreground="#5B6570" />
+                                        </StackPanel>
+                                        <StackPanel Grid.Column="1" Spacing="5">
+                                            <TextBlock Text="配对码" FontSize="12" Foreground="#5B6570" />
+                                            <TextBlock x:Name="OverviewLanPairingCodeText" Text="------" FontSize="25" FontWeight="SemiBold" CharacterSpacing="120" Foreground="#087C89" />
+                                            <TextBlock Text="仅向身边可信设备提供" FontSize="12" Foreground="#5B6570" />
+                                        </StackPanel>
+                                        <StackPanel Grid.Column="2" Spacing="6">
+                                            <TextBlock Text="扫码/配对链接" FontSize="12" Foreground="#5B6570" />
+                                            <TextBlock x:Name="OverviewLanPairingUriText" Text="启动主机后生成 sidedock:// 配对链接" FontSize="12" TextWrapping="Wrap" TextTrimming="CharacterEllipsis" MaxLines="2" Foreground="#30363D" />
+                                            <Button Height="32" HorizontalAlignment="Left" Padding="12,0" Click="OverviewCopyLanPairingLinkButton_Click">
+                                                <StackPanel Orientation="Horizontal" Spacing="7">
+                                                    <FontIcon Glyph="&#xE8C8;" FontSize="13" />
+                                                    <TextBlock Text="复制配对链接" FontSize="12" />
+                                                </StackPanel>
+                                            </Button>
+                                            <Button Height="32" HorizontalAlignment="Left" Padding="12,0" Click="OverviewManageLanPairingsButton_Click">
+                                                <StackPanel Orientation="Horizontal" Spacing="7">
+                                                    <FontIcon Glyph="&#xE77B;" FontSize="13" />
+                                                    <TextBlock Text="管理已配对设备" FontSize="12" />
+                                                </StackPanel>
+                                            </Button>
+                                        </StackPanel>
+                                    </Grid>
+                                </Grid>
+                            </Border>
+
                             <Grid ColumnSpacing="18">
                                 <Grid.ColumnDefinitions>
                                     <ColumnDefinition Width="1.64*" />

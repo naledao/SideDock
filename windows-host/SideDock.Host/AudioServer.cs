@@ -6,6 +6,7 @@ using System.IO.MemoryMappedFiles;
 using System.Net;
 using System.Net.Sockets;
 using System.Runtime.InteropServices;
+using System.Security.Authentication;
 using System.Text.Json.Nodes;
 using NAudio.CoreAudioApi;
 using NAudio.Wave;
@@ -28,7 +29,8 @@ internal static partial class Program
         IPAddress address,
         HostOptions options,
         ControlMessagePublisher controlPublisher,
-        AudioTestCoordinator audioTestCoordinator)
+        AudioTestCoordinator audioTestCoordinator,
+        LanSecurityManager? lanSecurity)
     {
         private const int HeaderSize = 36;
         private const int MaxMicPayloadBytes = AudioDefaults.SampleRate * AudioDefaults.MicFrameBytes;
@@ -92,6 +94,20 @@ internal static partial class Program
                 while (!cancellationToken.IsCancellationRequested)
                 {
                     var client = await _listener.AcceptTcpClientAsync(cancellationToken);
+                    Stream stream;
+                    try
+                    {
+                        stream = lanSecurity is null
+                            ? client.GetStream()
+                            : await lanSecurity.OpenAuthenticatedDataStreamAsync(client, "audio", cancellationToken);
+                    }
+                    catch (Exception ex) when (ex is AuthenticationException or IOException or UnauthorizedAccessException)
+                    {
+                        Log("AUDIO", $"rejected unauthenticated connection remote={SafeEndpoint(client, remote: true)} error={ex.Message}");
+                        client.Dispose();
+                        continue;
+                    }
+
                     var connectionId = Interlocked.Increment(ref _connectionSerial);
                     var connectionCts = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
 
@@ -114,7 +130,7 @@ internal static partial class Program
                     }
 
                     var connectionTask = Task.Run(
-                        () => HandleClientAsync(connectionId, client, connectionCts, cancellationToken),
+                        () => HandleClientAsync(connectionId, client, stream, connectionCts, cancellationToken),
                         cancellationToken);
                     lock (_connectionLock)
                     {
@@ -255,6 +271,7 @@ internal static partial class Program
         private async Task HandleClientAsync(
             int connectionId,
             TcpClient client,
+            Stream stream,
             CancellationTokenSource connectionCts,
             CancellationToken appToken)
         {
@@ -262,6 +279,7 @@ internal static partial class Program
             long playbackPumpRegistration = 0;
             using (client)
             using (connectionCts)
+            await using (stream)
             {
                 var remote = SafeEndpoint(client, remote: true);
                 var local = SafeEndpoint(client, remote: false);
@@ -281,7 +299,6 @@ internal static partial class Program
                 try
                 {
                     client.NoDelay = true;
-                    var stream = client.GetStream();
                     SpeakerConnectionState? speakerConnection = null;
                     if (options.SpeakerEnabled)
                     {

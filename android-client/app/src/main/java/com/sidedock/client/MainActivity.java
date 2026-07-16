@@ -2,11 +2,13 @@ package com.sidedock.client;
 
 import android.Manifest;
 import android.app.Activity;
+import android.app.AlertDialog;
 import android.app.KeyguardManager;
 import android.content.Context;
 import android.content.SharedPreferences;
 import android.content.pm.PackageManager;
 import android.content.res.Configuration;
+import android.net.Uri;
 import android.graphics.Canvas;
 import android.graphics.Paint;
 import android.graphics.Path;
@@ -36,9 +38,15 @@ import android.view.ViewGroup;
 import android.view.Window;
 import android.view.WindowManager;
 import android.widget.FrameLayout;
+import android.widget.Button;
+import android.widget.EditText;
 import android.widget.LinearLayout;
 import android.widget.ProgressBar;
+import android.widget.RadioButton;
+import android.widget.RadioGroup;
+import android.widget.ScrollView;
 import android.widget.TextView;
+import android.text.InputType;
 import org.json.JSONObject;
 import java.text.SimpleDateFormat;
 import java.util.ArrayDeque;
@@ -47,6 +55,7 @@ import java.util.Locale;
 
 public final class MainActivity extends Activity implements ControlClient.Listener, VideoClient.Listener, AudioCaptureClient.Listener, CameraCaptureClient.Listener, SurfaceHolder.Callback, InputCollector.Listener {
     private static final String TAG = "SideDock";
+    private static final int DEFAULT_CONTROL_PORT = 27183;
     private static final int DEFAULT_VIDEO_PORT = 27184;
     private static final int DEFAULT_AUDIO_PORT = 27185;
     private static final int DEFAULT_CAMERA_PORT = 27186;
@@ -81,6 +90,15 @@ public final class MainActivity extends Activity implements ControlClient.Listen
     private static final long CAMERA_CONFIG_DEBOUNCE_MS = 250L;
 
     private ControlClient controlClient;
+    private ConnectionProfile connectionProfile;
+    private LanDiscoveryClient lanDiscoveryClient;
+    private AlertDialog connectionDialog;
+    private RadioGroup connectionModeGroup;
+    private EditText connectionHostInput;
+    private EditText connectionPortInput;
+    private EditText connectionPairingCodeInput;
+    private LinearLayout discoveredHostsPanel;
+    private TextView discoveryStatusText;
     private VideoClient videoClient;
     private AudioCaptureClient audioCaptureClient;
     private CameraCaptureClient cameraCaptureClient;
@@ -120,6 +138,7 @@ public final class MainActivity extends Activity implements ControlClient.Listen
     private boolean pointerCaptureLogged;
     private TextView overlayText;
     private TextView modeToggleText;
+    private TextView transportToggleText;
     private LinearLayout modePanel;
     private LinearLayout audioPanel;
     private View topStatusPill;
@@ -302,16 +321,32 @@ public final class MainActivity extends Activity implements ControlClient.Listen
         setVolumeControlStream(AudioManager.STREAM_MUSIC);
         keepWindowReadyForVideoSurface();
 
-        controlClient = new ControlClient(this);
-        videoClient = new VideoClient(this);
-        audioCaptureClient = new AudioCaptureClient(this, this);
-        cameraCaptureClient = new CameraCaptureClient(this, this);
+        connectionProfile = new ConnectionProfile(this);
+        controlClient = new ControlClient(connectionProfile, this);
+        videoClient = new VideoClient(connectionProfile, this);
+        audioCaptureClient = new AudioCaptureClient(this, connectionProfile, this);
+        cameraCaptureClient = new CameraCaptureClient(this, connectionProfile, this);
+        lanDiscoveryClient = new LanDiscoveryClient(new LanDiscoveryClient.Listener() {
+            @Override
+            public void onHostFound(LanDiscoveryClient.DiscoveredHost host) {
+                refreshDiscoveredHosts();
+            }
+
+            @Override
+            public void onDiscoveryError(String message) {
+                if (discoveryStatusText != null) {
+                    discoveryStatusText.setText(message);
+                }
+            }
+        });
         inputCollector = new InputCollector(this);
         loadAudioPreferences();
         setContentView(buildContentView());
         enterImmersiveMode();
         useNativePointerIcon(getWindow().getDecorView());
         requestNativePointerCapture();
+        applyConnectionUri(getIntent() == null ? null : getIntent().getData());
+        updateTransportControl();
         controlClient.start();
     }
 
@@ -418,7 +453,17 @@ public final class MainActivity extends Activity implements ControlClient.Listen
         audioCaptureClient.shutdown();
         videoClient.stop();
         controlClient.shutdown();
+        lanDiscoveryClient.shutdown();
         super.onDestroy();
+    }
+
+    @Override
+    protected void onNewIntent(android.content.Intent intent) {
+        super.onNewIntent(intent);
+        setIntent(intent);
+        if (applyConnectionUri(intent == null ? null : intent.getData())) {
+            restartForConnectionProfile();
+        }
     }
 
     @Override
@@ -476,6 +521,7 @@ public final class MainActivity extends Activity implements ControlClient.Listen
             lastCameraHint = state == ConnectionState.RECONNECTING ? "Control channel reconnecting." : "Control channel disconnected.";
             publishCameraStatus(cameraRuntimeState, lastCameraHint);
             audioCaptureClient.stop();
+            videoClient.stop();
             microphoneRuntimeState = state == ConnectionState.RECONNECTING ? "reconnecting" : "waiting_device";
             speakerRuntimeState = state == ConnectionState.RECONNECTING ? "reconnecting" : "waiting_device";
             publishAudioMicrophoneStatus(audioStatusWireState(currentMicrophoneAudioStatus()), audioStatusText(AudioEndpoint.MICROPHONE, currentMicrophoneAudioStatus()));
@@ -487,6 +533,12 @@ public final class MainActivity extends Activity implements ControlClient.Listen
     @Override
     public void onLog(String message) {
         addLog("控制 " + message);
+        if (connectionProfile.isLan()
+            && message != null
+            && message.contains("PAIRING_REQUIRED")
+            && connectionDialog == null) {
+            showConnectionDialog();
+        }
     }
 
     @Override
@@ -1409,6 +1461,18 @@ public final class MainActivity extends Activity implements ControlClient.Listen
         row.setGravity(Gravity.CENTER_VERTICAL);
         useNativePointerIcon(row);
 
+        transportToggleText = createMetricPill("USB", density);
+        transportToggleText.setOnClickListener(new View.OnClickListener() {
+            @Override
+            public void onClick(View view) {
+                showConnectionDialog();
+            }
+        });
+        row.addView(transportToggleText, new LinearLayout.LayoutParams(
+            ViewGroup.LayoutParams.WRAP_CONTENT,
+            ViewGroup.LayoutParams.MATCH_PARENT
+        ));
+
         modeToggleText = createMetricPill("2K 120Hz", density);
         modeToggleText.setMinWidth(dp(132, density));
         modeToggleText.setOnClickListener(new View.OnClickListener() {
@@ -1418,10 +1482,12 @@ public final class MainActivity extends Activity implements ControlClient.Listen
                 updateOverlay();
             }
         });
-        row.addView(modeToggleText, new LinearLayout.LayoutParams(
+        LinearLayout.LayoutParams modeParams = new LinearLayout.LayoutParams(
             ViewGroup.LayoutParams.WRAP_CONTENT,
             ViewGroup.LayoutParams.MATCH_PARENT
-        ));
+        );
+        modeParams.leftMargin = dp(10, density);
+        row.addView(modeToggleText, modeParams);
 
         topLatencyText = createMetricPill("18 ms", density);
         LinearLayout.LayoutParams latencyParams = new LinearLayout.LayoutParams(
@@ -1445,6 +1511,245 @@ public final class MainActivity extends Activity implements ControlClient.Listen
         view.setBackground(makeRoundedBackground(0xD90A1620, 0x22000000, dp(9, density)));
         useNativePointerIcon(view);
         return view;
+    }
+
+    private void showConnectionDialog() {
+        if (connectionDialog != null) {
+            connectionDialog.show();
+            return;
+        }
+
+        float density = getResources().getDisplayMetrics().density;
+        LinearLayout content = new LinearLayout(this);
+        content.setOrientation(LinearLayout.VERTICAL);
+        content.setPadding(dp(22, density), dp(8, density), dp(22, density), dp(8, density));
+
+        connectionModeGroup = new RadioGroup(this);
+        connectionModeGroup.setOrientation(RadioGroup.HORIZONTAL);
+        RadioButton usbButton = new RadioButton(this);
+        usbButton.setId(View.generateViewId());
+        usbButton.setText("USB");
+        RadioButton lanButton = new RadioButton(this);
+        lanButton.setId(View.generateViewId());
+        lanButton.setText("局域网");
+        connectionModeGroup.addView(usbButton);
+        connectionModeGroup.addView(lanButton);
+        connectionModeGroup.check(connectionProfile.isLan() ? lanButton.getId() : usbButton.getId());
+        content.addView(connectionModeGroup);
+
+        connectionHostInput = createConnectionInput("Windows 主机地址，例如 192.168.1.20", density);
+        connectionHostInput.setText(connectionProfile.isLan() ? connectionProfile.getHost() : "");
+        content.addView(connectionHostInput);
+
+        connectionPortInput = createConnectionInput("控制端口", density);
+        connectionPortInput.setInputType(InputType.TYPE_CLASS_NUMBER);
+        connectionPortInput.setText(String.valueOf(connectionProfile.getControlPort()));
+        content.addView(connectionPortInput);
+
+        connectionPairingCodeInput = createConnectionInput("Windows 端显示的 6 位配对码", density);
+        connectionPairingCodeInput.setInputType(InputType.TYPE_CLASS_NUMBER);
+        content.addView(connectionPairingCodeInput);
+
+        Button discoverButton = new Button(this);
+        discoverButton.setText("搜索局域网主机");
+        discoverButton.setAllCaps(false);
+        discoverButton.setOnClickListener(new View.OnClickListener() {
+            @Override
+            public void onClick(View view) {
+                discoveryStatusText.setText("正在搜索同一局域网中的 SideDock 主机…");
+                lanDiscoveryClient.start();
+                lanDiscoveryClient.sendQuery();
+            }
+        });
+        content.addView(discoverButton, connectionFieldParams(density));
+
+        discoveryStatusText = new TextView(this);
+        discoveryStatusText.setText("可自动发现主机，也可以手动输入地址。扫码时可用系统扫码器打开 SideDock 配对链接。");
+        discoveryStatusText.setTextColor(0xFF5B6570);
+        discoveryStatusText.setTextSize(13f);
+        discoveryStatusText.setPadding(0, dp(8, density), 0, dp(6, density));
+        content.addView(discoveryStatusText);
+
+        discoveredHostsPanel = new LinearLayout(this);
+        discoveredHostsPanel.setOrientation(LinearLayout.VERTICAL);
+        content.addView(discoveredHostsPanel);
+
+        ScrollView scroll = new ScrollView(this);
+        scroll.addView(content);
+        connectionDialog = new AlertDialog.Builder(this)
+            .setTitle("SideDock 连接")
+            .setView(scroll)
+            .setPositiveButton("连接", null)
+            .setNegativeButton("取消", null)
+            .setNeutralButton("解除配对", null)
+            .create();
+        connectionDialog.setOnDismissListener(dialog -> {
+            lanDiscoveryClient.stop();
+            connectionDialog = null;
+            connectionModeGroup = null;
+            connectionHostInput = null;
+            connectionPortInput = null;
+            connectionPairingCodeInput = null;
+            discoveredHostsPanel = null;
+            discoveryStatusText = null;
+        });
+        connectionModeGroup.setOnCheckedChangeListener((group, checkedId) -> {
+            updateConnectionDialogMode(checkedId == lanButton.getId());
+        });
+        connectionDialog.setOnShowListener(dialog -> {
+            connectionDialog.getButton(AlertDialog.BUTTON_POSITIVE).setOnClickListener(view -> connectFromDialog(lanButton.getId()));
+            connectionDialog.getButton(AlertDialog.BUTTON_NEUTRAL).setOnClickListener(view -> {
+                connectionProfile.clearPairing();
+                connectionPairingCodeInput.setText("");
+                discoveryStatusText.setText("已解除当前主机配对，请输入 Windows 端的新配对码。");
+            });
+        });
+        connectionDialog.show();
+        updateConnectionDialogMode(connectionProfile.isLan());
+        refreshDiscoveredHosts();
+        if (connectionProfile.isLan()) {
+            lanDiscoveryClient.start();
+        }
+    }
+
+    private EditText createConnectionInput(String hint, float density) {
+        EditText input = new EditText(this);
+        input.setHint(hint);
+        input.setSingleLine(true);
+        input.setTextSize(15f);
+        input.setSelectAllOnFocus(false);
+        input.setLayoutParams(connectionFieldParams(density));
+        return input;
+    }
+
+    private LinearLayout.LayoutParams connectionFieldParams(float density) {
+        LinearLayout.LayoutParams params = new LinearLayout.LayoutParams(
+            ViewGroup.LayoutParams.MATCH_PARENT,
+            ViewGroup.LayoutParams.WRAP_CONTENT);
+        params.topMargin = dp(8, density);
+        return params;
+    }
+
+    private void updateConnectionDialogMode(boolean lan) {
+        int visibility = lan ? View.VISIBLE : View.GONE;
+        if (connectionHostInput != null) {
+            connectionHostInput.setVisibility(visibility);
+            connectionPortInput.setVisibility(visibility);
+            connectionPairingCodeInput.setVisibility(visibility);
+            discoveredHostsPanel.setVisibility(visibility);
+            discoveryStatusText.setVisibility(visibility);
+        }
+        if (lan) {
+            lanDiscoveryClient.start();
+        } else {
+            lanDiscoveryClient.stop();
+        }
+    }
+
+    private void connectFromDialog(int lanButtonId) {
+        boolean lan = connectionModeGroup.getCheckedRadioButtonId() == lanButtonId;
+        String host = connectionHostInput.getText().toString().trim();
+        int port;
+        try {
+            port = Integer.parseInt(connectionPortInput.getText().toString().trim());
+        } catch (NumberFormatException ex) {
+            discoveryStatusText.setText("控制端口必须是 1 到 65535 的数字。");
+            return;
+        }
+        if (lan && host.isEmpty()) {
+            discoveryStatusText.setText("请输入 Windows 主机的局域网地址，或从发现列表中选择。");
+            return;
+        }
+        if (port <= 0 || port > 65535) {
+            discoveryStatusText.setText("控制端口必须是 1 到 65535 的数字。");
+            return;
+        }
+
+        String code = connectionPairingCodeInput.getText().toString().trim();
+        connectionProfile.configure(
+            lan ? ConnectionProfile.Mode.LAN : ConnectionProfile.Mode.USB,
+            host,
+            port,
+            code);
+        if (lan && !connectionProfile.hasPairing() && !code.matches("\\d{6}")) {
+            discoveryStatusText.setText("首次连接需要输入 Windows 端显示的 6 位配对码。");
+            return;
+        }
+
+        connectionDialog.dismiss();
+        restartForConnectionProfile();
+    }
+
+    private void refreshDiscoveredHosts() {
+        if (discoveredHostsPanel == null) {
+            return;
+        }
+        discoveredHostsPanel.removeAllViews();
+        LanDiscoveryClient.DiscoveredHost[] hosts = lanDiscoveryClient.snapshot();
+        if (hosts.length == 0) {
+            return;
+        }
+
+        discoveryStatusText.setText("发现 " + hosts.length + " 台 SideDock 主机，点击一项填入地址：");
+        for (LanDiscoveryClient.DiscoveredHost host : hosts) {
+            Button button = new Button(this);
+            button.setAllCaps(false);
+            button.setText(host.displayName());
+            button.setOnClickListener(view -> {
+                connectionHostInput.setText(host.address);
+                connectionPortInput.setText(String.valueOf(host.controlPort));
+                discoveryStatusText.setText("已选择 " + host.displayName() + "，请输入 Windows 端配对码。");
+            });
+            discoveredHostsPanel.addView(button, connectionFieldParams(getResources().getDisplayMetrics().density));
+        }
+    }
+
+    private boolean applyConnectionUri(Uri uri) {
+        if (uri == null || !"sidedock".equalsIgnoreCase(uri.getScheme())) {
+            return false;
+        }
+        String host = uri.getQueryParameter("host");
+        if (host == null || host.trim().isEmpty()) {
+            return false;
+        }
+        int port = DEFAULT_CONTROL_PORT;
+        try {
+            String portValue = uri.getQueryParameter("port");
+            if (portValue != null) {
+                port = Integer.parseInt(portValue);
+            }
+        } catch (NumberFormatException ignored) {
+            port = DEFAULT_CONTROL_PORT;
+        }
+        connectionProfile.configure(
+            ConnectionProfile.Mode.LAN,
+            host,
+            port,
+            uri.getQueryParameter("code"));
+        String fingerprint = uri.getQueryParameter("fingerprint");
+        if (fingerprint != null && !fingerprint.trim().isEmpty()) {
+            connectionProfile.setExpectedCertificateFingerprint(fingerprint);
+        }
+        updateTransportControl();
+        return true;
+    }
+
+    private void restartForConnectionProfile() {
+        cameraCaptureClient.stop();
+        audioCaptureClient.stop();
+        videoClient.stop();
+        waitingForVideoFrame = true;
+        updateTransportControl();
+        controlClient.reconnectNow();
+    }
+
+    private void updateTransportControl() {
+        if (transportToggleText == null || connectionProfile == null) {
+            return;
+        }
+        transportToggleText.setText(connectionProfile.isLan()
+            ? "局域网 " + connectionProfile.getHost()
+            : "USB");
     }
 
     private FrameLayout createConnectionStatusLayer(float density) {
@@ -3352,6 +3657,7 @@ public final class MainActivity extends Activity implements ControlClient.Listen
         if (topLatencyText != null) {
             topLatencyText.setText(latencyText);
         }
+        updateTransportQualityLabel();
         if (panelTitleText != null) {
             panelTitleText.setText(dashboardTitle());
         }
@@ -3435,15 +3741,39 @@ public final class MainActivity extends Activity implements ControlClient.Listen
         if (controlConnectionState == ConnectionState.CONNECTED) {
             return "控制通道已连接，正在等待视频通道和首帧画面";
         }
-        return "请确认 Windows 端 SideDock Host 已启动，并完成 USB 调试端口映射";
+        return connectionProfile.isLan()
+            ? "请确认 Windows 与 Android 位于同一局域网，并在连接设置中选择主机"
+            : "请确认 Windows 端 SideDock Host 已启动，并完成 USB 调试端口映射";
     }
 
     private String dashboardTransportLabel() {
         if (controlConnectionState == ConnectionState.CONNECTED) {
-            return "正常";
+            return connectionProfile.isLan() ? "TLS 局域网" : "USB";
         }
 
         return controlState;
+    }
+
+    private void updateTransportQualityLabel() {
+        if (transportToggleText == null) {
+            return;
+        }
+        if (!connectionProfile.isLan()) {
+            transportToggleText.setText("USB");
+            return;
+        }
+        if (controlConnectionState != ConnectionState.CONNECTED) {
+            transportToggleText.setText("局域网");
+            return;
+        }
+
+        long latency = currentLatencyMs();
+        String quality = latency <= 0 || latency < 45
+            ? "良好"
+            : latency < 100
+                ? "一般"
+                : "较差";
+        transportToggleText.setText("局域网 · " + quality);
     }
 
     private boolean isDashboardConnected() {
@@ -3494,7 +3824,9 @@ public final class MainActivity extends Activity implements ControlClient.Listen
             hint = "Surface 创建完成后会自动请求视频流。";
         } else if (controlConnectionState == ConnectionState.DISCONNECTED) {
             title = "等待 Windows 主机";
-            hint = "请确认 Host 正在运行，并已配置 adb reverse tcp:27183/tcp:27184/tcp:27185/tcp:27186。";
+            hint = connectionProfile.isLan()
+                ? "请点击右上角“局域网”选择主机，并输入 Windows 端显示的配对码。"
+                : "请确认 Host 正在运行，并已配置 adb reverse tcp:27183/tcp:27184/tcp:27185/tcp:27186。";
         } else if (controlConnectionState == ConnectionState.CONNECTING) {
             title = "正在连接 Windows 主机";
             hint = "控制通道连接中。";

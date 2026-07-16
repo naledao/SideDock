@@ -160,7 +160,7 @@ public final class VideoClient {
     private static final long FRAME_STATS_INTERVAL_MS = 500L;
     private static final int DECODE_QUEUE_CAPACITY = 12;
 
-    private final String host;
+    private final ConnectionProfile connectionProfile;
     private final Listener listener;
     private final Handler mainHandler = new Handler(Looper.getMainLooper());
     private final Object lifecycleLock = new Object();
@@ -224,12 +224,8 @@ public final class VideoClient {
     private volatile long serverTimeOffsetMs;
     private volatile long latencyErrorBoundMs = Long.MAX_VALUE;
 
-    public VideoClient(Listener listener) {
-        this("127.0.0.1", listener);
-    }
-
-    public VideoClient(String host, Listener listener) {
-        this.host = host;
+    public VideoClient(ConnectionProfile connectionProfile, Listener listener) {
+        this.connectionProfile = connectionProfile;
         this.listener = listener;
     }
 
@@ -364,7 +360,7 @@ public final class VideoClient {
             Socket attemptSocket = null;
 
             try {
-                attemptSocket = new Socket();
+                attemptSocket = SocketTransport.connectData(connectionProfile, port, "video");
                 openDecodeRead(attemptSocket, runGeneration);
             } catch (Exception ex) {
                 if (running && !isSupersededGeneration(runGeneration)) {
@@ -395,7 +391,6 @@ public final class VideoClient {
 
     private void openDecodeRead(Socket nextSocket, long runGeneration) throws Exception {
         nextSocket.setTcpNoDelay(true);
-        nextSocket.connect(new InetSocketAddress(host, port), 3000);
         nextSocket.setSoTimeout(5000);
         synchronized (lifecycleLock) {
             if (!running || generation != runGeneration) {
@@ -406,8 +401,8 @@ public final class VideoClient {
             socket = nextSocket;
         }
         emitState("CONNECTED");
-        emitLog("Video channel connected " + host + ":" + port);
-        Log.i(TAG, "connected " + host + ":" + port);
+        emitLog("Video channel connected " + connectionProfile.getHost() + ":" + port);
+        Log.i(TAG, "connected " + connectionProfile.getHost() + ":" + port);
 
         InputStream input = nextSocket.getInputStream();
         LatestVideoPacketQueue decodeQueue = new LatestVideoPacketQueue(DECODE_QUEUE_CAPACITY);

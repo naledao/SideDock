@@ -168,6 +168,7 @@ public final class AudioCaptureClient {
     private static final byte[] SPEAKER_MAGIC = new byte[] { 'S', 'D', 'A', 'S' };
 
     private final Context context;
+    private final ConnectionProfile connectionProfile;
     private final Listener listener;
     private final Object lifecycleLock = new Object();
     private final Object testLock = new Object();
@@ -187,8 +188,9 @@ public final class AudioCaptureClient {
     private AudioTestSession activePlaybackTest;
     private AudioTestSession activeRecordingTest;
 
-    public AudioCaptureClient(Context context, Listener listener) {
+    public AudioCaptureClient(Context context, ConnectionProfile connectionProfile, Listener listener) {
         this.context = context.getApplicationContext();
+        this.connectionProfile = connectionProfile;
         this.listener = listener;
     }
 
@@ -378,9 +380,8 @@ public final class AudioCaptureClient {
                 emitPlaybackState(speakerEnabled ? (speakerMuted ? "muted" : "preparing") : "disabled",
                     speakerEnabled ? (speakerMuted ? "本机音响已静音。" : "正在准备音响播放。") : "音响已关闭。");
 
-                nextSocket = new Socket();
+                nextSocket = SocketTransport.connectData(connectionProfile, port, "audio");
                 nextSocket.setTcpNoDelay(true);
-                nextSocket.connect(new InetSocketAddress("127.0.0.1", port), 3000);
                 synchronized (lifecycleLock) {
                     if (!running || generation != runGeneration) {
                         closeQuietly(nextSocket);

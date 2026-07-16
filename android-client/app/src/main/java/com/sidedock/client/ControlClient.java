@@ -452,8 +452,7 @@ public final class ControlClient {
         }
     }
 
-    private final String host;
-    private final int port;
+    private final ConnectionProfile connectionProfile;
     private final Listener listener;
     private final Handler mainHandler = new Handler(Looper.getMainLooper());
     private final ExecutorService networkExecutor = Executors.newSingleThreadExecutor(new NamedThreadFactory("SideDock-ControlClient"));
@@ -485,13 +484,8 @@ public final class ControlClient {
     private long pointerAbsWindowDrainRuns;
     private long pointerAbsWindowQueueRejects;
 
-    public ControlClient(Listener listener) {
-        this("127.0.0.1", 27183, listener);
-    }
-
-    public ControlClient(String host, int port, Listener listener) {
-        this.host = host;
-        this.port = port;
+    public ControlClient(ConnectionProfile connectionProfile, Listener listener) {
+        this.connectionProfile = connectionProfile;
         this.listener = listener;
     }
 
@@ -1058,18 +1052,21 @@ public final class ControlClient {
     }
 
     private void openAndRead() throws Exception {
-        Socket nextSocket = new Socket();
-        nextSocket.setTcpNoDelay(true);
-        nextSocket.connect(new InetSocketAddress(host, port), 3000);
+        SocketTransport.ConnectedSocket connected = SocketTransport.connectControl(connectionProfile);
+        Socket nextSocket = connected.socket;
         nextSocket.setSoTimeout(5000);
 
         socket = nextSocket;
         writer = new BufferedWriter(new OutputStreamWriter(nextSocket.getOutputStream(), StandardCharsets.UTF_8));
         BufferedReader reader = new BufferedReader(new InputStreamReader(nextSocket.getInputStream(), StandardCharsets.UTF_8));
+        if (connectionProfile.isLan()) {
+            authenticateLanControl(reader, connected.certificateFingerprint);
+        }
         reconnectCount = 0;
         missedPongs = 0;
         emitState(ConnectionState.CONNECTED);
-        log("已连接 " + host + ":" + port);
+        log("已连接 " + connectionProfile.getHost() + ":" + connectionProfile.getControlPort()
+            + (connectionProfile.isLan() ? "（TLS 局域网）" : "（USB）"));
 
         send("hello", payload("client", "SideDock.Android", "androidApi", Build.VERSION.SDK_INT));
         send("status", payload("state", "CONNECTED"));
@@ -1092,6 +1089,55 @@ public final class ControlClient {
 
             handleMessage(ProtocolMessage.fromJsonLine(line));
         }
+    }
+
+    private void authenticateLanControl(BufferedReader reader, String peerFingerprint) throws Exception {
+        JSONObject authPayload = payload(
+            "deviceId", connectionProfile.getDeviceId(),
+            "deviceName", connectionProfile.getDeviceName(),
+            "hostId", connectionProfile.getHostId(),
+            "pairingToken", connectionProfile.getPairingToken(),
+            "pairingCode", connectionProfile.getPairingCode()
+        );
+        ProtocolMessage auth = new ProtocolMessage(
+            1,
+            "auth",
+            0L,
+            System.currentTimeMillis(),
+            authPayload);
+        writer.write(auth.toJsonLine());
+        writer.newLine();
+        writer.flush();
+
+        String line = reader.readLine();
+        if (line == null) {
+            throw new SecurityException("Windows host closed the connection during pairing.");
+        }
+        ProtocolMessage response = ProtocolMessage.fromJsonLine(line);
+        if ("auth_error".equals(response.type)) {
+            throw new SecurityException(
+                response.payload.optString("code", "AUTH_FAILED")
+                    + ": "
+                    + response.payload.optString("message", "Pairing failed."));
+        }
+        if (!"auth_ack".equals(response.type)) {
+            throw new SecurityException("Unexpected Windows host pairing response: " + response.type);
+        }
+
+        String advertisedFingerprint = response.payload.optString("certificateFingerprint", "")
+            .replace(":", "")
+            .toUpperCase(java.util.Locale.ROOT);
+        if (!peerFingerprint.equals(advertisedFingerprint)) {
+            throw new SecurityException("Windows host certificate fingerprint does not match its pairing response.");
+        }
+        connectionProfile.saveAuthenticatedSession(
+            response.payload.optString("hostId", ""),
+            peerFingerprint,
+            response.payload.optString("pairingToken", ""),
+            response.payload.optString("sessionToken", ""));
+        log(response.payload.optBoolean("newlyPaired", false)
+            ? "局域网设备配对成功，已固定主机证书。"
+            : "局域网身份验证成功。");
     }
 
     private void handleMessage(ProtocolMessage message) {

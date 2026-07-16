@@ -113,6 +113,7 @@ public final class CameraCaptureClient {
     private static final long PTS_MATCH_TOLERANCE_US = 2_000L;
 
     private final Context context;
+    private final ConnectionProfile connectionProfile;
     private final Listener listener;
     private final Object lifecycleLock = new Object();
 
@@ -134,8 +135,9 @@ public final class CameraCaptureClient {
     private long recoveryStartedAtMs;
     private String lastDisconnectReason = "";
 
-    public CameraCaptureClient(Context context, Listener listener) {
+    public CameraCaptureClient(Context context, ConnectionProfile connectionProfile, Listener listener) {
         this.context = context.getApplicationContext();
+        this.connectionProfile = connectionProfile;
         this.listener = listener;
     }
 
@@ -325,10 +327,9 @@ public final class CameraCaptureClient {
                 try {
                     emitState("preparing", "Preparing camera uplink.");
 
-                    nextSocket = new Socket();
+                    nextSocket = SocketTransport.connectData(connectionProfile, port, "camera");
                     nextSocket.setTcpNoDelay(true);
                     nextSocket.setSendBufferSize(512 * 1024);
-                    nextSocket.connect(new InetSocketAddress("127.0.0.1", port), 3000);
                     synchronized (lifecycleLock) {
                         if (!running || generation != runGeneration) {
                             closeQuietly(nextSocket);

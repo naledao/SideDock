@@ -76,10 +76,29 @@ internal static partial class Program
             appCts.Cancel();
         };
 
+        using var lanSecurity = options.ConnectionMode == ConnectionMode.Lan
+            ? LanSecurityManager.Create()
+            : null;
+        var listenAddress = options.ConnectionMode == ConnectionMode.Lan
+            ? IPAddress.Any
+            : IPAddress.Loopback;
         var videoModeState = new VideoModeState(options);
         var displayLayoutProvider = new DisplayLayoutProvider(options, videoModeState, message => Log("DISPLAY", message));
 
         PrintHeader(options);
+        if (lanSecurity is not null)
+        {
+            var addresses = GetLanAddresses();
+            Log(
+                "LAN READY",
+                $"hostId={lanSecurity.HostId} hostName={Environment.MachineName} "
+                + $"addresses={string.Join(',', addresses)} controlPort={options.ControlPort} "
+                + $"pairingCode={lanSecurity.PairingCode} fingerprint={lanSecurity.CertificateFingerprint}");
+            await WindowsFirewallManager.EnsureRulesAsync(
+                new[] { options.ControlPort, options.VideoPort, options.AudioPort, options.CameraPort },
+                DefaultDiscoveryPort,
+                appCts.Token);
+        }
         Log("VIDEO", $"startup video-source={FormatVideoSource(options.VideoSource)} input-target={options.InputTarget.ToString().ToLowerInvariant()}");
         if (IsIddVideoSource(options.VideoSource) || options.InputTarget == InputTargetKind.Idd)
         {
@@ -99,10 +118,15 @@ internal static partial class Program
             Log("ADB", $"目标设备: {adbSerial}");
         }
 
-        var skipAdbReverse = IsTruthy(Environment.GetEnvironmentVariable("SIDEDOCK_SKIP_ADB_REVERSE"));
+        var skipAdbReverse = options.ConnectionMode == ConnectionMode.Lan
+            || IsTruthy(Environment.GetEnvironmentVariable("SIDEDOCK_SKIP_ADB_REVERSE"));
         if (skipAdbReverse)
         {
-            Log("ADB", "跳过自动配置 reverse: SIDEDOCK_SKIP_ADB_REVERSE 已启用");
+            Log(
+                "ADB",
+                options.ConnectionMode == ConnectionMode.Lan
+                    ? "局域网模式不使用 ADB reverse。"
+                    : "跳过自动配置 reverse: SIDEDOCK_SKIP_ADB_REVERSE 已启用");
         }
         else
         {
@@ -115,13 +139,14 @@ internal static partial class Program
         }
 
         var controlPublisher = new ControlMessagePublisher();
+        var networkQualityState = new NetworkQualityState();
         var audioTestCoordinator = new AudioTestCoordinator(options, controlPublisher);
         var cameraRuntimeState = new CameraRuntimeState(CameraRuntimeConfig.FromOptions(options));
-        var controlServer = new ControlServer(IPAddress.Loopback, options, videoModeState, controlPublisher, displayLayoutProvider, cameraRuntimeState, audioTestCoordinator);
-        var cameraCommandServer = new CameraCommandServer(IPAddress.Loopback, DefaultCameraCommandPort, options, controlPublisher, cameraRuntimeState, audioTestCoordinator);
-        var videoServer = new VideoServer(IPAddress.Loopback, options, videoModeState, controlPublisher, displayLayoutProvider);
-        var audioServer = new AudioServer(IPAddress.Loopback, options, controlPublisher, audioTestCoordinator);
-        var cameraServer = new CameraServer(IPAddress.Loopback, options, controlPublisher, cameraRuntimeState);
+        var controlServer = new ControlServer(listenAddress, options, videoModeState, controlPublisher, displayLayoutProvider, cameraRuntimeState, audioTestCoordinator, lanSecurity, networkQualityState);
+        var cameraCommandServer = new CameraCommandServer(IPAddress.Loopback, DefaultCameraCommandPort, options, controlPublisher, cameraRuntimeState, audioTestCoordinator, lanSecurity);
+        var videoServer = new VideoServer(listenAddress, options, videoModeState, controlPublisher, displayLayoutProvider, lanSecurity, networkQualityState);
+        var audioServer = new AudioServer(listenAddress, options, controlPublisher, audioTestCoordinator, lanSecurity);
+        var cameraServer = new CameraServer(listenAddress, options, controlPublisher, cameraRuntimeState, lanSecurity);
         if (!string.IsNullOrWhiteSpace(options.CameraReplayFilePath))
         {
             _ = Task.Run(
@@ -137,6 +162,11 @@ internal static partial class Program
             ["audio"] = audioServer.RunAsync(appCts.Token),
             ["camera"] = cameraServer.RunAsync(appCts.Token)
         };
+        if (lanSecurity is not null)
+        {
+            var discovery = new LanDiscoveryService(lanSecurity, options.ControlPort, appCts.Token);
+            serverTasks["lan-discovery"] = discovery.RunAsync();
+        }
         var firstCompletedServer = await Task.WhenAny(serverTasks.Values);
         if (!appCts.IsCancellationRequested)
         {
@@ -296,10 +326,12 @@ internal static partial class Program
     private static void PrintHeader(HostOptions options)
     {
         Console.WriteLine("SideDock Windows 服务");
-        Console.WriteLine($"控制通道: 127.0.0.1:{options.ControlPort}");
-        Console.WriteLine($"视频通道: 127.0.0.1:{options.VideoPort}");
-        Console.WriteLine($"麦克风通道: 127.0.0.1:{options.AudioPort}");
-        Console.WriteLine($"摄像头通道: 127.0.0.1:{options.CameraPort}");
+        var address = options.ConnectionMode == ConnectionMode.Lan ? "0.0.0.0" : "127.0.0.1";
+        Console.WriteLine($"连接模式: {options.ConnectionMode.ToString().ToLowerInvariant()}");
+        Console.WriteLine($"控制通道: {address}:{options.ControlPort}");
+        Console.WriteLine($"视频通道: {address}:{options.VideoPort}");
+        Console.WriteLine($"麦克风通道: {address}:{options.AudioPort}");
+        Console.WriteLine($"摄像头通道: {address}:{options.CameraPort}");
         Console.WriteLine($"视频源: {FormatVideoSource(options.VideoSource)}");
         Console.WriteLine($"测试视频: {options.VideoFilePath}");
         Console.WriteLine($"实时编码器: {options.Encoder}");
@@ -1073,7 +1105,8 @@ internal static partial class Program
         HostOptions options,
         ControlMessagePublisher publisher,
         CameraRuntimeState cameraRuntimeState,
-        AudioTestCoordinator audioTestCoordinator)
+        AudioTestCoordinator audioTestCoordinator,
+        LanSecurityManager? lanSecurity)
     {
         private readonly TcpListener _listener = new(address, port);
 
@@ -1147,6 +1180,46 @@ internal static partial class Program
                     return;
                 }
 
+                if (message.Type == "lan_pairings_list")
+                {
+                    var devices = new JsonArray();
+                    if (lanSecurity is not null)
+                    {
+                        foreach (var device in lanSecurity.GetPairedDevices())
+                        {
+                            devices.Add(new JsonObject
+                            {
+                                ["deviceId"] = device.DeviceId,
+                                ["deviceName"] = device.DeviceName,
+                                ["pairedAtUnixMs"] = device.PairedAtUnixMs,
+                                ["lastConnectedAtUnixMs"] = device.LastConnectedAtUnixMs
+                            });
+                        }
+                    }
+
+                    await WriteJsonResponseAsync(writer, new JsonObject
+                    {
+                        ["ok"] = lanSecurity is not null,
+                        ["message"] = lanSecurity is null ? "LAN mode is not active." : "paired devices loaded",
+                        ["devices"] = devices
+                    }, cancellationToken);
+                    return;
+                }
+
+                if (message.Type == "lan_pairing_remove")
+                {
+                    var deviceId = ReadCommandString(payload, "deviceId");
+                    var removed = lanSecurity is not null
+                        && !string.IsNullOrWhiteSpace(deviceId)
+                        && lanSecurity.RemovePairedDevice(deviceId);
+                    await WriteJsonResponseAsync(writer, new JsonObject
+                    {
+                        ["ok"] = removed,
+                        ["message"] = removed ? "paired device removed" : "paired device was not found"
+                    }, cancellationToken);
+                    return;
+                }
+
                 if (message.Type != "host_camera_config")
                 {
                     await WriteCommandResponseAsync(writer, ok: false, "unsupported command", cancellationToken);
@@ -1195,6 +1268,15 @@ internal static partial class Program
         {
             var response = JsonSerializer.Serialize(CreateAudioTestCommandResponsePayload(result), JsonOptions);
             await writer.WriteLineAsync(response.AsMemory(), cancellationToken);
+        }
+
+        private static async Task WriteJsonResponseAsync(
+            StreamWriter writer,
+            JsonObject response,
+            CancellationToken cancellationToken)
+        {
+            var json = response.ToJsonString(JsonOptions);
+            await writer.WriteLineAsync(json.AsMemory(), cancellationToken);
         }
     }
 
@@ -2222,7 +2304,9 @@ internal static partial class Program
         ControlMessagePublisher publisher,
         DisplayLayoutProvider displayLayoutProvider,
         CameraRuntimeState cameraRuntimeState,
-        AudioTestCoordinator audioTestCoordinator)
+        AudioTestCoordinator audioTestCoordinator,
+        LanSecurityManager? lanSecurity,
+        NetworkQualityState networkQualityState)
     {
         private readonly TcpListener _listener = new(address, options.ControlPort);
         private readonly HostOptions _options = options;
@@ -2246,20 +2330,6 @@ internal static partial class Program
                     var client = await _listener.AcceptTcpClientAsync(cancellationToken);
                     var connectionId = Interlocked.Increment(ref _connectionSerial);
                     var connectionCts = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
-
-                    CancellationTokenSource? previousConnectionCts;
-                    lock (_connectionLock)
-                    {
-                        previousConnectionCts = _activeConnectionCts;
-                        _activeConnectionCts = connectionCts;
-                    }
-
-                    if (previousConnectionCts is not null)
-                    {
-                        Log("CONTROL", "检测到新的 Android 控制连接，关闭旧连接。");
-                        await previousConnectionCts.CancelAsync();
-                    }
-
                     _ = Task.Run(() => HandleClientAsync(connectionId, client, connectionCts, cancellationToken), cancellationToken);
                 }
             }
@@ -2287,12 +2357,32 @@ internal static partial class Program
             using (connectionCts)
             {
                 var remote = client.Client.RemoteEndPoint?.ToString() ?? "unknown";
-                var session = new ControlSession(connectionId, client, connectionCts, _options, _videoModeState, _publisher, _displayLayoutProvider, _cameraRuntimeState, audioTestCoordinator);
                 Log($"CONN {connectionId}", $"控制通道已连接: {remote}");
 
                 try
                 {
-                    await session.RunAsync(appToken);
+                    await using var stream = lanSecurity is null
+                        ? client.GetStream()
+                        : await lanSecurity.OpenEncryptedStreamAsync(client, connectionCts.Token);
+                    using var lanSession = lanSecurity is null
+                        ? null
+                        : await lanSecurity.AuthenticateControlAsync(stream, client, connectionCts.Token);
+
+                    CancellationTokenSource? previousConnectionCts;
+                    lock (_connectionLock)
+                    {
+                        previousConnectionCts = _activeConnectionCts;
+                        _activeConnectionCts = connectionCts;
+                    }
+
+                    if (previousConnectionCts is not null)
+                    {
+                        Log("CONTROL", "检测到新的已认证 Android 控制连接，关闭旧连接。");
+                        await previousConnectionCts.CancelAsync();
+                    }
+
+                    var session = new ControlSession(connectionId, client, connectionCts, _options, _videoModeState, _publisher, _displayLayoutProvider, _cameraRuntimeState, audioTestCoordinator, networkQualityState);
+                    await session.RunAsync(stream, appToken);
                 }
                 catch (OperationCanceledException) when (appToken.IsCancellationRequested)
                 {
@@ -2329,6 +2419,7 @@ internal static partial class Program
         private readonly DisplayLayoutProvider _displayLayoutProvider;
         private readonly CameraRuntimeState _cameraRuntimeState;
         private readonly AudioTestCoordinator _audioTestCoordinator;
+        private readonly NetworkQualityState _networkQualityState;
         private readonly HostInputController _inputController;
         private readonly PeriodicTimer _heartbeatTimer = new(TimeSpan.FromSeconds(2));
         private readonly PeriodicTimer _inputStatsTimer = new(TimeSpan.FromSeconds(1));
@@ -2351,7 +2442,8 @@ internal static partial class Program
             ControlMessagePublisher publisher,
             DisplayLayoutProvider displayLayoutProvider,
             CameraRuntimeState cameraRuntimeState,
-            AudioTestCoordinator audioTestCoordinator)
+            AudioTestCoordinator audioTestCoordinator,
+            NetworkQualityState networkQualityState)
         {
             _connectionId = connectionId;
             _client = client;
@@ -2362,6 +2454,7 @@ internal static partial class Program
             _displayLayoutProvider = displayLayoutProvider;
             _cameraRuntimeState = cameraRuntimeState;
             _audioTestCoordinator = audioTestCoordinator;
+            _networkQualityState = networkQualityState;
             _client.NoDelay = true;
             _inputController = new HostInputController(
                 options.EnableInputInjection,
@@ -2370,9 +2463,8 @@ internal static partial class Program
                 message => Log(Scope, message));
         }
 
-        public async Task RunAsync(CancellationToken appToken)
+        public async Task RunAsync(Stream stream, CancellationToken appToken)
         {
-            await using var stream = _client.GetStream();
             using var reader = new StreamReader(stream, Encoding.UTF8, detectEncodingFromByteOrderMarks: false, bufferSize: 8192, leaveOpen: true);
             using var writer = new StreamWriter(stream, new UTF8Encoding(encoderShouldEmitUTF8Identifier: false), bufferSize: 8192, leaveOpen: true)
             {
@@ -2628,6 +2720,8 @@ internal static partial class Program
             {
                 return;
             }
+
+            _networkQualityState.Update(payload);
 
             var frameKind = payload.TryGetPropertyValue("lastFrameKind", out var frameKindNode)
                 ? frameKindNode?.GetValue<string>() ?? ""
@@ -5483,7 +5577,9 @@ internal static partial class Program
         HostOptions options,
         VideoModeState videoModeState,
         ControlMessagePublisher controlPublisher,
-        DisplayLayoutProvider displayLayoutProvider)
+        DisplayLayoutProvider displayLayoutProvider,
+        LanSecurityManager? lanSecurity,
+        NetworkQualityState networkQualityState)
     {
         private readonly TcpListener _listener = new(address, options.VideoPort);
         private readonly HostOptions _options = options;
@@ -5547,6 +5643,9 @@ internal static partial class Program
 
         private async Task StartConnectionAsync(int connectionId, TcpClient client, CancellationToken appToken)
         {
+            var stream = lanSecurity is null
+                ? client.GetStream()
+                : await lanSecurity.OpenAuthenticatedDataStreamAsync(client, "video", appToken);
             var accepted = false;
             await _sessionSupervisor.WaitAsync(appToken);
             try
@@ -5598,7 +5697,7 @@ internal static partial class Program
                     await startGate.Task;
                     await RunConnectionAsync(connection!, appToken);
                 });
-                connection = new ActiveVideoConnection(connectionId, client, connectionCts, connectionTask);
+                connection = new ActiveVideoConnection(connectionId, client, stream, connectionCts, connectionTask);
                 lock (_connectionLock)
                 {
                     _activeConnection = connection;
@@ -5613,6 +5712,7 @@ internal static partial class Program
                 _sessionSupervisor.Release();
                 if (!accepted)
                 {
+                    await stream.DisposeAsync();
                     AbortClient(client);
                 }
             }
@@ -5622,7 +5722,7 @@ internal static partial class Program
         {
             try
             {
-                await HandleClientAsync(connection.ConnectionId, connection.Client, connection.ConnectionCts, appToken);
+                await HandleClientAsync(connection.ConnectionId, connection.Client, connection.Stream, connection.ConnectionCts, appToken);
             }
             finally
             {
@@ -5714,6 +5814,7 @@ internal static partial class Program
         private async Task HandleClientAsync(
             int connectionId,
             TcpClient client,
+            Stream stream,
             CancellationTokenSource connectionCts,
             CancellationToken appToken)
         {
@@ -5727,7 +5828,7 @@ internal static partial class Program
                 await using var source = OperatingSystem.IsWindows()
                     ? CreateVideoSource(connectionId, videoOptions)
                     : CreateNonWindowsVideoSource(connectionId, videoOptions);
-                var session = new VideoSession(connectionId, client, source, videoOptions, _videoModeState, _controlPublisher);
+                var session = new VideoSession(connectionId, client, stream, source, videoOptions, _videoModeState, _controlPublisher, networkQualityState);
                 await session.RunAsync(connectionCts.Token);
             }
             catch (FileNotFoundException)
@@ -5752,6 +5853,7 @@ internal static partial class Program
         private sealed record ActiveVideoConnection(
             int ConnectionId,
             TcpClient Client,
+            Stream Stream,
             CancellationTokenSource ConnectionCts,
             Task ConnectionTask);
 
@@ -5837,15 +5939,17 @@ internal static partial class Program
     private sealed class VideoSession(
         int connectionId,
         TcpClient client,
+        Stream stream,
         IEncodedVideoSource videoSource,
         HostOptions options,
         VideoModeState videoModeState,
-        ControlMessagePublisher controlPublisher)
+        ControlMessagePublisher controlPublisher,
+        NetworkQualityState networkQualityState)
     {
         private static readonly TimeSpan SocketWriteTimeout = TimeSpan.FromSeconds(1);
         private static readonly object DumpFileLock = new();
         private static readonly HashSet<string> InitializedDumpPaths = new(StringComparer.OrdinalIgnoreCase);
-        private readonly AdaptiveFrameRateController _adaptiveController = new(videoModeState, controlPublisher, options.VideoPort, $"VIDEO {connectionId}");
+        private readonly AdaptiveFrameRateController _adaptiveController = new(videoModeState, controlPublisher, options.VideoPort, $"VIDEO {connectionId}", networkQualityState);
         private readonly IAdaptiveVideoStatsSource? _adaptiveStatsSource = videoSource as IAdaptiveVideoStatsSource;
         private readonly LatestFrameQueue<EncodedVideoPacket> _sendQueue = new(
             Math.Max(1, options.EncodedPacketQueue),
@@ -5858,7 +5962,7 @@ internal static partial class Program
             client.NoDelay = true;
             client.SendBufferSize = 1024 * 1024;
 
-            await using var stream = client.GetStream();
+            await using var activeStream = stream;
             using var sessionCts = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
             Task? producerTask = null;
             long packetsSent = 0;
@@ -5877,7 +5981,7 @@ internal static partial class Program
                 {
                     cancellationToken.ThrowIfCancellationRequested();
                     var sendStopwatch = Stopwatch.StartNew();
-                    await WritePacketWithTimeoutAsync(stream, packet, cancellationToken);
+                    await WritePacketWithTimeoutAsync(activeStream, packet, cancellationToken);
                     sendStopwatch.Stop();
                     _sendStageStats.RecordProcessed(sendStopwatch.Elapsed.TotalMilliseconds);
 
@@ -5934,7 +6038,7 @@ internal static partial class Program
             }
         }
 
-        private async Task WritePacketWithTimeoutAsync(NetworkStream stream, EncodedVideoPacket packet, CancellationToken cancellationToken)
+        private async Task WritePacketWithTimeoutAsync(Stream stream, EncodedVideoPacket packet, CancellationToken cancellationToken)
         {
             var writeTask = WritePacketAsync(stream, packet, cancellationToken);
             var timeoutTask = Task.Delay(SocketWriteTimeout, cancellationToken);
@@ -5955,7 +6059,7 @@ internal static partial class Program
             throw new TimeoutException($"Video socket write timed out after {SocketWriteTimeout.TotalMilliseconds:F0}ms.");
         }
 
-        private static async Task WritePacketAsync(NetworkStream stream, EncodedVideoPacket packet, CancellationToken cancellationToken)
+        private static async Task WritePacketAsync(Stream stream, EncodedVideoPacket packet, CancellationToken cancellationToken)
         {
             try
             {
@@ -14796,6 +14900,55 @@ internal static partial class Program
         }
     }
 
+    private sealed class NetworkQualityState
+    {
+        private NetworkQualitySnapshot _latest = NetworkQualitySnapshot.Empty;
+
+        public NetworkQualitySnapshot Current => Volatile.Read(ref _latest);
+
+        public void Update(JsonObject payload)
+        {
+            Volatile.Write(ref _latest, new NetworkQualitySnapshot(
+                ReadLongValue(payload, "roughLatencyMs"),
+                ReadDoubleValue(payload, "p95QueueToRenderMs"),
+                ReadDoubleValue(payload, "p99QueueToRenderMs"),
+                ReadLongValue(payload, "decodeErrors"),
+                ReadLongValue(payload, "videoReconnects"),
+                DateTimeOffset.UtcNow));
+        }
+
+        private static long ReadLongValue(JsonObject payload, string name)
+        {
+            return payload.TryGetPropertyValue(name, out var node)
+                && node is not null
+                && long.TryParse(node.ToString(), NumberStyles.Any, CultureInfo.InvariantCulture, out var value)
+                    ? value
+                    : 0;
+        }
+
+        private static double ReadDoubleValue(JsonObject payload, string name)
+        {
+            return payload.TryGetPropertyValue(name, out var node)
+                && node is not null
+                && double.TryParse(node.ToString(), NumberStyles.Any, CultureInfo.InvariantCulture, out var value)
+                    ? value
+                    : 0;
+        }
+    }
+
+    private sealed record NetworkQualitySnapshot(
+        long RoughLatencyMs,
+        double P95QueueToRenderMs,
+        double P99QueueToRenderMs,
+        long DecodeErrors,
+        long Reconnects,
+        DateTimeOffset ObservedAt)
+    {
+        public static NetworkQualitySnapshot Empty { get; } = new(0, 0, 0, 0, 0, DateTimeOffset.MinValue);
+
+        public bool IsRecent(DateTimeOffset now) => now - ObservedAt <= TimeSpan.FromSeconds(3);
+    }
+
     private sealed class AdaptiveFrameRateController
     {
         private static readonly int[] FrameRateLevels = [120, 90, 72];
@@ -14804,6 +14957,7 @@ internal static partial class Program
         private readonly ControlMessagePublisher _controlPublisher;
         private readonly int _videoPort;
         private readonly string _scope;
+        private readonly NetworkQualityState _networkQualityState;
         private CaptureStatsSnapshot? _latestCaptureSnapshot;
         private RealtimeEncoderStatsSnapshot? _latestEncoderSnapshot;
         private RealtimeEncoderStatsSnapshot? _lastEvaluatedEncoderSnapshot;
@@ -14816,12 +14970,14 @@ internal static partial class Program
             VideoModeState videoModeState,
             ControlMessagePublisher controlPublisher,
             int videoPort,
-            string scope)
+            string scope,
+            NetworkQualityState networkQualityState)
         {
             _videoModeState = videoModeState;
             _controlPublisher = controlPublisher;
             _videoPort = videoPort;
             _scope = scope;
+            _networkQualityState = networkQualityState;
             _currentLevelIndex = LevelIndexFor(videoModeState.Current.Fps);
         }
 
@@ -14874,13 +15030,6 @@ internal static partial class Program
             }
 
             var currentMode = _videoModeState.Current;
-            if (currentMode.Fps >= FrameRateLevels[0])
-            {
-                _badWindowStreak = 0;
-                _goodWindowStreak = 0;
-                return null;
-            }
-
             var liveIndex = LevelIndexFor(currentMode.Fps);
             if (liveIndex < 0)
             {
@@ -14909,9 +15058,12 @@ internal static partial class Program
             }
 
             var captureSnapshot = _latestCaptureSnapshot;
-            var overloaded = IsOverloaded(captureSnapshot, encoderSnapshot, currentMode.Fps);
+            var networkSnapshot = _networkQualityState.Current;
+            var networkOverloaded = IsNetworkOverloaded(networkSnapshot, now);
+            var overloaded = networkOverloaded || IsOverloaded(captureSnapshot, encoderSnapshot, currentMode.Fps);
             var idle = IsIdle(captureSnapshot, encoderSnapshot, currentMode.Fps);
-            var healthy = IsHealthy(captureSnapshot, encoderSnapshot, currentMode.Fps);
+            var healthy = IsNetworkHealthy(networkSnapshot, now)
+                && IsHealthy(captureSnapshot, encoderSnapshot, currentMode.Fps);
 
             if ((_currentLevelIndex < FrameRateLevels.Length - 1) && (overloaded || idle))
             {
@@ -14921,6 +15073,7 @@ internal static partial class Program
                     || encoderSnapshot.LateFrames > Math.Max(2, currentMode.Fps / 20)
                     || encoderSnapshot.P99EncodeMs >= 12.0
                     || encoderSnapshot.P99SendMs >= 8.0
+                    || (networkOverloaded && networkSnapshot.RoughLatencyMs >= 180)
                     || (captureSnapshot is not null && captureSnapshot.CaptureErrors > 0);
 
                 if (_badWindowStreak >= 2 || immediate)
@@ -14931,7 +15084,7 @@ internal static partial class Program
                     return new AdaptiveDecision(
                         currentMode,
                         FrameRateLevels[_currentLevelIndex],
-                        overloaded ? "encode_pressure" : "static_scene");
+                        networkOverloaded ? "network_congestion" : overloaded ? "encode_pressure" : "static_scene");
                 }
             }
             else if (_currentLevelIndex > 0 && healthy && encoderSnapshot.NewFramesSent >= encoderSnapshot.RepeatFramesSent)
@@ -15003,6 +15156,26 @@ internal static partial class Program
                 || encoderSnapshot.P99SendMs > Math.Max(8.0, frameBudgetMs * 0.75)
                 || (hasActiveNewFrames && encoderSnapshot.StreamFps < currentFps * 0.85)
                 || capturePressure;
+        }
+
+        private static bool IsNetworkOverloaded(NetworkQualitySnapshot snapshot, DateTimeOffset now)
+        {
+            return snapshot.IsRecent(now)
+                && ((snapshot.RoughLatencyMs > 0 && snapshot.RoughLatencyMs >= 120)
+                    || snapshot.P95QueueToRenderMs >= 70
+                    || snapshot.P99QueueToRenderMs >= 120);
+        }
+
+        private static bool IsNetworkHealthy(NetworkQualitySnapshot snapshot, DateTimeOffset now)
+        {
+            if (!snapshot.IsRecent(now))
+            {
+                return true;
+            }
+
+            return (snapshot.RoughLatencyMs <= 0 || snapshot.RoughLatencyMs < 70)
+                && snapshot.P95QueueToRenderMs < 35
+                && snapshot.P99QueueToRenderMs < 70;
         }
 
         private static bool IsIdle(
@@ -16101,6 +16274,7 @@ internal static partial class Program
         int Gop120Fps);
 
     private sealed record HostOptions(
+        ConnectionMode ConnectionMode,
         int ControlPort,
         int VideoPort,
         int AudioPort,
@@ -16159,6 +16333,7 @@ internal static partial class Program
 
         public static HostOptions Parse(string[] args)
         {
+            var connectionMode = ConnectionMode.Usb;
             var controlPort = DefaultControlPort;
             var videoPort = DefaultVideoPort;
             var audioPort = DefaultAudioPort;
@@ -16234,6 +16409,11 @@ internal static partial class Program
             {
                 switch (args[index])
                 {
+                    case "--connection-mode":
+                    case "--transport":
+                        connectionMode = ParseConnectionMode(args[index + 1]);
+                        break;
+
                     case "--port":
                     case "--control-port":
                         if (int.TryParse(args[index + 1], out var parsedControlPort))
@@ -16502,6 +16682,7 @@ internal static partial class Program
             inputTarget ??= IsIddVideoSource(videoSource) ? InputTargetKind.Idd : InputTargetKind.System;
 
             return new HostOptions(
+                connectionMode,
                 controlPort,
                 videoPort,
                 audioPort,
@@ -16544,6 +16725,16 @@ internal static partial class Program
                 NormalizeOptionalAudioEndpointId(audioOutputLoopbackEndpointId),
                 NormalizeOptionalAudioEndpointId(audioMicrophoneRenderEndpointId),
                 NormalizeOptionalPath(cameraReplayFilePath));
+        }
+
+        private static ConnectionMode ParseConnectionMode(string value)
+        {
+            return value.Trim().ToLowerInvariant() switch
+            {
+                "usb" => ConnectionMode.Usb,
+                "lan" or "wifi" or "network" => ConnectionMode.Lan,
+                _ => throw new ArgumentException("--connection-mode must be 'usb' or 'lan'.")
+            };
         }
 
         private static string? NormalizeOptionalAudioEndpointId(string? value)

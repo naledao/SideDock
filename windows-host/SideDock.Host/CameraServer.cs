@@ -5,6 +5,7 @@ using System.IO.MemoryMappedFiles;
 using System.Runtime.InteropServices;
 using System.Net;
 using System.Net.Sockets;
+using System.Security.Authentication;
 using System.Security.Principal;
 using System.Text;
 using System.Text.Json.Nodes;
@@ -19,7 +20,8 @@ internal static partial class Program
         IPAddress address,
         HostOptions options,
         ControlMessagePublisher controlPublisher,
-        CameraRuntimeState cameraRuntimeState)
+        CameraRuntimeState cameraRuntimeState,
+        LanSecurityManager? lanSecurity)
     {
         private const int HeaderSize = 40;
         private const int Version = 1;
@@ -64,6 +66,20 @@ internal static partial class Program
                 while (!cancellationToken.IsCancellationRequested)
                 {
                     var client = await _listener.AcceptTcpClientAsync(cancellationToken);
+                    Stream stream;
+                    try
+                    {
+                        stream = lanSecurity is null
+                            ? client.GetStream()
+                            : await lanSecurity.OpenAuthenticatedDataStreamAsync(client, "camera", cancellationToken);
+                    }
+                    catch (Exception ex) when (ex is AuthenticationException or IOException or UnauthorizedAccessException)
+                    {
+                        Log("CAMERA", $"rejected unauthenticated connection remote={SafeEndpoint(client, remote: true)} error={ex.Message}");
+                        client.Dispose();
+                        continue;
+                    }
+
                     var connectionId = Interlocked.Increment(ref _connectionSerial);
                     var connectionCts = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
 
@@ -85,7 +101,7 @@ internal static partial class Program
                     }
 
                     var connectionTask = Task.Run(
-                        () => HandleClientAsync(connectionId, client, connectionCts, cancellationToken),
+                        () => HandleClientAsync(connectionId, client, stream, connectionCts, cancellationToken),
                         cancellationToken);
                     lock (_connectionLock)
                     {
@@ -120,11 +136,13 @@ internal static partial class Program
         private async Task HandleClientAsync(
             int connectionId,
             TcpClient client,
+            Stream stream,
             CancellationTokenSource connectionCts,
             CancellationToken appToken)
         {
             using (client)
             using (connectionCts)
+            await using (stream)
             {
                 var remote = SafeEndpoint(client, remote: true);
                 var local = SafeEndpoint(client, remote: false);
@@ -144,7 +162,7 @@ internal static partial class Program
                 {
                     client.NoDelay = true;
                     client.ReceiveBufferSize = 1024 * 1024;
-                    await ReceivePacketsAsync(connectionId, client.GetStream(), connectionCts.Token);
+                    await ReceivePacketsAsync(connectionId, stream, connectionCts.Token);
                 }
                 catch (OperationCanceledException) when (appToken.IsCancellationRequested || connectionCts.IsCancellationRequested)
                 {
@@ -199,7 +217,7 @@ internal static partial class Program
             }
         }
 
-        private async Task ReceivePacketsAsync(int connectionId, NetworkStream stream, CancellationToken cancellationToken)
+        private async Task ReceivePacketsAsync(int connectionId, Stream stream, CancellationToken cancellationToken)
         {
             var header = ArrayPool<byte>.Shared.Rent(HeaderSize);
             var stats = new CameraReceiveStats(cameraRuntimeState.Current.Fps);
