@@ -1331,7 +1331,7 @@ public final class MainActivity extends Activity implements ControlClient.Listen
         float density = getResources().getDisplayMetrics().density;
 
         rootView = new PointerHidingFrameLayout(this);
-        rootView.setBackgroundColor(0xFF061A25);
+        rootView.setBackgroundColor(0xFF000000);
         rootView.setLayoutParams(new ViewGroup.LayoutParams(
             ViewGroup.LayoutParams.MATCH_PARENT,
             ViewGroup.LayoutParams.MATCH_PARENT
